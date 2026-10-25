@@ -1,0 +1,19 @@
+# Binaries
+/karsad
+*.exe
+*.test
+*.out
+
+# Local node data and runtime artifacts
+/data/
+/.testnets/
+*.log
+
+# Backup files
+*.bak
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
