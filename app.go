@@ -1,4 +1,4 @@
-package evmd
+package karsa
 
 import (
 	"encoding/json"
@@ -22,7 +22,6 @@ import (
 	antetypes "github.com/cosmos/evm/ante/types"
 	evmencoding "github.com/cosmos/evm/encoding"
 	evmaddress "github.com/cosmos/evm/encoding/address"
-	evmconfig "github.com/cosmos/evm/evmd/config"
 	evmmempool "github.com/cosmos/evm/mempool"
 	precompiletypes "github.com/cosmos/evm/precompiles/types"
 	cosmosevmserver "github.com/cosmos/evm/server"
@@ -53,6 +52,7 @@ import (
 	ibckeeper "github.com/cosmos/ibc-go/v11/modules/core/keeper"
 	ibctm "github.com/cosmos/ibc-go/v11/modules/light-clients/07-tendermint"
 	ibctesting "github.com/cosmos/ibc-go/v11/testing"
+	evmconfig "github.com/karsa/karsa/config"
 
 	autocliv1 "cosmossdk.io/api/cosmos/autocli/v1"
 	reflectionv1 "cosmossdk.io/api/cosmos/reflection/v1"
@@ -144,13 +144,13 @@ const appName = "karsa"
 var defaultNodeHome string
 
 var (
-	_ runtime.AppI                = (*EVMD)(nil)
-	_ cosmosevmserver.Application = (*EVMD)(nil)
-	_ ibctesting.TestingApp       = (*EVMD)(nil)
+	_ runtime.AppI                = (*App)(nil)
+	_ cosmosevmserver.Application = (*App)(nil)
+	_ ibctesting.TestingApp       = (*App)(nil)
 )
 
-// EVMD extends an ABCI application, but with most of its parameters exported.
-type EVMD struct {
+// App extends an ABCI application, but with most of its parameters exported.
+type App struct {
 	*baseapp.BaseApp
 
 	legacyAmino       *codec.LegacyAmino
@@ -200,14 +200,14 @@ type EVMD struct {
 	configurator module.Configurator
 }
 
-// NewExampleApp returns a reference to an initialized EVMD.
-func NewExampleApp(
+// NewApp returns a reference to an initialized App.
+func NewApp(
 	logger log.Logger,
 	db dbm.DB,
 	loadLatest bool,
 	appOpts servertypes.AppOptions,
 	baseAppOptions ...func(*baseapp.BaseApp),
-) *EVMD {
+) *App {
 	evmChainID := cast.ToUint64(appOpts.Get(srvflags.EVMChainID))
 	encodingConfig := evmencoding.MakeConfig(evmChainID)
 
@@ -269,7 +269,7 @@ func NewExampleApp(
 		panic("version db not supported in this example chain")
 	}
 
-	app := &EVMD{
+	app := &App{
 		BaseApp:           bApp,
 		legacyAmino:       legacyAmino,
 		appCodec:          appCodec,
@@ -795,7 +795,7 @@ func NewExampleApp(
 	return app
 }
 
-func (app *EVMD) setAnteHandler(txConfig client.TxConfig, maxGasWanted uint64) {
+func (app *App) setAnteHandler(txConfig client.TxConfig, maxGasWanted uint64) {
 	options := evmante.HandlerOptions{
 		Cdc:                    app.appCodec,
 		AccountKeeper:          app.AccountKeeper,
@@ -818,18 +818,18 @@ func (app *EVMD) setAnteHandler(txConfig client.TxConfig, maxGasWanted uint64) {
 	app.SetAnteHandler(evmante.NewAnteHandler(options))
 }
 
-func (app *EVMD) onPendingTx(hash common.Hash) {
+func (app *App) onPendingTx(hash common.Hash) {
 	for _, listener := range app.pendingTxListeners {
 		listener(hash)
 	}
 }
 
 // RegisterPendingTxListener is used by json-rpc server to listen to pending transactions callback.
-func (app *EVMD) RegisterPendingTxListener(listener func(common.Hash)) {
+func (app *App) RegisterPendingTxListener(listener func(common.Hash)) {
 	app.pendingTxListeners = append(app.pendingTxListeners, listener)
 }
 
-func (app *EVMD) setPostHandler() {
+func (app *App) setPostHandler() {
 	postHandler, err := posthandler.NewPostHandler(
 		posthandler.HandlerOptions{},
 	)
@@ -841,28 +841,28 @@ func (app *EVMD) setPostHandler() {
 }
 
 // Name returns the name of the App
-func (app *EVMD) Name() string { return app.BaseApp.Name() }
+func (app *App) Name() string { return app.BaseApp.Name() }
 
 // BeginBlocker application updates every begin block
-func (app *EVMD) BeginBlocker(ctx sdk.Context) (sdk.BeginBlock, error) {
+func (app *App) BeginBlocker(ctx sdk.Context) (sdk.BeginBlock, error) {
 	return app.ModuleManager.BeginBlock(ctx)
 }
 
 // EndBlocker application updates every end block
-func (app *EVMD) EndBlocker(ctx sdk.Context) (sdk.EndBlock, error) {
+func (app *App) EndBlocker(ctx sdk.Context) (sdk.EndBlock, error) {
 	return app.ModuleManager.EndBlock(ctx)
 }
 
-func (app *EVMD) FinalizeBlock(req *abci.RequestFinalizeBlock) (res *abci.ResponseFinalizeBlock, err error) {
+func (app *App) FinalizeBlock(req *abci.RequestFinalizeBlock) (res *abci.ResponseFinalizeBlock, err error) {
 	return app.BaseApp.FinalizeBlock(req)
 }
 
-func (app *EVMD) Configurator() module.Configurator {
+func (app *App) Configurator() module.Configurator {
 	return app.configurator
 }
 
 // InitChainer application update at chain initialization
-func (app *EVMD) InitChainer(ctx sdk.Context, req *abci.RequestInitChain) (*abci.ResponseInitChain, error) {
+func (app *App) InitChainer(ctx sdk.Context, req *abci.RequestInitChain) (*abci.ResponseInitChain, error) {
 	var genesisState GenesisState
 	if err := json.Unmarshal(req.AppStateBytes, &genesisState); err != nil {
 		panic(err)
@@ -875,43 +875,43 @@ func (app *EVMD) InitChainer(ctx sdk.Context, req *abci.RequestInitChain) (*abci
 	return app.ModuleManager.InitGenesis(ctx, app.appCodec, genesisState)
 }
 
-func (app *EVMD) PreBlocker(ctx sdk.Context, _ *abci.RequestFinalizeBlock) (*sdk.ResponsePreBlock, error) {
+func (app *App) PreBlocker(ctx sdk.Context, _ *abci.RequestFinalizeBlock) (*sdk.ResponsePreBlock, error) {
 	return app.ModuleManager.PreBlock(ctx)
 }
 
 // LoadHeight loads a particular height
-func (app *EVMD) LoadHeight(height int64) error {
+func (app *App) LoadHeight(height int64) error {
 	return app.LoadVersion(height)
 }
 
-// LegacyAmino returns EVMD's amino codec.
+// LegacyAmino returns App's amino codec.
 //
 // NOTE: This is solely to be used for testing purposes as it may be desirable
 // for modules to register their own custom testing types.
-func (app *EVMD) LegacyAmino() *codec.LegacyAmino {
+func (app *App) LegacyAmino() *codec.LegacyAmino {
 	return app.legacyAmino
 }
 
-// AppCodec returns EVMD's app codec.
+// AppCodec returns App's app codec.
 //
 // NOTE: This is solely to be used for testing purposes as it may be desirable
 // for modules to register their own custom testing types.
-func (app *EVMD) AppCodec() codec.Codec {
+func (app *App) AppCodec() codec.Codec {
 	return app.appCodec
 }
 
-// InterfaceRegistry returns EVMD's InterfaceRegistry
-func (app *EVMD) InterfaceRegistry() types.InterfaceRegistry {
+// InterfaceRegistry returns App's InterfaceRegistry
+func (app *App) InterfaceRegistry() types.InterfaceRegistry {
 	return app.interfaceRegistry
 }
 
-// TxConfig returns EVMD's TxConfig
-func (app *EVMD) TxConfig() client.TxConfig {
+// TxConfig returns App's TxConfig
+func (app *App) TxConfig() client.TxConfig {
 	return app.txConfig
 }
 
 // DefaultGenesis returns a default genesis from the registered AppModuleBasic's.
-func (app *EVMD) DefaultGenesis() map[string]json.RawMessage {
+func (app *App) DefaultGenesis() map[string]json.RawMessage {
 	genesis := app.BasicModuleManager.DefaultGenesis(app.appCodec)
 
 	mintGenState := NewMintGenesisState()
@@ -931,18 +931,18 @@ func (app *EVMD) DefaultGenesis() map[string]json.RawMessage {
 // GetKey returns the KVStoreKey for the provided store key.
 //
 // NOTE: This is solely to be used for testing purposes.
-func (app *EVMD) GetKey(storeKey string) *storetypes.KVStoreKey {
+func (app *App) GetKey(storeKey string) *storetypes.KVStoreKey {
 	return app.keys[storeKey]
 }
 
 // SimulationManager implements the SimulationApp interface
-func (app *EVMD) SimulationManager() *module.SimulationManager {
+func (app *App) SimulationManager() *module.SimulationManager {
 	return app.sm
 }
 
 // RegisterAPIRoutes registers all application module routes with the provided
 // API server.
-func (app *EVMD) RegisterAPIRoutes(apiSvr *api.Server, apiConfig config.APIConfig) {
+func (app *App) RegisterAPIRoutes(apiSvr *api.Server, apiConfig config.APIConfig) {
 	clientCtx := apiSvr.ClientCtx
 	// Register new tx routes from grpc-gateway.
 	authtx.RegisterGRPCGatewayRoutes(clientCtx, apiSvr.GRPCGatewayRouter)
@@ -963,12 +963,12 @@ func (app *EVMD) RegisterAPIRoutes(apiSvr *api.Server, apiConfig config.APIConfi
 }
 
 // RegisterTxService implements the Application.RegisterTxService method.
-func (app *EVMD) RegisterTxService(clientCtx client.Context) {
+func (app *App) RegisterTxService(clientCtx client.Context) {
 	authtx.RegisterTxService(app.GRPCQueryRouter(), clientCtx, app.Simulate, app.interfaceRegistry)
 }
 
 // RegisterTendermintService implements the Application.RegisterTendermintService method.
-func (app *EVMD) RegisterTendermintService(clientCtx client.Context) {
+func (app *App) RegisterTendermintService(clientCtx client.Context) {
 	cmtservice.RegisterTendermintService(
 		clientCtx,
 		app.GRPCQueryRouter(),
@@ -977,7 +977,7 @@ func (app *EVMD) RegisterTendermintService(clientCtx client.Context) {
 	)
 }
 
-func (app *EVMD) RegisterNodeService(clientCtx client.Context, cfg config.Config) {
+func (app *App) RegisterNodeService(clientCtx client.Context, cfg config.Config) {
 	node.RegisterNodeService(clientCtx, app.GRPCQueryRouter(), cfg, func() int64 {
 		return app.CommitMultiStore().EarliestVersion()
 	})
@@ -988,103 +988,103 @@ func (app *EVMD) RegisterNodeService(clientCtx client.Context, cfg config.Config
 //
 
 // GetBaseApp implements the TestingApp interface.
-func (app *EVMD) GetBaseApp() *baseapp.BaseApp {
+func (app *App) GetBaseApp() *baseapp.BaseApp {
 	return app.BaseApp
 }
 
 // GetStakingKeeperSDK implements the TestingApp interface.
-func (app *EVMD) GetStakingKeeperSDK() stakingkeeper.Keeper {
+func (app *App) GetStakingKeeperSDK() stakingkeeper.Keeper {
 	return *app.StakingKeeper
 }
 
 // GetIBCKeeper implements the TestingApp interface.
-func (app *EVMD) GetIBCKeeper() *ibckeeper.Keeper {
+func (app *App) GetIBCKeeper() *ibckeeper.Keeper {
 	return app.IBCKeeper
 }
 
-func (app *EVMD) GetEVMKeeper() *evmkeeper.Keeper {
+func (app *App) GetEVMKeeper() *evmkeeper.Keeper {
 	return app.EVMKeeper
 }
 
-func (app *EVMD) GetErc20Keeper() *erc20keeper.Keeper {
+func (app *App) GetErc20Keeper() *erc20keeper.Keeper {
 	return &app.Erc20Keeper
 }
 
-func (app *EVMD) SetErc20Keeper(erc20Keeper erc20keeper.Keeper) {
+func (app *App) SetErc20Keeper(erc20Keeper erc20keeper.Keeper) {
 	app.Erc20Keeper = erc20Keeper
 }
 
-func (app *EVMD) GetGovKeeper() govkeeper.Keeper {
+func (app *App) GetGovKeeper() govkeeper.Keeper {
 	return app.GovKeeper
 }
 
-func (app *EVMD) GetEvidenceKeeper() *evidencekeeper.Keeper {
+func (app *App) GetEvidenceKeeper() *evidencekeeper.Keeper {
 	return &app.EvidenceKeeper
 }
 
-func (app *EVMD) GetSlashingKeeper() slashingkeeper.Keeper {
+func (app *App) GetSlashingKeeper() slashingkeeper.Keeper {
 	return app.SlashingKeeper
 }
 
-func (app *EVMD) GetBankKeeper() bankkeeper.Keeper {
+func (app *App) GetBankKeeper() bankkeeper.Keeper {
 	return app.BankKeeper
 }
 
-func (app *EVMD) GetFeeMarketKeeper() *feemarketkeeper.Keeper {
+func (app *App) GetFeeMarketKeeper() *feemarketkeeper.Keeper {
 	return &app.FeeMarketKeeper
 }
 
-func (app *EVMD) GetFeeGrantKeeper() feegrantkeeper.Keeper {
+func (app *App) GetFeeGrantKeeper() feegrantkeeper.Keeper {
 	return app.FeeGrantKeeper
 }
 
-func (app *EVMD) GetConsensusParamsKeeper() consensusparamkeeper.Keeper {
+func (app *App) GetConsensusParamsKeeper() consensusparamkeeper.Keeper {
 	return app.ConsensusParamsKeeper
 }
 
-func (app *EVMD) GetAccountKeeper() authkeeper.AccountKeeper {
+func (app *App) GetAccountKeeper() authkeeper.AccountKeeper {
 	return app.AccountKeeper
 }
 
-func (app *EVMD) GetDistrKeeper() distrkeeper.Keeper {
+func (app *App) GetDistrKeeper() distrkeeper.Keeper {
 	return app.DistrKeeper
 }
 
-func (app *EVMD) GetStakingKeeper() *stakingkeeper.Keeper {
+func (app *App) GetStakingKeeper() *stakingkeeper.Keeper {
 	return app.StakingKeeper
 }
 
-func (app *EVMD) GetMintKeeper() mintkeeper.Keeper {
+func (app *App) GetMintKeeper() mintkeeper.Keeper {
 	return app.MintKeeper
 }
 
-func (app *EVMD) GetCallbackKeeper() ibccallbackskeeper.ContractKeeper {
+func (app *App) GetCallbackKeeper() ibccallbackskeeper.ContractKeeper {
 	return app.CallbackKeeper
 }
 
-func (app *EVMD) GetTransferKeeper() *transferkeeper.Keeper {
+func (app *App) GetTransferKeeper() *transferkeeper.Keeper {
 	return app.TransferKeeper
 }
 
-func (app *EVMD) SetTransferKeeper(transferKeeper *transferkeeper.Keeper) {
+func (app *App) SetTransferKeeper(transferKeeper *transferkeeper.Keeper) {
 	app.TransferKeeper = transferKeeper
 }
 
-func (app *EVMD) GetMempool() sdkmempool.ExtMempool {
+func (app *App) GetMempool() sdkmempool.ExtMempool {
 	return app.EVMMempool
 }
 
-func (app *EVMD) GetAnteHandler() sdk.AnteHandler {
+func (app *App) GetAnteHandler() sdk.AnteHandler {
 	return app.AnteHandler()
 }
 
 // GetTxConfig implements the TestingApp interface.
-func (app *EVMD) GetTxConfig() client.TxConfig {
+func (app *App) GetTxConfig() client.TxConfig {
 	return app.txConfig
 }
 
 // Close unsubscribes from the CometBFT event bus (if set) and closes the mempool and underlying BaseApp.
-func (app *EVMD) Close() error {
+func (app *App) Close() error {
 	var err error
 	if m, ok := app.EVMMempool.(*evmmempool.Mempool); ok && m != nil {
 		app.Logger().Info("Shutting down mempool")
@@ -1103,7 +1103,7 @@ func (app *EVMD) Close() error {
 }
 
 // AutoCliOpts returns the autocli options for the app.
-func (app *EVMD) AutoCliOpts() autocli.AppOptions {
+func (app *App) AutoCliOpts() autocli.AppOptions {
 	modules := make(map[string]appmodule.AppModule, 0)
 	for _, m := range app.ModuleManager.Modules {
 		if moduleWithName, ok := m.(module.HasName); ok {

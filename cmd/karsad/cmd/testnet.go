@@ -19,12 +19,12 @@ import (
 	dbm "github.com/cosmos/cosmos-db"
 	cosmosevmhd "github.com/cosmos/evm/crypto/hd"
 	cosmosevmkeyring "github.com/cosmos/evm/crypto/keyring"
-	"github.com/cosmos/evm/evmd"
-	"github.com/cosmos/evm/evmd/config"
-	customnetwork "github.com/cosmos/evm/evmd/tests/network"
 	cosmosevmserverconfig "github.com/cosmos/evm/server/config"
 	evmnetwork "github.com/cosmos/evm/testutil/integration/evm/network"
 	evmtypes "github.com/cosmos/evm/x/vm/types"
+	"github.com/karsa/karsa"
+	"github.com/karsa/karsa/config"
+	customnetwork "github.com/karsa/karsa/tests/network"
 
 	"cosmossdk.io/log/v2"
 	"cosmossdk.io/math"
@@ -168,7 +168,7 @@ or a similar setup where each node has a manually configurable IP address.
 Note, strict routability for addresses is turned off in the config file.
 
 Example:
-	evmd testnet init-files --v 4 --output-dir ./.testnets --starting-ip-address 192.168.10.2
+	karsad testnet init-files --v 4 --output-dir ./.testnets --starting-ip-address 192.168.10.2
 	`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			clientCtx, err := client.GetClientQueryContext(cmd)
@@ -232,7 +232,7 @@ and generate "v" directories, populated with necessary validator configuration f
 (private validator, genesis, config, etc.).
 
 Example:
-	evmd testnet --v 4 --output-dir ./.testnets
+	karsad testnet --v 4 --output-dir ./.testnets
 	`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			args := startArgs{}
@@ -746,7 +746,7 @@ func startTestnet(cmd *cobra.Command, args startArgs) error {
 	return nil
 }
 
-// NewTestNetworkFixture returns a new evmd AppConstructor for network simulation tests
+// NewTestNetworkFixture returns a new Karsa AppConstructor for network simulation tests
 func NewTestNetworkFixture() sdknetwork.TestFixture {
 	dir, err := os.MkdirTemp("", "evm")
 	if err != nil {
@@ -754,7 +754,7 @@ func NewTestNetworkFixture() sdknetwork.TestFixture {
 	}
 	defer os.RemoveAll(dir)
 
-	app := evmd.NewExampleApp(
+	app := karsa.NewApp(
 		log.NewNopLogger(),
 		dbm.NewMemDB(),
 		true,
@@ -762,7 +762,7 @@ func NewTestNetworkFixture() sdknetwork.TestFixture {
 	)
 
 	appCtr := func(val sdknetwork.ValidatorI) servertypes.Application {
-		return evmd.NewExampleApp(
+		return karsa.NewApp(
 			log.NewNopLogger(),
 			dbm.NewMemDB(),
 			true,

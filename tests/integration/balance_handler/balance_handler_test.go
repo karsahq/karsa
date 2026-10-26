@@ -8,10 +8,10 @@ import (
 
 	"github.com/cosmos/evm"
 	"github.com/cosmos/evm/contracts"
-	"github.com/cosmos/evm/evmd/tests/integration"
-	debugprecompile "github.com/cosmos/evm/evmd/tests/testdata/debug"
 	evmibctesting "github.com/cosmos/evm/testutil/ibc"
 	testutiltypes "github.com/cosmos/evm/testutil/types"
+	"github.com/karsa/karsa/tests/integration"
+	debugprecompile "github.com/karsa/karsa/tests/testdata/debug"
 
 	sdkmath "cosmossdk.io/math"
 
@@ -34,7 +34,7 @@ func TestBalanceHandlerTestSuite(t *testing.T) {
 
 func (s *BalanceHandlerTestSuite) SetupTest() {
 	// Create coordinator with one chain
-	s.coordinator = evmibctesting.NewCoordinator(s.T(), 1, 0, integration.SetupEvmd)
+	s.coordinator = evmibctesting.NewCoordinator(s.T(), 1, 0, integration.SetupKarsa)
 	s.chain = s.coordinator.GetChain(evmibctesting.GetEvmChainID(1))
 }
 

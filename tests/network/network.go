@@ -27,12 +27,12 @@ import (
 
 	dbm "github.com/cosmos/cosmos-db"
 	"github.com/cosmos/evm/crypto/hd"
-	"github.com/cosmos/evm/evmd"
-	evmconfig "github.com/cosmos/evm/evmd/config"
 	"github.com/cosmos/evm/server/config"
 	evmtestutil "github.com/cosmos/evm/testutil"
 	testconstants "github.com/cosmos/evm/testutil/constants"
 	"github.com/cosmos/evm/utils"
+	"github.com/karsa/karsa"
+	evmconfig "github.com/karsa/karsa/config"
 
 	"cosmossdk.io/log/v2"
 	"cosmossdk.io/math"
@@ -109,7 +109,7 @@ func DefaultConfig() Config {
 		panic(fmt.Sprintf("failed creating temporary directory: %v", err))
 	}
 	defer os.RemoveAll(dir)
-	tempApp := evmd.NewExampleApp(log.NewNopLogger(), dbm.NewMemDB(), true, simutils.NewAppOptionsWithFlagHome(dir), baseapp.SetChainID(chainID))
+	tempApp := karsa.NewApp(log.NewNopLogger(), dbm.NewMemDB(), true, simutils.NewAppOptionsWithFlagHome(dir), baseapp.SetChainID(chainID))
 
 	cfg := Config{
 		Codec:             tempApp.AppCodec(),
@@ -139,7 +139,7 @@ func DefaultConfig() Config {
 // NewAppConstructor returns a new Cosmos EVM AppConstructor
 func NewAppConstructor(chainID string) AppConstructor {
 	return func(val Validator) servertypes.Application {
-		return evmd.NewExampleApp(
+		return karsa.NewApp(
 			val.Ctx.Logger, dbm.NewMemDB(), true,
 			simutils.NewAppOptionsWithFlagHome(val.Ctx.Config.RootDir),
 			baseapp.SetPruning(pruningtypes.NewPruningOptionsFromString(val.AppConfig.Pruning)),

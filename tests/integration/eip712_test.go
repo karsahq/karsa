@@ -11,7 +11,7 @@ import (
 )
 
 func TestEIP712TestSuite(t *testing.T) {
-	create := testapp.ToEvmAppCreator[evm.IntegrationNetworkApp](CreateEvmd, "evm.IntegrationNetworkApp")
+	create := testapp.ToEvmAppCreator[evm.IntegrationNetworkApp](CreateKarsa, "evm.IntegrationNetworkApp")
 	s := eip712.NewTestSuite(create, false)
 	suite.Run(t, s)
 

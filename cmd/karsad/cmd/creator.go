@@ -9,7 +9,7 @@ import (
 	"github.com/spf13/viper"
 
 	dbm "github.com/cosmos/cosmos-db"
-	"github.com/cosmos/evm/evmd"
+	"github.com/karsa/karsa"
 
 	"cosmossdk.io/log/v2"
 	"github.com/cosmos/cosmos-sdk/store/v2"
@@ -89,7 +89,7 @@ func (a appCreator) newApp(
 		baseapp.SetIAVLCacheSize(cast.ToInt(appOpts.Get(server.FlagIAVLCacheSize))),
 	}
 
-	return evmd.NewExampleApp(
+	return karsa.NewApp(
 		logger,
 		db,
 		true,
@@ -108,7 +108,7 @@ func (a appCreator) appExport(
 	appOpts servertypes.AppOptions,
 	modulesToExport []string,
 ) (servertypes.ExportedApp, error) {
-	var evmApp *evmd.EVMD
+	var evmApp *karsa.App
 
 	homePath, ok := appOpts.Get(flags.FlagHome).(string)
 	if !ok || homePath == "" {
@@ -129,7 +129,7 @@ func (a appCreator) appExport(
 		loadLatest = true
 	}
 
-	evmApp = evmd.NewExampleApp(
+	evmApp = karsa.NewApp(
 		logger,
 		db,
 		loadLatest,

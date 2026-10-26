@@ -1,4 +1,4 @@
-package evmd
+package karsa
 
 import (
 	evmmempool "github.com/cosmos/evm/mempool"
@@ -13,7 +13,7 @@ import (
 )
 
 // configureEVMMempool sets up the EVM mempool and related handlers using viper configuration.
-func (app *EVMD) configureEVMMempool(appOpts servertypes.AppOptions, logger log.Logger) error {
+func (app *App) configureEVMMempool(appOpts servertypes.AppOptions, logger log.Logger) error {
 	if evmtypes.GetChainConfig() == nil {
 		logger.Debug("evm chain config is not set, skipping mempool configuration")
 		return nil

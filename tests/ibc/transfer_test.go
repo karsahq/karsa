@@ -10,11 +10,11 @@ import (
 
 	"github.com/stretchr/testify/suite"
 
-	"github.com/cosmos/evm/evmd"
-	"github.com/cosmos/evm/evmd/tests/integration"
 	evmibctesting "github.com/cosmos/evm/testutil/ibc"
 	"github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
 	clienttypes "github.com/cosmos/ibc-go/v11/modules/core/02-client/types"
+	"github.com/karsa/karsa"
+	"github.com/karsa/karsa/tests/integration"
 
 	sdkmath "cosmossdk.io/math"
 
@@ -33,7 +33,7 @@ type TransferTestSuite struct {
 }
 
 func (suite *TransferTestSuite) SetupTest() {
-	suite.coordinator = evmibctesting.NewCoordinator(suite.T(), 1, 2, integration.SetupEvmd)
+	suite.coordinator = evmibctesting.NewCoordinator(suite.T(), 1, 2, integration.SetupKarsa)
 	suite.evmChainA = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(1))
 	suite.chainB = suite.coordinator.GetChain(evmibctesting.GetChainID(2))
 	suite.chainC = suite.coordinator.GetChain(evmibctesting.GetChainID(3))
@@ -51,7 +51,7 @@ func (suite *TransferTestSuite) TestHandleMsgTransfer() {
 	)
 
 	// originally a basic test case from the IBC testing package, and it has been added as-is to ensure that
-	// it still works properly when invoked by evmd app.
+	// it still works properly when invoked by Karsa app.
 	testCases := []struct {
 		name     string
 		malleate func()
@@ -95,7 +95,7 @@ func (suite *TransferTestSuite) TestHandleMsgTransfer() {
 			senderAddr := senderAccount.SenderAccount.GetAddress()
 			tc.malleate()
 
-			evmApp := suite.evmChainA.App.(*evmd.EVMD)
+			evmApp := suite.evmChainA.App.(*karsa.App)
 			sourceDenomToTransfer, err = evmApp.StakingKeeper.BondDenom(suite.evmChainA.GetContext())
 			suite.Require().NoError(err)
 			senderBalance := evmApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), senderAddr, sourceDenomToTransfer)

@@ -5,11 +5,11 @@ import (
 
 	"github.com/stretchr/testify/suite"
 
-	"github.com/cosmos/evm/evmd/tests/integration"
 	"github.com/cosmos/evm/tests/integration/precompiles/common"
+	"github.com/karsa/karsa/tests/integration"
 )
 
 func TestStaticCallTestSuite(t *testing.T) {
-	s := common.NewStaticCallTestSuite(integration.CreateEvmd)
+	s := common.NewStaticCallTestSuite(integration.CreateKarsa)
 	suite.Run(t, s)
 }

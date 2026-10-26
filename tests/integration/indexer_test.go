@@ -9,6 +9,6 @@ import (
 )
 
 func TestKVIndexer(t *testing.T) {
-	create := testapp.ToEvmAppCreator[evm.IntegrationNetworkApp](CreateEvmd, "evm.IntegrationNetworkApp")
+	create := testapp.ToEvmAppCreator[evm.IntegrationNetworkApp](CreateKarsa, "evm.IntegrationNetworkApp")
 	indexer.TestKVIndexer(t, create)
 }

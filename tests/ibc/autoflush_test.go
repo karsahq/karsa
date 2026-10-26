@@ -8,13 +8,13 @@ import (
 	"github.com/stretchr/testify/suite"
 
 	"github.com/cosmos/evm/contracts"
-	"github.com/cosmos/evm/evmd"
-	"github.com/cosmos/evm/evmd/tests/integration"
 	"github.com/cosmos/evm/testutil"
 	evmibctesting "github.com/cosmos/evm/testutil/ibc"
 	testutiltypes "github.com/cosmos/evm/testutil/types"
 	erc20types "github.com/cosmos/evm/x/erc20/types"
 	evmtypes "github.com/cosmos/evm/x/vm/types"
+	"github.com/karsa/karsa"
+	"github.com/karsa/karsa/tests/integration"
 
 	sdkmath "cosmossdk.io/math"
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -38,7 +38,7 @@ type AutoFlushTestSuite struct {
 }
 
 func (suite *AutoFlushTestSuite) SetupTest() {
-	suite.coordinator = evmibctesting.NewCoordinator(suite.T(), 1, 0, integration.SetupEvmd)
+	suite.coordinator = evmibctesting.NewCoordinator(suite.T(), 1, 0, integration.SetupKarsa)
 	suite.chain = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(1))
 }
 
@@ -48,7 +48,7 @@ func TestAutoFlushTestSuite(t *testing.T) {
 
 // Helper: Deploy and setup ERC20 token
 func (suite *AutoFlushTestSuite) deployAndRegisterERC20(name, symbol string) (common.Address, evmtypes.CompiledContract) {
-	evmApp := suite.chain.App.(*evmd.EVMD)
+	evmApp := suite.chain.App.(*karsa.App)
 
 	// Deploy ERC20
 	erc20ContractData := contracts.ERC20MinterBurnerDecimalsContract
@@ -74,7 +74,7 @@ func (suite *AutoFlushTestSuite) deployAndRegisterERC20(name, symbol string) (co
 
 // Helper: Get validator address
 func (suite *AutoFlushTestSuite) getValidatorAddress() string {
-	evmApp := suite.chain.App.(*evmd.EVMD)
+	evmApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	vals, err := evmApp.StakingKeeper.GetAllValidators(ctx)
@@ -86,7 +86,7 @@ func (suite *AutoFlushTestSuite) getValidatorAddress() string {
 
 // Helper: Mint tokens to address
 func (suite *AutoFlushTestSuite) mintTokens(tokenAddr common.Address, erc20Data evmtypes.CompiledContract, recipient common.Address, amount *big.Int) {
-	evmApp := suite.chain.App.(*evmd.EVMD)
+	evmApp := suite.chain.App.(*karsa.App)
 	deployerAddr := common.BytesToAddress(suite.chain.SenderPrivKey.PubKey().Address().Bytes())
 
 	ctx := suite.chain.GetContext()
@@ -110,7 +110,7 @@ func (suite *AutoFlushTestSuite) mintTokens(tokenAddr common.Address, erc20Data 
 
 // Helper: Fund contract with native tokens
 func (suite *AutoFlushTestSuite) fundContractNative(contractAddr sdk.AccAddress, amount sdkmath.Int) {
-	evmApp := suite.chain.App.(*evmd.EVMD)
+	evmApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 	bondDenom, err := evmApp.StakingKeeper.BondDenom(ctx)
 	suite.Require().NoError(err)
@@ -142,7 +142,7 @@ func (suite *AutoFlushTestSuite) verifyState(
 	expectedNativeBalances map[string]sdkmath.Int, // bech32 address -> balance
 	expectedAccountsCreated int,
 ) {
-	evmApp := suite.chain.App.(*evmd.EVMD)
+	evmApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Check event count
@@ -185,7 +185,7 @@ func (suite *AutoFlushTestSuite) verifyState(
 func (suite *AutoFlushTestSuite) TestScenario1_TransferDelegateTransfer() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*evmd.EVMD)
+	evmApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Deploy test contract
@@ -275,7 +275,7 @@ func (suite *AutoFlushTestSuite) TestScenario1_TransferDelegateTransfer() {
 func (suite *AutoFlushTestSuite) TestScenario2_TransferDelegateRevertTransfer() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*evmd.EVMD)
+	evmApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Deploy test contract
@@ -362,7 +362,7 @@ func (suite *AutoFlushTestSuite) TestScenario2_TransferDelegateRevertTransfer() 
 func (suite *AutoFlushTestSuite) TestScenario3_NativeTransferDelegateNativeTransfer() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*evmd.EVMD)
+	evmApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Deploy test contract
@@ -452,7 +452,7 @@ func (suite *AutoFlushTestSuite) TestScenario3_NativeTransferDelegateNativeTrans
 func (suite *AutoFlushTestSuite) TestScenario4_NativeTransferDelegateRevertNativeTransfer() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*evmd.EVMD)
+	evmApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Deploy test contract
@@ -551,7 +551,7 @@ func (suite *AutoFlushTestSuite) TestScenario4_NativeTransferDelegateRevertNativ
 func (suite *AutoFlushTestSuite) TestScenario5_DelegateCreateDelegate() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*evmd.EVMD)
+	evmApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Deploy test contract
@@ -616,7 +616,7 @@ func (suite *AutoFlushTestSuite) TestScenario5_DelegateCreateDelegate() {
 func (suite *AutoFlushTestSuite) TestScenario6_DelegateCreateRevertDelegate() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*evmd.EVMD)
+	evmApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Deploy test contract
@@ -681,7 +681,7 @@ func (suite *AutoFlushTestSuite) TestScenario6_DelegateCreateRevertDelegate() {
 func (suite *AutoFlushTestSuite) TestScenario7_CreateRevertDelegateCreateRevert() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*evmd.EVMD)
+	evmApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Deploy test contract
@@ -761,7 +761,7 @@ func (suite *AutoFlushTestSuite) TestScenario7_CreateRevertDelegateCreateRevert(
 func (suite *AutoFlushTestSuite) TestScenario8_CreateDelegateRevertSend() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*evmd.EVMD)
+	evmApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Deploy test contract
@@ -821,7 +821,7 @@ func (suite *AutoFlushTestSuite) TestScenario8_CreateDelegateRevertSend() {
 func (suite *AutoFlushTestSuite) TestScenario9_CreateRevertDelegateCreateSuccess() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*evmd.EVMD)
+	evmApp := suite.chain.App.(*karsa.App)
 
 	// Deploy test contract
 	contractData, err := contracts.LoadContractCreationTester()

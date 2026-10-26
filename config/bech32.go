@@ -22,6 +22,19 @@ const (
 	Bech32PrefixConsPub = Bech32Prefix + sdk.PrefixValidator + sdk.PrefixConsensus + sdk.PrefixPublic
 )
 
+// init sets the Bech32 prefixes as early as possible, before any of this
+// package's importers can stringify an address.
+//
+// It also disables the SDK's global address string cache: the SDK caches the
+// result of AccAddress.String() per address bytes, and dependency initializers
+// may stringify module addresses before these custom prefixes are applied. Such
+// entries would keep returning "cosmos"-prefixed strings for the lifetime of
+// the process, so lookups always re-encode with the configured prefix instead.
+func init() {
+	SetBech32Prefixes(sdk.GetConfig())
+	sdk.SetAddrCacheEnabled(false)
+}
+
 // SetBech32Prefixes sets the global prefixes to be used when serializing addresses and public keys to Bech32 strings.
 func SetBech32Prefixes(config *sdk.Config) {
 	config.SetBech32PrefixForAccount(Bech32PrefixAccAddr, Bech32PrefixAccPub)

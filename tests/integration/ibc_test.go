@@ -11,7 +11,7 @@ import (
 )
 
 func TestIBCKeeperTestSuite(t *testing.T) {
-	create := testapp.ToEvmAppCreator[evm.IBCIntegrationApp](CreateEvmd, "evm.IBCIntegrationApp")
+	create := testapp.ToEvmAppCreator[evm.IBCIntegrationApp](CreateKarsa, "evm.IBCIntegrationApp")
 	s := ibc.NewKeeperTestSuite(create)
 	suite.Run(t, s)
 }

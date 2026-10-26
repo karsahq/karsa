@@ -11,6 +11,6 @@ import (
 )
 
 func TestIBCCallback(t *testing.T) {
-	create := testapp.ToEvmAppCreator[evm.IBCCallbackIntegrationApp](CreateEvmd, "evm.IBCCallbackIntegrationApp")
+	create := testapp.ToEvmAppCreator[evm.IBCCallbackIntegrationApp](CreateKarsa, "evm.IBCCallbackIntegrationApp")
 	suite.Run(t, callbacks.NewKeeperTestSuite(create))
 }

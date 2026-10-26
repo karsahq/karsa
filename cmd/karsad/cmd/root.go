@@ -15,12 +15,12 @@ import (
 	cosmosevmcmd "github.com/cosmos/evm/client"
 	evmdebug "github.com/cosmos/evm/client/debug"
 	"github.com/cosmos/evm/crypto/hd"
-	"github.com/cosmos/evm/evmd"
-	"github.com/cosmos/evm/evmd/config"
 	cosmosevmserver "github.com/cosmos/evm/server"
 	srvflags "github.com/cosmos/evm/server/flags"
 	"github.com/cosmos/evm/utils"
 	"github.com/cosmos/evm/x/vm/types"
+	"github.com/karsa/karsa"
+	"github.com/karsa/karsa/config"
 
 	"cosmossdk.io/log/v2"
 	confixcmd "cosmossdk.io/tools/confix/cmd"
@@ -55,7 +55,7 @@ func NewRootCmd() *cobra.Command {
 	// we "pre"-instantiate the application for getting the injected/configured encoding configuration
 	// and the CLI options for the modules
 	// add keyring to autocli opts
-	tempApp := evmd.NewExampleApp(
+	tempApp := karsa.NewApp(
 		log.NewNopLogger(),
 		dbm.NewMemDB(),
 		true,
@@ -158,7 +158,7 @@ func initCometConfig() *cmtcfg.Config {
 	return cfg
 }
 
-func initRootCmd(rootCmd *cobra.Command, evmApp *evmd.EVMD) {
+func initRootCmd(rootCmd *cobra.Command, evmApp *karsa.App) {
 	cfg := sdk.GetConfig()
 	cfg.Seal()
 
@@ -306,7 +306,7 @@ func newApp(
 		baseapp.SetChainID(chainID),
 	}
 
-	return evmd.NewExampleApp(
+	return karsa.NewApp(
 		logger, db, true,
 		appOpts,
 		baseappOptions...,
@@ -323,7 +323,7 @@ func appExport(
 	appOpts servertypes.AppOptions,
 	modulesToExport []string,
 ) (servertypes.ExportedApp, error) {
-	var exampleApp *evmd.EVMD
+	var exampleApp *karsa.App
 
 	// this check is necessary as we use the flag in x/upgrade.
 	// we can exit more gracefully by checking the flag here.
@@ -348,13 +348,13 @@ func appExport(
 	}
 
 	if height != -1 {
-		exampleApp = evmd.NewExampleApp(logger, db, false, appOpts, baseapp.SetChainID(chainID))
+		exampleApp = karsa.NewApp(logger, db, false, appOpts, baseapp.SetChainID(chainID))
 
 		if err := exampleApp.LoadHeight(height); err != nil {
 			return servertypes.ExportedApp{}, err
 		}
 	} else {
-		exampleApp = evmd.NewExampleApp(logger, db, true, appOpts, baseapp.SetChainID(chainID)) // TODO:VLAD - Remove // TODO:VLAD - Remove appoptions and evmchainid
+		exampleApp = karsa.NewApp(logger, db, true, appOpts, baseapp.SetChainID(chainID)) // TODO:VLAD - Remove // TODO:VLAD - Remove appoptions and evmchainid
 	}
 
 	return exampleApp.ExportAppStateAndValidators(forZeroHeight, jailAllowedAddrs, modulesToExport)

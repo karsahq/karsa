@@ -6,11 +6,11 @@ import (
 
 	dbm "github.com/cosmos/cosmos-db"
 	"github.com/cosmos/evm"
-	"github.com/cosmos/evm/evmd"
 	srvflags "github.com/cosmos/evm/server/flags"
 	"github.com/cosmos/evm/testutil/constants"
 	feemarkettypes "github.com/cosmos/evm/x/feemarket/types"
 	ibctesting "github.com/cosmos/ibc-go/v11/testing"
+	"github.com/karsa/karsa"
 
 	"cosmossdk.io/log/v2"
 
@@ -22,11 +22,11 @@ import (
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 )
 
-// CreateEvmd creates an evm app for integration tests
-func CreateEvmd(chainID string, evmChainID uint64, customBaseAppOptions ...func(*baseapp.BaseApp)) evm.EvmApp {
+// CreateKarsa creates an evm app for integration tests
+func CreateKarsa(chainID string, evmChainID uint64, customBaseAppOptions ...func(*baseapp.BaseApp)) evm.EvmApp {
 	// A temporary home directory is created and used to prevent race conditions
 	// related to home directory locks in chains that use the WASM module.
-	defaultNodeHome, err := os.MkdirTemp("", "evmd-temp-homedir")
+	defaultNodeHome, err := os.MkdirTemp("", "karsa-temp-homedir")
 	if err != nil {
 		panic(err)
 	}
@@ -39,7 +39,7 @@ func CreateEvmd(chainID string, evmChainID uint64, customBaseAppOptions ...func(
 	baseAppOptions := append(customBaseAppOptions, baseapp.SetChainID(chainID))
 
 	// Start the app
-	app := evmd.NewExampleApp(
+	app := karsa.NewApp(
 		logger,
 		db,
 		loadLatest,
@@ -60,15 +60,15 @@ func CreateEvmd(chainID string, evmChainID uint64, customBaseAppOptions ...func(
 	return app
 }
 
-// SetupEvmd initializes a new evmd app with default genesis state.
-// It is used in IBC integration tests to create a new evmd app instance.
-func SetupEvmd() (ibctesting.TestingApp, map[string]json.RawMessage) {
-	defaultNodeHome, err := os.MkdirTemp("", "evmd-temp-homedir")
+// SetupKarsa initializes a new Karsa app with default genesis state.
+// It is used in IBC integration tests to create a new Karsa app instance.
+func SetupKarsa() (ibctesting.TestingApp, map[string]json.RawMessage) {
+	defaultNodeHome, err := os.MkdirTemp("", "karsa-temp-homedir")
 	if err != nil {
 		panic(err)
 	}
 
-	app := evmd.NewExampleApp(
+	app := karsa.NewApp(
 		log.NewNopLogger(),
 		dbm.NewMemDB(),
 		true,

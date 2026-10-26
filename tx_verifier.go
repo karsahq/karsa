@@ -1,4 +1,4 @@
-package evmd
+package karsa
 
 import (
 	"github.com/cosmos/cosmos-sdk/baseapp"

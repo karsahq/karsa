@@ -1,4 +1,4 @@
-package evmd
+package karsa
 
 import (
 	"encoding/json"
@@ -11,12 +11,12 @@ import (
 	cmttypes "github.com/cometbft/cometbft/types"
 
 	dbm "github.com/cosmos/cosmos-db"
-	"github.com/cosmos/evm/evmd/config"
 	testconstants "github.com/cosmos/evm/testutil/constants"
 	"github.com/cosmos/evm/testutil/integration/evm/network"
 	feemarkettypes "github.com/cosmos/evm/x/feemarket/types"
 	"github.com/cosmos/evm/x/vm/types"
 	ibctesting "github.com/cosmos/ibc-go/v11/testing"
+	"github.com/karsa/karsa/config"
 
 	"cosmossdk.io/log/v2"
 	"cosmossdk.io/math"
@@ -50,14 +50,14 @@ func init() {
 	config.SetBip44CoinType(cfg)
 }
 
-func setup(withGenesis bool, invCheckPeriod uint, chainID string, evmChainID uint64) (*EVMD, GenesisState) {
+func setup(withGenesis bool, invCheckPeriod uint, chainID string, evmChainID uint64) (*App, GenesisState) {
 	db := dbm.NewMemDB()
 
 	appOptions := make(simtestutil.AppOptionsMap, 0)
 	appOptions[flags.FlagHome] = defaultNodeHome
 	appOptions[server.FlagInvCheckPeriod] = invCheckPeriod
 
-	app := NewExampleApp(log.NewNopLogger(), db, true, appOptions, baseapp.SetChainID(chainID))
+	app := NewApp(log.NewNopLogger(), db, true, appOptions, baseapp.SetChainID(chainID))
 	if withGenesis {
 		return app, app.DefaultGenesis()
 	}
@@ -65,8 +65,8 @@ func setup(withGenesis bool, invCheckPeriod uint, chainID string, evmChainID uin
 	return app, GenesisState{}
 }
 
-// Setup initializes a new EVMD. A Nop logger is set in EVMD.
-func Setup(t *testing.T, chainID string, evmChainID uint64) *EVMD {
+// Setup initializes a new App. A Nop logger is set in App.
+func Setup(t *testing.T, chainID string, evmChainID uint64) *App {
 	t.Helper()
 
 	privVal := mock.NewPV()
@@ -90,11 +90,11 @@ func Setup(t *testing.T, chainID string, evmChainID uint64) *EVMD {
 	return app
 }
 
-// SetupWithGenesisValSet initializes a new EVMD with a validator set and genesis accounts
+// SetupWithGenesisValSet initializes a new App with a validator set and genesis accounts
 // that also act as delegators. For simplicity, each validator is bonded with a delegation
 // of one consensus engine unit in the default token of the simapp from first genesis
-// account. A Nop logger is set in EVMD.
-func SetupWithGenesisValSet(t *testing.T, chainID string, evmChainID uint64, valSet *cmttypes.ValidatorSet, genAccs []authtypes.GenesisAccount, balances ...banktypes.Balance) *EVMD {
+// account. A Nop logger is set in App.
+func SetupWithGenesisValSet(t *testing.T, chainID string, evmChainID uint64, valSet *cmttypes.ValidatorSet, genAccs []authtypes.GenesisAccount, balances ...banktypes.Balance) *App {
 	t.Helper()
 
 	app, genesisState := setup(true, 5, chainID, evmChainID)
@@ -137,7 +137,7 @@ func SetupWithGenesisValSet(t *testing.T, chainID string, evmChainID uint64, val
 func SetupTestingApp(chainID string) func() (ibctesting.TestingApp, map[string]json.RawMessage) {
 	return func() (ibctesting.TestingApp, map[string]json.RawMessage) {
 		db := dbm.NewMemDB()
-		app := NewExampleApp(
+		app := NewApp(
 			log.NewNopLogger(),
 			db, true,
 			simtestutil.NewAppOptionsWithFlagHome(defaultNodeHome),

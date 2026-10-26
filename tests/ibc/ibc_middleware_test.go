@@ -12,8 +12,6 @@ import (
 	testifysuite "github.com/stretchr/testify/suite"
 
 	"github.com/cosmos/evm/contracts"
-	"github.com/cosmos/evm/evmd"
-	"github.com/cosmos/evm/evmd/tests/integration"
 	"github.com/cosmos/evm/ibc"
 	ics20precompile "github.com/cosmos/evm/precompiles/ics20"
 	"github.com/cosmos/evm/testutil"
@@ -31,6 +29,8 @@ import (
 	clienttypes "github.com/cosmos/ibc-go/v11/modules/core/02-client/types"
 	channeltypes "github.com/cosmos/ibc-go/v11/modules/core/04-channel/types"
 	ibctesting "github.com/cosmos/ibc-go/v11/testing"
+	"github.com/karsa/karsa"
+	"github.com/karsa/karsa/tests/integration"
 
 	"cosmossdk.io/math"
 
@@ -53,7 +53,7 @@ type MiddlewareTestSuite struct {
 
 // SetupTest initializes the coordinator and test chains before each test.
 func (suite *MiddlewareTestSuite) SetupTest() {
-	suite.coordinator = evmibctesting.NewCoordinator(suite.T(), 1, 1, integration.SetupEvmd)
+	suite.coordinator = evmibctesting.NewCoordinator(suite.T(), 1, 1, integration.SetupKarsa)
 	suite.evmChainA = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(1))
 	suite.chainB = suite.coordinator.GetChain(evmibctesting.GetChainID(2))
 
@@ -70,7 +70,7 @@ func (suite *MiddlewareTestSuite) SetupTest() {
 	suite.Require().True(found)
 
 	// Setup ICS20 precompile for evmChainA
-	evmAppA := suite.evmChainA.App.(*evmd.EVMD)
+	evmAppA := suite.evmChainA.App.(*karsa.App)
 	suite.evmChainAPrecompile = ics20precompile.NewPrecompile(
 		evmAppA.BankKeeper,
 		*evmAppA.StakingKeeper,
@@ -91,7 +91,7 @@ func (suite *MiddlewareTestSuite) transferViaPrecompile(
 	timeoutTimestamp uint64,
 	memo string,
 ) (uint64, error) {
-	evmApp := suite.evmChainA.App.(*evmd.EVMD)
+	evmApp := suite.evmChainA.App.(*karsa.App)
 
 	// Convert sender to address type
 	senderAddr := sdk.MustAccAddressFromBech32(sender)
@@ -458,7 +458,7 @@ func (suite *MiddlewareTestSuite) TestOnRecvPacketWithCallback() {
 			)
 
 			// Validate successful callback
-			evmApp := suite.evmChainA.App.(*evmd.EVMD)
+			evmApp := suite.evmChainA.App.(*karsa.App)
 			singleTokenRepresentation, err := types.NewTokenPairSTRv2(voucherDenom)
 			suite.Require().NoError(err)
 			erc20Contract := singleTokenRepresentation.GetERC20Contract()
@@ -618,7 +618,7 @@ func (suite *MiddlewareTestSuite) TestOnRecvPacket() {
 
 				voucherDenom := testutil.GetVoucherDenomFromPacketData(data, packet.GetDestPort(), packet.GetDestChannel())
 
-				evmApp := suite.evmChainA.App.(*evmd.EVMD)
+				evmApp := suite.evmChainA.App.(*karsa.App)
 				voucherCoin := evmApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), receiver, voucherDenom)
 				suite.Require().Equal(sendAmt.String(), voucherCoin.Amount.String())
 
@@ -680,7 +680,7 @@ func (suite *MiddlewareTestSuite) TestOnRecvPacketNativeErc20() {
 			suite.SetupTest()
 			nativeErc20 := SetupNativeErc20(suite.T(), suite.evmChainA, suite.evmChainA.SenderAccounts[0])
 
-			evmApp := suite.evmChainA.App.(*evmd.EVMD)
+			evmApp := suite.evmChainA.App.(*karsa.App)
 
 			// Scenario: Native ERC20 token transfer from evmChainA to chainB
 			timeoutHeight := clienttypes.NewHeight(1, 110)
@@ -830,7 +830,6 @@ func (suite *MiddlewareTestSuite) TestOnRecvPacketNativeErc20() {
 					suite.evmChainA.SenderAccount.GetAddress(),
 				)
 				suite.Require().False(errAck.Success())
-
 
 				// SendEnabled=true causes our callback to succeed
 				evmApp.BankKeeper.SetSendEnabled(suite.evmChainA.GetContext(), nativeErc20.Denom, true)
@@ -1168,7 +1167,7 @@ func (suite *MiddlewareTestSuite) TestOnAcknowledgementPacketWithCallback() {
 		suite.Run(tc.name, func() {
 			suite.SetupTest()
 
-			evmApp := suite.evmChainA.App.(*evmd.EVMD)
+			evmApp := suite.evmChainA.App.(*karsa.App)
 
 			bondDenom, err := evmApp.StakingKeeper.BondDenom(suite.evmChainA.GetContext())
 			suite.Require().NoError(err)
@@ -1405,7 +1404,7 @@ func (suite *MiddlewareTestSuite) TestOnAcknowledgementPacket() {
 		suite.Run(tc.name, func() {
 			suite.SetupTest()
 
-			evmApp := suite.evmChainA.App.(*evmd.EVMD)
+			evmApp := suite.evmChainA.App.(*karsa.App)
 
 			bondDenom, err := evmApp.StakingKeeper.BondDenom(suite.evmChainA.GetContext())
 			suite.Require().NoError(err)
@@ -1556,7 +1555,7 @@ func (suite *MiddlewareTestSuite) TestOnAcknowledgementPacketNativeErc20() {
 			suite.SetupTest()
 			nativeErc20 := SetupNativeErc20(suite.T(), suite.evmChainA, suite.evmChainA.SenderAccounts[0])
 
-			evmApp := suite.evmChainA.App.(*evmd.EVMD)
+			evmApp := suite.evmChainA.App.(*karsa.App)
 
 			timeoutHeight := clienttypes.NewHeight(1, 110)
 			path := suite.path
@@ -1689,7 +1688,7 @@ func (suite *MiddlewareTestSuite) TestOnTimeoutPacket() {
 		suite.Run(tc.name, func() {
 			suite.SetupTest()
 
-			evmApp := suite.evmChainA.App.(*evmd.EVMD)
+			evmApp := suite.evmChainA.App.(*karsa.App)
 			bondDenom, err := evmApp.StakingKeeper.BondDenom(suite.evmChainA.GetContext())
 			suite.Require().NoError(err)
 
@@ -2006,7 +2005,7 @@ func (suite *MiddlewareTestSuite) TestOnTimeoutPacketWithCallback() {
 		suite.Run(tc.name, func() {
 			suite.SetupTest()
 
-			evmApp := suite.evmChainA.App.(*evmd.EVMD)
+			evmApp := suite.evmChainA.App.(*karsa.App)
 
 			bondDenom, err := evmApp.StakingKeeper.BondDenom(suite.evmChainA.GetContext())
 			suite.Require().NoError(err)
@@ -2216,7 +2215,7 @@ func (suite *MiddlewareTestSuite) TestOnTimeoutPacketNativeErc20() {
 			suite.SetupTest()
 			nativeErc20 := SetupNativeErc20(suite.T(), suite.evmChainA, suite.evmChainA.SenderAccounts[0])
 
-			evmApp := suite.evmChainA.App.(*evmd.EVMD)
+			evmApp := suite.evmChainA.App.(*karsa.App)
 
 			timeoutHeight := clienttypes.NewHeight(1, 110)
 			path := suite.path

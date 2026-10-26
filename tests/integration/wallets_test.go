@@ -11,7 +11,7 @@ import (
 )
 
 func TestLedgerTestSuite(t *testing.T) {
-	create := testapp.ToEvmAppCreator[evm.IntegrationNetworkApp](CreateEvmd, "evm.IntegrationNetworkApp")
+	create := testapp.ToEvmAppCreator[evm.IntegrationNetworkApp](CreateKarsa, "evm.IntegrationNetworkApp")
 	s := wallets.NewLedgerTestSuite(create)
 	suite.Run(t, s)
 }

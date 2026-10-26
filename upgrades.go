@@ -1,4 +1,4 @@
-package evmd
+package karsa
 
 import (
 	"context"
@@ -9,15 +9,15 @@ import (
 	upgradetypes "github.com/cosmos/cosmos-sdk/x/upgrade/types"
 )
 
-// UpgradeName defines the on-chain upgrade name for the sample EVMD upgrade
+// UpgradeName defines the on-chain upgrade name for the sample App upgrade
 // from v0.6.0 to v0.7.0.
 //
 // NOTE: This upgrade defines a reference implementation of what an upgrade
-// could look like when an application is migrating from EVMD version
+// could look like when an application is migrating from App version
 // v0.6.x to v0.7.0.
 const UpgradeName = "v0.6.0-to-v0.7.0"
 
-func (app EVMD) RegisterUpgradeHandlers() {
+func (app App) RegisterUpgradeHandlers() {
 	app.UpgradeKeeper.SetUpgradeHandler(
 		UpgradeName,
 		func(ctx context.Context, _ upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {

@@ -19,7 +19,7 @@ import (
 )
 
 func BenchmarkGasEstimation(b *testing.B) {
-	vmAppCreator := testapp.ToEvmAppCreator[evm.VMIntegrationApp](CreateEvmd, "evm.VMIntegrationApp")
+	vmAppCreator := testapp.ToEvmAppCreator[evm.VMIntegrationApp](CreateKarsa, "evm.VMIntegrationApp")
 	// Setup benchmark test environment
 	keys := keyring.New(2)
 	// Set custom balance based on test params
@@ -87,7 +87,7 @@ func BenchmarkGasEstimation(b *testing.B) {
 }
 
 func TestKeeperTestSuite(t *testing.T) {
-	create := testapp.ToEvmAppCreator[evm.VMIntegrationApp](CreateEvmd, "evm.VMIntegrationApp")
+	create := testapp.ToEvmAppCreator[evm.VMIntegrationApp](CreateKarsa, "evm.VMIntegrationApp")
 	s := vm.NewKeeperTestSuite(create)
 	s.EnableFeemarket = false
 	s.EnableLondonHF = true
@@ -95,24 +95,24 @@ func TestKeeperTestSuite(t *testing.T) {
 }
 
 func TestNestedEVMExtensionCallSuite(t *testing.T) {
-	create := testapp.ToEvmAppCreator[evm.VMIntegrationApp](CreateEvmd, "evm.VMIntegrationApp")
+	create := testapp.ToEvmAppCreator[evm.VMIntegrationApp](CreateKarsa, "evm.VMIntegrationApp")
 	s := vm.NewNestedEVMExtensionCallSuite(create)
 	suite.Run(t, s)
 }
 
 func TestGenesisTestSuite(t *testing.T) {
-	create := testapp.ToEvmAppCreator[evm.VMIntegrationApp](CreateEvmd, "evm.VMIntegrationApp")
+	create := testapp.ToEvmAppCreator[evm.VMIntegrationApp](CreateKarsa, "evm.VMIntegrationApp")
 	s := vm.NewGenesisTestSuite(create)
 	suite.Run(t, s)
 }
 
 func TestVmAnteTestSuite(t *testing.T) {
-	create := testapp.ToEvmAppCreator[evm.VMIntegrationApp](CreateEvmd, "evm.VMIntegrationApp")
+	create := testapp.ToEvmAppCreator[evm.VMIntegrationApp](CreateKarsa, "evm.VMIntegrationApp")
 	s := vm.NewEvmAnteTestSuite(create)
 	suite.Run(t, s)
 }
 
 func TestIterateContracts(t *testing.T) {
-	create := testapp.ToEvmAppCreator[evm.VMIntegrationApp](CreateEvmd, "evm.VMIntegrationApp")
+	create := testapp.ToEvmAppCreator[evm.VMIntegrationApp](CreateKarsa, "evm.VMIntegrationApp")
 	vm.TestIterateContracts(t, create)
 }

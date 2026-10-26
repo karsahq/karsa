@@ -1,4 +1,4 @@
-package evmd
+package karsa
 
 import (
 	cmn "github.com/cosmos/evm/precompiles/common"

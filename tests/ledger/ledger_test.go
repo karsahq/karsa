@@ -11,10 +11,10 @@ import (
 
 	"github.com/cosmos/evm/crypto/hd"
 	"github.com/cosmos/evm/encoding"
-	"github.com/cosmos/evm/evmd/tests/ledger/mocks"
 	"github.com/cosmos/evm/server/config"
 	"github.com/cosmos/evm/testutil"
 	utiltx "github.com/cosmos/evm/testutil/tx"
+	"github.com/karsa/karsa/tests/ledger/mocks"
 
 	"cosmossdk.io/math"
 

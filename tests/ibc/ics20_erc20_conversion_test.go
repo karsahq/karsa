@@ -9,13 +9,13 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/stretchr/testify/suite"
 
-	"github.com/cosmos/evm/evmd"
-	"github.com/cosmos/evm/evmd/tests/integration"
 	"github.com/cosmos/evm/precompiles/ics20"
 	evmibctesting "github.com/cosmos/evm/testutil/ibc"
 	erc20types "github.com/cosmos/evm/x/erc20/types"
 	transfertypes "github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
 	clienttypes "github.com/cosmos/ibc-go/v11/modules/core/02-client/types"
+	"github.com/karsa/karsa"
+	"github.com/karsa/karsa/tests/integration"
 
 	sdkmath "cosmossdk.io/math"
 
@@ -35,11 +35,11 @@ type ICS20ERC20ConversionTestSuite struct {
 }
 
 func (suite *ICS20ERC20ConversionTestSuite) SetupTest() {
-	suite.coordinator = evmibctesting.NewCoordinator(suite.T(), 2, 0, integration.SetupEvmd)
+	suite.coordinator = evmibctesting.NewCoordinator(suite.T(), 2, 0, integration.SetupKarsa)
 	suite.chainA = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(1))
 	suite.chainB = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(2))
 
-	evmAppA := suite.chainA.App.(*evmd.EVMD)
+	evmAppA := suite.chainA.App.(*karsa.App)
 	suite.chainAPrecompile = ics20.NewPrecompile(
 		evmAppA.BankKeeper,
 		*evmAppA.StakingKeeper,
@@ -47,7 +47,7 @@ func (suite *ICS20ERC20ConversionTestSuite) SetupTest() {
 		evmAppA.IBCKeeper.ChannelKeeper,
 		evmAppA.Erc20Keeper,
 	)
-	evmAppB := suite.chainB.App.(*evmd.EVMD)
+	evmAppB := suite.chainB.App.(*karsa.App)
 	suite.chainBPrecompile = ics20.NewPrecompile(
 		evmAppB.BankKeeper,
 		*evmAppB.StakingKeeper,
@@ -82,7 +82,7 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 		{
 			"pass - no token pair",
 			func() {
-				evmAppA := suite.chainA.App.(*evmd.EVMD)
+				evmAppA := suite.chainA.App.(*karsa.App)
 				var err error
 				denom, err = evmAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
 				suite.Require().NoError(err)
@@ -100,7 +100,7 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 				amount = sdkmath.NewInt(nativeErc20.InitialBal.Int64())
 
 				// Convert ERC20 to coins
-				evmAppA := suite.chainA.App.(*evmd.EVMD)
+				evmAppA := suite.chainA.App.(*karsa.App)
 				_, err := evmAppA.Erc20Keeper.ConvertERC20(suite.chainA.GetContext(), &erc20types.MsgConvertERC20{
 					ContractAddress: nativeErc20.ContractAddr.Hex(),
 					Amount:          amount,
@@ -129,7 +129,7 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 				denom = nativeErc20.Denom
 				amount = sdkmath.NewInt(nativeErc20.InitialBal.Int64())
 
-				evmAppA := suite.chainA.App.(*evmd.EVMD)
+				evmAppA := suite.chainA.App.(*karsa.App)
 				ctx := suite.chainA.GetContext()
 
 				// No conversion to IBC coin, so the balance is insufficient
@@ -168,7 +168,7 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 				amount = sdkmath.NewInt(nativeErc20.InitialBal.Int64())
 
 				// Convert to coins first
-				evmAppA := suite.chainA.App.(*evmd.EVMD)
+				evmAppA := suite.chainA.App.(*karsa.App)
 				_, err := evmAppA.Erc20Keeper.ConvertERC20(suite.chainA.GetContext(), &erc20types.MsgConvertERC20{
 					ContractAddress: nativeErc20.ContractAddr.Hex(),
 					Amount:          amount,
@@ -219,7 +219,7 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 				amount = sdkmath.NewInt(nativeErc20.InitialBal.Int64())
 
 				// Convert to coins
-				evmAppA := suite.chainA.App.(*evmd.EVMD)
+				evmAppA := suite.chainA.App.(*karsa.App)
 				_, err := evmAppA.Erc20Keeper.ConvertERC20(suite.chainA.GetContext(), &erc20types.MsgConvertERC20{
 					ContractAddress: nativeErc20.ContractAddr.Hex(),
 					Amount:          amount,
@@ -253,7 +253,7 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 				denom = nativeErc20.Denom
 				amount = sdkmath.NewInt(nativeErc20.InitialBal.Int64())
 
-				evmAppA := suite.chainA.App.(*evmd.EVMD)
+				evmAppA := suite.chainA.App.(*karsa.App)
 				ctx := suite.chainA.GetContext()
 
 				// Create a denom with erc20: prefix
@@ -278,7 +278,7 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 		{
 			"no-op - fail transfer",
 			func() {
-				evmAppA := suite.chainA.App.(*evmd.EVMD)
+				evmAppA := suite.chainA.App.(*karsa.App)
 				ctx := suite.chainA.GetContext()
 				senderAcc := suite.chainA.SenderAccount.GetAddress()
 
@@ -379,7 +379,7 @@ func (suite *ICS20ERC20ConversionTestSuite) TestPrefixTrimming() {
 				// Verify the denom has the correct prefix
 				suite.Require().Contains(denom, erc20types.Erc20NativeCoinDenomPrefix)
 
-				evmAppA := suite.chainA.App.(*evmd.EVMD)
+				evmAppA := suite.chainA.App.(*karsa.App)
 				ctx := suite.chainA.GetContext()
 
 				// TEST: Verify that the prefix trimming works correctly
@@ -418,7 +418,7 @@ func (suite *ICS20ERC20ConversionTestSuite) TestPrefixTrimming() {
 				denom = nativeErc20.Denom
 				amount = sdkmath.NewInt(nativeErc20.InitialBal.Int64())
 
-				evmAppA := suite.chainA.App.(*evmd.EVMD)
+				evmAppA := suite.chainA.App.(*karsa.App)
 				ctx := suite.chainA.GetContext()
 
 				// Demonstrate the bug's impact: incorrect vs correct prefix trimming

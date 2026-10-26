@@ -6,12 +6,12 @@ import (
 	"github.com/stretchr/testify/suite"
 
 	"github.com/cosmos/evm"
-	"github.com/cosmos/evm/evmd/tests/integration"
 	"github.com/cosmos/evm/tests/integration/precompiles/ics20"
 	testapp "github.com/cosmos/evm/testutil/app"
+	"github.com/karsa/karsa/tests/integration"
 )
 
-var ibcAppCreator = testapp.ToIBCAppCreator[evm.ICS20PrecompileApp](integration.SetupEvmd, "evm.ICS20PrecompileApp")
+var ibcAppCreator = testapp.ToIBCAppCreator[evm.ICS20PrecompileApp](integration.SetupKarsa, "evm.ICS20PrecompileApp")
 
 func TestICS20PrecompileTestSuite(t *testing.T) {
 	s := ics20.NewPrecompileTestSuite(t, ibcAppCreator)

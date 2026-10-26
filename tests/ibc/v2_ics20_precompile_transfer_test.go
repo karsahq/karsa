@@ -15,8 +15,6 @@ import (
 	"github.com/stretchr/testify/suite"
 
 	"github.com/cosmos/evm"
-	"github.com/cosmos/evm/evmd"
-	"github.com/cosmos/evm/evmd/tests/integration"
 	"github.com/cosmos/evm/precompiles/ics20"
 	chainutil "github.com/cosmos/evm/testutil"
 	evmibctesting "github.com/cosmos/evm/testutil/ibc"
@@ -24,6 +22,8 @@ import (
 	"github.com/cosmos/evm/x/vm/statedb"
 	transfertypes "github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
 	clienttypes "github.com/cosmos/ibc-go/v11/modules/core/02-client/types"
+	"github.com/karsa/karsa"
+	"github.com/karsa/karsa/tests/integration"
 
 	sdkmath "cosmossdk.io/math"
 
@@ -44,11 +44,11 @@ type ICS20TransferV2TestSuite struct {
 }
 
 func (suite *ICS20TransferV2TestSuite) SetupTest() {
-	suite.coordinator = evmibctesting.NewCoordinator(suite.T(), 2, 0, integration.SetupEvmd)
+	suite.coordinator = evmibctesting.NewCoordinator(suite.T(), 2, 0, integration.SetupKarsa)
 	suite.chainA = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(1))
 	suite.chainB = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(2))
 
-	evmAppA := suite.chainA.App.(*evmd.EVMD)
+	evmAppA := suite.chainA.App.(*karsa.App)
 	suite.chainAPrecompile = ics20.NewPrecompile(
 		evmAppA.BankKeeper,
 		*evmAppA.StakingKeeper,
@@ -56,7 +56,7 @@ func (suite *ICS20TransferV2TestSuite) SetupTest() {
 		evmAppA.IBCKeeper.ChannelKeeper,
 		evmAppA.Erc20Keeper,
 	)
-	evmAppB := suite.chainB.App.(*evmd.EVMD)
+	evmAppB := suite.chainB.App.(*karsa.App)
 	suite.chainBPrecompile = ics20.NewPrecompile(
 		evmAppB.BankKeeper,
 		*evmAppB.StakingKeeper,
@@ -85,7 +85,7 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 		{
 			"transfer single denom",
 			func(_ evmibctesting.SenderAccount) {
-				evmAppA := suite.chainA.App.(*evmd.EVMD)
+				evmAppA := suite.chainA.App.(*karsa.App)
 				sourceDenomToTransfer, err = evmAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
 				msgAmount = evmibctesting.DefaultCoinAmount
 			},
@@ -94,7 +94,7 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 			"transfer amount larger than int64",
 			func(_ evmibctesting.SenderAccount) {
 				var ok bool
-				evmAppA := suite.chainA.App.(*evmd.EVMD)
+				evmAppA := suite.chainA.App.(*karsa.App)
 				sourceDenomToTransfer, err = evmAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
 				msgAmount, ok = sdkmath.NewIntFromString("9223372036854775808") // 2^63 (one above int64)
 				suite.Require().True(ok)
@@ -103,7 +103,7 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 		{
 			"transfer entire balance",
 			func(_ evmibctesting.SenderAccount) {
-				evmAppA := suite.chainA.App.(*evmd.EVMD)
+				evmAppA := suite.chainA.App.(*karsa.App)
 				sourceDenomToTransfer, err = evmAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
 				msgAmount = transfertypes.UnboundedSpendLimit()
 			},
@@ -138,7 +138,7 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 
 			tc.malleate(senderAccount)
 
-			evmAppA := suite.chainA.App.(*evmd.EVMD)
+			evmAppA := suite.chainA.App.(*karsa.App)
 
 			GetBalance := func(addr sdk.AccAddress) sdk.Coin {
 				ctx := suite.chainA.GetContext()
@@ -224,7 +224,7 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 			suite.Require().True(transferAmount.Equal(chainAEscrowBalance.Amount))
 
 			// check that voucher exists on chain B
-			evmAppB := suite.chainB.App.(*evmd.EVMD)
+			evmAppB := suite.chainB.App.(*karsa.App)
 			chainBDenom := transfertypes.NewDenom(originalCoin.Denom, traceAToB)
 			chainBBalance := evmAppB.BankKeeper.GetBalance(
 				suite.chainB.GetContext(),

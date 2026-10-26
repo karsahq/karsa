@@ -11,7 +11,7 @@ import (
 )
 
 func TestBackend(t *testing.T) {
-	create := testapp.ToEvmAppCreator[evm.IntegrationNetworkApp](CreateEvmd, "evm.IntegrationNetworkApp")
+	create := testapp.ToEvmAppCreator[evm.IntegrationNetworkApp](CreateKarsa, "evm.IntegrationNetworkApp")
 	s := backend.NewTestSuite(create)
 	suite.Run(t, s)
 }

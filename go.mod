@@ -1,4 +1,4 @@
-module github.com/cosmos/evm/evmd
+module github.com/karsa/karsa
 
 go 1.26.10
 
