@@ -29,8 +29,8 @@ import (
 	"github.com/cosmos/evm/encoding"
 	"github.com/cosmos/evm/testutil/constants"
 	utiltx "github.com/cosmos/evm/testutil/tx"
-	"github.com/karsa/karsa"
-	"github.com/karsa/karsa/tests/ledger/mocks"
+	"github.com/karsahq/karsa"
+	"github.com/karsahq/karsa/tests/ledger/mocks"
 
 	"github.com/cosmos/cosmos-sdk/client"
 	"github.com/cosmos/cosmos-sdk/client/flags"

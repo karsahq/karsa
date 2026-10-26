@@ -10,7 +10,7 @@ import (
 	"github.com/cosmos/evm/testutil/constants"
 	feemarkettypes "github.com/cosmos/evm/x/feemarket/types"
 	ibctesting "github.com/cosmos/ibc-go/v11/testing"
-	"github.com/karsa/karsa"
+	"github.com/karsahq/karsa"
 
 	"cosmossdk.io/log/v2"
 

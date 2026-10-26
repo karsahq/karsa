@@ -13,8 +13,8 @@ import (
 	testutiltypes "github.com/cosmos/evm/testutil/types"
 	erc20types "github.com/cosmos/evm/x/erc20/types"
 	evmtypes "github.com/cosmos/evm/x/vm/types"
-	"github.com/karsa/karsa"
-	"github.com/karsa/karsa/tests/integration"
+	"github.com/karsahq/karsa"
+	"github.com/karsahq/karsa/tests/integration"
 
 	sdkmath "cosmossdk.io/math"
 	sdk "github.com/cosmos/cosmos-sdk/types"

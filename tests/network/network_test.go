@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/suite"
 
 	"github.com/cosmos/evm/server/config"
-	cosmosevmnetwork "github.com/karsa/karsa/tests/network"
+	cosmosevmnetwork "github.com/karsahq/karsa/tests/network"
 )
 
 type IntegrationTestSuite struct {

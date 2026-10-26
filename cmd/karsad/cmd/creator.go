@@ -9,7 +9,7 @@ import (
 	"github.com/spf13/viper"
 
 	dbm "github.com/cosmos/cosmos-db"
-	"github.com/karsa/karsa"
+	"github.com/karsahq/karsa"
 
 	"cosmossdk.io/log/v2"
 	"github.com/cosmos/cosmos-sdk/store/v2"

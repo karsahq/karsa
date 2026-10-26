@@ -1,4 +1,4 @@
-module github.com/karsa/karsa
+module github.com/karsahq/karsa
 
 go 1.26.10
 

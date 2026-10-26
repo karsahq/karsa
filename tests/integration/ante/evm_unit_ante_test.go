@@ -8,7 +8,7 @@ import (
 
 	"github.com/cosmos/evm/tests/integration/ante"
 	testapp "github.com/cosmos/evm/testutil/app"
-	"github.com/karsa/karsa/tests/integration"
+	"github.com/karsahq/karsa/tests/integration"
 )
 
 func TestEvmUnitAnteTestSuite(t *testing.T) {

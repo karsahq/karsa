@@ -8,7 +8,7 @@ import (
 	evm "github.com/cosmos/evm"
 	"github.com/cosmos/evm/tests/integration/precompiles/p256"
 	testapp "github.com/cosmos/evm/testutil/app"
-	"github.com/karsa/karsa/tests/integration"
+	"github.com/karsahq/karsa/tests/integration"
 )
 
 func TestP256PrecompileTestSuite(t *testing.T) {

@@ -14,7 +14,7 @@ import (
 	"github.com/cosmos/evm/server/config"
 	"github.com/cosmos/evm/testutil"
 	utiltx "github.com/cosmos/evm/testutil/tx"
-	"github.com/karsa/karsa/tests/ledger/mocks"
+	"github.com/karsahq/karsa/tests/ledger/mocks"
 
 	"cosmossdk.io/math"
 

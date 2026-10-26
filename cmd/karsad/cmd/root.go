@@ -19,8 +19,8 @@ import (
 	srvflags "github.com/cosmos/evm/server/flags"
 	"github.com/cosmos/evm/utils"
 	"github.com/cosmos/evm/x/vm/types"
-	"github.com/karsa/karsa"
-	"github.com/karsa/karsa/config"
+	"github.com/karsahq/karsa"
+	"github.com/karsahq/karsa/config"
 
 	"cosmossdk.io/log/v2"
 	confixcmd "cosmossdk.io/tools/confix/cmd"

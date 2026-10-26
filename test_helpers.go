@@ -16,7 +16,7 @@ import (
 	feemarkettypes "github.com/cosmos/evm/x/feemarket/types"
 	"github.com/cosmos/evm/x/vm/types"
 	ibctesting "github.com/cosmos/ibc-go/v11/testing"
-	"github.com/karsa/karsa/config"
+	"github.com/karsahq/karsa/config"
 
 	"cosmossdk.io/log/v2"
 	"cosmossdk.io/math"

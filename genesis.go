@@ -7,7 +7,7 @@ import (
 	erc20types "github.com/cosmos/evm/x/erc20/types"
 	feemarkettypes "github.com/cosmos/evm/x/feemarket/types"
 	evmtypes "github.com/cosmos/evm/x/vm/types"
-	"github.com/karsa/karsa/config"
+	"github.com/karsahq/karsa/config"
 
 	minttypes "github.com/cosmos/cosmos-sdk/x/mint/types"
 )

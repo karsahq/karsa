@@ -31,8 +31,8 @@ import (
 	evmtestutil "github.com/cosmos/evm/testutil"
 	testconstants "github.com/cosmos/evm/testutil/constants"
 	"github.com/cosmos/evm/utils"
-	"github.com/karsa/karsa"
-	karsaconfig "github.com/karsa/karsa/config"
+	"github.com/karsahq/karsa"
+	karsaconfig "github.com/karsahq/karsa/config"
 
 	"cosmossdk.io/log/v2"
 	"cosmossdk.io/math"

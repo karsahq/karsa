@@ -6,7 +6,7 @@ import (
 	evm "github.com/cosmos/evm"
 	"github.com/cosmos/evm/tests/integration/eips"
 	testapp "github.com/cosmos/evm/testutil/app"
-	"github.com/karsa/karsa/tests/integration"
+	"github.com/karsahq/karsa/tests/integration"
 	//nolint:revive // dot imports are fine for Ginkgo
 	//nolint:revive // dot imports are fine for Ginkgo
 )

@@ -8,7 +8,7 @@ import (
 	evm "github.com/cosmos/evm"
 	"github.com/cosmos/evm/tests/integration/precompiles/staking"
 	testapp "github.com/cosmos/evm/testutil/app"
-	"github.com/karsa/karsa/tests/integration"
+	"github.com/karsahq/karsa/tests/integration"
 )
 
 func TestStakingPrecompileTestSuite(t *testing.T) {

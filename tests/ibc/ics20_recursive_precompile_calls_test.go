@@ -22,8 +22,8 @@ import (
 	evmtypes "github.com/cosmos/evm/x/vm/types"
 	transfertypes "github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
 	clienttypes "github.com/cosmos/ibc-go/v11/modules/core/02-client/types"
-	"github.com/karsa/karsa"
-	"github.com/karsa/karsa/tests/integration"
+	"github.com/karsahq/karsa"
+	"github.com/karsahq/karsa/tests/integration"
 
 	sdkmath "cosmossdk.io/math"
 

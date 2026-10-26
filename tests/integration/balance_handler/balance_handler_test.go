@@ -10,8 +10,8 @@ import (
 	"github.com/cosmos/evm/contracts"
 	evmibctesting "github.com/cosmos/evm/testutil/ibc"
 	testutiltypes "github.com/cosmos/evm/testutil/types"
-	"github.com/karsa/karsa/tests/integration"
-	debugprecompile "github.com/karsa/karsa/tests/testdata/debug"
+	"github.com/karsahq/karsa/tests/integration"
+	debugprecompile "github.com/karsahq/karsa/tests/testdata/debug"
 
 	sdkmath "cosmossdk.io/math"
 

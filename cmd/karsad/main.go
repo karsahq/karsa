@@ -6,8 +6,8 @@ import (
 
 	svrcmd "github.com/cosmos/cosmos-sdk/server/cmd"
 	sdk "github.com/cosmos/cosmos-sdk/types"
-	"github.com/karsa/karsa/cmd/karsad/cmd"
-	"github.com/karsa/karsa/config"
+	"github.com/karsahq/karsa/cmd/karsad/cmd"
+	"github.com/karsahq/karsa/config"
 )
 
 func main() {

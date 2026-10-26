@@ -24,8 +24,8 @@ import (
 	clienttypes "github.com/cosmos/ibc-go/v11/modules/core/02-client/types"
 	channeltypes "github.com/cosmos/ibc-go/v11/modules/core/04-channel/types"
 	channeltypesv2 "github.com/cosmos/ibc-go/v11/modules/core/04-channel/v2/types"
-	"github.com/karsa/karsa"
-	"github.com/karsa/karsa/tests/integration"
+	"github.com/karsahq/karsa"
+	"github.com/karsahq/karsa/tests/integration"
 
 	sdkmath "cosmossdk.io/math"
 

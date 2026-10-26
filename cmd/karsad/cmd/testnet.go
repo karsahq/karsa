@@ -22,9 +22,9 @@ import (
 	cosmosevmserverconfig "github.com/cosmos/evm/server/config"
 	evmnetwork "github.com/cosmos/evm/testutil/integration/evm/network"
 	evmtypes "github.com/cosmos/evm/x/vm/types"
-	"github.com/karsa/karsa"
-	"github.com/karsa/karsa/config"
-	customnetwork "github.com/karsa/karsa/tests/network"
+	"github.com/karsahq/karsa"
+	"github.com/karsahq/karsa/config"
+	customnetwork "github.com/karsahq/karsa/tests/network"
 
 	"cosmossdk.io/log/v2"
 	"cosmossdk.io/math"

@@ -15,8 +15,8 @@ import (
 
 	"github.com/cosmos/evm/precompiles/ics20"
 	evmibctesting "github.com/cosmos/evm/testutil/ibc"
-	"github.com/karsa/karsa"
-	"github.com/karsa/karsa/tests/integration"
+	"github.com/karsahq/karsa"
+	"github.com/karsahq/karsa/tests/integration"
 )
 
 // Test constants for sequential ICS20 sends

@@ -6,7 +6,7 @@ import (
 	evm "github.com/cosmos/evm"
 	"github.com/cosmos/evm/tests/integration/eip7702"
 	testapp "github.com/cosmos/evm/testutil/app"
-	"github.com/karsa/karsa/tests/integration"
+	"github.com/karsahq/karsa/tests/integration"
 )
 
 func TestEIP7702IntegrationTestSuite(t *testing.T) {

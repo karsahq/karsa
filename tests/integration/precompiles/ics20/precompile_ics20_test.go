@@ -8,7 +8,7 @@ import (
 	"github.com/cosmos/evm"
 	"github.com/cosmos/evm/tests/integration/precompiles/ics20"
 	testapp "github.com/cosmos/evm/testutil/app"
-	"github.com/karsa/karsa/tests/integration"
+	"github.com/karsahq/karsa/tests/integration"
 )
 
 var ibcAppCreator = testapp.ToIBCAppCreator[evm.ICS20PrecompileApp](integration.SetupKarsa, "evm.ICS20PrecompileApp")

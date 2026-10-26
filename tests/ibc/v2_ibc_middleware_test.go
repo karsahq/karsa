@@ -21,8 +21,8 @@ import (
 	channeltypesv2 "github.com/cosmos/ibc-go/v11/modules/core/04-channel/v2/types"
 	ibctesting "github.com/cosmos/ibc-go/v11/testing"
 	ibcmockv2 "github.com/cosmos/ibc-go/v11/testing/mock/v2"
-	"github.com/karsa/karsa"
-	"github.com/karsa/karsa/tests/integration"
+	"github.com/karsahq/karsa"
+	"github.com/karsahq/karsa/tests/integration"
 
 	"cosmossdk.io/math"
 

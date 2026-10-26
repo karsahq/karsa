@@ -8,7 +8,7 @@ import (
 	evm "github.com/cosmos/evm"
 	"github.com/cosmos/evm/tests/integration/precompiles/distribution"
 	testapp "github.com/cosmos/evm/testutil/app"
-	"github.com/karsa/karsa/tests/integration"
+	"github.com/karsahq/karsa/tests/integration"
 )
 
 func TestDistributionPrecompileTestSuite(t *testing.T) {
