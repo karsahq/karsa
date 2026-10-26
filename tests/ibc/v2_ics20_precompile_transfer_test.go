@@ -48,21 +48,21 @@ func (suite *ICS20TransferV2TestSuite) SetupTest() {
 	suite.chainA = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(1))
 	suite.chainB = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(2))
 
-	evmAppA := suite.chainA.App.(*karsa.App)
+	karsaAppA := suite.chainA.App.(*karsa.App)
 	suite.chainAPrecompile = ics20.NewPrecompile(
-		evmAppA.BankKeeper,
-		*evmAppA.StakingKeeper,
-		evmAppA.TransferKeeper,
-		evmAppA.IBCKeeper.ChannelKeeper,
-		evmAppA.Erc20Keeper,
+		karsaAppA.BankKeeper,
+		*karsaAppA.StakingKeeper,
+		karsaAppA.TransferKeeper,
+		karsaAppA.IBCKeeper.ChannelKeeper,
+		karsaAppA.Erc20Keeper,
 	)
-	evmAppB := suite.chainB.App.(*karsa.App)
+	karsaAppB := suite.chainB.App.(*karsa.App)
 	suite.chainBPrecompile = ics20.NewPrecompile(
-		evmAppB.BankKeeper,
-		*evmAppB.StakingKeeper,
-		evmAppB.TransferKeeper,
-		evmAppB.IBCKeeper.ChannelKeeper,
-		evmAppB.Erc20Keeper,
+		karsaAppB.BankKeeper,
+		*karsaAppB.StakingKeeper,
+		karsaAppB.TransferKeeper,
+		karsaAppB.IBCKeeper.ChannelKeeper,
+		karsaAppB.Erc20Keeper,
 	)
 }
 
@@ -85,8 +85,8 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 		{
 			"transfer single denom",
 			func(_ evmibctesting.SenderAccount) {
-				evmAppA := suite.chainA.App.(*karsa.App)
-				sourceDenomToTransfer, err = evmAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
+				karsaAppA := suite.chainA.App.(*karsa.App)
+				sourceDenomToTransfer, err = karsaAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
 				msgAmount = evmibctesting.DefaultCoinAmount
 			},
 		},
@@ -94,8 +94,8 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 			"transfer amount larger than int64",
 			func(_ evmibctesting.SenderAccount) {
 				var ok bool
-				evmAppA := suite.chainA.App.(*karsa.App)
-				sourceDenomToTransfer, err = evmAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
+				karsaAppA := suite.chainA.App.(*karsa.App)
+				sourceDenomToTransfer, err = karsaAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
 				msgAmount, ok = sdkmath.NewIntFromString("9223372036854775808") // 2^63 (one above int64)
 				suite.Require().True(ok)
 			},
@@ -103,8 +103,8 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 		{
 			"transfer entire balance",
 			func(_ evmibctesting.SenderAccount) {
-				evmAppA := suite.chainA.App.(*karsa.App)
-				sourceDenomToTransfer, err = evmAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
+				karsaAppA := suite.chainA.App.(*karsa.App)
+				sourceDenomToTransfer, err = karsaAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
 				msgAmount = transfertypes.UnboundedSpendLimit()
 			},
 		},
@@ -138,18 +138,18 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 
 			tc.malleate(senderAccount)
 
-			evmAppA := suite.chainA.App.(*karsa.App)
+			karsaAppA := suite.chainA.App.(*karsa.App)
 
 			GetBalance := func(addr sdk.AccAddress) sdk.Coin {
 				ctx := suite.chainA.GetContext()
 				if erc20 {
-					balanceAmt := evmAppA.Erc20Keeper.BalanceOf(ctx, nativeErc20.ContractAbi, nativeErc20.ContractAddr, nativeErc20.Account)
+					balanceAmt := karsaAppA.Erc20Keeper.BalanceOf(ctx, nativeErc20.ContractAbi, nativeErc20.ContractAddr, nativeErc20.Account)
 					return sdk.Coin{
 						Denom:  nativeErc20.Denom,
 						Amount: sdkmath.NewIntFromBigInt(balanceAmt),
 					}
 				}
-				return evmAppA.BankKeeper.GetBalance(ctx, addr, sourceDenomToTransfer)
+				return karsaAppA.BankKeeper.GetBalance(ctx, addr, sourceDenomToTransfer)
 			}
 
 			senderBalance := GetBalance(senderAddr)
@@ -179,7 +179,7 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 			transferAmount := msgAmount
 
 			// check that the balance for chainA is updated
-			afterSenderBalance := evmAppA.BankKeeper.GetBalance(suite.chainA.GetContext(), senderAddr, originalCoin.Denom)
+			afterSenderBalance := karsaAppA.BankKeeper.GetBalance(suite.chainA.GetContext(), senderAddr, originalCoin.Denom)
 			// Note: When an UnboundedSpendLimit value is sent, the spendable amount is used.
 			if msgAmount.Equal(transfertypes.UnboundedSpendLimit()) {
 				transferAmount = senderBalance.Amount
@@ -216,7 +216,7 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 			)
 
 			// check that module account escrow address has locked the tokens
-			chainAEscrowBalance := evmAppA.BankKeeper.GetBalance(
+			chainAEscrowBalance := karsaAppA.BankKeeper.GetBalance(
 				suite.chainA.GetContext(),
 				escrowAddress,
 				originalCoin.Denom,
@@ -224,9 +224,9 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 			suite.Require().True(transferAmount.Equal(chainAEscrowBalance.Amount))
 
 			// check that voucher exists on chain B
-			evmAppB := suite.chainB.App.(*karsa.App)
+			karsaAppB := suite.chainB.App.(*karsa.App)
 			chainBDenom := transfertypes.NewDenom(originalCoin.Denom, traceAToB)
-			chainBBalance := evmAppB.BankKeeper.GetBalance(
+			chainBBalance := karsaAppB.BankKeeper.GetBalance(
 				suite.chainB.GetContext(),
 				suite.chainB.SenderAccount.GetAddress(),
 				chainBDenom.IBCDenom(),
@@ -240,7 +240,7 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 			chainBAddr := common.BytesToAddress(suite.chainB.SenderAccount.GetAddress().Bytes())
 			ctxB := evmante.BuildEvmExecutionCtx(suite.chainB.GetContext())
 			stateDB := statedb.New(ctxB, suite.chainB.App.(evm.EvmApp).GetEVMKeeper(), statedb.NewEmptyTxConfig())
-			evmRes, err := evmAppB.EVMKeeper.CallEVM(
+			evmRes, err := karsaAppB.EVMKeeper.CallEVM(
 				ctxB,
 				stateDB,
 				suite.chainBPrecompile.ABI,
@@ -265,7 +265,7 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 			suite.Require().Equal(chainBDenom, denomsResponse.Denoms[0])
 
 			// denom query method
-			evmRes, err = evmAppB.EVMKeeper.CallEVM(
+			evmRes, err = karsaAppB.EVMKeeper.CallEVM(
 				ctxB,
 				stateDB,
 				suite.chainBPrecompile.ABI,
@@ -284,7 +284,7 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 			suite.Require().Equal(chainBDenom, denomResponse.Denom)
 
 			// denom query method not exists case
-			evmRes, err = evmAppB.EVMKeeper.CallEVM(
+			evmRes, err = karsaAppB.EVMKeeper.CallEVM(
 				ctxB,
 				stateDB,
 				suite.chainBPrecompile.ABI,
@@ -303,7 +303,7 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 			suite.Require().Equal(denomResponse.Denom, transfertypes.Denom{Base: "", Trace: []transfertypes.Hop{}})
 
 			// denom query method invalid error case
-			evmRes, err = evmAppB.EVMKeeper.CallEVM(
+			evmRes, err = karsaAppB.EVMKeeper.CallEVM(
 				ctxB,
 				stateDB,
 				suite.chainBPrecompile.ABI,
@@ -321,7 +321,7 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 			ctxB.GasMeter().RefundGas(ctxB.GasMeter().Limit(), "refund after error")
 
 			// denomHash query method
-			evmRes, err = evmAppB.EVMKeeper.CallEVM(
+			evmRes, err = karsaAppB.EVMKeeper.CallEVM(
 				ctxB,
 				stateDB,
 				suite.chainBPrecompile.ABI,
@@ -340,7 +340,7 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 			suite.Require().Equal(chainBDenom.Hash().String(), denomHashResponse.Hash)
 
 			// denomHash query method not exists case
-			evmRes, err = evmAppB.EVMKeeper.CallEVM(
+			evmRes, err = karsaAppB.EVMKeeper.CallEVM(
 				ctxB,
 				stateDB,
 				suite.chainBPrecompile.ABI,
@@ -358,7 +358,7 @@ func (suite *ICS20TransferV2TestSuite) TestHandleMsgTransfer() {
 			suite.Require().Equal(denomHashResponse.Hash, "")
 
 			// denomHash query method invalid error case
-			evmRes, err = evmAppB.EVMKeeper.CallEVM(
+			evmRes, err = karsaAppB.EVMKeeper.CallEVM(
 				ctxB,
 				stateDB,
 				suite.chainBPrecompile.ABI,

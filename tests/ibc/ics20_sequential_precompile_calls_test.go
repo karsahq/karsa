@@ -43,29 +43,29 @@ func (suite *ICS20SequentialPrecompileCallsTestSuite) SetupTest() {
 	suite.chainA = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(1))
 	suite.chainB = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(2))
 
-	evmAppA := suite.chainA.App.(*karsa.App)
+	karsaAppA := suite.chainA.App.(*karsa.App)
 	suite.chainAPrecompile = ics20.NewPrecompile(
-		evmAppA.BankKeeper,
-		*evmAppA.StakingKeeper,
-		evmAppA.TransferKeeper,
-		evmAppA.IBCKeeper.ChannelKeeper,
-		evmAppA.Erc20Keeper,
+		karsaAppA.BankKeeper,
+		*karsaAppA.StakingKeeper,
+		karsaAppA.TransferKeeper,
+		karsaAppA.IBCKeeper.ChannelKeeper,
+		karsaAppA.Erc20Keeper,
 	)
-	bondDenom, err := evmAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
+	bondDenom, err := karsaAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
 	suite.Require().NoError(err)
 
-	evmAppA.Erc20Keeper.GetTokenPair(suite.chainA.GetContext(), evmAppA.Erc20Keeper.GetTokenPairID(suite.chainA.GetContext(), bondDenom))
+	karsaAppA.Erc20Keeper.GetTokenPair(suite.chainA.GetContext(), karsaAppA.Erc20Keeper.GetTokenPairID(suite.chainA.GetContext(), bondDenom))
 
-	avail := evmAppA.Erc20Keeper.IsNativePrecompileAvailable(suite.chainA.GetContext(), common.HexToAddress("0xD4949664cD82660AaE99bEdc034a0deA8A0bd517"))
+	avail := karsaAppA.Erc20Keeper.IsNativePrecompileAvailable(suite.chainA.GetContext(), common.HexToAddress("0xD4949664cD82660AaE99bEdc034a0deA8A0bd517"))
 	suite.Require().True(avail)
 
-	evmAppB := suite.chainB.App.(*karsa.App)
+	karsaAppB := suite.chainB.App.(*karsa.App)
 	suite.chainBPrecompile = ics20.NewPrecompile(
-		evmAppB.BankKeeper,
-		*evmAppB.StakingKeeper,
-		evmAppB.TransferKeeper,
-		evmAppB.IBCKeeper.ChannelKeeper,
-		evmAppB.Erc20Keeper,
+		karsaAppB.BankKeeper,
+		*karsaAppB.StakingKeeper,
+		karsaAppB.TransferKeeper,
+		karsaAppB.IBCKeeper.ChannelKeeper,
+		karsaAppB.Erc20Keeper,
 	)
 }
 
@@ -77,7 +77,7 @@ func (suite *ICS20SequentialPrecompileCallsTestSuite) TestReceiveAndSendTwice() 
 	pathAToB := evmibctesting.NewTransferPath(suite.chainA, suite.chainB)
 	pathAToB.Setup()
 
-	evmAppA := suite.chainA.App.(*karsa.App)
+	karsaAppA := suite.chainA.App.(*karsa.App)
 	// Deployer has MINTER_ROLE - use it for minting
 	deployerAddr := common.BytesToAddress(suite.chainA.SenderPrivKey.PubKey().Address().Bytes())
 	// Use a different account for the actual test tx
@@ -97,8 +97,8 @@ func (suite *ICS20SequentialPrecompileCallsTestSuite) TestReceiveAndSendTwice() 
 
 	// 2. Register the ERC20
 	ctx := suite.chainA.GetContext()
-	_, err = evmAppA.Erc20Keeper.RegisterERC20(ctx, &erc20types.MsgRegisterERC20{
-		Signer:         evmAppA.AccountKeeper.GetModuleAddress("gov").String(),
+	_, err = karsaAppA.Erc20Keeper.RegisterERC20(ctx, &erc20types.MsgRegisterERC20{
+		Signer:         karsaAppA.AccountKeeper.GetModuleAddress("gov").String(),
 		Erc20Addresses: []string{erc20Addr.Hex()},
 	})
 	suite.Require().NoError(err)
@@ -118,26 +118,26 @@ func (suite *ICS20SequentialPrecompileCallsTestSuite) TestReceiveAndSendTwice() 
 
 	// 4. Mint ERC20 tokens to the test sender using deployer (who has MINTER_ROLE)
 	ctx = suite.chainA.GetContext()
-	mintStateDB := testutil.NewStateDB(ctx, evmAppA.EVMKeeper)
-	_, err = evmAppA.GetEVMKeeper().CallEVM(ctx, mintStateDB, erc20ContractData.ABI, deployerAddr, erc20Addr, true, false, nil, "mint", senderAddr, big.NewInt(SeqICS20InitialTokenAmount))
+	mintStateDB := testutil.NewStateDB(ctx, karsaAppA.EVMKeeper)
+	_, err = karsaAppA.GetEVMKeeper().CallEVM(ctx, mintStateDB, erc20ContractData.ABI, deployerAddr, erc20Addr, true, false, nil, "mint", senderAddr, big.NewInt(SeqICS20InitialTokenAmount))
 	suite.Require().NoError(err)
 	suite.chainA.NextBlock()
 
 	// Verify minted balance
-	senderBal := evmAppA.GetErc20Keeper().BalanceOf(suite.chainA.GetContext(), erc20ContractData.ABI, erc20Addr, senderAddr)
+	senderBal := karsaAppA.GetErc20Keeper().BalanceOf(suite.chainA.GetContext(), erc20ContractData.ABI, erc20Addr, senderAddr)
 	suite.Require().Equal(big.NewInt(SeqICS20InitialTokenAmount), senderBal)
 	fmt.Printf("Sender balance before: %s\n", senderBal.String())
 
 	// 5. Approve the contract to spend tokens (called by sender)
 	ctx = suite.chainA.GetContext()
-	approveStateDB := testutil.NewStateDB(ctx, evmAppA.EVMKeeper)
-	_, err = evmAppA.GetEVMKeeper().CallEVM(ctx, approveStateDB, erc20ContractData.ABI, senderAddr, erc20Addr, true, false, nil, "approve", contractAddr, big.NewInt(SeqICS20InitialTokenAmount*2))
+	approveStateDB := testutil.NewStateDB(ctx, karsaAppA.EVMKeeper)
+	_, err = karsaAppA.GetEVMKeeper().CallEVM(ctx, approveStateDB, erc20ContractData.ABI, senderAddr, erc20Addr, true, false, nil, "approve", contractAddr, big.NewInt(SeqICS20InitialTokenAmount*2))
 	suite.Require().NoError(err)
 	suite.chainA.NextBlock()
 
 	// Get balances before
-	senderBalBefore := evmAppA.GetErc20Keeper().BalanceOf(suite.chainA.GetContext(), erc20ContractData.ABI, erc20Addr, senderAddr)
-	contractBalBefore := evmAppA.GetErc20Keeper().BalanceOf(suite.chainA.GetContext(), erc20ContractData.ABI, erc20Addr, contractAddr)
+	senderBalBefore := karsaAppA.GetErc20Keeper().BalanceOf(suite.chainA.GetContext(), erc20ContractData.ABI, erc20Addr, senderAddr)
+	contractBalBefore := karsaAppA.GetErc20Keeper().BalanceOf(suite.chainA.GetContext(), erc20ContractData.ABI, erc20Addr, contractAddr)
 	fmt.Printf("Before tx - Sender: %s, Contract: %s\n", senderBalBefore.String(), contractBalBefore.String())
 
 	// 6. Call receiveAndSendTwice - this should:
@@ -187,8 +187,8 @@ func (suite *ICS20SequentialPrecompileCallsTestSuite) TestReceiveAndSendTwice() 
 	}
 
 	// Get balances after
-	senderBalAfter := evmAppA.GetErc20Keeper().BalanceOf(suite.chainA.GetContext(), erc20ContractData.ABI, erc20Addr, senderAddr)
-	contractBalAfter := evmAppA.GetErc20Keeper().BalanceOf(suite.chainA.GetContext(), erc20ContractData.ABI, erc20Addr, contractAddr)
+	senderBalAfter := karsaAppA.GetErc20Keeper().BalanceOf(suite.chainA.GetContext(), erc20ContractData.ABI, erc20Addr, senderAddr)
+	contractBalAfter := karsaAppA.GetErc20Keeper().BalanceOf(suite.chainA.GetContext(), erc20ContractData.ABI, erc20Addr, contractAddr)
 	fmt.Printf("After tx - Sender: %s, Contract: %s\n", senderBalAfter.String(), contractBalAfter.String())
 
 	// The second ICS20 send should have failed, causing a revert

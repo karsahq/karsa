@@ -52,7 +52,7 @@ import (
 	ibckeeper "github.com/cosmos/ibc-go/v11/modules/core/keeper"
 	ibctm "github.com/cosmos/ibc-go/v11/modules/light-clients/07-tendermint"
 	ibctesting "github.com/cosmos/ibc-go/v11/testing"
-	evmconfig "github.com/karsa/karsa/config"
+	karsaconfig "github.com/karsa/karsa/config"
 
 	autocliv1 "cosmossdk.io/api/cosmos/autocli/v1"
 	reflectionv1 "cosmossdk.io/api/cosmos/reflection/v1"
@@ -132,7 +132,7 @@ func init() {
 	// manually update the power reduction by replacing micro (u) -> atto (a) evmos
 	sdk.DefaultPowerReduction = utils.AttoPowerReduction
 
-	defaultNodeHome = evmconfig.MustGetDefaultNodeHome()
+	defaultNodeHome = karsaconfig.MustGetDefaultNodeHome()
 }
 
 // appName is the application name.
@@ -296,7 +296,7 @@ func NewApp(
 	// add keepers
 	app.AccountKeeper = authkeeper.NewAccountKeeper(
 		appCodec, runtime.NewKVStoreService(keys[authtypes.StoreKey]),
-		authtypes.ProtoBaseAccount, evmconfig.GetMaccPerms(),
+		authtypes.ProtoBaseAccount, karsaconfig.GetMaccPerms(),
 		evmaddress.NewEvmCodec(sdk.GetConfig().GetBech32AccountAddrPrefix()),
 		sdk.GetConfig().GetBech32AccountAddrPrefix(),
 		authAddr,
@@ -306,7 +306,7 @@ func NewApp(
 		appCodec,
 		runtime.NewKVStoreService(keys[banktypes.StoreKey]),
 		app.AccountKeeper,
-		evmconfig.BlockedAddresses(),
+		karsaconfig.BlockedAddresses(),
 		authAddr,
 		logger,
 	)

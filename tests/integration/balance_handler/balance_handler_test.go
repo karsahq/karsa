@@ -41,17 +41,17 @@ func (s *BalanceHandlerTestSuite) SetupTest() {
 // TestRecursivePrecompileCallsWithDebugPrecompile demonstrates the balance handler bug
 // by triggering recursive calls that share the same BalanceHandler instance.
 func (s *BalanceHandlerTestSuite) TestRecursivePrecompileCallsWithDebugPrecompile() {
-	evmApp := s.chain.App.(evm.EvmApp)
+	karsaApp := s.chain.App.(evm.EvmApp)
 	ctx := s.chain.GetContext()
 
 	// Create and register debug precompile
-	debugPrec := debugprecompile.NewPrecompile(evmApp.GetBankKeeper(), evmApp.GetEVMKeeper())
+	debugPrec := debugprecompile.NewPrecompile(karsaApp.GetBankKeeper(), karsaApp.GetEVMKeeper())
 	// Set the precompile directly in the EVM keeper's precompile map
-	evmApp.GetEVMKeeper().RegisterStaticPrecompile(debugPrec.Address(), debugPrec)
-	err := evmApp.GetEVMKeeper().EnableStaticPrecompiles(ctx, debugPrec.Address())
+	karsaApp.GetEVMKeeper().RegisterStaticPrecompile(debugPrec.Address(), debugPrec)
+	err := karsaApp.GetEVMKeeper().EnableStaticPrecompiles(ctx, debugPrec.Address())
 	s.Require().NoError(err)
 
-	a, b, c := evmApp.GetEVMKeeper().GetPrecompileInstance(ctx, debugPrec.Address())
+	a, b, c := karsaApp.GetEVMKeeper().GetPrecompileInstance(ctx, debugPrec.Address())
 	s.T().Logf("Precompile instance: %v, %v, %v", a, b, c)
 
 	// Deploy caller contract
@@ -76,7 +76,7 @@ func (s *BalanceHandlerTestSuite) TestRecursivePrecompileCallsWithDebugPrecompil
 	s.Require().NoError(err)
 
 	// Fund Contract
-	err = evmApp.GetBankKeeper().SendCoins(ctx, s.chain.SenderAccounts[0].SenderAccount.GetAddress(), callerAddr.Bytes(), types.NewCoins(types.NewCoin("aatom", sdkmath.NewInt(10000000))))
+	err = karsaApp.GetBankKeeper().SendCoins(ctx, s.chain.SenderAccounts[0].SenderAccount.GetAddress(), callerAddr.Bytes(), types.NewCoins(types.NewCoin("aatom", sdkmath.NewInt(10000000))))
 	s.Require().NoError(err)
 
 	res, _, _, err := s.chain.SendEvmTx(

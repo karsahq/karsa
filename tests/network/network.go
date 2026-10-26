@@ -32,7 +32,7 @@ import (
 	testconstants "github.com/cosmos/evm/testutil/constants"
 	"github.com/cosmos/evm/utils"
 	"github.com/karsa/karsa"
-	evmconfig "github.com/karsa/karsa/config"
+	karsaconfig "github.com/karsa/karsa/config"
 
 	"cosmossdk.io/log/v2"
 	"cosmossdk.io/math"
@@ -484,7 +484,7 @@ func New(l Logger, baseDir string, cfg Config) (*Network, error) {
 			return nil, err
 		}
 
-		customAppTemplate, _ := evmconfig.InitAppConfig(testconstants.ExampleAttoDenom, testconstants.EighteenDecimalsChainID)
+		customAppTemplate, _ := karsaconfig.InitAppConfig(testconstants.ExampleAttoDenom, testconstants.EighteenDecimalsChainID)
 		srvconfig.SetConfigTemplate(customAppTemplate)
 		srvconfig.WriteConfigFile(filepath.Join(nodeDir, "config/app.toml"), appCfg)
 

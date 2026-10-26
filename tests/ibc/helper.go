@@ -48,19 +48,19 @@ type NativeErc20Info struct {
 func SetupNativeErc20(t *testing.T, chain *evmibctesting.TestChain, senderAcc evmibctesting.SenderAccount) *NativeErc20Info {
 	t.Helper()
 
-	evmApp := chain.App.(evm.EvmApp)
+	karsaApp := chain.App.(evm.EvmApp)
 	ctx := chain.GetContext()
 
 	// Deploy new ERC20 contract with default metadata.
 	// The deployer is a dedicated EOA.
 	deployer := common.BytesToAddress([]byte("erc20-test-deployer"))
 	deployerAccAddr := sdk.AccAddress(deployer.Bytes())
-	if evmApp.GetAccountKeeper().GetAccount(ctx, deployerAccAddr) == nil {
-		evmApp.GetAccountKeeper().SetAccount(ctx, evmApp.GetAccountKeeper().NewAccountWithAddress(ctx, deployerAccAddr))
+	if karsaApp.GetAccountKeeper().GetAccount(ctx, deployerAccAddr) == nil {
+		karsaApp.GetAccountKeeper().SetAccount(ctx, karsaApp.GetAccountKeeper().NewAccountWithAddress(ctx, deployerAccAddr))
 	}
 
-	stateDB := statedb.New(ctx, evmApp.GetEVMKeeper(), statedb.NewEmptyTxConfig())
-	contractAddr, err := DeployERC20Contract(ctx, stateDB, evmApp.GetAccountKeeper(), evmApp.GetEVMKeeper(), banktypes.Metadata{
+	stateDB := statedb.New(ctx, karsaApp.GetEVMKeeper(), statedb.NewEmptyTxConfig())
+	contractAddr, err := DeployERC20Contract(ctx, stateDB, karsaApp.GetAccountKeeper(), karsaApp.GetEVMKeeper(), banktypes.Metadata{
 		DenomUnits: []*banktypes.DenomUnit{
 			{Denom: "example", Exponent: 18},
 		},
@@ -72,7 +72,7 @@ func SetupNativeErc20(t *testing.T, chain *evmibctesting.TestChain, senderAcc ev
 	}
 
 	// Register the contract
-	_, err = evmApp.GetErc20Keeper().RegisterERC20(ctx, &erc20types.MsgRegisterERC20{
+	_, err = karsaApp.GetErc20Keeper().RegisterERC20(ctx, &erc20types.MsgRegisterERC20{
 		Signer:         authtypes.NewModuleAddress(govtypes.ModuleName).String(), // does not have to be gov
 		Erc20Addresses: []string{contractAddr.Hex()},
 	})
@@ -86,8 +86,8 @@ func SetupNativeErc20(t *testing.T, chain *evmibctesting.TestChain, senderAcc ev
 	sendAmt := ibctesting.DefaultCoinAmount
 	senderAddr := senderAcc.SenderAccount.GetAddress()
 
-	stateDB = statedb.New(ctx, evmApp.GetEVMKeeper(), statedb.NewEmptyTxConfig())
-	_, err = evmApp.GetEVMKeeper().CallEVM(
+	stateDB = statedb.New(ctx, karsaApp.GetEVMKeeper(), statedb.NewEmptyTxConfig())
+	_, err = karsaApp.GetEVMKeeper().CallEVM(
 		ctx,
 		stateDB,
 		contractAbi,
@@ -105,8 +105,8 @@ func SetupNativeErc20(t *testing.T, chain *evmibctesting.TestChain, senderAcc ev
 	}
 
 	// Verify minted balance
-	stateDB = statedb.New(ctx, evmApp.GetEVMKeeper(), statedb.NewEmptyTxConfig())
-	ethRes, err := evmApp.GetEVMKeeper().CallEVM(
+	stateDB = statedb.New(ctx, karsaApp.GetEVMKeeper(), statedb.NewEmptyTxConfig())
+	ethRes, err := karsaApp.GetEVMKeeper().CallEVM(
 		ctx,
 		stateDB,
 		contractAbi,

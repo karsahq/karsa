@@ -45,15 +45,15 @@ func (s *ICS02ClientTestSuite) SetupTest() {
 	s.pathBToA = evmibctesting.NewTransferPath(s.chainB, s.chainA)
 	s.pathBToA.Setup()
 
-	evmAppA := s.chainA.App.(*karsa.App)
+	karsaAppA := s.chainA.App.(*karsa.App)
 	s.chainAPrecompile = ics02.NewPrecompile(
-		evmAppA.AppCodec(),
-		evmAppA.IBCKeeper.ClientKeeper,
+		karsaAppA.AppCodec(),
+		karsaAppA.IBCKeeper.ClientKeeper,
 	)
-	evmAppB := s.chainB.App.(*karsa.App)
+	karsaAppB := s.chainB.App.(*karsa.App)
 	s.chainBPrecompile = ics02.NewPrecompile(
-		evmAppA.AppCodec(),
-		evmAppB.IBCKeeper.ClientKeeper,
+		karsaAppA.AppCodec(),
+		karsaAppB.IBCKeeper.ClientKeeper,
 	)
 }
 
@@ -899,13 +899,13 @@ func (s *ICS02ClientTestSuite) TestVerifyNonMembership() {
 
 func (s *ICS02ClientTestSuite) TestFalseMisbehaviourClientFreezeAttack() {
 	clientID := ibctesting.FirstClientID
-	evmAppA := s.chainA.App.(*karsa.App)
+	karsaAppA := s.chainA.App.(*karsa.App)
 
 	// ---------------------------------------------------------------
 	// Step 1: Record the current trusted height (the client's latest
 	// consensus state) and the trusted validators at that height.
 	// ---------------------------------------------------------------
-	trustedHeight := evmAppA.IBCKeeper.ClientKeeper.GetClientLatestHeight(
+	trustedHeight := karsaAppA.IBCKeeper.ClientKeeper.GetClientLatestHeight(
 		s.chainA.GetContext(), clientID,
 	)
 	trustedVals, ok := s.chainB.TrustedValidators[trustedHeight.RevisionHeight]
@@ -1004,7 +1004,7 @@ func (s *ICS02ClientTestSuite) TestFalseMisbehaviourClientFreezeAttack() {
 	// ---------------------------------------------------------------
 	// Step 8: Assert the client is still active (not frozen).
 	// ---------------------------------------------------------------
-	status := evmAppA.IBCKeeper.ClientKeeper.GetClientStatus(
+	status := karsaAppA.IBCKeeper.ClientKeeper.GetClientStatus(
 		s.chainA.GetContext(), clientID,
 	)
 	s.Require().Equal(ibcexported.Active, status,

@@ -48,7 +48,7 @@ func TestAutoFlushTestSuite(t *testing.T) {
 
 // Helper: Deploy and setup ERC20 token
 func (suite *AutoFlushTestSuite) deployAndRegisterERC20(name, symbol string) (common.Address, evmtypes.CompiledContract) {
-	evmApp := suite.chain.App.(*karsa.App)
+	karsaApp := suite.chain.App.(*karsa.App)
 
 	// Deploy ERC20
 	erc20ContractData := contracts.ERC20MinterBurnerDecimalsContract
@@ -62,8 +62,8 @@ func (suite *AutoFlushTestSuite) deployAndRegisterERC20(name, symbol string) (co
 	suite.Require().NoError(err)
 
 	// Register ERC20
-	_, err = evmApp.Erc20Keeper.RegisterERC20(suite.chain.GetContext(), &erc20types.MsgRegisterERC20{
-		Signer:         evmApp.AccountKeeper.GetModuleAddress("gov").String(),
+	_, err = karsaApp.Erc20Keeper.RegisterERC20(suite.chain.GetContext(), &erc20types.MsgRegisterERC20{
+		Signer:         karsaApp.AccountKeeper.GetModuleAddress("gov").String(),
 		Erc20Addresses: []string{erc20Addr.Hex()},
 	})
 	suite.Require().NoError(err)
@@ -74,10 +74,10 @@ func (suite *AutoFlushTestSuite) deployAndRegisterERC20(name, symbol string) (co
 
 // Helper: Get validator address
 func (suite *AutoFlushTestSuite) getValidatorAddress() string {
-	evmApp := suite.chain.App.(*karsa.App)
+	karsaApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
-	vals, err := evmApp.StakingKeeper.GetAllValidators(ctx)
+	vals, err := karsaApp.StakingKeeper.GetAllValidators(ctx)
 	suite.Require().NoError(err)
 	suite.Require().Greater(len(vals), 0, "no validators found")
 
@@ -86,12 +86,12 @@ func (suite *AutoFlushTestSuite) getValidatorAddress() string {
 
 // Helper: Mint tokens to address
 func (suite *AutoFlushTestSuite) mintTokens(tokenAddr common.Address, erc20Data evmtypes.CompiledContract, recipient common.Address, amount *big.Int) {
-	evmApp := suite.chain.App.(*karsa.App)
+	karsaApp := suite.chain.App.(*karsa.App)
 	deployerAddr := common.BytesToAddress(suite.chain.SenderPrivKey.PubKey().Address().Bytes())
 
 	ctx := suite.chain.GetContext()
-	stateDB := testutil.NewStateDB(ctx, evmApp.EVMKeeper)
-	_, err := evmApp.GetEVMKeeper().CallEVM(
+	stateDB := testutil.NewStateDB(ctx, karsaApp.EVMKeeper)
+	_, err := karsaApp.GetEVMKeeper().CallEVM(
 		ctx,
 		stateDB,
 		erc20Data.ABI,
@@ -110,16 +110,16 @@ func (suite *AutoFlushTestSuite) mintTokens(tokenAddr common.Address, erc20Data 
 
 // Helper: Fund contract with native tokens
 func (suite *AutoFlushTestSuite) fundContractNative(contractAddr sdk.AccAddress, amount sdkmath.Int) {
-	evmApp := suite.chain.App.(*karsa.App)
+	karsaApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
-	bondDenom, err := evmApp.StakingKeeper.BondDenom(ctx)
+	bondDenom, err := karsaApp.StakingKeeper.BondDenom(ctx)
 	suite.Require().NoError(err)
 
 	coins := sdk.NewCoins(sdk.NewCoin(bondDenom, amount))
-	err = evmApp.GetBankKeeper().MintCoins(ctx, "mint", coins)
+	err = karsaApp.GetBankKeeper().MintCoins(ctx, "mint", coins)
 	suite.Require().NoError(err)
 
-	err = evmApp.GetBankKeeper().SendCoinsFromModuleToAccount(
+	err = karsaApp.GetBankKeeper().SendCoinsFromModuleToAccount(
 		ctx,
 		"mint",
 		contractAddr,
@@ -142,7 +142,7 @@ func (suite *AutoFlushTestSuite) verifyState(
 	expectedNativeBalances map[string]sdkmath.Int, // bech32 address -> balance
 	expectedAccountsCreated int,
 ) {
-	evmApp := suite.chain.App.(*karsa.App)
+	karsaApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Check event count
@@ -152,13 +152,13 @@ func (suite *AutoFlushTestSuite) verifyState(
 
 	// Check ERC20 balances
 	for tokenAddr, holders := range expectedBalances {
-		tokenPairID := evmApp.Erc20Keeper.GetTokenPairID(ctx, "erc20:"+tokenAddr.Hex())
-		tokenPair, found := evmApp.Erc20Keeper.GetTokenPair(ctx, tokenPairID)
+		tokenPairID := karsaApp.Erc20Keeper.GetTokenPairID(ctx, "erc20:"+tokenAddr.Hex())
+		tokenPair, found := karsaApp.Erc20Keeper.GetTokenPair(ctx, tokenPairID)
 		suite.Require().True(found, "%s: token pair not found for %s", label, tokenAddr.Hex())
 
 		erc20Data := contracts.ERC20MinterBurnerDecimalsContract
 		for holderAddr, expectedBal := range holders {
-			actualBal := evmApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenPair.GetERC20Contract(), holderAddr)
+			actualBal := karsaApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenPair.GetERC20Contract(), holderAddr)
 			suite.Require().Equal(expectedBal.String(), actualBal.String(),
 				"%s: ERC20 balance mismatch for %s holding %s", label, holderAddr.Hex(), tokenAddr.Hex())
 		}
@@ -166,13 +166,13 @@ func (suite *AutoFlushTestSuite) verifyState(
 
 	// Check native balances
 	for addrStr, expectedBal := range expectedNativeBalances {
-		bondDenom, err := evmApp.StakingKeeper.BondDenom(ctx)
+		bondDenom, err := karsaApp.StakingKeeper.BondDenom(ctx)
 		suite.Require().NoError(err)
 
 		addr, err := sdk.AccAddressFromBech32(addrStr)
 		suite.Require().NoError(err)
 
-		actualBal := evmApp.GetBankKeeper().GetBalance(ctx, addr, bondDenom)
+		actualBal := karsaApp.GetBankKeeper().GetBalance(ctx, addr, bondDenom)
 		suite.Require().Equal(expectedBal.String(), actualBal.Amount.String(),
 			"%s: native balance mismatch for %s", label, addrStr)
 	}
@@ -185,7 +185,7 @@ func (suite *AutoFlushTestSuite) verifyState(
 func (suite *AutoFlushTestSuite) TestScenario1_TransferDelegateTransfer() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*karsa.App)
+	karsaApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Deploy test contract
@@ -219,8 +219,8 @@ func (suite *AutoFlushTestSuite) TestScenario1_TransferDelegateTransfer() {
 
 	// Get balances before
 	ctx = suite.chain.GetContext()
-	contractBalBefore := evmApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenAddr, contractAddr)
-	recipientBalBefore := evmApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenAddr, recipientAddr)
+	contractBalBefore := karsaApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenAddr, contractAddr)
+	recipientBalBefore := karsaApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenAddr, recipientAddr)
 
 	// Pack the call data
 	callData, err := contractData.ABI.Pack(
@@ -246,8 +246,8 @@ func (suite *AutoFlushTestSuite) TestScenario1_TransferDelegateTransfer() {
 
 	// Get balances after
 	ctx = suite.chain.GetContext()
-	contractBalAfter := evmApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenAddr, contractAddr)
-	recipientBalAfter := evmApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenAddr, recipientAddr)
+	contractBalAfter := karsaApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenAddr, contractAddr)
+	recipientBalAfter := karsaApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenAddr, recipientAddr)
 
 	expectedDelta := new(big.Int).Mul(big.NewInt(AutoFlushTransferAmount), big.NewInt(2))
 	actualDelta := new(big.Int).Sub(contractBalBefore, contractBalAfter)
@@ -261,10 +261,10 @@ func (suite *AutoFlushTestSuite) TestScenario1_TransferDelegateTransfer() {
 	)
 
 	// Verify delegation occurred
-	delegations, err := evmApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
+	delegations, err := karsaApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(len(delegations), 1, "should have at 1 delegation")
-	bondedTokens, err := evmApp.StakingKeeper.GetDelegatorBonded(suite.chain.GetContext(), contractAddrSDK)
+	bondedTokens, err := karsaApp.StakingKeeper.GetDelegatorBonded(suite.chain.GetContext(), contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(AutoFlushDelegationAmount, bondedTokens.Int64())
 
@@ -275,7 +275,7 @@ func (suite *AutoFlushTestSuite) TestScenario1_TransferDelegateTransfer() {
 func (suite *AutoFlushTestSuite) TestScenario2_TransferDelegateRevertTransfer() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*karsa.App)
+	karsaApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Deploy test contract
@@ -304,8 +304,8 @@ func (suite *AutoFlushTestSuite) TestScenario2_TransferDelegateRevertTransfer() 
 
 	// Get balances before
 	ctx = suite.chain.GetContext()
-	contractBalBefore := evmApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenAddr, contractAddr)
-	recipientBalBefore := evmApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenAddr, recipientAddr)
+	contractBalBefore := karsaApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenAddr, contractAddr)
+	recipientBalBefore := karsaApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenAddr, recipientAddr)
 
 	// Pack the call data with excessive delegation amount (will revert and be caught)
 	excessiveAmount := new(big.Int).Mul(big.NewInt(AutoFlushDelegationAmount), big.NewInt(1000))
@@ -332,8 +332,8 @@ func (suite *AutoFlushTestSuite) TestScenario2_TransferDelegateRevertTransfer() 
 
 	// Get balances after
 	ctx = suite.chain.GetContext()
-	contractBalAfter := evmApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenAddr, contractAddr)
-	recipientBalAfter := evmApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenAddr, recipientAddr)
+	contractBalAfter := karsaApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenAddr, contractAddr)
+	recipientBalAfter := karsaApp.GetErc20Keeper().BalanceOf(ctx, erc20Data.ABI, tokenAddr, recipientAddr)
 
 	expectedDelta := new(big.Int).Mul(big.NewInt(AutoFlushTransferAmount), big.NewInt(2))
 	actualDelta := new(big.Int).Sub(contractBalBefore, contractBalAfter)
@@ -348,10 +348,10 @@ func (suite *AutoFlushTestSuite) TestScenario2_TransferDelegateRevertTransfer() 
 
 	// Verify NO delegation occurred (it was reverted)
 	contractAddrSDK := sdk.AccAddress(contractAddr.Bytes())
-	delegations, err := evmApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
+	delegations, err := karsaApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(0, len(delegations), "should have no delegations since it reverted")
-	bondedTokens, err := evmApp.StakingKeeper.GetDelegatorBonded(suite.chain.GetContext(), contractAddrSDK)
+	bondedTokens, err := karsaApp.StakingKeeper.GetDelegatorBonded(suite.chain.GetContext(), contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(int64(0), bondedTokens.Int64())
 
@@ -362,7 +362,7 @@ func (suite *AutoFlushTestSuite) TestScenario2_TransferDelegateRevertTransfer() 
 func (suite *AutoFlushTestSuite) TestScenario3_NativeTransferDelegateNativeTransfer() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*karsa.App)
+	karsaApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Deploy test contract
@@ -394,11 +394,11 @@ func (suite *AutoFlushTestSuite) TestScenario3_NativeTransferDelegateNativeTrans
 
 	// Get balances before
 	ctx = suite.chain.GetContext()
-	bondDenom, err := evmApp.StakingKeeper.BondDenom(ctx)
+	bondDenom, err := karsaApp.StakingKeeper.BondDenom(ctx)
 	suite.Require().NoError(err)
 
-	contractBalBefore := evmApp.GetBankKeeper().GetBalance(ctx, contractAddrSDK, bondDenom)
-	recipientBalBefore := evmApp.GetBankKeeper().GetBalance(ctx, recipientAddrSDK, bondDenom)
+	contractBalBefore := karsaApp.GetBankKeeper().GetBalance(ctx, contractAddrSDK, bondDenom)
+	recipientBalBefore := karsaApp.GetBankKeeper().GetBalance(ctx, recipientAddrSDK, bondDenom)
 
 	// Pack the call data
 	callData, err := contractData.ABI.Pack(
@@ -423,8 +423,8 @@ func (suite *AutoFlushTestSuite) TestScenario3_NativeTransferDelegateNativeTrans
 
 	// Get balances after
 	ctx = suite.chain.GetContext()
-	contractBalAfter := evmApp.GetBankKeeper().GetBalance(ctx, contractAddrSDK, bondDenom)
-	recipientBalAfter := evmApp.GetBankKeeper().GetBalance(ctx, recipientAddrSDK, bondDenom)
+	contractBalAfter := karsaApp.GetBankKeeper().GetBalance(ctx, contractAddrSDK, bondDenom)
+	recipientBalAfter := karsaApp.GetBankKeeper().GetBalance(ctx, recipientAddrSDK, bondDenom)
 
 	// Verify balances - contract should lose 2x native transfer + delegation (in bank units)
 	expectedContractDeltaWei := sdkmath.NewInt(AutoFlushNativeAmount*2 + AutoFlushDelegationAmount)
@@ -438,10 +438,10 @@ func (suite *AutoFlushTestSuite) TestScenario3_NativeTransferDelegateNativeTrans
 	suite.Require().Equal(expectedRecipientDeltaWei.String(), actualRecipientDelta.String(), "recipient should receive 2x native amount")
 
 	// Verify delegation occurred
-	delegations, err := evmApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
+	delegations, err := karsaApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(len(delegations), 1, "should have 1 delegation")
-	bondedTokens, err := evmApp.StakingKeeper.GetDelegatorBonded(suite.chain.GetContext(), contractAddrSDK)
+	bondedTokens, err := karsaApp.StakingKeeper.GetDelegatorBonded(suite.chain.GetContext(), contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(AutoFlushDelegationAmount, bondedTokens.Int64())
 
@@ -452,7 +452,7 @@ func (suite *AutoFlushTestSuite) TestScenario3_NativeTransferDelegateNativeTrans
 func (suite *AutoFlushTestSuite) TestScenario4_NativeTransferDelegateRevertNativeTransfer() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*karsa.App)
+	karsaApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Deploy test contract
@@ -490,11 +490,11 @@ func (suite *AutoFlushTestSuite) TestScenario4_NativeTransferDelegateRevertNativ
 	validatorAddr := suite.getValidatorAddress()
 
 	// Get balances before
-	bondDenom, err := evmApp.StakingKeeper.BondDenom(ctx)
+	bondDenom, err := karsaApp.StakingKeeper.BondDenom(ctx)
 	suite.Require().NoError(err)
 
-	contractBalBefore := evmApp.GetBankKeeper().GetBalance(ctx, contractAddrSDK, bondDenom)
-	recipientBalBefore := evmApp.GetBankKeeper().GetBalance(ctx, recipientAddrSDK, bondDenom)
+	contractBalBefore := karsaApp.GetBankKeeper().GetBalance(ctx, contractAddrSDK, bondDenom)
+	recipientBalBefore := karsaApp.GetBankKeeper().GetBalance(ctx, recipientAddrSDK, bondDenom)
 
 	// Pack the call data with excessive delegation amount (will revert and be caught)
 	excessiveAmount := new(big.Int).Mul(big.NewInt(AutoFlushDelegationAmount), big.NewInt(1000))
@@ -520,8 +520,8 @@ func (suite *AutoFlushTestSuite) TestScenario4_NativeTransferDelegateRevertNativ
 
 	// Get balances after
 	ctx = suite.chain.GetContext()
-	contractBalAfter := evmApp.GetBankKeeper().GetBalance(ctx, contractAddrSDK, bondDenom)
-	recipientBalAfter := evmApp.GetBankKeeper().GetBalance(ctx, recipientAddrSDK, bondDenom)
+	contractBalAfter := karsaApp.GetBankKeeper().GetBalance(ctx, contractAddrSDK, bondDenom)
+	recipientBalAfter := karsaApp.GetBankKeeper().GetBalance(ctx, recipientAddrSDK, bondDenom)
 
 	// Bank balances are in Cosmos units (6 decimals), EVM amounts are in wei (18 decimals)
 
@@ -537,10 +537,10 @@ func (suite *AutoFlushTestSuite) TestScenario4_NativeTransferDelegateRevertNativ
 	suite.Require().Equal(expectedRecipientDeltaWei.String(), actualRecipientDelta.String(), "recipient should receive 2x native amount")
 
 	// Verify NO delegation occurred (it was reverted)
-	delegations, err := evmApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
+	delegations, err := karsaApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(0, len(delegations), "should have no delegations since it reverted")
-	bondedTokens, err := evmApp.StakingKeeper.GetDelegatorBonded(suite.chain.GetContext(), contractAddrSDK)
+	bondedTokens, err := karsaApp.StakingKeeper.GetDelegatorBonded(suite.chain.GetContext(), contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(int64(0), bondedTokens.Int64())
 
@@ -551,7 +551,7 @@ func (suite *AutoFlushTestSuite) TestScenario4_NativeTransferDelegateRevertNativ
 func (suite *AutoFlushTestSuite) TestScenario5_DelegateCreateDelegate() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*karsa.App)
+	karsaApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Deploy test contract
@@ -602,10 +602,10 @@ func (suite *AutoFlushTestSuite) TestScenario5_DelegateCreateDelegate() {
 	suite.Require().NoError(err)
 
 	// Verify 1 delegations occurred
-	delegations, err := evmApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
+	delegations, err := karsaApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(1, len(delegations), "should have 1 delegation")
-	bondedTokens, err := evmApp.StakingKeeper.GetDelegatorBonded(suite.chain.GetContext(), contractAddrSDK)
+	bondedTokens, err := karsaApp.StakingKeeper.GetDelegatorBonded(suite.chain.GetContext(), contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(AutoFlushDelegationAmount*2, bondedTokens.Int64())
 
@@ -616,7 +616,7 @@ func (suite *AutoFlushTestSuite) TestScenario5_DelegateCreateDelegate() {
 func (suite *AutoFlushTestSuite) TestScenario6_DelegateCreateRevertDelegate() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*karsa.App)
+	karsaApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Deploy test contract
@@ -667,10 +667,10 @@ func (suite *AutoFlushTestSuite) TestScenario6_DelegateCreateRevertDelegate() {
 	suite.Require().NoError(err)
 
 	// Verify 1 delegation occurred
-	delegations, err := evmApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
+	delegations, err := karsaApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(1, len(delegations), "should have 1 delegation")
-	bondedTokens, err := evmApp.StakingKeeper.GetDelegatorBonded(suite.chain.GetContext(), contractAddrSDK)
+	bondedTokens, err := karsaApp.StakingKeeper.GetDelegatorBonded(suite.chain.GetContext(), contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(AutoFlushDelegationAmount*2, bondedTokens.Int64())
 
@@ -681,7 +681,7 @@ func (suite *AutoFlushTestSuite) TestScenario6_DelegateCreateRevertDelegate() {
 func (suite *AutoFlushTestSuite) TestScenario7_CreateRevertDelegateCreateRevert() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*karsa.App)
+	karsaApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Deploy test contract
@@ -747,10 +747,10 @@ func (suite *AutoFlushTestSuite) TestScenario7_CreateRevertDelegateCreateRevert(
 	suite.Require().NoError(err)
 
 	// Verify 1 delegation occurred
-	delegations, err := evmApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
+	delegations, err := karsaApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(1, len(delegations), "should have 1 delegation")
-	bondedTokens, err := evmApp.StakingKeeper.GetDelegatorBonded(suite.chain.GetContext(), contractAddrSDK)
+	bondedTokens, err := karsaApp.StakingKeeper.GetDelegatorBonded(suite.chain.GetContext(), contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(AutoFlushDelegationAmount, bondedTokens.Int64())
 
@@ -761,7 +761,7 @@ func (suite *AutoFlushTestSuite) TestScenario7_CreateRevertDelegateCreateRevert(
 func (suite *AutoFlushTestSuite) TestScenario8_CreateDelegateRevertSend() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*karsa.App)
+	karsaApp := suite.chain.App.(*karsa.App)
 	ctx := suite.chain.GetContext()
 
 	// Deploy test contract
@@ -810,7 +810,7 @@ func (suite *AutoFlushTestSuite) TestScenario8_CreateDelegateRevertSend() {
 
 	// Verify NO delegation occurred (it was reverted)
 	contractAddrSDK := sdk.AccAddress(contractAddr.Bytes())
-	delegations, err := evmApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
+	delegations, err := karsaApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(0, len(delegations), "should have no delegations since it reverted")
 
@@ -821,7 +821,7 @@ func (suite *AutoFlushTestSuite) TestScenario8_CreateDelegateRevertSend() {
 func (suite *AutoFlushTestSuite) TestScenario9_CreateRevertDelegateCreateSuccess() {
 	suite.SetupTest()
 
-	evmApp := suite.chain.App.(*karsa.App)
+	karsaApp := suite.chain.App.(*karsa.App)
 
 	// Deploy test contract
 	contractData, err := contracts.LoadContractCreationTester()
@@ -866,9 +866,9 @@ func (suite *AutoFlushTestSuite) TestScenario9_CreateRevertDelegateCreateSuccess
 
 	// Get balances before
 	ctx := suite.chain.GetContext()
-	bondDenom, err := evmApp.StakingKeeper.BondDenom(ctx)
+	bondDenom, err := karsaApp.StakingKeeper.BondDenom(ctx)
 	suite.Require().NoError(err)
-	contractBalBefore := evmApp.GetBankKeeper().GetBalance(ctx, contractAddrSDK, bondDenom)
+	contractBalBefore := karsaApp.GetBankKeeper().GetBalance(ctx, contractAddrSDK, bondDenom)
 
 	// Pack the call data
 	callData, err := contractData.ABI.Pack(
@@ -895,17 +895,17 @@ func (suite *AutoFlushTestSuite) TestScenario9_CreateRevertDelegateCreateSuccess
 	ctx = suite.chain.GetContext()
 
 	// Check delegation occurred
-	delegations, err := evmApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
+	delegations, err := karsaApp.StakingKeeper.GetAllDelegatorDelegations(ctx, contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(1, len(delegations), "should have 1 delegation")
-	bondedTokens, err := evmApp.StakingKeeper.GetDelegatorBonded(suite.chain.GetContext(), contractAddrSDK)
+	bondedTokens, err := karsaApp.StakingKeeper.GetDelegatorBonded(suite.chain.GetContext(), contractAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(AutoFlushDelegationAmount, bondedTokens.Int64())
 
 	// Check created contracts count
-	stateDB := testutil.NewStateDB(ctx, evmApp.EVMKeeper)
+	stateDB := testutil.NewStateDB(ctx, karsaApp.EVMKeeper)
 
-	countResult, err := evmApp.GetEVMKeeper().CallEVM(
+	countResult, err := karsaApp.GetEVMKeeper().CallEVM(
 		ctx,
 		stateDB,
 		contractData.ABI,
@@ -924,7 +924,7 @@ func (suite *AutoFlushTestSuite) TestScenario9_CreateRevertDelegateCreateSuccess
 	suite.Require().Equal(int64(1), createdCount.Int64(), "should have 1 created contract (reverted one doesn't count)")
 
 	// Get the created contract address
-	addrResult, err := evmApp.GetEVMKeeper().CallEVM(
+	addrResult, err := karsaApp.GetEVMKeeper().CallEVM(
 		ctx,
 		stateDB,
 		contractData.ABI,
@@ -948,7 +948,7 @@ func (suite *AutoFlushTestSuite) TestScenario9_CreateRevertDelegateCreateSuccess
 		"created contract should have the creation value")
 
 	// Check main contract's bank balance decreased by delegation + created contract value
-	contractBalAfter := evmApp.GetBankKeeper().GetBalance(ctx, contractAddrSDK, bondDenom)
+	contractBalAfter := karsaApp.GetBankKeeper().GetBalance(ctx, contractAddrSDK, bondDenom)
 	// Delta = delegation amount + successful creation value (reverted creation returns the value)
 	expectedDelta := sdkmath.NewInt((AutoFlushDelegationAmount + successCreationValue.Int64()))
 	actualDelta := contractBalBefore.Amount.Sub(contractBalAfter.Amount)

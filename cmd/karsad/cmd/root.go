@@ -158,7 +158,7 @@ func initCometConfig() *cmtcfg.Config {
 	return cfg
 }
 
-func initRootCmd(rootCmd *cobra.Command, evmApp *karsa.App) {
+func initRootCmd(rootCmd *cobra.Command, karsaApp *karsa.App) {
 	cfg := sdk.GetConfig()
 	cfg.Seal()
 
@@ -167,14 +167,14 @@ func initRootCmd(rootCmd *cobra.Command, evmApp *karsa.App) {
 		return newApp(l, d, ao)
 	}
 	rootCmd.AddCommand(
-		genutilcli.InitCmd(evmApp.BasicModuleManager, defaultNodeHome),
-		genutilcli.Commands(evmApp.TxConfig(), evmApp.BasicModuleManager, defaultNodeHome),
+		genutilcli.InitCmd(karsaApp.BasicModuleManager, defaultNodeHome),
+		genutilcli.Commands(karsaApp.TxConfig(), karsaApp.BasicModuleManager, defaultNodeHome),
 		cmtcli.NewCompletionCmd(rootCmd, true),
 		evmdebug.Cmd(),
 		confixcmd.ConfigCommand(),
 		pruning.Cmd(sdkAppCreator, defaultNodeHome),
 		snapshot.Cmd(sdkAppCreator),
-		NewTestnetCmd(evmApp.BasicModuleManager, banktypes.GenesisBalancesIterator{}, appCreator{}),
+		NewTestnetCmd(karsaApp.BasicModuleManager, banktypes.GenesisBalancesIterator{}, appCreator{}),
 	)
 
 	// add Cosmos EVM' flavored TM commands to start server, etc.

@@ -21,7 +21,7 @@ import (
 // event.
 func SubmitProposal(
 	ctx sdk.Context,
-	evmApp evm.EvmApp,
+	karsaApp evm.EvmApp,
 	pk *ethsecp256k1.PrivKey,
 	content govv1beta1.Content,
 	eventNum int,
@@ -34,7 +34,7 @@ func SubmitProposal(
 	if err != nil {
 		return id, err
 	}
-	res, err := DeliverTx(ctx, evmApp, pk, nil, msg)
+	res, err := DeliverTx(ctx, karsaApp, pk, nil, msg)
 	if err != nil {
 		return id, err
 	}
@@ -50,7 +50,7 @@ func SubmitProposal(
 // Delegate delivers a delegate tx
 func Delegate(
 	ctx sdk.Context,
-	evmApp evm.EvmApp,
+	karsaApp evm.EvmApp,
 	priv *ethsecp256k1.PrivKey,
 	delegateAmount sdk.Coin,
 	validator stakingtypes.Validator,
@@ -63,13 +63,13 @@ func Delegate(
 	}
 
 	delegateMsg := stakingtypes.NewMsgDelegate(accountAddress.String(), val.String(), delegateAmount)
-	return DeliverTx(ctx, evmApp, priv, nil, delegateMsg)
+	return DeliverTx(ctx, karsaApp, priv, nil, delegateMsg)
 }
 
 // Vote delivers a vote tx with the VoteOption "yes"
 func Vote(
 	ctx sdk.Context,
-	evmApp evm.EvmApp,
+	karsaApp evm.EvmApp,
 	priv *ethsecp256k1.PrivKey,
 	proposalID uint64,
 	voteOption govv1beta1.VoteOption,
@@ -77,5 +77,5 @@ func Vote(
 	accountAddress := sdk.AccAddress(priv.PubKey().Address().Bytes())
 
 	voteMsg := govv1beta1.NewMsgVote(accountAddress, proposalID, voteOption)
-	return DeliverTx(ctx, evmApp, priv, nil, voteMsg)
+	return DeliverTx(ctx, karsaApp, priv, nil, voteMsg)
 }

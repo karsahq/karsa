@@ -150,8 +150,8 @@ func (suite *TransferTestSuiteV2) TestOnSendPacket() {
 		suite.Run(tc.name, func() {
 			suite.SetupTest() // reset
 
-			evmApp := suite.evmChainA.App.(*karsa.App)
-			originalBalance := evmApp.BankKeeper.GetBalance(
+			karsaApp := suite.evmChainA.App.(*karsa.App)
+			originalBalance := karsaApp.BankKeeper.GetBalance(
 				suite.evmChainA.GetContext(),
 				suite.evmChainA.SenderAccount.GetAddress(),
 				tc.sourceDenomToTransfer,
@@ -201,7 +201,7 @@ func (suite *TransferTestSuiteV2) TestOnSendPacket() {
 
 				escrowAddress := types.GetEscrowAddress(types.PortID, suite.pathAToB.EndpointA.ClientID)
 				// check that the balance for evmChainA is updated
-				chainABalance := evmApp.BankKeeper.GetBalance(
+				chainABalance := karsaApp.BankKeeper.GetBalance(
 					suite.evmChainA.GetContext(),
 					suite.evmChainA.SenderAccount.GetAddress(),
 					originalCoin.Denom,
@@ -209,7 +209,7 @@ func (suite *TransferTestSuiteV2) TestOnSendPacket() {
 				suite.Require().Equal(originalBalance.Amount.Sub(amount).Int64(), chainABalance.Amount.Int64())
 
 				// check that module account escrow address has locked the tokens
-				chainAEscrowBalance := evmApp.BankKeeper.GetBalance(
+				chainAEscrowBalance := karsaApp.BankKeeper.GetBalance(
 					suite.evmChainA.GetContext(),
 					escrowAddress,
 					originalCoin.Denom,
@@ -312,8 +312,8 @@ func (suite *TransferTestSuiteV2) TestOnRecvPacket() {
 			)
 
 			ctx := suite.evmChainA.GetContext()
-			evmApp := suite.evmChainA.App.(*karsa.App)
-			cbs := evmApp.GetIBCKeeper().ChannelKeeperV2.Router.Route(evmibctesting.TransferPort)
+			karsaApp := suite.evmChainA.App.(*karsa.App)
+			cbs := karsaApp.GetIBCKeeper().ChannelKeeperV2.Router.Route(evmibctesting.TransferPort)
 
 			// malleate payload after it has been sent but before OnRecvPacket callback is called
 			tc.malleate()
@@ -349,7 +349,7 @@ func (suite *TransferTestSuiteV2) TestOnRecvPacket() {
 
 				// check that voucher exists on chain B
 				chainADenom := types.NewDenom(originalCoin.Denom, traceBToA)
-				chainABalance := evmApp.BankKeeper.GetBalance(
+				chainABalance := karsaApp.BankKeeper.GetBalance(
 					suite.evmChainA.GetContext(),
 					suite.evmChainA.SenderAccount.GetAddress(),
 					chainADenom.IBCDenom(),
@@ -379,8 +379,8 @@ func (suite *TransferTestSuiteV2) TestOnAckPacket() {
 		suite.Run(tc.name, func() {
 			suite.SetupTest() // reset
 
-			evmApp := suite.evmChainA.App.(*karsa.App)
-			originalBalance := evmApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), suite.evmChainA.SenderAccount.GetAddress(), tc.sourceDenomToTransfer)
+			karsaApp := suite.evmChainA.App.(*karsa.App)
+			originalBalance := karsaApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), suite.evmChainA.SenderAccount.GetAddress(), tc.sourceDenomToTransfer)
 
 			timeoutTimestamp := uint64(suite.chainB.GetContext().BlockTime().Add(time.Hour).Unix()) //nolint:gosec // G115
 
@@ -397,7 +397,7 @@ func (suite *TransferTestSuiteV2) TestOnAckPacket() {
 			_, err := suite.evmChainA.SendMsgs(msg)
 			suite.Require().NoError(err) // message committed
 
-			token, err := evmApp.TransferKeeper.TokenFromCoin(suite.evmChainA.GetContext(), originalCoin)
+			token, err := karsaApp.TransferKeeper.TokenFromCoin(suite.evmChainA.GetContext(), originalCoin)
 			suite.Require().NoError(err)
 
 			transferData := types.NewFungibleTokenPacketData(
@@ -414,7 +414,7 @@ func (suite *TransferTestSuiteV2) TestOnAckPacket() {
 			)
 
 			ctx := suite.evmChainA.GetContext()
-			cbs := evmApp.GetIBCKeeper().ChannelKeeperV2.Router.Route(evmibctesting.TransferPort)
+			cbs := karsaApp.GetIBCKeeper().ChannelKeeperV2.Router.Route(evmibctesting.TransferPort)
 
 			ack := channeltypes.NewResultAcknowledgement([]byte{byte(1)})
 
@@ -427,11 +427,11 @@ func (suite *TransferTestSuiteV2) TestOnAckPacket() {
 			// on successful ack, the tokens sent in packets should still be in escrow
 			escrowAddress := types.GetEscrowAddress(types.PortID, suite.pathAToB.EndpointA.ClientID)
 			// check that the balance for evmChainA is updated
-			chainABalance := evmApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), suite.evmChainA.SenderAccount.GetAddress(), originalCoin.Denom)
+			chainABalance := karsaApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), suite.evmChainA.SenderAccount.GetAddress(), originalCoin.Denom)
 			suite.Require().Equal(originalBalance.Amount.Sub(amount).Int64(), chainABalance.Amount.Int64())
 
 			// check that module account escrow address has locked the tokens
-			chainAEscrowBalance := evmApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), escrowAddress, originalCoin.Denom)
+			chainAEscrowBalance := karsaApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), escrowAddress, originalCoin.Denom)
 			suite.Require().Equal(originalCoin, chainAEscrowBalance)
 
 			// create a custom error ack and replay the callback to ensure it fails with IBC v2 callbacks
@@ -452,7 +452,7 @@ func (suite *TransferTestSuiteV2) TestOnAckPacket() {
 
 			// on error ack, the tokens sent in packets should be returned to sender
 			// check that the balance for evmChainA is refunded
-			chainABalance = evmApp.BankKeeper.GetBalance(
+			chainABalance = karsaApp.BankKeeper.GetBalance(
 				suite.evmChainA.GetContext(),
 				suite.evmChainA.SenderAccount.GetAddress(),
 				originalCoin.Denom,
@@ -460,7 +460,7 @@ func (suite *TransferTestSuiteV2) TestOnAckPacket() {
 			suite.Require().Equal(originalBalance.Amount, chainABalance.Amount)
 
 			// check that module account escrow address has no tokens
-			chainAEscrowBalance = evmApp.BankKeeper.GetBalance(
+			chainAEscrowBalance = karsaApp.BankKeeper.GetBalance(
 				suite.evmChainA.GetContext(),
 				escrowAddress,
 				originalCoin.Denom,
@@ -486,8 +486,8 @@ func (suite *TransferTestSuiteV2) TestOnTimeoutPacket() {
 		suite.Run(tc.name, func() {
 			suite.SetupTest() // reset
 
-			evmApp := suite.evmChainA.App.(*karsa.App)
-			originalBalance := evmApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), suite.evmChainA.SenderAccount.GetAddress(), tc.sourceDenomToTransfer)
+			karsaApp := suite.evmChainA.App.(*karsa.App)
+			originalBalance := karsaApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), suite.evmChainA.SenderAccount.GetAddress(), tc.sourceDenomToTransfer)
 
 			timeoutTimestamp := uint64(suite.chainB.GetContext().BlockTime().Add(time.Hour).Unix()) //nolint:gosec // G115
 
@@ -504,7 +504,7 @@ func (suite *TransferTestSuiteV2) TestOnTimeoutPacket() {
 			_, err := suite.evmChainA.SendMsgs(msg)
 			suite.Require().NoError(err) // message committed
 
-			token, err := evmApp.TransferKeeper.TokenFromCoin(suite.evmChainA.GetContext(), originalCoin)
+			token, err := karsaApp.TransferKeeper.TokenFromCoin(suite.evmChainA.GetContext(), originalCoin)
 			suite.Require().NoError(err)
 
 			transferData := types.NewFungibleTokenPacketData(
@@ -523,7 +523,7 @@ func (suite *TransferTestSuiteV2) TestOnTimeoutPacket() {
 			// on successful send, the tokens sent in packets should be in escrow
 			escrowAddress := types.GetEscrowAddress(types.PortID, suite.pathAToB.EndpointA.ClientID)
 			// check that the balance for evmChainA is updated
-			chainABalance := evmApp.BankKeeper.GetBalance(
+			chainABalance := karsaApp.BankKeeper.GetBalance(
 				suite.evmChainA.GetContext(),
 				suite.evmChainA.SenderAccount.GetAddress(),
 				originalCoin.Denom,
@@ -531,7 +531,7 @@ func (suite *TransferTestSuiteV2) TestOnTimeoutPacket() {
 			suite.Require().Equal(originalBalance.Amount.Sub(amount).Int64(), chainABalance.Amount.Int64())
 
 			// check that module account escrow address has locked the tokens
-			chainAEscrowBalance := evmApp.BankKeeper.GetBalance(
+			chainAEscrowBalance := karsaApp.BankKeeper.GetBalance(
 				suite.evmChainA.GetContext(),
 				escrowAddress,
 				originalCoin.Denom,
@@ -549,7 +549,7 @@ func (suite *TransferTestSuiteV2) TestOnTimeoutPacket() {
 
 			// on timeout, the tokens sent in packets should be returned to sender
 			// check that the balance for evmChainA is refunded
-			chainABalance = evmApp.BankKeeper.GetBalance(
+			chainABalance = karsaApp.BankKeeper.GetBalance(
 				suite.evmChainA.GetContext(),
 				suite.evmChainA.SenderAccount.GetAddress(),
 				originalCoin.Denom,
@@ -557,7 +557,7 @@ func (suite *TransferTestSuiteV2) TestOnTimeoutPacket() {
 			suite.Require().Equal(originalBalance.Amount, chainABalance.Amount)
 
 			// check that module account escrow address has no tokens
-			chainAEscrowBalance = evmApp.BankKeeper.GetBalance(
+			chainAEscrowBalance = karsaApp.BankKeeper.GetBalance(
 				suite.evmChainA.GetContext(),
 				escrowAddress,
 				originalCoin.Denom,

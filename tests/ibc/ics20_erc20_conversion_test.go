@@ -39,21 +39,21 @@ func (suite *ICS20ERC20ConversionTestSuite) SetupTest() {
 	suite.chainA = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(1))
 	suite.chainB = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(2))
 
-	evmAppA := suite.chainA.App.(*karsa.App)
+	karsaAppA := suite.chainA.App.(*karsa.App)
 	suite.chainAPrecompile = ics20.NewPrecompile(
-		evmAppA.BankKeeper,
-		*evmAppA.StakingKeeper,
-		evmAppA.TransferKeeper,
-		evmAppA.IBCKeeper.ChannelKeeper,
-		evmAppA.Erc20Keeper,
+		karsaAppA.BankKeeper,
+		*karsaAppA.StakingKeeper,
+		karsaAppA.TransferKeeper,
+		karsaAppA.IBCKeeper.ChannelKeeper,
+		karsaAppA.Erc20Keeper,
 	)
-	evmAppB := suite.chainB.App.(*karsa.App)
+	karsaAppB := suite.chainB.App.(*karsa.App)
 	suite.chainBPrecompile = ics20.NewPrecompile(
-		evmAppB.BankKeeper,
-		*evmAppB.StakingKeeper,
-		evmAppB.TransferKeeper,
-		evmAppB.IBCKeeper.ChannelKeeper,
-		evmAppB.Erc20Keeper,
+		karsaAppB.BankKeeper,
+		*karsaAppB.StakingKeeper,
+		karsaAppB.TransferKeeper,
+		karsaAppB.IBCKeeper.ChannelKeeper,
+		karsaAppB.Erc20Keeper,
 	)
 }
 
@@ -82,9 +82,9 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 		{
 			"pass - no token pair",
 			func() {
-				evmAppA := suite.chainA.App.(*karsa.App)
+				karsaAppA := suite.chainA.App.(*karsa.App)
 				var err error
-				denom, err = evmAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
+				denom, err = karsaAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
 				suite.Require().NoError(err)
 				amount = sdkmath.NewInt(10)
 				sender = common.BytesToAddress(suite.chainA.SenderAccount.GetAddress().Bytes())
@@ -100,8 +100,8 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 				amount = sdkmath.NewInt(nativeErc20.InitialBal.Int64())
 
 				// Convert ERC20 to coins
-				evmAppA := suite.chainA.App.(*karsa.App)
-				_, err := evmAppA.Erc20Keeper.ConvertERC20(suite.chainA.GetContext(), &erc20types.MsgConvertERC20{
+				karsaAppA := suite.chainA.App.(*karsa.App)
+				_, err := karsaAppA.Erc20Keeper.ConvertERC20(suite.chainA.GetContext(), &erc20types.MsgConvertERC20{
 					ContractAddress: nativeErc20.ContractAddr.Hex(),
 					Amount:          amount,
 					Receiver:        suite.chainA.SenderAccount.GetAddress().String(),
@@ -111,9 +111,9 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 				suite.chainA.NextBlock()
 
 				// Disable ERC20
-				params := evmAppA.Erc20Keeper.GetParams(suite.chainA.GetContext())
+				params := karsaAppA.Erc20Keeper.GetParams(suite.chainA.GetContext())
 				params.EnableErc20 = false
-				err = evmAppA.Erc20Keeper.SetParams(suite.chainA.GetContext(), params)
+				err = karsaAppA.Erc20Keeper.SetParams(suite.chainA.GetContext(), params)
 				suite.Require().NoError(err)
 				suite.chainA.NextBlock()
 
@@ -129,20 +129,20 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 				denom = nativeErc20.Denom
 				amount = sdkmath.NewInt(nativeErc20.InitialBal.Int64())
 
-				evmAppA := suite.chainA.App.(*karsa.App)
+				karsaAppA := suite.chainA.App.(*karsa.App)
 				ctx := suite.chainA.GetContext()
 
 				// No conversion to IBC coin, so the balance is insufficient
 				suite.Require().EqualValues(
-					evmAppA.BankKeeper.GetBalance(ctx, suite.chainA.SenderAccount.GetAddress(), denom).Amount,
+					karsaAppA.BankKeeper.GetBalance(ctx, suite.chainA.SenderAccount.GetAddress(), denom).Amount,
 					sdkmath.ZeroInt(),
 					"Bank balance should be zero since we didn't convert",
 				)
 
 				// Disable ERC20 without converting
-				params := evmAppA.Erc20Keeper.GetParams(ctx)
+				params := karsaAppA.Erc20Keeper.GetParams(ctx)
 				params.EnableErc20 = false
-				err := evmAppA.Erc20Keeper.SetParams(ctx, params)
+				err := karsaAppA.Erc20Keeper.SetParams(ctx, params)
 				suite.Require().NoError(err)
 				suite.chainA.NextBlock()
 
@@ -168,8 +168,8 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 				amount = sdkmath.NewInt(nativeErc20.InitialBal.Int64())
 
 				// Convert to coins first
-				evmAppA := suite.chainA.App.(*karsa.App)
-				_, err := evmAppA.Erc20Keeper.ConvertERC20(suite.chainA.GetContext(), &erc20types.MsgConvertERC20{
+				karsaAppA := suite.chainA.App.(*karsa.App)
+				_, err := karsaAppA.Erc20Keeper.ConvertERC20(suite.chainA.GetContext(), &erc20types.MsgConvertERC20{
 					ContractAddress: nativeErc20.ContractAddr.Hex(),
 					Amount:          amount,
 					Receiver:        suite.chainA.SenderAccount.GetAddress().String(),
@@ -180,7 +180,7 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 
 				// Disable the token pair
 				govAddr := authtypes.NewModuleAddress(govtypes.ModuleName).String()
-				_, err = evmAppA.Erc20Keeper.ToggleConversion(suite.chainA.GetContext(), &erc20types.MsgToggleConversion{
+				_, err = karsaAppA.Erc20Keeper.ToggleConversion(suite.chainA.GetContext(), &erc20types.MsgToggleConversion{
 					Token:     denom,
 					Authority: govAddr,
 				})
@@ -219,8 +219,8 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 				amount = sdkmath.NewInt(nativeErc20.InitialBal.Int64())
 
 				// Convert to coins
-				evmAppA := suite.chainA.App.(*karsa.App)
-				_, err := evmAppA.Erc20Keeper.ConvertERC20(suite.chainA.GetContext(), &erc20types.MsgConvertERC20{
+				karsaAppA := suite.chainA.App.(*karsa.App)
+				_, err := karsaAppA.Erc20Keeper.ConvertERC20(suite.chainA.GetContext(), &erc20types.MsgConvertERC20{
 					ContractAddress: nativeErc20.ContractAddr.Hex(),
 					Amount:          amount,
 					Receiver:        suite.chainA.SenderAccount.GetAddress().String(),
@@ -253,7 +253,7 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 				denom = nativeErc20.Denom
 				amount = sdkmath.NewInt(nativeErc20.InitialBal.Int64())
 
-				evmAppA := suite.chainA.App.(*karsa.App)
+				karsaAppA := suite.chainA.App.(*karsa.App)
 				ctx := suite.chainA.GetContext()
 
 				// Create a denom with erc20: prefix
@@ -261,11 +261,11 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 				suite.Require().Equal(erc20types.Erc20NativeCoinDenomPrefix+nativeErc20.ContractAddr.String(), erc20Denom)
 
 				// Verify that GetTokenPairID works correctly with the contract address (hex string)
-				pairIDFromAddress := evmAppA.Erc20Keeper.GetTokenPairID(ctx, nativeErc20.ContractAddr.String())
+				pairIDFromAddress := karsaAppA.Erc20Keeper.GetTokenPairID(ctx, nativeErc20.ContractAddr.String())
 				suite.Require().NotEmpty(pairIDFromAddress)
 
 				// Verify that GetTokenPairID works correctly with the full denom
-				pairIDFromDenom := evmAppA.Erc20Keeper.GetTokenPairID(ctx, erc20Denom)
+				pairIDFromDenom := karsaAppA.Erc20Keeper.GetTokenPairID(ctx, erc20Denom)
 				suite.Require().NotEmpty(pairIDFromDenom)
 
 				// Both should return the same pair ID
@@ -278,7 +278,7 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 		{
 			"no-op - fail transfer",
 			func() {
-				evmAppA := suite.chainA.App.(*karsa.App)
+				karsaAppA := suite.chainA.App.(*karsa.App)
 				ctx := suite.chainA.GetContext()
 				senderAcc := suite.chainA.SenderAccount.GetAddress()
 
@@ -286,15 +286,15 @@ func (suite *ICS20ERC20ConversionTestSuite) TestTransferWithERC20Conversion() {
 				denom = "ibc/DF63978F803A2E27CA5CC9B7631654CCF0BBC788B3B7F0A10200508E37C70992"
 
 				// Register it as an ERC20 extension
-				_, err := evmAppA.Erc20Keeper.RegisterERC20Extension(ctx, denom)
+				_, err := karsaAppA.Erc20Keeper.RegisterERC20Extension(ctx, denom)
 				suite.Require().NoError(err)
 				suite.chainA.NextBlock()
 
 				// Verify the pair exists
-				pairID := evmAppA.Erc20Keeper.GetTokenPairID(ctx, denom)
+				pairID := karsaAppA.Erc20Keeper.GetTokenPairID(ctx, denom)
 				suite.Require().NotEmpty(pairID, "Token pair should be registered")
 
-				pair, found := evmAppA.Erc20Keeper.GetTokenPair(ctx, pairID)
+				pair, found := karsaAppA.Erc20Keeper.GetTokenPair(ctx, pairID)
 				suite.Require().True(found)
 				suite.Require().Equal(pair.Denom, denom)
 
@@ -379,7 +379,7 @@ func (suite *ICS20ERC20ConversionTestSuite) TestPrefixTrimming() {
 				// Verify the denom has the correct prefix
 				suite.Require().Contains(denom, erc20types.Erc20NativeCoinDenomPrefix)
 
-				evmAppA := suite.chainA.App.(*karsa.App)
+				karsaAppA := suite.chainA.App.(*karsa.App)
 				ctx := suite.chainA.GetContext()
 
 				// TEST: Verify that the prefix trimming works correctly
@@ -397,11 +397,11 @@ func (suite *ICS20ERC20ConversionTestSuite) TestPrefixTrimming() {
 					"Since 'erc20/' is not in the string, TrimPrefix returns it unchanged")
 
 				// Verify that GetTokenPairID works correctly with the contract address (hex string)
-				pairIDFromAddress := evmAppA.Erc20Keeper.GetTokenPairID(ctx, nativeErc20.ContractAddr.String())
+				pairIDFromAddress := karsaAppA.Erc20Keeper.GetTokenPairID(ctx, nativeErc20.ContractAddr.String())
 				suite.Require().NotEmpty(pairIDFromAddress)
 
 				// Verify that GetTokenPairID works correctly with the full denom
-				pairIDFromDenom := evmAppA.Erc20Keeper.GetTokenPairID(ctx, denom)
+				pairIDFromDenom := karsaAppA.Erc20Keeper.GetTokenPairID(ctx, denom)
 				suite.Require().NotEmpty(pairIDFromDenom)
 
 				// Both should return the same pair ID
@@ -418,7 +418,7 @@ func (suite *ICS20ERC20ConversionTestSuite) TestPrefixTrimming() {
 				denom = nativeErc20.Denom
 				amount = sdkmath.NewInt(nativeErc20.InitialBal.Int64())
 
-				evmAppA := suite.chainA.App.(*karsa.App)
+				karsaAppA := suite.chainA.App.(*karsa.App)
 				ctx := suite.chainA.GetContext()
 
 				// Demonstrate the bug's impact: incorrect vs correct prefix trimming
@@ -440,8 +440,8 @@ func (suite *ICS20ERC20ConversionTestSuite) TestPrefixTrimming() {
 				// Demonstrate why the bug wasn't caught earlier:
 				// Both lookups work due to dual mapping in the keeper
 				// The keeper maps both "0x1234..." and "erc20:0x1234..." to the same pair
-				pairIDFromCorrect := evmAppA.Erc20Keeper.GetTokenPairID(ctx, correctTrimmed)     // "0x1234..."
-				pairIDFromIncorrect := evmAppA.Erc20Keeper.GetTokenPairID(ctx, incorrectTrimmed) // "erc20:0x1234..."
+				pairIDFromCorrect := karsaAppA.Erc20Keeper.GetTokenPairID(ctx, correctTrimmed)     // "0x1234..."
+				pairIDFromIncorrect := karsaAppA.Erc20Keeper.GetTokenPairID(ctx, incorrectTrimmed) // "erc20:0x1234..."
 
 				suite.Require().NotEmpty(pairIDFromCorrect)
 				suite.Require().NotEmpty(pairIDFromIncorrect)

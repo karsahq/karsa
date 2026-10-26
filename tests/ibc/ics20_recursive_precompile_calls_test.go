@@ -112,28 +112,28 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) setupContractForTesting(
 	contractData evmtypes.CompiledContract,
 	senderAcc evmibctesting.SenderAccount,
 ) {
-	evmAppA := suite.chainA.App.(*karsa.App)
+	karsaAppA := suite.chainA.App.(*karsa.App)
 	senderAddr := senderAcc.SenderAccount.GetAddress()
 	senderEVMAddr := common.BytesToAddress(senderAddr.Bytes())
 	deployerAddr := common.BytesToAddress(suite.chainA.SenderPrivKey.PubKey().Address().Bytes())
 
 	// Register ERC20 contract
-	_, err := evmAppA.Erc20Keeper.RegisterERC20(suite.chainA.GetContext(), &erc20types.MsgRegisterERC20{
-		Signer:         evmAppA.AccountKeeper.GetModuleAddress("gov").String(),
+	_, err := karsaAppA.Erc20Keeper.RegisterERC20(suite.chainA.GetContext(), &erc20types.MsgRegisterERC20{
+		Signer:         karsaAppA.AccountKeeper.GetModuleAddress("gov").String(),
 		Erc20Addresses: []string{contractAddr.Hex()},
 	})
 	suite.Require().NoError(err, "registering ERC20 token should succeed")
 	suite.chainA.NextBlock()
 
 	// Send native tokens to contract for delegation
-	bondDenom, err := evmAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
+	bondDenom, err := karsaAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
 	suite.Require().NoError(err)
 
 	contractAddrBech32, err := sdk.AccAddressFromHexUnsafe(contractAddr.Hex()[2:])
 	suite.Require().NoError(err)
 
 	deployerAddrBech32 := sdk.AccAddress(deployerAddr.Bytes())
-	deployerBalance := evmAppA.BankKeeper.GetBalance(suite.chainA.GetContext(), deployerAddrBech32, bondDenom)
+	deployerBalance := karsaAppA.BankKeeper.GetBalance(suite.chainA.GetContext(), deployerAddrBech32, bondDenom)
 
 	// Send delegation amount to contract
 	sendAmount := sdkmath.NewInt(DelegationAmount)
@@ -141,7 +141,7 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) setupContractForTesting(
 		sendAmount = deployerBalance.Amount.Quo(sdkmath.NewInt(2))
 	}
 
-	err = evmAppA.BankKeeper.SendCoins(
+	err = karsaAppA.BankKeeper.SendCoins(
 		suite.chainA.GetContext(),
 		deployerAddrBech32,
 		contractAddrBech32,
@@ -150,8 +150,8 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) setupContractForTesting(
 	suite.Require().NoError(err, "sending native tokens to contract should succeed")
 
 	// Mint ERC20 tokens
-	stateDB := statedb.New(suite.chainA.GetContext(), evmAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
-	_, err = evmAppA.GetEVMKeeper().CallEVM(
+	stateDB := statedb.New(suite.chainA.GetContext(), karsaAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
+	_, err = karsaAppA.GetEVMKeeper().CallEVM(
 		suite.chainA.GetContext(),
 		stateDB,
 		contractData.ABI,
@@ -168,11 +168,11 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) setupContractForTesting(
 	suite.chainA.NextBlock()
 
 	// Delegate tokens
-	vals, err := evmAppA.StakingKeeper.GetAllValidators(suite.chainA.GetContext())
+	vals, err := karsaAppA.StakingKeeper.GetAllValidators(suite.chainA.GetContext())
 	suite.Require().NoError(err)
 
-	stateDB = statedb.New(suite.chainA.GetContext(), evmAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
-	_, err = evmAppA.GetEVMKeeper().CallEVM(
+	stateDB = statedb.New(suite.chainA.GetContext(), karsaAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
+	_, err = karsaAppA.GetEVMKeeper().CallEVM(
 		suite.chainA.GetContext(),
 		stateDB,
 		contractData.ABI,
@@ -191,7 +191,7 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) setupContractForTesting(
 	valAddr, err := sdk.ValAddressFromBech32(vals[0].OperatorAddress)
 	suite.Require().NoError(err)
 
-	amt, err := evmAppA.StakingKeeper.GetDelegation(suite.chainA.GetContext(), contractAddrBech32, valAddr)
+	amt, err := karsaAppA.StakingKeeper.GetDelegation(suite.chainA.GetContext(), contractAddrBech32, valAddr)
 	suite.Require().NoError(err)
 	suite.Require().Equal(sendAmount.BigInt(), amt.Shares.BigInt())
 
@@ -208,8 +208,8 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) setupContractForTesting(
 	suite.chainA.NextBlock()
 
 	// Verify minted balance
-	stateDB = statedb.New(suite.chainA.GetContext(), evmAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
-	ethRes, err := evmAppA.GetEVMKeeper().CallEVM(
+	stateDB = statedb.New(suite.chainA.GetContext(), karsaAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
+	ethRes, err := karsaAppA.GetEVMKeeper().CallEVM(
 		suite.chainA.GetContext(),
 		stateDB,
 		contractData.ABI,
@@ -232,30 +232,30 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) SetupTest() {
 	suite.chainA = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(1))
 	suite.chainB = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(2))
 
-	evmAppA := suite.chainA.App.(*karsa.App)
+	karsaAppA := suite.chainA.App.(*karsa.App)
 	suite.chainAPrecompile = ics20.NewPrecompile(
-		evmAppA.BankKeeper,
-		*evmAppA.StakingKeeper,
-		evmAppA.TransferKeeper,
-		evmAppA.IBCKeeper.ChannelKeeper,
-		evmAppA.Erc20Keeper,
+		karsaAppA.BankKeeper,
+		*karsaAppA.StakingKeeper,
+		karsaAppA.TransferKeeper,
+		karsaAppA.IBCKeeper.ChannelKeeper,
+		karsaAppA.Erc20Keeper,
 	)
-	bondDenom, err := evmAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
+	bondDenom, err := karsaAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
 	suite.Require().NoError(err)
 
-	evmAppA.Erc20Keeper.GetTokenPair(suite.chainA.GetContext(), evmAppA.Erc20Keeper.GetTokenPairID(suite.chainA.GetContext(), bondDenom))
-	// evmAppA.Erc20Keeper.SetNativePrecompile(suite.chainA.GetContext(), werc20.Address())
+	karsaAppA.Erc20Keeper.GetTokenPair(suite.chainA.GetContext(), karsaAppA.Erc20Keeper.GetTokenPairID(suite.chainA.GetContext(), bondDenom))
+	// karsaAppA.Erc20Keeper.SetNativePrecompile(suite.chainA.GetContext(), werc20.Address())
 
-	avail := evmAppA.Erc20Keeper.IsNativePrecompileAvailable(suite.chainA.GetContext(), common.HexToAddress("0xD4949664cD82660AaE99bEdc034a0deA8A0bd517"))
+	avail := karsaAppA.Erc20Keeper.IsNativePrecompileAvailable(suite.chainA.GetContext(), common.HexToAddress("0xD4949664cD82660AaE99bEdc034a0deA8A0bd517"))
 	suite.Require().True(avail)
 
-	evmAppB := suite.chainB.App.(*karsa.App)
+	karsaAppB := suite.chainB.App.(*karsa.App)
 	suite.chainBPrecompile = ics20.NewPrecompile(
-		evmAppB.BankKeeper,
-		*evmAppB.StakingKeeper,
-		evmAppB.TransferKeeper,
-		evmAppB.IBCKeeper.ChannelKeeper,
-		evmAppB.Erc20Keeper,
+		karsaAppB.BankKeeper,
+		*karsaAppB.StakingKeeper,
+		karsaAppB.TransferKeeper,
+		karsaAppB.IBCKeeper.ChannelKeeper,
+		karsaAppB.Erc20Keeper,
 	)
 }
 
@@ -310,10 +310,10 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestHandleMsgTransfer() {
 				suite.setupContractForTesting(contractAddr, contractData, senderAcc)
 			},
 			func(querier distributionkeeper.Querier, valAddr string, eventAmount int) {
-				evmAppA := suite.chainA.App.(*karsa.App)
-				bondDenom, err := evmAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
+				karsaAppA := suite.chainA.App.(*karsa.App)
+				bondDenom, err := karsaAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
 				suite.Require().NoError(err)
-				contractBondDenomBalance := evmAppA.BankKeeper.GetBalance(suite.chainA.GetContext(), nativeErc20.ContractAddr.Bytes(), bondDenom)
+				contractBondDenomBalance := karsaAppA.BankKeeper.GetBalance(suite.chainA.GetContext(), nativeErc20.ContractAddr.Bytes(), bondDenom)
 				suite.Require().Equal(contractBondDenomBalance.Amount, sdkmath.NewInt(0))
 				// Check distribution rewards after transfer
 				afterRewards, err := querier.DelegationRewards(suite.chainA.GetContext(), &distrtypes.QueryDelegationRewardsRequest{
@@ -358,10 +358,10 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestHandleMsgTransfer() {
 				suite.setupContractForTesting(contractAddr, contractData, senderAcc)
 			},
 			func(querier distributionkeeper.Querier, valAddr string, eventAmount int) {
-				evmAppA := suite.chainA.App.(*karsa.App)
-				bondDenom, err := evmAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
+				karsaAppA := suite.chainA.App.(*karsa.App)
+				bondDenom, err := karsaAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
 				suite.Require().NoError(err)
-				contractBondDenomBalance := evmAppA.BankKeeper.GetBalance(suite.chainA.GetContext(), nativeErc20.ContractAddr.Bytes(), bondDenom)
+				contractBondDenomBalance := karsaAppA.BankKeeper.GetBalance(suite.chainA.GetContext(), nativeErc20.ContractAddr.Bytes(), bondDenom)
 
 				suite.Require().Equal(sdkmath.NewInt(50), contractBondDenomBalance.Amount)
 
@@ -390,27 +390,27 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestHandleMsgTransfer() {
 
 			tc.malleate(senderAccount)
 
-			evmAppA := suite.chainA.App.(*karsa.App)
+			karsaAppA := suite.chainA.App.(*karsa.App)
 
 			// Get balance helper function
 			GetBalance := func(addr sdk.AccAddress) sdk.Coin {
 				ctx := suite.chainA.GetContext()
 				if erc20 {
-					balanceAmt := evmAppA.Erc20Keeper.BalanceOf(ctx, nativeErc20.ContractAbi, nativeErc20.ContractAddr, nativeErc20.Account)
+					balanceAmt := karsaAppA.Erc20Keeper.BalanceOf(ctx, nativeErc20.ContractAbi, nativeErc20.ContractAddr, nativeErc20.Account)
 					return sdk.Coin{
 						Denom:  nativeErc20.Denom,
 						Amount: sdkmath.NewIntFromBigInt(balanceAmt),
 					}
 				}
-				return evmAppA.BankKeeper.GetBalance(ctx, addr, sourceDenomToTransfer)
+				return karsaAppA.BankKeeper.GetBalance(ctx, addr, sourceDenomToTransfer)
 			}
 
 			// Verify initial state
 			senderBalance := GetBalance(nativeErc20.ContractAddr.Bytes())
 			suite.Require().NoError(err)
-			bondDenom, err := evmAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
+			bondDenom, err := karsaAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
 			suite.Require().NoError(err)
-			contractBondDenomBalance := evmAppA.BankKeeper.GetBalance(suite.chainA.GetContext(), nativeErc20.ContractAddr.Bytes(), bondDenom)
+			contractBondDenomBalance := karsaAppA.BankKeeper.GetBalance(suite.chainA.GetContext(), nativeErc20.ContractAddr.Bytes(), bondDenom)
 			suite.Require().Equal(contractBondDenomBalance.Amount, sdkmath.NewInt(0))
 
 			// Setup transfer parameters
@@ -418,8 +418,8 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestHandleMsgTransfer() {
 			originalCoin := sdk.NewCoin(sourceDenomToTransfer, msgAmount)
 
 			// Check distribution rewards before transfer
-			querier := distributionkeeper.NewQuerier(evmAppA.DistrKeeper)
-			vals, err := evmAppA.StakingKeeper.GetAllValidators(suite.chainA.GetContext())
+			querier := distributionkeeper.NewQuerier(karsaAppA.DistrKeeper)
+			vals, err := karsaAppA.StakingKeeper.GetAllValidators(suite.chainA.GetContext())
 			suite.Require().NoError(err)
 
 			beforeRewards, err := querier.DelegationRewards(suite.chainA.GetContext(), &distrtypes.QueryDelegationRewardsRequest{
@@ -471,7 +471,7 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestHandleMsgTransfer() {
 			relayerBalance := GetBalance(relayerAddr)
 
 			// relay send
-			pathAToB.EndpointA.Chain.SenderAccount = evmAppA.AccountKeeper.GetAccount(suite.chainA.GetContext(), relayerAddr) // update account in the path as the sequence recorded in that object is out of date
+			pathAToB.EndpointA.Chain.SenderAccount = karsaAppA.AccountKeeper.GetAccount(suite.chainA.GetContext(), relayerAddr) // update account in the path as the sequence recorded in that object is out of date
 			err = pathAToB.RelayPacket(packet)
 			suite.Require().NoError(err) // relay committed
 
@@ -489,7 +489,7 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestHandleMsgTransfer() {
 			escrowAddress := transfertypes.GetEscrowAddress(packet.GetSourcePort(), packet.GetSourceChannel())
 
 			// check that module account escrow address has locked the tokens
-			chainAEscrowBalance := evmAppA.BankKeeper.GetBalance(
+			chainAEscrowBalance := karsaAppA.BankKeeper.GetBalance(
 				suite.chainA.GetContext(),
 				escrowAddress,
 				sourceDenomToTransfer,
@@ -497,9 +497,9 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestHandleMsgTransfer() {
 			suite.Require().Equal(transferAmount.String(), chainAEscrowBalance.Amount.String())
 
 			// check that voucher exists on chain B
-			evmAppB := suite.chainB.App.(*karsa.App)
+			karsaAppB := suite.chainB.App.(*karsa.App)
 			chainBDenom := transfertypes.NewDenom(originalCoin.Denom, traceAToB)
-			chainBBalance := evmAppB.BankKeeper.GetBalance(
+			chainBBalance := karsaAppB.BankKeeper.GetBalance(
 				suite.chainB.GetContext(),
 				suite.chainB.SenderAccount.GetAddress(),
 				chainBDenom.IBCDenom(),
@@ -559,11 +559,11 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestContractICS20TransferWi
 	suite.chainA.NextBlock()
 	suite.Require().NoError(err)
 
-	evmAppA := suite.chainA.App.(*karsa.App)
+	karsaAppA := suite.chainA.App.(*karsa.App)
 
 	// Register both ERC20 contracts
-	_, err = evmAppA.Erc20Keeper.RegisterERC20(suite.chainA.GetContext(), &erc20types.MsgRegisterERC20{
-		Signer:         evmAppA.AccountKeeper.GetModuleAddress("gov").String(),
+	_, err = karsaAppA.Erc20Keeper.RegisterERC20(suite.chainA.GetContext(), &erc20types.MsgRegisterERC20{
+		Signer:         karsaAppA.AccountKeeper.GetModuleAddress("gov").String(),
 		Erc20Addresses: []string{hookTokenAddr.Hex()},
 	})
 	suite.Require().NoError(err, "registering hook token should succeed")
@@ -574,16 +574,16 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestContractICS20TransferWi
 	mintData, err := hookTokenData.ABI.Pack("mint", testerAddr, hookTokenAmount)
 	suite.Require().NoError(err)
 
-	stateDB := statedb.New(suite.chainA.GetContext(), evmAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
+	stateDB := statedb.New(suite.chainA.GetContext(), karsaAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
 	deployer := common.BytesToAddress(suite.chainA.SenderPrivKey.PubKey().Address().Bytes())
-	_, err = evmAppA.GetEVMKeeper().CallEVMWithData(suite.chainA.GetContext(), stateDB, deployer, &hookTokenAddr, mintData, true, false, nil)
+	_, err = karsaAppA.GetEVMKeeper().CallEVMWithData(suite.chainA.GetContext(), stateDB, deployer, &hookTokenAddr, mintData, true, false, nil)
 	suite.Require().NoError(err)
 	suite.chainA.NextBlock()
 
 	// Mint regular tokens to tester for the dummy transfer
 	regularTokenAmount := big.NewInt(1000)
-	stateDB = statedb.New(suite.chainA.GetContext(), evmAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
-	_, err = evmAppA.GetEVMKeeper().CallEVM(
+	stateDB = statedb.New(suite.chainA.GetContext(), karsaAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
+	_, err = karsaAppA.GetEVMKeeper().CallEVM(
 		suite.chainA.GetContext(),
 		stateDB,
 		regularTokenData.ABI,
@@ -600,10 +600,10 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestContractICS20TransferWi
 	suite.chainA.NextBlock()
 
 	// Configure hook to perform delegation
-	bondDenom, err := evmAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
+	bondDenom, err := karsaAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
 	suite.Require().NoError(err)
 
-	vals, err := evmAppA.StakingKeeper.GetAllValidators(suite.chainA.GetContext())
+	vals, err := karsaAppA.StakingKeeper.GetAllValidators(suite.chainA.GetContext())
 	suite.Require().NoError(err)
 	validatorAddr := vals[0].OperatorAddress
 
@@ -643,8 +643,8 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestContractICS20TransferWi
 	suite.Require().NoError(err)
 
 	// Use CallEVM for configuration (setup function)
-	stateDB = statedb.New(suite.chainA.GetContext(), evmAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
-	_, err = evmAppA.GetEVMKeeper().CallEVMWithData(suite.chainA.GetContext(), stateDB, deployer, &hookTokenAddr, configData, true, false, nil)
+	stateDB = statedb.New(suite.chainA.GetContext(), karsaAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
+	_, err = karsaAppA.GetEVMKeeper().CallEVMWithData(suite.chainA.GetContext(), stateDB, deployer, &hookTokenAddr, configData, true, false, nil)
 	suite.Require().NoError(err)
 	suite.chainA.NextBlock()
 
@@ -654,10 +654,10 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestContractICS20TransferWi
 	transferTokenAmount := sdkmath.NewIntFromBigInt(big.NewInt(InitialTokenAmount / 2))
 
 	// Get balances before
-	testerHookBalBefore := evmAppA.Erc20Keeper.BalanceOf(suite.chainA.GetContext(), hookTokenData.ABI, hookTokenAddr, testerAddr)
-	hookTokenNativeBalBefore := evmAppA.GetBankKeeper().GetBalance(suite.chainA.GetContext(), hookTokenAddrSDK, bondDenom)
+	testerHookBalBefore := karsaAppA.Erc20Keeper.BalanceOf(suite.chainA.GetContext(), hookTokenData.ABI, hookTokenAddr, testerAddr)
+	hookTokenNativeBalBefore := karsaAppA.GetBankKeeper().GetBalance(suite.chainA.GetContext(), hookTokenAddrSDK, bondDenom)
 	recipientAddrSDK := senderAccount.SenderAccount.GetAddress()
-	recipientNativeBalBefore := evmAppA.GetBankKeeper().GetBalance(suite.chainA.GetContext(), recipientAddrSDK, bondDenom)
+	recipientNativeBalBefore := karsaAppA.GetBankKeeper().GetBalance(suite.chainA.GetContext(), recipientAddrSDK, bondDenom)
 
 	// Call scenario9_transferICS20Transfer from tester contract
 	callData, err := testerData.ABI.Pack(
@@ -680,9 +680,9 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestContractICS20TransferWi
 	suite.Require().NoError(err)
 
 	// Get balances after
-	testerHookBalAfter := evmAppA.Erc20Keeper.BalanceOf(suite.chainA.GetContext(), hookTokenData.ABI, hookTokenAddr, testerAddr)
-	hookTokenNativeBalAfter := evmAppA.GetBankKeeper().GetBalance(suite.chainA.GetContext(), hookTokenAddrSDK, bondDenom)
-	recipientNativeBalAfter := evmAppA.GetBankKeeper().GetBalance(suite.chainA.GetContext(), recipientAddrSDK, bondDenom)
+	testerHookBalAfter := karsaAppA.Erc20Keeper.BalanceOf(suite.chainA.GetContext(), hookTokenData.ABI, hookTokenAddr, testerAddr)
+	hookTokenNativeBalAfter := karsaAppA.GetBankKeeper().GetBalance(suite.chainA.GetContext(), hookTokenAddrSDK, bondDenom)
+	recipientNativeBalAfter := karsaAppA.GetBankKeeper().GetBalance(suite.chainA.GetContext(), recipientAddrSDK, bondDenom)
 
 	// Verify ERC20 balance changes
 	expectedERC20Delta := transferTokenAmount.BigInt()
@@ -705,12 +705,12 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestContractICS20TransferWi
 		"recipient should receive 2 native transfers")
 
 	// Verify delegation occurred
-	delegations, err := evmAppA.StakingKeeper.GetAllDelegatorDelegations(suite.chainA.GetContext(), hookTokenAddrSDK)
+	delegations, err := karsaAppA.StakingKeeper.GetAllDelegatorDelegations(suite.chainA.GetContext(), hookTokenAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(1, len(delegations), "should have 1 delegation from beforeTransfer hook")
 
 	// Verify total bonded amount
-	bondedTokens, err := evmAppA.StakingKeeper.GetDelegatorBonded(suite.chainA.GetContext(), hookTokenAddrSDK)
+	bondedTokens, err := karsaAppA.StakingKeeper.GetDelegatorBonded(suite.chainA.GetContext(), hookTokenAddrSDK)
 	suite.Require().NoError(err)
 	expectedBondedAmount := DelegationAmount // Convert wei to base denom
 	suite.Require().Equal(int64(expectedBondedAmount), bondedTokens.Int64(),
@@ -768,14 +768,14 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestContractICS20TransferRe
 	suite.chainA.NextBlock()
 	suite.Require().NoError(err)
 
-	evmAppA := suite.chainA.App.(*karsa.App)
+	karsaAppA := suite.chainA.App.(*karsa.App)
 
 	// Get deployer address for CallEVM
 	deployer := common.BytesToAddress(suite.chainA.SenderPrivKey.PubKey().Address().Bytes())
 
 	// Register both ERC20 contracts
-	_, err = evmAppA.Erc20Keeper.RegisterERC20(suite.chainA.GetContext(), &erc20types.MsgRegisterERC20{
-		Signer:         evmAppA.AccountKeeper.GetModuleAddress("gov").String(),
+	_, err = karsaAppA.Erc20Keeper.RegisterERC20(suite.chainA.GetContext(), &erc20types.MsgRegisterERC20{
+		Signer:         karsaAppA.AccountKeeper.GetModuleAddress("gov").String(),
 		Erc20Addresses: []string{regularTokenAddr.Hex(), hookTokenAddr.Hex()},
 	})
 	suite.Require().NoError(err, "registering tokens should succeed")
@@ -786,8 +786,8 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestContractICS20TransferRe
 	mintRegularData, err := regularTokenData.ABI.Pack("mint", testerAddr, regularTokenAmount)
 	suite.Require().NoError(err)
 
-	stateDB := statedb.New(suite.chainA.GetContext(), evmAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
-	_, err = evmAppA.GetEVMKeeper().CallEVMWithData(suite.chainA.GetContext(), stateDB, deployer, &regularTokenAddr, mintRegularData, true, false, nil)
+	stateDB := statedb.New(suite.chainA.GetContext(), karsaAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
+	_, err = karsaAppA.GetEVMKeeper().CallEVMWithData(suite.chainA.GetContext(), stateDB, deployer, &regularTokenAddr, mintRegularData, true, false, nil)
 	suite.Require().NoError(err)
 	suite.chainA.NextBlock()
 
@@ -796,12 +796,12 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestContractICS20TransferRe
 	mintHookData, err := hookTokenData.ABI.Pack("mint", testerAddr, hookTokenAmount)
 	suite.Require().NoError(err)
 
-	stateDB = statedb.New(suite.chainA.GetContext(), evmAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
-	_, err = evmAppA.GetEVMKeeper().CallEVMWithData(suite.chainA.GetContext(), stateDB, deployer, &hookTokenAddr, mintHookData, true, false, nil)
+	stateDB = statedb.New(suite.chainA.GetContext(), karsaAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
+	_, err = karsaAppA.GetEVMKeeper().CallEVMWithData(suite.chainA.GetContext(), stateDB, deployer, &hookTokenAddr, mintHookData, true, false, nil)
 	suite.Require().NoError(err)
 	suite.chainA.NextBlock()
 
-	vals, err := evmAppA.StakingKeeper.GetAllValidators(suite.chainA.GetContext())
+	vals, err := karsaAppA.StakingKeeper.GetAllValidators(suite.chainA.GetContext())
 	suite.Require().NoError(err)
 	validatorAddr := vals[0].OperatorAddress
 
@@ -841,8 +841,8 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestContractICS20TransferRe
 	suite.Require().NoError(err)
 
 	// Use CallEVM for configuration (setup function)
-	stateDB = statedb.New(suite.chainA.GetContext(), evmAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
-	_, err = evmAppA.GetEVMKeeper().CallEVMWithData(suite.chainA.GetContext(), stateDB, deployer, &hookTokenAddr, configData, true, false, nil)
+	stateDB = statedb.New(suite.chainA.GetContext(), karsaAppA.GetEVMKeeper(), statedb.NewEmptyTxConfig())
+	_, err = karsaAppA.GetEVMKeeper().CallEVMWithData(suite.chainA.GetContext(), stateDB, deployer, &hookTokenAddr, configData, true, false, nil)
 	suite.Require().NoError(err)
 	suite.chainA.NextBlock()
 
@@ -852,13 +852,13 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestContractICS20TransferRe
 	transferTokenAmount := sdkmath.NewIntFromBigInt(big.NewInt(InitialTokenAmount / 2))
 
 	// Get balances before
-	bondDenom, err := evmAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
+	bondDenom, err := karsaAppA.StakingKeeper.BondDenom(suite.chainA.GetContext())
 	suite.Require().NoError(err)
-	regularTokenBalBefore := evmAppA.Erc20Keeper.BalanceOf(suite.chainA.GetContext(), regularTokenData.ABI, regularTokenAddr, testerAddr)
-	testerHookBalBefore := evmAppA.Erc20Keeper.BalanceOf(suite.chainA.GetContext(), hookTokenData.ABI, hookTokenAddr, testerAddr)
-	hookTokenNativeBalBefore := evmAppA.GetBankKeeper().GetBalance(suite.chainA.GetContext(), hookTokenAddrSDK, bondDenom)
+	regularTokenBalBefore := karsaAppA.Erc20Keeper.BalanceOf(suite.chainA.GetContext(), regularTokenData.ABI, regularTokenAddr, testerAddr)
+	testerHookBalBefore := karsaAppA.Erc20Keeper.BalanceOf(suite.chainA.GetContext(), hookTokenData.ABI, hookTokenAddr, testerAddr)
+	hookTokenNativeBalBefore := karsaAppA.GetBankKeeper().GetBalance(suite.chainA.GetContext(), hookTokenAddrSDK, bondDenom)
 	recipientAddrSDK := senderAccount.SenderAccount.GetAddress()
-	recipientNativeBalBefore := evmAppA.GetBankKeeper().GetBalance(suite.chainA.GetContext(), recipientAddrSDK, bondDenom)
+	recipientNativeBalBefore := karsaAppA.GetBankKeeper().GetBalance(suite.chainA.GetContext(), recipientAddrSDK, bondDenom)
 
 	// Call scenario10_transferICS20TransferRevert from tester contract
 	// First transfer will revert due to excessive amount
@@ -883,10 +883,10 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestContractICS20TransferRe
 	suite.Require().NoError(err)
 
 	// Get balances after
-	regularTokenBalAfter := evmAppA.Erc20Keeper.BalanceOf(suite.chainA.GetContext(), regularTokenData.ABI, regularTokenAddr, testerAddr)
-	testerHookBalAfter := evmAppA.Erc20Keeper.BalanceOf(suite.chainA.GetContext(), hookTokenData.ABI, hookTokenAddr, testerAddr)
-	hookTokenNativeBalAfter := evmAppA.GetBankKeeper().GetBalance(suite.chainA.GetContext(), hookTokenAddrSDK, bondDenom)
-	recipientNativeBalAfter := evmAppA.GetBankKeeper().GetBalance(suite.chainA.GetContext(), recipientAddrSDK, bondDenom)
+	regularTokenBalAfter := karsaAppA.Erc20Keeper.BalanceOf(suite.chainA.GetContext(), regularTokenData.ABI, regularTokenAddr, testerAddr)
+	testerHookBalAfter := karsaAppA.Erc20Keeper.BalanceOf(suite.chainA.GetContext(), hookTokenData.ABI, hookTokenAddr, testerAddr)
+	hookTokenNativeBalAfter := karsaAppA.GetBankKeeper().GetBalance(suite.chainA.GetContext(), hookTokenAddrSDK, bondDenom)
+	recipientNativeBalAfter := karsaAppA.GetBankKeeper().GetBalance(suite.chainA.GetContext(), recipientAddrSDK, bondDenom)
 
 	// Verify regular token balance unchanged (transfer reverted)
 	suite.Require().Equal(regularTokenBalBefore.String(), regularTokenBalAfter.String(),
@@ -914,12 +914,12 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) TestContractICS20TransferRe
 		"recipient should receive 2 native transfers")
 
 	// Verify delegation occurred (from beforeTransfer hook)
-	delegations, err := evmAppA.StakingKeeper.GetAllDelegatorDelegations(suite.chainA.GetContext(), hookTokenAddrSDK)
+	delegations, err := karsaAppA.StakingKeeper.GetAllDelegatorDelegations(suite.chainA.GetContext(), hookTokenAddrSDK)
 	suite.Require().NoError(err)
 	suite.Require().Equal(1, len(delegations), "should have 1 delegation from beforeTransfer hook")
 
 	// Verify total bonded amount
-	bondedTokens, err := evmAppA.StakingKeeper.GetDelegatorBonded(suite.chainA.GetContext(), hookTokenAddrSDK)
+	bondedTokens, err := karsaAppA.StakingKeeper.GetDelegatorBonded(suite.chainA.GetContext(), hookTokenAddrSDK)
 	suite.Require().NoError(err)
 	expectedBondedAmount := DelegationAmount // Convert wei to base denom
 	suite.Require().Equal(int64(expectedBondedAmount), bondedTokens.Int64(),

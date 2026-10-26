@@ -95,10 +95,10 @@ func (suite *TransferTestSuite) TestHandleMsgTransfer() {
 			senderAddr := senderAccount.SenderAccount.GetAddress()
 			tc.malleate()
 
-			evmApp := suite.evmChainA.App.(*karsa.App)
-			sourceDenomToTransfer, err = evmApp.StakingKeeper.BondDenom(suite.evmChainA.GetContext())
+			karsaApp := suite.evmChainA.App.(*karsa.App)
+			sourceDenomToTransfer, err = karsaApp.StakingKeeper.BondDenom(suite.evmChainA.GetContext())
 			suite.Require().NoError(err)
-			senderBalance := evmApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), senderAddr, sourceDenomToTransfer)
+			senderBalance := karsaApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), senderAddr, sourceDenomToTransfer)
 
 			timeoutHeight := clienttypes.NewHeight(1, 110)
 
@@ -126,7 +126,7 @@ func (suite *TransferTestSuite) TestHandleMsgTransfer() {
 			transferAmount, ok := sdkmath.NewIntFromString(packetData.Token.Amount)
 			suite.Require().True(ok)
 
-			afterSenderBalance := evmApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), senderAddr, sourceDenomToTransfer)
+			afterSenderBalance := karsaApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), senderAddr, sourceDenomToTransfer)
 			suite.Require().Equal(
 				senderBalance.Amount.Sub(fee).Sub(transferAmount).String(),
 				afterSenderBalance.Amount.String(),
@@ -136,7 +136,7 @@ func (suite *TransferTestSuite) TestHandleMsgTransfer() {
 			}
 
 			relayerAddr := suite.evmChainA.SenderAccounts[0].SenderAccount.GetAddress()
-			relayerBalance := evmApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), relayerAddr, originalCoin.Denom)
+			relayerBalance := karsaApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), relayerAddr, originalCoin.Denom)
 
 			// relay send
 			err = pathAToB.RelayPacket(packet)
@@ -145,7 +145,7 @@ func (suite *TransferTestSuite) TestHandleMsgTransfer() {
 			// One for UpdateClient() and one for AcknowledgePacket()
 			relayPacketFeeAmt := fee.Mul(sdkmath.NewInt(2))
 
-			afterRelayerBalance := evmApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), relayerAddr, originalCoin.Denom)
+			afterRelayerBalance := karsaApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), relayerAddr, originalCoin.Denom)
 			suite.Require().Equal(
 				relayerBalance.Amount.Sub(relayPacketFeeAmt).String(),
 				afterRelayerBalance.Amount.String(),
@@ -154,7 +154,7 @@ func (suite *TransferTestSuite) TestHandleMsgTransfer() {
 			escrowAddress := types.GetEscrowAddress(packet.GetSourcePort(), packet.GetSourceChannel())
 
 			// check that module account escrow address has locked the tokens
-			chainAEscrowBalance := evmApp.BankKeeper.GetBalance(
+			chainAEscrowBalance := karsaApp.BankKeeper.GetBalance(
 				suite.evmChainA.GetContext(),
 				escrowAddress,
 				originalCoin.Denom,
@@ -269,7 +269,7 @@ func (suite *TransferTestSuite) TestHandleMsgTransfer() {
 
 			// check balances for evmChainA after transfer from chainC to chainB
 			// check that the balance is unchanged
-			chainASenderBalance := evmApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), senderAddr, originalCoin.Denom)
+			chainASenderBalance := karsaApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), senderAddr, originalCoin.Denom)
 			suite.Require().Equal(
 				afterSenderBalance.Amount.String(),
 				chainASenderBalance.Amount.String(),
@@ -277,7 +277,7 @@ func (suite *TransferTestSuite) TestHandleMsgTransfer() {
 
 			// check that module account escrow address is unchanged
 			escrowAddress = types.GetEscrowAddress(pathAToB.EndpointA.ChannelConfig.PortID, pathAToB.EndpointA.ChannelID)
-			chainAEscrowBalance = evmApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), escrowAddress, originalCoin.Denom)
+			chainAEscrowBalance = karsaApp.BankKeeper.GetBalance(suite.evmChainA.GetContext(), escrowAddress, originalCoin.Denom)
 			suite.Require().True(transferAmount.Equal(chainAEscrowBalance.Amount))
 		})
 	}

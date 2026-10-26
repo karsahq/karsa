@@ -108,7 +108,7 @@ func (a appCreator) appExport(
 	appOpts servertypes.AppOptions,
 	modulesToExport []string,
 ) (servertypes.ExportedApp, error) {
-	var evmApp *karsa.App
+	var karsaApp *karsa.App
 
 	homePath, ok := appOpts.Get(flags.FlagHome).(string)
 	if !ok || homePath == "" {
@@ -129,7 +129,7 @@ func (a appCreator) appExport(
 		loadLatest = true
 	}
 
-	evmApp = karsa.NewApp(
+	karsaApp = karsa.NewApp(
 		logger,
 		db,
 		loadLatest,
@@ -137,10 +137,10 @@ func (a appCreator) appExport(
 	)
 
 	if height != -1 {
-		if err := evmApp.LoadHeight(height); err != nil {
+		if err := karsaApp.LoadHeight(height); err != nil {
 			return servertypes.ExportedApp{}, err
 		}
 	}
 
-	return evmApp.ExportAppStateAndValidators(forZeroHeight, jailAllowedAddrs, modulesToExport)
+	return karsaApp.ExportAppStateAndValidators(forZeroHeight, jailAllowedAddrs, modulesToExport)
 }
