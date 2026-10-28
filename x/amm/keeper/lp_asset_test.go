@@ -43,6 +43,13 @@ func (m *mockBankKeeper) SetDenomMetaData(_ context.Context, metadata banktypes.
 	m.metadata = &metadata
 }
 
+func (m *mockBankKeeper) GetDenomMetaData(context.Context, string) (banktypes.Metadata, bool) {
+	if m.metadata == nil {
+		return banktypes.Metadata{}, false
+	}
+	return *m.metadata, true
+}
+
 type mockErc20Keeper struct {
 	tokenSet       bool
 	dynamicEnabled bool

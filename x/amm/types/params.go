@@ -8,6 +8,12 @@ import (
 	sdk "github.com/cosmos/cosmos-sdk/types"
 )
 
+// Amplification bounds for stableswap pools.
+const (
+	MinAmplification uint64 = 1
+	MaxAmplification uint64 = 1_000_000
+)
+
 // DefaultParams returns the default module parameters.
 func DefaultParams() Params {
 	return Params{

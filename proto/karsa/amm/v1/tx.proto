@@ -30,6 +30,10 @@ message MsgCreatePool {
       [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
   string amount_b = 6
       [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  // Pool type: 0 = constant product (default), 1 = stableswap.
+  PoolType pool_type = 7;
+  // Amplification coefficient for stableswap pools; must be 0 otherwise.
+  uint64 amplification = 8;
 }
 
 message MsgCreatePoolResponse {

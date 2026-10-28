@@ -36,10 +36,15 @@ const (
 
 	// A bank-backed test denom (stands in for USDC in tests).
 	testUSDCDenom = "uusdc"
+	// A second bank-backed test denom (stands in for USDT in tests).
+	testUSDTDenom = "uusdt"
 )
 
 // testUSDCPair is the module-owned ERC20 address we assign to the test denom.
 var testUSDCPair = common.HexToAddress("0x1000000000000000000000000000000000000001")
+
+// testUSDTPair is the module-owned ERC20 address assigned to the USDT test denom.
+var testUSDTPair = common.HexToAddress("0x1000000000000000000000000000000000000003")
 
 func newTestApp(t *testing.T) (*karsa.App, sdk.Context) {
 	t.Helper()
@@ -73,13 +78,19 @@ func karsaNativeDenom() string {
 	return "akra"
 }
 
+// registerTestPair registers a bank denom as a module-owned token pair.
+func registerTestPair(t *testing.T, app *karsa.App, ctx sdk.Context, pair common.Address, denom string) {
+	t.Helper()
+
+	tokenPair := erc20types.NewTokenPair(pair, denom, erc20types.OWNER_MODULE)
+	require.NoError(t, app.Erc20Keeper.SetToken(ctx, tokenPair))
+	require.NoError(t, app.Erc20Keeper.EnableDynamicPrecompile(ctx, pair))
+}
+
 // registerTestUSDCPair registers the test denom as a module-owned token pair.
 func registerTestUSDCPair(t *testing.T, app *karsa.App, ctx sdk.Context) {
 	t.Helper()
-
-	pair := erc20types.NewTokenPair(testUSDCPair, testUSDCDenom, erc20types.OWNER_MODULE)
-	require.NoError(t, app.Erc20Keeper.SetToken(ctx, pair))
-	require.NoError(t, app.Erc20Keeper.EnableDynamicPrecompile(ctx, testUSDCPair))
+	registerTestPair(t, app, ctx, testUSDCPair, testUSDCDenom)
 }
 
 // TestCreatePoolAddRemoveAndSwap exercises the full pool lifecycle with two
@@ -333,6 +344,131 @@ func TestSwapExactOutMultiHop(t *testing.T) {
 	require.Equal(t, akraBefore.Sub(amountIn), app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount)
 }
 
+// fundDenom mints and sends an arbitrary coin to an account using the amm
+// module account (which holds Minter permissions).
+func fundDenom(t *testing.T, app *karsa.App, ctx sdk.Context, sender sdk.AccAddress, denom string, amount sdkmath.Int) {
+	t.Helper()
+
+	coins := sdk.NewCoins(sdk.NewCoin(denom, amount))
+	require.NoError(t, app.BankKeeper.MintCoins(ctx, ammtypes.ModuleName, coins))
+	require.NoError(t, app.BankKeeper.SendCoinsFromModuleToAccount(ctx, ammtypes.ModuleName, sender, coins))
+}
+
+// TestStableSwapPool exercises a two-asset stableswap pool with 6-decimal
+// assets: creation, quote, exact-in and exact-out swaps.
+func TestStableSwapPool(t *testing.T) {
+	app, ctx := newTestApp(t)
+	registerTestUSDCPair(t, app, ctx)
+	registerTestPair(t, app, ctx, testUSDTPair, testUSDTDenom)
+
+	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000D1").Bytes())
+	receiver := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000D2").Bytes())
+	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
+	fundDenom(t, app, ctx, sender, testUSDTDenom, sdkmath.NewIntWithDecimal(1_000, 18))
+
+	deposit := sdkmath.NewInt(1_000_000)
+	poolID, _, err := app.AmmKeeper.CreatePoolWithType(
+		ctx, sender, testUSDCPair.Hex(), testUSDTPair.Hex(), 30, deposit, deposit,
+		ammtypes.PoolType_POOL_TYPE_STABLESWAP, 100,
+	)
+	require.NoError(t, err)
+
+	pool, found := app.AmmKeeper.GetPool(ctx, poolID)
+	require.True(t, found)
+	require.Equal(t, ammtypes.PoolType_POOL_TYPE_STABLESWAP, pool.PoolType)
+	require.Equal(t, uint64(100), pool.Amplification)
+	// Both assets have 6 decimals, so the normalisation factor is 10^12.
+	require.Equal(t, uint64(1_000_000_000_000), pool.ScalingFactorA)
+	require.Equal(t, uint64(1_000_000_000_000), pool.ScalingFactorB)
+
+	path := []string{testUSDCPair.Hex(), testUSDTPair.Hex()}
+	amountIn := sdkmath.NewInt(10_000)
+
+	quoted, err := app.AmmKeeper.Quote(ctx, path, amountIn)
+	require.NoError(t, err)
+	// Constant product would return ~9_871; stableswap should stay near par.
+	require.True(t, quoted.GT(sdkmath.NewInt(9_900)), "quote = %s", quoted)
+	require.True(t, quoted.LT(amountIn), "quote = %s", quoted)
+
+	usdtBefore := app.BankKeeper.GetBalance(ctx, receiver, testUSDTDenom).Amount
+	usdcBefore := app.BankKeeper.GetBalance(ctx, sender, testUSDCDenom).Amount
+
+	amountOut, _, err := app.AmmKeeper.Swap(
+		ctx, sender, receiver, path, amountIn, sdkmath.NewInt(1), nil, 0,
+	)
+	require.NoError(t, err)
+	require.Equal(t, quoted, amountOut)
+	require.Equal(t, usdtBefore.Add(amountOut), app.BankKeeper.GetBalance(ctx, receiver, testUSDTDenom).Amount)
+	require.Equal(t, usdcBefore.Sub(amountIn), app.BankKeeper.GetBalance(ctx, sender, testUSDCDenom).Amount)
+
+	// Exact output.
+	exactOut := sdkmath.NewInt(5_000)
+	quotedIn, err := app.AmmKeeper.QuoteExactOut(ctx, path, exactOut)
+	require.NoError(t, err)
+	require.True(t, quotedIn.IsPositive())
+
+	usdtBefore = app.BankKeeper.GetBalance(ctx, receiver, testUSDTDenom).Amount
+	amountInUsed, _, err := app.AmmKeeper.SwapExactOut(
+		ctx, sender, receiver, path, exactOut, quotedIn, nil, 0,
+	)
+	require.NoError(t, err)
+	require.Equal(t, quotedIn, amountInUsed)
+	require.Equal(t, usdtBefore.Add(exactOut), app.BankKeeper.GetBalance(ctx, receiver, testUSDTDenom).Amount)
+
+	// The pool stays close to 1:1 after small swaps.
+	priceA, priceB, _, err := app.AmmKeeper.Twap(ctx, poolID, 60)
+	require.NoError(t, err)
+	require.True(t, priceA.Sub(sdkmath.LegacyOneDec()).Abs().LT(sdkmath.LegacyNewDecWithPrec(1, 2)), "priceA = %s", priceA)
+	require.True(t, priceB.Sub(sdkmath.LegacyOneDec()).Abs().LT(sdkmath.LegacyNewDecWithPrec(1, 2)), "priceB = %s", priceB)
+}
+
+// TestStableSwapMixedDecimals checks that scaling factors normalise an
+// 18-decimal and a 6-decimal asset to the same unit.
+func TestStableSwapMixedDecimals(t *testing.T) {
+	app, ctx := newTestApp(t)
+	registerTestUSDCPair(t, app, ctx)
+
+	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000D3").Bytes())
+	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
+
+	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+
+	// 1e18 raw akra and 1e6 raw USDC are both one whole token after scaling.
+	poolID, _, err := app.AmmKeeper.CreatePoolWithType(
+		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 30,
+		sdkmath.NewIntWithDecimal(1, 18), sdkmath.NewIntWithDecimal(1, 6),
+		ammtypes.PoolType_POOL_TYPE_STABLESWAP, 100,
+	)
+	require.NoError(t, err)
+
+	pool, found := app.AmmKeeper.GetPool(ctx, poolID)
+	require.True(t, found)
+	require.ElementsMatch(t,
+		[]uint64{1, 1_000_000_000_000},
+		[]uint64{pool.ScalingFactorA, pool.ScalingFactorB},
+	)
+
+	path := []string{testUSDCPair.Hex(), akraAsset.Hex()}
+	amountIn := sdkmath.NewInt(10_000) // 0.01 USDC
+
+	quoted, err := app.AmmKeeper.Quote(ctx, path, amountIn)
+	require.NoError(t, err)
+	maxOut := sdkmath.NewIntWithDecimal(1, 16) // 0.01 akra, in 18-decimal units
+	require.True(t, quoted.GT(maxOut.MulRaw(99).QuoRaw(100)), "quote = %s", quoted)
+	require.True(t, quoted.LT(maxOut), "quote = %s", quoted)
+
+	usdcBefore := app.BankKeeper.GetBalance(ctx, sender, testUSDCDenom).Amount
+	akraBefore := app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount
+
+	amountOut, _, err := app.AmmKeeper.Swap(
+		ctx, sender, sender, path, amountIn, sdkmath.NewInt(1), nil, 0,
+	)
+	require.NoError(t, err)
+	require.Equal(t, quoted, amountOut)
+	require.Equal(t, usdcBefore.Sub(amountIn), app.BankKeeper.GetBalance(ctx, sender, testUSDCDenom).Amount)
+	require.Equal(t, akraBefore.Add(amountOut), app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount)
+}
+
 // deployTestERC20 deploys the example ERC20 contract from the given address and
 // returns its address.
 func deployTestERC20(t *testing.T, app *karsa.App, ctx sdk.Context, deployer common.Address, name, symbol string, decimals uint8) common.Address {
@@ -557,4 +693,53 @@ func TestExternalERC20Pool(t *testing.T) {
 	after := erc20BalanceOf(t, app, ctx, token, deployer)
 	require.Equal(t, before.Add(amountOut), after)
 	require.Equal(t, sdkmath.NewInt(100_000).Sub(amountOut), erc20BalanceOf(t, app, ctx, token, moduleAddr))
+}
+
+// TestStableSwapExternalERC20 checks that a stableswap pool can resolve the
+// decimals of an external ERC20 contract through the on-chain decimals() call.
+func TestStableSwapExternalERC20(t *testing.T) {
+	app, ctx := newTestApp(t)
+
+	deployer := common.HexToAddress("0x00000000000000000000000000000000000000E1")
+	nativeCoins := sdk.NewCoins(sdk.NewCoin(karsaNativeDenom(), sdkmath.NewIntWithDecimal(1_000, 18)))
+	require.NoError(t, app.BankKeeper.MintCoins(ctx, ammtypes.ModuleName, nativeCoins))
+	require.NoError(t, app.BankKeeper.SendCoinsFromModuleToAccount(
+		ctx, ammtypes.ModuleName, sdk.AccAddress(deployer.Bytes()), nativeCoins,
+	))
+
+	token := deployTestERC20(t, app, ctx, deployer, "Momo", "MOMO", 18)
+	mintTestERC20(t, app, ctx, token, deployer, sdkmath.NewInt(1_000_000))
+
+	denom := "erc20:" + strings.ToLower(token.Hex())
+	require.NoError(t, app.Erc20Keeper.SetToken(ctx, erc20types.NewTokenPair(
+		token, denom, erc20types.OWNER_EXTERNAL,
+	)))
+
+	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	sender := sdk.AccAddress(deployer.Bytes())
+
+	poolID, _, err := app.AmmKeeper.CreatePoolWithType(
+		ctx, sender, akraAsset.Hex(), token.Hex(), 30,
+		sdkmath.NewInt(100_000), sdkmath.NewInt(100_000),
+		ammtypes.PoolType_POOL_TYPE_STABLESWAP, 100,
+	)
+	require.NoError(t, err)
+
+	pool, found := app.AmmKeeper.GetPool(ctx, poolID)
+	require.True(t, found)
+	// Both assets have 18 decimals, so no scaling is needed.
+	require.ElementsMatch(t, []uint64{1, 1}, []uint64{pool.ScalingFactorA, pool.ScalingFactorB})
+
+	path := []string{akraAsset.Hex(), token.Hex()}
+	before := erc20BalanceOf(t, app, ctx, token, deployer)
+
+	amountOut, _, err := app.AmmKeeper.Swap(
+		ctx, sender, sender, path, sdkmath.NewInt(1_000), sdkmath.NewInt(1), nil, 0,
+	)
+	require.NoError(t, err)
+	require.True(t, amountOut.GT(sdkmath.NewInt(990)), "amountOut = %s", amountOut)
+	require.True(t, amountOut.LT(sdkmath.NewInt(1_000)), "amountOut = %s", amountOut)
+
+	after := erc20BalanceOf(t, app, ctx, token, deployer)
+	require.Equal(t, before.Add(amountOut), after)
 }

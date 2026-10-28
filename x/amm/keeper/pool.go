@@ -85,7 +85,8 @@ func (k Keeper) IteratePools(ctx sdk.Context, cb func(types.Pool) bool) {
 	}
 }
 
-// CreatePool creates a new pool, pulls the initial liquidity and mints LP shares.
+// CreatePool creates a constant-product pool. It is a convenience wrapper
+// around CreatePoolWithType.
 func (k Keeper) CreatePool(
 	ctx sdk.Context,
 	sender sdk.AccAddress,
@@ -93,7 +94,38 @@ func (k Keeper) CreatePool(
 	feeBps uint32,
 	amountA, amountB sdkmath.Int,
 ) (uint64, sdkmath.Int, error) {
+	return k.CreatePoolWithType(
+		ctx, sender, assetA, assetB, feeBps, amountA, amountB,
+		types.PoolType_POOL_TYPE_CONSTANT_PRODUCT, 0,
+	)
+}
+
+// CreatePoolWithType creates a new pool of the requested type, pulls the initial
+// liquidity and mints LP shares.
+func (k Keeper) CreatePoolWithType(
+	ctx sdk.Context,
+	sender sdk.AccAddress,
+	assetA, assetB string,
+	feeBps uint32,
+	amountA, amountB sdkmath.Int,
+	poolType types.PoolType,
+	amplification uint64,
+) (uint64, sdkmath.Int, error) {
 	params := k.GetParams(ctx)
+
+	switch poolType {
+	case types.PoolType_POOL_TYPE_CONSTANT_PRODUCT:
+		amplification = 0
+	case types.PoolType_POOL_TYPE_STABLESWAP:
+		if amplification < types.MinAmplification || amplification > types.MaxAmplification {
+			return 0, sdkmath.Int{}, types.ErrInvalidParams.Wrapf(
+				"amplification must be in [%d,%d], got %d",
+				types.MinAmplification, types.MaxAmplification, amplification,
+			)
+		}
+	default:
+		return 0, sdkmath.Int{}, types.ErrInvalidParams.Wrapf("unknown pool type %d", poolType)
+	}
 
 	if feeBps == 0 {
 		feeBps = params.DefaultFeeBps
@@ -125,6 +157,33 @@ func (k Keeper) CreatePool(
 	}
 	if _, found := k.GetPoolIDByAssets(ctx, a.Address, b.Address); found {
 		return 0, sdkmath.Int{}, types.ErrPoolExists.Wrapf("pool %s/%s already exists", a.Address, b.Address)
+	}
+
+	var scalingA, scalingB uint64
+	if poolType == types.PoolType_POOL_TYPE_STABLESWAP {
+		decimalsA, err := k.assetDecimals(ctx, a)
+		if err != nil {
+			return 0, sdkmath.Int{}, err
+		}
+		decimalsB, err := k.assetDecimals(ctx, b)
+		if err != nil {
+			return 0, sdkmath.Int{}, err
+		}
+
+		scalingA, err = scalingFactor(decimalsA)
+		if err != nil {
+			return 0, sdkmath.Int{}, err
+		}
+		scalingB, err = scalingFactor(decimalsB)
+		if err != nil {
+			return 0, sdkmath.Int{}, err
+		}
+
+		x := amountA.Mul(scalingFactorInt(scalingA))
+		y := amountB.Mul(scalingFactorInt(scalingB))
+		if !stableInvariant(x, y, amplification).IsPositive() {
+			return 0, sdkmath.Int{}, types.ErrInvalidAmount.Wrap("invalid stableswap initial reserves")
+		}
 	}
 
 	totalShares := sdkmath.NewIntFromBigInt(sqrt(amountA.BigInt(), amountB.BigInt()))
@@ -181,18 +240,22 @@ func (k Keeper) CreatePool(
 	}
 
 	pool := types.Pool{
-		Id:           id,
-		AssetA:       a.Address,
-		AssetB:       b.Address,
-		DenomA:       a.Denom,
-		DenomB:       b.Denom,
-		ReserveA:     amountA,
-		ReserveB:     amountB,
-		TotalShares:  totalShares,
-		LockedShares: params.MinLockedShares,
-		FeeBps:       feeBps,
-		LpDenom:      lpDenom,
-		LpAssetId:    lpAssetID,
+		Id:             id,
+		AssetA:         a.Address,
+		AssetB:         b.Address,
+		DenomA:         a.Denom,
+		DenomB:         b.Denom,
+		ReserveA:       amountA,
+		ReserveB:       amountB,
+		TotalShares:    totalShares,
+		LockedShares:   params.MinLockedShares,
+		FeeBps:         feeBps,
+		LpDenom:        lpDenom,
+		LpAssetId:      lpAssetID,
+		PoolType:       poolType,
+		Amplification:  amplification,
+		ScalingFactorA: scalingA,
+		ScalingFactorB: scalingB,
 	}
 	k.SetPool(ctx, pool)
 	k.updateOracle(ctx, pool)

@@ -45,7 +45,10 @@ func (m msgServer) CreatePool(goCtx context.Context, msg *types.MsgCreatePool) (
 		return nil, types.ErrInvalidAmount.Wrapf("invalid sender: %s", err)
 	}
 
-	poolID, _, err := m.Keeper.CreatePool(ctx, sender, msg.AssetA, msg.AssetB, msg.FeeBps, msg.AmountA, msg.AmountB)
+	poolID, _, err := m.Keeper.CreatePoolWithType(
+		ctx, sender, msg.AssetA, msg.AssetB, msg.FeeBps, msg.AmountA, msg.AmountB,
+		msg.PoolType, msg.Amplification,
+	)
 	if err != nil {
 		return nil, err
 	}

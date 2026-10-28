@@ -21,6 +21,7 @@ type BankKeeper interface {
 	BurnCoins(ctx context.Context, moduleName string, amt sdk.Coins) error
 	SpendableCoins(ctx context.Context, addr sdk.AccAddress) sdk.Coins
 	SetDenomMetaData(ctx context.Context, metadata banktypes.Metadata)
+	GetDenomMetaData(ctx context.Context, denom string) (banktypes.Metadata, bool)
 }
 
 // Erc20Keeper resolves ERC20 addresses to token pairs and registers LP shares as

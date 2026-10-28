@@ -6,7 +6,13 @@ import "cosmos/base/v1beta1/coin.proto";
 
 option go_package = "github.com/karsahq/karsa/x/amm/types";
 
-// Pool is a constant-product liquidity pool keyed by two ERC20 addresses.
+// PoolType selects the pricing curve of a pool.
+enum PoolType {
+  POOL_TYPE_CONSTANT_PRODUCT = 0;
+  POOL_TYPE_STABLESWAP = 1;
+}
+
+// Pool is a liquidity pool keyed by two ERC20 addresses.
 message Pool {
   uint64 id = 1;
   // ERC20 addresses (lowercase hex) of the two assets, sorted ascending.
@@ -28,6 +34,14 @@ message Pool {
   	string lp_denom = 11;
   	// ERC20 precompile address of the LP share (lowercase hex).
   	string lp_asset_id = 12;
+	// Pricing curve. Defaults to constant product for backwards compatibility.
+	PoolType pool_type = 13;
+	// Amplification coefficient A for stableswap pools; 0 for constant product.
+	uint64 amplification = 14;
+	// Reserves are normalised to 18 decimals with these factors
+	// (10^(18-decimals)). A zero value means 1.
+	uint64 scaling_factor_a = 15;
+	uint64 scaling_factor_b = 16;
 }
 
 // Params defines the module parameters.

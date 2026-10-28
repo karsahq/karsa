@@ -53,6 +53,10 @@ func spotPrices(pool types.Pool) (sdkmath.Int, sdkmath.Int) {
 		return sdkmath.ZeroInt(), sdkmath.ZeroInt()
 	}
 
+	if pool.PoolType == types.PoolType_POOL_TYPE_STABLESWAP {
+		return stableSpotPrices(pool)
+	}
+
 	aToB := pool.ReserveB.Mul(priceScaleInt).Quo(pool.ReserveA)
 	bToA := pool.ReserveA.Mul(priceScaleInt).Quo(pool.ReserveB)
 

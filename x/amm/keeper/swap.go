@@ -114,14 +114,7 @@ func (k Keeper) QuoteExactOut(ctx sdk.Context, path []string, amountOut sdkmath.
 			return sdkmath.Int{}, err
 		}
 
-		var reserveIn, reserveOut sdkmath.Int
-		if aIsA {
-			reserveIn, reserveOut = pool.ReserveA, pool.ReserveB
-		} else {
-			reserveIn, reserveOut = pool.ReserveB, pool.ReserveA
-		}
-
-		need = calcAmountInExactOut(need, reserveIn, reserveOut, pool.FeeBps)
+		need = k.poolAmountIn(pool, aIsA, need)
 		if !need.IsPositive() {
 			return sdkmath.Int{}, types.ErrInvalidAmount.Wrapf(
 				"insufficient liquidity for the requested output at hop %d", i-1,
@@ -148,14 +141,7 @@ func (k Keeper) Quote(ctx sdk.Context, path []string, amountIn sdkmath.Int) (sdk
 			return sdkmath.Int{}, err
 		}
 
-		var reserveIn, reserveOut sdkmath.Int
-		if aIsA {
-			reserveIn, reserveOut = pool.ReserveA, pool.ReserveB
-		} else {
-			reserveIn, reserveOut = pool.ReserveB, pool.ReserveA
-		}
-
-		amount = calcAmountOut(amount, reserveIn, reserveOut, pool.FeeBps)
+		amount = k.poolAmountOut(pool, aIsA, amount)
 		if !amount.IsPositive() {
 			return sdkmath.Int{}, types.ErrInvalidAmount.Wrapf("hop %d produced no output", i)
 		}
@@ -258,16 +244,14 @@ func (k Keeper) swapExec(
 			return sdkmath.Int{}, sdkmath.Int{}, err
 		}
 
-		var reserveIn, reserveOut sdkmath.Int
-		if aIsA {
-			reserveIn, reserveOut = pool.ReserveA, pool.ReserveB
-		} else {
-			reserveIn, reserveOut = pool.ReserveB, pool.ReserveA
-		}
-
-		out := calcAmountOut(amount, reserveIn, reserveOut, pool.FeeBps)
+		out := k.poolAmountOut(pool, aIsA, amount)
 		if !out.IsPositive() {
 			return sdkmath.Int{}, sdkmath.Int{}, types.ErrInvalidAmount.Wrapf("hop %d produced no output", i)
+		}
+
+		reserveOut := pool.ReserveB
+		if !aIsA {
+			reserveOut = pool.ReserveA
 		}
 		if out.GTE(reserveOut) {
 			return sdkmath.Int{}, sdkmath.Int{}, types.ErrInvalidAmount.Wrap("output exceeds reserve")
@@ -357,14 +341,7 @@ func (k Keeper) SwapExactOut(
 			return sdkmath.Int{}, sdkmath.Int{}, err
 		}
 
-		var reserveIn, reserveOut sdkmath.Int
-		if aIsA {
-			reserveIn, reserveOut = pool.ReserveA, pool.ReserveB
-		} else {
-			reserveIn, reserveOut = pool.ReserveB, pool.ReserveA
-		}
-
-		in := calcAmountInExactOut(need, reserveIn, reserveOut, pool.FeeBps)
+		in := k.poolAmountIn(pool, aIsA, need)
 		if !in.IsPositive() {
 			return sdkmath.Int{}, sdkmath.Int{}, types.ErrInvalidAmount.Wrapf(
 				"insufficient liquidity for the requested output at hop %d", i-1,

@@ -1,10 +1,11 @@
 # Karsa AMM — Design
 
-Status: **in progress** — `x/amm` implements constant-product pools, integrator
-fees, exact-in and exact-out swaps, LP shares with an ERC20 precompile, direct
-custody for external ERC20 contracts, an EVM precompile (`quote`, `getPool`,
-`swapExactIn`), and a cumulative-price TWAP. Remaining: stableswap pools,
-on-chain route search. Fee abstraction (paying gas in a token) is **descoped**.
+Status: **in progress** — `x/amm` implements constant-product and two-asset
+stableswap pools, integrator fees, exact-in and exact-out swaps, LP shares with
+an ERC20 precompile, direct custody for external ERC20 contracts, an EVM
+precompile (`quote`, `getPool`, `swapExactIn`), and a cumulative-price TWAP.
+Remaining: bounded route search. Fee abstraction (paying gas in a token) is
+**descoped**.
 
 ## 1. Goals
 
@@ -152,17 +153,21 @@ Special case: the asset whose resolved denom equals `evmtypes.GetEVMCoinDenom()`
 
 ```go
 type Pool struct {
-    ID           uint64
-    AssetA       common.Address // sorted: bytes.Compare(AssetA, AssetB) < 0
-    AssetB       common.Address
-    DenomA       string         // resolved at creation, immutable
-    DenomB       string
-    ReserveA     sdkmath.Int
-    ReserveB     sdkmath.Int
-    TotalShares  sdkmath.Int
-    LPAssetID    common.Address // phase 2
-    FeeBps       uint32         // e.g. 30 = 0.30%
-    PoolType     PoolType       // constant_product | stableswap (phase 3)
+    ID             uint64
+    AssetA         common.Address // sorted: bytes.Compare(AssetA, AssetB) < 0
+    AssetB         common.Address
+    DenomA         string         // resolved at creation, immutable
+    DenomB         string
+    ReserveA       sdkmath.Int
+    ReserveB       sdkmath.Int
+    TotalShares    sdkmath.Int
+    LockedShares   sdkmath.Int
+    LPAssetID      common.Address
+    FeeBps         uint32         // e.g. 30 = 0.30%
+    PoolType       PoolType       // CONSTANT_PRODUCT (0) | STABLESWAP (1)
+    Amplification  uint64         // A, stableswap only; 0 otherwise
+    ScalingFactorA uint64         // 10^(18-decimals); 0 means 1
+    ScalingFactorB uint64
 }
 ```
 
@@ -184,11 +189,43 @@ Params (`MsgUpdateParams`, governance only):
 | `fee_burn_bps` | 0 | share of `creation_fee` burned instead of pooled |
 | `max_price_impact_bps` | 1000 | guard on `quote`/`swap` |
 
+`amplification` is not a global param: it is chosen by the pool creator and
+bounded by `MinAmplification`/`MaxAmplification` (1 … 1,000,000).
+
+### Stableswap pools (2 assets)
+
+A stableswap pool uses the Curve invariant generalised to two assets:
+
+```
+Ann*S + D = Ann*D + D^3/(4xy),   Ann = 2A,  S = x + y
+```
+
+- `x` and `y` are the reserves normalised to 18 decimals with the pool's
+  `ScalingFactorA/B` (`10^(18-decimals)`). A zero factor is treated as 1.
+- `A` controls how flat the curve is near 1:1. Higher `A` means less slippage and
+  more exposure to a depegged asset; lower `A` behaves more like constant product.
+- `D` is found with Newton iteration (max 255 rounds), the same bound Curve uses.
+- Exact-in prices with the net input (`amountIn - fee`) and then adds the full
+  input to the reserve, so the fee accrues to LPs. Exact-out solves for the input
+  and grosses the fee up.
+- Spot/TWAP prices use the marginal derivative of the invariant, not the raw
+  reserve ratio, so a flat curve is not misreported as a large price move.
+- Add/remove liquidity stay proportional (same code path as constant product);
+  imbalanced deposits are not accepted as a single-sided operation.
+
+Pool creation resolves decimals from bank metadata, then the denom prefix
+(`u…` = 6, `a…` = 18), then an on-chain `decimals()` call. Assets with more than
+18 decimals are rejected for stableswap.
+
+Risk note: `A` is chosen by the creator and is immutable. A depeg can make the
+pool absorb the falling asset at near-par; LPs bear that risk. There is no
+protocol backstop and no curation list.
+
 ## 5. Messages
 
 | Message | Who | Notes |
 |---|---|---|
-| `MsgCreatePool{asset_a, asset_b, fee_bps, amount_a, amount_b}` | anyone (or `authority` only, configurable) | validates both assets per §3 |
+| `MsgCreatePool{asset_a, asset_b, fee_bps, amount_a, amount_b, pool_type, amplification}` | anyone (or `authority` only, configurable) | validates both assets per §3; `pool_type` defaults to constant product |
 | `MsgAddLiquidity{pool_id, max_a, max_b, min_shares}` | LP | proportional deposit |
 | `MsgRemoveLiquidity{pool_id, shares, min_a, min_b}` | LP | proportional withdrawal |
 | `MsgSwapExactIn{sender, path[], amount_in, min_out, receiver, deadline, integrator, integrator_fee_bps}` | user | `path` is a list of `AssetID`; `len(path) >= 2`; integrator fields are optional (§13) |
@@ -240,7 +277,7 @@ Rules:
 - Hard cap `len(path) - 1 <= max_hops` (default 2).
 - Each hop looks up `pool_by_assets`; missing pool ⇒ error (no silent fallback).
 - Path validation: no duplicate assets, all assets poolable, deadline respected.
-- Optional (phase 3): bounded on-chain route search over `pools_by_asset`, max 3 hops, gas-capped.
+- Optional (phase 4): bounded on-chain route search over `pools_by_asset`, max 3 hops, gas-capped.
 
 ## 9. LP shares
 
@@ -328,8 +365,8 @@ Open design points (ante path):
 |---|---|
 | 1 | Module skeleton, constant product, create/add/remove, exact-in and exact-out swap, `Quote`, integrator fee, 1–2 hop path, LP as bank denom, precompile for `swap`/`quote` |
 | 2 | Direct-custody pools for external ERC20 contracts (EVM transfers, balance-delta checks, reentrancy guard) |
-| 3 | TWAP for fees/pricing (fee abstraction is descoped) |
-| 4 | Stableswap pools, bounded route search, LP as ERC20 |
+| 3 | TWAP for fees/pricing; two-asset stableswap pools with scaling factors and amplification (fee abstraction is descoped) |
+| 4 | Bounded route search, LP as ERC20 |
 | 5 | ERC-4337 paymaster for ERC20 contracts (separate project) |
 
 ## 13. Integrator fee & external routers

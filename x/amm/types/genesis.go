@@ -50,6 +50,16 @@ func (gs GenesisState) Validate() error {
 		if pool.LpDenom != LPDenom(pool.Id) {
 			return fmt.Errorf("pool %d: lp denom must be %q, got %q", pool.Id, LPDenom(pool.Id), pool.LpDenom)
 		}
+		switch pool.PoolType {
+		case PoolType_POOL_TYPE_CONSTANT_PRODUCT:
+		case PoolType_POOL_TYPE_STABLESWAP:
+			if pool.Amplification < MinAmplification || pool.Amplification > MaxAmplification {
+				return fmt.Errorf("pool %d: amplification must be in [%d,%d], got %d",
+					pool.Id, MinAmplification, MaxAmplification, pool.Amplification)
+			}
+		default:
+			return fmt.Errorf("pool %d: unknown pool type %d", pool.Id, pool.PoolType)
+		}
 	}
 
 	if gs.NextPoolId <= maxID {
