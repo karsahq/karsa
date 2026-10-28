@@ -76,6 +76,62 @@ func calcAmountOut(amountIn, reserveIn, reserveOut sdkmath.Int, feeBps uint32) s
 	return inAfterFee.Mul(reserveOut).Quo(denominator)
 }
 
+// calcAmountInExactOut returns the input required to receive exactly amountOut.
+// It returns zero when the request cannot be satisfied by the pool.
+func calcAmountInExactOut(amountOut, reserveIn, reserveOut sdkmath.Int, feeBps uint32) sdkmath.Int {
+	if !amountOut.IsPositive() || !reserveIn.IsPositive() || !reserveOut.IsPositive() {
+		return sdkmath.ZeroInt()
+	}
+	if amountOut.GTE(reserveOut) {
+		return sdkmath.ZeroInt()
+	}
+
+	feeFactor := sdkmath.NewInt(int64(10_000 - feeBps))
+
+	// inAfterFee = amountOut * reserveIn * 1e4 / (reserveOut - amountOut)
+	numerator := amountOut.Mul(reserveIn).MulRaw(10_000)
+	denominator := reserveOut.Sub(amountOut)
+	inAfterFee := ceilDiv(numerator, denominator)
+
+	// in = inAfterFee / feeFactor, rounded up. inAfterFee is already scaled by
+	// (10_000 - feeBps) by the constant-product definition of calcAmountOut.
+	return ceilDiv(inAfterFee, feeFactor)
+}
+
+// QuoteExactOut computes the input required to receive exactly amountOut.
+func (k Keeper) QuoteExactOut(ctx sdk.Context, path []string, amountOut sdkmath.Int) (sdkmath.Int, error) {
+	if err := k.validatePath(ctx, path); err != nil {
+		return sdkmath.Int{}, err
+	}
+	if !amountOut.IsPositive() {
+		return sdkmath.Int{}, types.ErrInvalidAmount.Wrap("amount_out must be positive")
+	}
+
+	need := amountOut
+	for i := len(path) - 1; i > 0; i-- {
+		pool, aIsA, err := k.poolForHop(ctx, path[i-1], path[i])
+		if err != nil {
+			return sdkmath.Int{}, err
+		}
+
+		var reserveIn, reserveOut sdkmath.Int
+		if aIsA {
+			reserveIn, reserveOut = pool.ReserveA, pool.ReserveB
+		} else {
+			reserveIn, reserveOut = pool.ReserveB, pool.ReserveA
+		}
+
+		need = calcAmountInExactOut(need, reserveIn, reserveOut, pool.FeeBps)
+		if !need.IsPositive() {
+			return sdkmath.Int{}, types.ErrInvalidAmount.Wrapf(
+				"insufficient liquidity for the requested output at hop %d", i-1,
+			)
+		}
+	}
+
+	return need, nil
+}
+
 // Quote computes the output amount for a swap path without changing state.
 func (k Keeper) Quote(ctx sdk.Context, path []string, amountIn sdkmath.Int) (sdkmath.Int, error) {
 	if err := k.validatePath(ctx, path); err != nil {
@@ -250,4 +306,136 @@ func (k Keeper) swapExec(
 	))
 
 	return amount, integratorFee, nil
+}
+
+// SwapExactOut executes a swap for an exact output amount, bounded by maxAmountIn.
+func (k Keeper) SwapExactOut(
+	ctx sdk.Context,
+	sender, receiver sdk.AccAddress,
+	path []string,
+	amountOut, maxAmountIn sdkmath.Int,
+	integrator sdk.AccAddress,
+	integratorFeeBps uint32,
+) (sdkmath.Int, sdkmath.Int, error) {
+	if err := k.validatePath(ctx, path); err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
+	}
+	if !amountOut.IsPositive() || !maxAmountIn.IsPositive() {
+		return sdkmath.Int{}, sdkmath.Int{}, types.ErrInvalidAmount.Wrap("amounts must be positive")
+	}
+
+	params := k.GetParams(ctx)
+	if integratorFeeBps > params.MaxIntegratorFeeBps {
+		return sdkmath.Int{}, sdkmath.Int{}, types.ErrInvalidFee.Wrapf(
+			"integrator fee %d bps exceeds max %d bps", integratorFeeBps, params.MaxIntegratorFeeBps,
+		)
+	}
+
+	first, err := k.resolveAsset(ctx, path[0])
+	if err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
+	}
+	last, err := k.resolveAsset(ctx, path[len(path)-1])
+	if err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
+	}
+
+	type hop struct {
+		pool      types.Pool
+		aIsA      bool
+		amountIn  sdkmath.Int
+		amountOut sdkmath.Int
+	}
+
+	hops := make([]hop, 0, len(path)-1)
+	need := amountOut
+
+	// Walk the path backwards to find the input required at each hop.
+	for i := len(path) - 1; i > 0; i-- {
+		pool, aIsA, err := k.poolForHop(ctx, path[i-1], path[i])
+		if err != nil {
+			return sdkmath.Int{}, sdkmath.Int{}, err
+		}
+
+		var reserveIn, reserveOut sdkmath.Int
+		if aIsA {
+			reserveIn, reserveOut = pool.ReserveA, pool.ReserveB
+		} else {
+			reserveIn, reserveOut = pool.ReserveB, pool.ReserveA
+		}
+
+		in := calcAmountInExactOut(need, reserveIn, reserveOut, pool.FeeBps)
+		if !in.IsPositive() {
+			return sdkmath.Int{}, sdkmath.Int{}, types.ErrInvalidAmount.Wrapf(
+				"insufficient liquidity for the requested output at hop %d", i-1,
+			)
+		}
+
+		hops = append(hops, hop{pool: pool, aIsA: aIsA, amountIn: in, amountOut: need})
+		need = in
+	}
+
+	// The hops were collected in reverse order.
+	for i, j := 0, len(hops)-1; i < j; i, j = i+1, j-1 {
+		hops[i], hops[j] = hops[j], hops[i]
+	}
+
+	integratorFee := sdkmath.ZeroInt()
+	if integrator != nil && integratorFeeBps > 0 {
+		// Fee is bps of the total amount paid, so it is grossed up.
+		feeFactor := sdkmath.NewInt(int64(10_000 - integratorFeeBps))
+		integratorFee = ceilDiv(need.MulRaw(int64(integratorFeeBps)), feeFactor)
+	}
+
+	totalIn := need.Add(integratorFee)
+	if totalIn.GT(maxAmountIn) {
+		return sdkmath.Int{}, sdkmath.Int{}, types.ErrSlippageExceeded.Wrapf(
+			"required input %s exceeds max_amount_in %s", totalIn, maxAmountIn,
+		)
+	}
+
+	if err := k.moveIn(ctx, first, common.BytesToAddress(sender.Bytes()), totalIn); err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, types.ErrInsufficientFunds.Wrap(err.Error())
+	}
+
+	if integratorFee.IsPositive() {
+		if err := k.moveOut(ctx, first, common.BytesToAddress(integrator.Bytes()), integratorFee); err != nil {
+			return sdkmath.Int{}, sdkmath.Int{}, err
+		}
+	}
+
+	for _, h := range hops {
+		pool := h.pool
+		if h.aIsA {
+			if h.amountOut.GTE(pool.ReserveB) {
+				return sdkmath.Int{}, sdkmath.Int{}, types.ErrInvalidAmount.Wrap("output exceeds reserve")
+			}
+			pool.ReserveA = pool.ReserveA.Add(h.amountIn)
+			pool.ReserveB = pool.ReserveB.Sub(h.amountOut)
+		} else {
+			if h.amountOut.GTE(pool.ReserveA) {
+				return sdkmath.Int{}, sdkmath.Int{}, types.ErrInvalidAmount.Wrap("output exceeds reserve")
+			}
+			pool.ReserveB = pool.ReserveB.Add(h.amountIn)
+			pool.ReserveA = pool.ReserveA.Sub(h.amountOut)
+		}
+
+		k.SetPool(ctx, pool)
+		k.updateOracle(ctx, pool)
+	}
+
+	if err := k.moveOut(ctx, last, common.BytesToAddress(receiver.Bytes()), amountOut); err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
+	}
+
+	ctx.EventManager().EmitEvent(sdk.NewEvent(
+		types.EventTypeSwap,
+		sdk.NewAttribute(types.AttributeKeySender, sender.String()),
+		sdk.NewAttribute(types.AttributeKeyReceiver, receiver.String()),
+		sdk.NewAttribute(types.AttributeKeyAmountIn, totalIn.String()),
+		sdk.NewAttribute(types.AttributeKeyAmountOut, amountOut.String()),
+		sdk.NewAttribute(types.AttributeKeyIntegratorFee, integratorFee.String()),
+	))
+
+	return totalIn, integratorFee, nil
 }

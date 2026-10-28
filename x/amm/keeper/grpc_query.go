@@ -118,6 +118,22 @@ func (q queryServer) Quote(goCtx context.Context, req *types.QueryQuoteRequest) 
 	return &types.QueryQuoteResponse{AmountOut: amountOut}, nil
 }
 
+// QuoteExactOut returns the input required to receive an exact output amount.
+func (q queryServer) QuoteExactOut(goCtx context.Context, req *types.QueryQuoteExactOutRequest) (*types.QueryQuoteExactOutResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "empty request")
+	}
+
+	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	amountIn, err := q.Keeper.QuoteExactOut(ctx, req.Path, req.AmountOut)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	return &types.QueryQuoteExactOutResponse{AmountIn: amountIn}, nil
+}
+
 // Params returns the module params.
 func (q queryServer) Twap(goCtx context.Context, req *types.QueryTwapRequest) (*types.QueryTwapResponse, error) {
 	if req == nil {

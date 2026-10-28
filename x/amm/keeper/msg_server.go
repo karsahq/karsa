@@ -141,6 +141,50 @@ func (m msgServer) SwapExactIn(goCtx context.Context, msg *types.MsgSwapExactIn)
 	return &types.MsgSwapExactInResponse{AmountOut: amountOut, IntegratorFee: integratorFee}, nil
 }
 
+// SwapExactOut executes an exact-output swap.
+func (m msgServer) SwapExactOut(goCtx context.Context, msg *types.MsgSwapExactOut) (*types.MsgSwapExactOutResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	if err := m.acquireLock(ctx); err != nil {
+		return nil, err
+	}
+	defer m.releaseLock(ctx)
+
+	sender, err := sdk.AccAddressFromBech32(msg.Sender)
+	if err != nil {
+		return nil, types.ErrInvalidAmount.Wrapf("invalid sender: %s", err)
+	}
+
+	receiver := sender
+	if msg.Receiver != "" {
+		receiver, err = parseAddress(msg.Receiver)
+		if err != nil {
+			return nil, types.ErrInvalidAmount.Wrapf("invalid receiver: %s", err)
+		}
+	}
+
+	var integrator sdk.AccAddress
+	if msg.Integrator != "" {
+		integrator, err = parseAddress(msg.Integrator)
+		if err != nil {
+			return nil, types.ErrInvalidAmount.Wrapf("invalid integrator: %s", err)
+		}
+	}
+
+	if msg.Deadline > 0 && ctx.BlockTime().Unix() > msg.Deadline {
+		return nil, types.ErrDeadlineExceeded
+	}
+
+	amountIn, integratorFee, err := m.Keeper.SwapExactOut(
+		ctx, sender, receiver, msg.Path, msg.AmountOut, msg.MaxAmountIn, integrator, msg.IntegratorFeeBps,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &types.MsgSwapExactOutResponse{AmountIn: amountIn, IntegratorFee: integratorFee}, nil
+}
+
 // UpdateParams updates the module params. Only the authority may call it.
 func (m msgServer) UpdateParams(goCtx context.Context, msg *types.MsgUpdateParams) (*types.MsgUpdateParamsResponse, error) {
 	ctx := sdk.UnwrapSDKContext(goCtx)

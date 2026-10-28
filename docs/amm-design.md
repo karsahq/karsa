@@ -1,10 +1,10 @@
 # Karsa AMM — Design
 
 Status: **in progress** — `x/amm` implements constant-product pools, integrator
-fees, LP shares with an ERC20 precompile, direct custody for external ERC20
-contracts, an EVM precompile (`quote`, `getPool`, `swapExactIn`), and a
-cumulative-price TWAP. Remaining: stableswap pools, `SwapExactOut`, on-chain
-route search. Fee abstraction (paying gas in a token) is **descoped**.
+fees, exact-in and exact-out swaps, LP shares with an ERC20 precompile, direct
+custody for external ERC20 contracts, an EVM precompile (`quote`, `getPool`,
+`swapExactIn`), and a cumulative-price TWAP. Remaining: stableswap pools,
+on-chain route search. Fee abstraction (paying gas in a token) is **descoped**.
 
 ## 1. Goals
 
@@ -192,7 +192,7 @@ Params (`MsgUpdateParams`, governance only):
 | `MsgAddLiquidity{pool_id, max_a, max_b, min_shares}` | LP | proportional deposit |
 | `MsgRemoveLiquidity{pool_id, shares, min_a, min_b}` | LP | proportional withdrawal |
 | `MsgSwapExactIn{sender, path[], amount_in, min_out, receiver, deadline, integrator, integrator_fee_bps}` | user | `path` is a list of `AssetID`; `len(path) >= 2`; integrator fields are optional (§13) |
-| `MsgSwapExactOut{...}` | user | phase 3 |
+| `MsgSwapExactOut{sender, path[], amount_out, max_amount_in, receiver, deadline, integrator, integrator_fee_bps}` | user | bounded by `max_amount_in`; integrator fee is grossed up on top of the pool input (§13) |
 | `MsgUpdateParams{authority, params}` | governance | |
 
 All messages reject `deadline` in the past and `min_out == 0`.
@@ -204,6 +204,7 @@ All messages reject `deadline` in the past and `min_out == 0`.
 | `Pool{id}` / `Pools{pagination}` | pool state |
 | `PoolByAssets{a,b}` | pool id + state |
 | `Quote{path, amount_in, integrator, integrator_fee_bps}` | `amount_out`, `pool_fee`, `integrator_fee`, per-hop impact |
+| `QuoteExactOut{path, amount_out}` | `amount_in` required (including pool fees) |
 | `PoolsByAsset{asset}` | candidate pools for routing |
 | `Twap{pool_id, window}` | time-weighted price (phase 2) |
 
@@ -325,10 +326,10 @@ Open design points (ante path):
 
 | Phase | Scope |
 |---|---|
-| 1 | Module skeleton, constant product, create/add/remove/swap, `Quote`, integrator fee, 1–2 hop path, LP as bank denom, precompile for `swap`/`quote` |
+| 1 | Module skeleton, constant product, create/add/remove, exact-in and exact-out swap, `Quote`, integrator fee, 1–2 hop path, LP as bank denom, precompile for `swap`/`quote` |
 | 2 | Direct-custody pools for external ERC20 contracts (EVM transfers, balance-delta checks, reentrancy guard) |
 | 3 | TWAP for fees/pricing (fee abstraction is descoped) |
-| 4 | Stableswap pools, `SwapExactOut`, bounded route search, LP as ERC20 |
+| 4 | Stableswap pools, bounded route search, LP as ERC20 |
 | 5 | ERC-4337 paymaster for ERC20 contracts (separate project) |
 
 ## 13. Integrator fee & external routers
@@ -355,6 +356,8 @@ user pays 0.5%
 Notes:
 
 - The fee is deducted before the pool math: `amountInForPool = amountIn - integratorFee`.
+- For exact-output swaps the fee is grossed up on top of the pool input so it stays a percentage of
+  the total amount paid: `totalIn = poolIn + ceil(poolIn * bps / (10_000 - bps))`.
 - `integrator` may be any valid address; it does not need to be the caller. Contracts normally pass
   their own address.
 - The cap is a **user-protection** parameter: users cannot easily inspect calldata, so without a cap

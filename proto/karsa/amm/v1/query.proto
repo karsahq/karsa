@@ -13,6 +13,7 @@ service Query {
   rpc Pools(QueryPoolsRequest) returns (QueryPoolsResponse);
   rpc PoolByAssets(QueryPoolByAssetsRequest) returns (QueryPoolByAssetsResponse);
   rpc Quote(QueryQuoteRequest) returns (QueryQuoteResponse);
+  rpc QuoteExactOut(QueryQuoteExactOutRequest) returns (QueryQuoteExactOutResponse);
   rpc Twap(QueryTwapRequest) returns (QueryTwapResponse);
   rpc Params(QueryParamsRequest) returns (QueryParamsResponse);
 }
@@ -51,6 +52,17 @@ message QueryQuoteRequest {
 
 message QueryQuoteResponse {
   string amount_out = 1
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+}
+
+message QueryQuoteExactOutRequest {
+  repeated string path = 1;
+  string amount_out = 2
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+}
+
+message QueryQuoteExactOutResponse {
+  string amount_in = 1
       [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
 }
 

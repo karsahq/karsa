@@ -15,6 +15,7 @@ service Msg {
   rpc AddLiquidity(MsgAddLiquidity) returns (MsgAddLiquidityResponse);
   rpc RemoveLiquidity(MsgRemoveLiquidity) returns (MsgRemoveLiquidityResponse);
   rpc SwapExactIn(MsgSwapExactIn) returns (MsgSwapExactInResponse);
+  rpc SwapExactOut(MsgSwapExactOut) returns (MsgSwapExactOutResponse);
   rpc UpdateParams(MsgUpdateParams) returns (MsgUpdateParamsResponse);
 }
 
@@ -93,6 +94,30 @@ message MsgSwapExactIn {
 
 message MsgSwapExactInResponse {
   string amount_out = 1
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  string integrator_fee = 2
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+}
+
+message MsgSwapExactOut {
+  option (cosmos.msg.v1.signer) = "sender";
+
+  string sender = 1;
+  // Path of ERC20 addresses; len(path) >= 2.
+  repeated string path = 2;
+  string amount_out = 3
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  // Upper bound on the amount of the first asset the sender is willing to pay.
+  string max_amount_in = 4
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  string receiver = 5;
+  int64 deadline = 6;
+  string integrator = 7;
+  uint32 integrator_fee_bps = 8;
+}
+
+message MsgSwapExactOutResponse {
+  string amount_in = 1
       [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
   string integrator_fee = 2
       [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];

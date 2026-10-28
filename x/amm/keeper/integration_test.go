@@ -202,6 +202,137 @@ func TestSwapWithIntegratorFee(t *testing.T) {
 	require.ErrorIs(t, err, ammtypes.ErrInvalidFee)
 }
 
+// TestSwapExactOut checks exact-output swaps: the receiver gets exactly the
+// requested amount and the sender pays the quoted input, bounded by max_in.
+func TestSwapExactOut(t *testing.T) {
+	app, ctx := newTestApp(t)
+	registerTestUSDCPair(t, app, ctx)
+
+	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AD").Bytes())
+	receiver := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AE").Bytes())
+	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
+
+	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	_, _, err := app.AmmKeeper.CreatePool(
+		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 30,
+		sdkmath.NewInt(1_000_000), sdkmath.NewInt(1_000_000),
+	)
+	require.NoError(t, err)
+
+	path := []string{akraAsset.Hex(), testUSDCPair.Hex()}
+	amountOut := sdkmath.NewInt(9_000)
+
+	quotedIn, err := app.AmmKeeper.QuoteExactOut(ctx, path, amountOut)
+	require.NoError(t, err)
+	require.True(t, quotedIn.IsPositive())
+
+	// The bound is checked before any funds move.
+	_, _, err = app.AmmKeeper.SwapExactOut(
+		ctx, sender, receiver, path, amountOut, quotedIn.SubRaw(1), nil, 0,
+	)
+	require.ErrorIs(t, err, ammtypes.ErrSlippageExceeded)
+
+	akraBefore := app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount
+	usdcBefore := app.BankKeeper.GetBalance(ctx, receiver, testUSDCDenom).Amount
+
+	amountIn, integratorFee, err := app.AmmKeeper.SwapExactOut(
+		ctx, sender, receiver, path, amountOut, quotedIn, nil, 0,
+	)
+	require.NoError(t, err)
+	require.Equal(t, quotedIn, amountIn)
+	require.True(t, integratorFee.IsZero())
+
+	require.Equal(t, usdcBefore.Add(amountOut), app.BankKeeper.GetBalance(ctx, receiver, testUSDCDenom).Amount)
+	require.Equal(t, akraBefore.Sub(amountIn), app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount)
+}
+
+// TestSwapExactOutIntegratorFee checks that the integrator fee is grossed up on
+// top of the pool input so it is a percentage of the total amount paid.
+func TestSwapExactOutIntegratorFee(t *testing.T) {
+	app, ctx := newTestApp(t)
+	registerTestUSDCPair(t, app, ctx)
+
+	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000BA").Bytes())
+	integrator := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000CA").Bytes())
+	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
+
+	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	_, _, err := app.AmmKeeper.CreatePool(
+		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 30,
+		sdkmath.NewInt(1_000_000), sdkmath.NewInt(1_000_000),
+	)
+	require.NoError(t, err)
+
+	path := []string{akraAsset.Hex(), testUSDCPair.Hex()}
+	amountOut := sdkmath.NewInt(9_000)
+
+	poolNeed, err := app.AmmKeeper.QuoteExactOut(ctx, path, amountOut)
+	require.NoError(t, err)
+
+	feeBps := uint32(20)
+	// fee = ceil(poolNeed * bps / (10_000 - bps))
+	expectedFee := poolNeed.MulRaw(int64(feeBps)).AddRaw(10_000 - int64(feeBps) - 1).QuoRaw(10_000 - int64(feeBps))
+	senderBefore := app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount
+
+	amountIn, integratorFee, err := app.AmmKeeper.SwapExactOut(
+		ctx, sender, sender, path, amountOut, poolNeed.Add(expectedFee), integrator, feeBps,
+	)
+	require.NoError(t, err)
+	require.Equal(t, expectedFee, integratorFee)
+	require.Equal(t, poolNeed.Add(expectedFee), amountIn)
+	require.Equal(t, expectedFee, app.BankKeeper.GetBalance(ctx, integrator, karsaNativeDenom()).Amount)
+	require.Equal(t, senderBefore.Sub(amountIn), app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount)
+}
+
+// TestSwapExactOutMultiHop exercises the backward pass over two pools.
+func TestSwapExactOutMultiHop(t *testing.T) {
+	app, ctx := newTestApp(t)
+	registerTestUSDCPair(t, app, ctx)
+
+	const momoDenom = "umomo"
+	momoPair := common.HexToAddress("0x1000000000000000000000000000000000000002")
+	require.NoError(t, app.Erc20Keeper.SetToken(
+		ctx, erc20types.NewTokenPair(momoPair, momoDenom, erc20types.OWNER_MODULE),
+	))
+	require.NoError(t, app.Erc20Keeper.EnableDynamicPrecompile(ctx, momoPair))
+
+	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000BD").Bytes())
+	receiver := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000CE").Bytes())
+	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
+
+	momoCoins := sdk.NewCoins(sdk.NewCoin(momoDenom, sdkmath.NewIntWithDecimal(1_000, 18)))
+	require.NoError(t, app.BankKeeper.MintCoins(ctx, ammtypes.ModuleName, momoCoins))
+	require.NoError(t, app.BankKeeper.SendCoinsFromModuleToAccount(ctx, ammtypes.ModuleName, sender, momoCoins))
+
+	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	deposit := sdkmath.NewInt(1_000_000)
+	_, _, err := app.AmmKeeper.CreatePool(
+		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 30, deposit, deposit,
+	)
+	require.NoError(t, err)
+	_, _, err = app.AmmKeeper.CreatePool(
+		ctx, sender, testUSDCPair.Hex(), momoPair.Hex(), 30, deposit, deposit,
+	)
+	require.NoError(t, err)
+
+	path := []string{akraAsset.Hex(), testUSDCPair.Hex(), momoPair.Hex()}
+	amountOut := sdkmath.NewInt(5_000)
+
+	quotedIn, err := app.AmmKeeper.QuoteExactOut(ctx, path, amountOut)
+	require.NoError(t, err)
+
+	akraBefore := app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount
+	momoBefore := app.BankKeeper.GetBalance(ctx, receiver, momoDenom).Amount
+
+	amountIn, _, err := app.AmmKeeper.SwapExactOut(
+		ctx, sender, receiver, path, amountOut, quotedIn, nil, 0,
+	)
+	require.NoError(t, err)
+	require.Equal(t, quotedIn, amountIn)
+	require.Equal(t, momoBefore.Add(amountOut), app.BankKeeper.GetBalance(ctx, receiver, momoDenom).Amount)
+	require.Equal(t, akraBefore.Sub(amountIn), app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount)
+}
+
 // deployTestERC20 deploys the example ERC20 contract from the given address and
 // returns its address.
 func deployTestERC20(t *testing.T, app *karsa.App, ctx sdk.Context, deployer common.Address, name, symbol string, decimals uint8) common.Address {
