@@ -2,8 +2,8 @@
 
 Status: **in progress** — `x/amm` implements constant-product pools, integrator
 fees, LP shares with an ERC20 precompile, and direct custody for external ERC20
-contracts. Pending: AMM precompile, TWAP, fee abstraction, conversion-free
-whitelisting policy.
+contracts. Pending: AMM precompile and TWAP. Fee abstraction (paying gas in a
+token) is **descoped**.
 
 ## 1. Goals
 
@@ -31,7 +31,7 @@ An ERC20 address on Karsa can be one of:
 | Native denom (`akra`) | `OWNER_MODULE` | bank (precompile at the native address) | ✅ no conversion |
 | IBC voucher auto-pair | `OWNER_MODULE` | bank (address derived from trace hash) | ✅ no conversion |
 | Coin-registered pair | `OWNER_MODULE` | bank | ✅ no conversion |
-| User-deployed ERC20 | `OWNER_EXTERNAL` | contract storage (escrowed when converted) | ✅ only in whitelisted conversion pools |
+| User-deployed ERC20 | `OWNER_EXTERNAL` | contract storage (held by the module) | ✅ permissionless, capability-checked |
 
 Pool reserves are **bank denoms** in all cases. For `OWNER_MODULE` pairs the bank balance and the
 EVM view are the same number. For `OWNER_EXTERNAL` pairs the reserve is the `erc20:0x…` denom,
@@ -108,12 +108,15 @@ user (or the ICS20 precompile) explicitly converts for an IBC transfer; the AMM 
 
 Requirements:
 
-- **Whitelist** the token (governance). Only immutable, standard ERC20 contracts: reject
-  fee-on-transfer, rebasing, pausable/blacklistable, upgradeable or self-destructible tokens.
+- **Capability checks, not a whitelist.** Pools are permissionless. A token is accepted only if the
+  first real transfer behaves like a standard ERC20: the module measures `balanceOf` before/after and
+  rejects the deposit when the delta differs from the requested amount (this rejects fee-on-transfer
+  and rebasing tokens).
 - **Measure balance deltas** (`balanceOf` before/after). Never assume the received amount equals the
   requested amount.
-- **Reentrancy guard** covering the whole message: a hostile token can call back into the AMM
-  precompile while reserves are mid-update.
+- **Reentrancy guard** covering the whole message: a hostile token can call back into the module
+  while reserves are mid-update.
+- **Gas cap**: EVM calls are bounded by `server/config.DefaultGasCap` (25M).
 - **Authorization**: the module executes `transfer` with `from` equal to the message signer, and only
   for the exact signed amount. Never accept an arbitrary `from` from calldata.
 - **Fee abstraction is not solved here**: gas is charged before execution, so an `OWNER_EXTERNAL`
@@ -140,7 +143,7 @@ Rejection rules (return an error, never silently skip):
 - the input is a denom string instead of a 20-byte address (e.g. `ibc/…`, `akra`,
   `erc20:0x…`) — the API boundary only accepts ERC20 addresses; denoms are an
   internal detail resolved via `x/erc20`
-- `OWNER_EXTERNAL` pair whose token is not whitelisted (see §2.2)
+- `OWNER_EXTERNAL` pair whose token fails the capability check on first deposit
 
 Special case: the asset whose resolved denom equals `evmtypes.GetEVMCoinDenom()` is the native asset. Its reserves are plain bank `akra`.
 
@@ -177,7 +180,6 @@ Params (`MsgUpdateParams`, governance only):
 | `protocol_fee_bps` | 0 | off in phase 1 |
 | `min_initial_liquidity` | 1000 | anti-spam, also locks a minimum share |
 | `max_price_impact_bps` | 1000 | guard on `quote`/`swap` |
-| `fee_abstraction_tokens` | `[]` | whitelist for gas payment |
 
 ## 5. Messages
 
@@ -246,7 +248,12 @@ Rules:
   derivation — `sha256(denom)` truncated to 20 bytes — plus
   `RegisterERC20CodeHash` + `EnableDynamicPrecompile`.
 
-## 10. Fee abstraction integration
+## 10. Fee abstraction integration (descoped)
+
+> **Status: not in scope.** Paying gas with a non-native token was descoped: it requires trading a
+> token into `akra` before execution, which adds price-manipulation and MEV surface for a benefit
+> that is mostly onboarding. Kept here as a reference if it is ever revived; gas can instead be
+> sponsored by integrators through an ERC-4337 paymaster (§10.2).
 
 Fee abstraction has two different scopes, because the ante handler can only move **bank**
 balances:
@@ -292,7 +299,7 @@ Open design points (ante path):
 |---|---|
 | CheckTx vs DeliverTx price drift | TWAP + 10–20% buffer; reject beyond `max_price_impact_bps` |
 | Gas refunds | charge on `gasLimit`, or settle actual usage in a post-handler |
-| Which tokens | whitelist only (`fee_abstraction_tokens`) |
+| Which tokens (if revived) | whitelist only |
 | Solvency | floor per pool; cap per-block fee swaps |
 
 ## 11. Security checklist
@@ -316,8 +323,8 @@ Open design points (ante path):
 | Phase | Scope |
 |---|---|
 | 1 | Module skeleton, constant product, create/add/remove/swap, `Quote`, integrator fee, 1–2 hop path, LP as bank denom, precompile for `swap`/`quote` |
-| 2 | Direct-custody pools for whitelisted ERC20 contracts (EVM transfers, balance-delta checks, reentrancy guard) |
-| 3 | TWAP + ante fee abstraction for bank-canonical assets (`akra`, IBC) |
+| 2 | Direct-custody pools for external ERC20 contracts (EVM transfers, balance-delta checks, reentrancy guard) |
+| 3 | TWAP for fees/pricing (fee abstraction is descoped) |
 | 4 | Stableswap pools, `SwapExactOut`, bounded route search, LP as ERC20 |
 | 5 | ERC-4337 paymaster for ERC20 contracts (separate project) |
 
@@ -387,4 +394,5 @@ Rules:
 - Solidity AMM/router contracts
 - Flash swaps (module → EVM callback)
 - Cross-chain swaps (IBC packet-forward based)
-- Permissionless pools for non-whitelisted ERC20 contracts
+- Token whitelisting (pools are permissionless; compatibility is enforced by balance-delta checks)
+- Paying gas with a non-native token (descoped, see §10)
