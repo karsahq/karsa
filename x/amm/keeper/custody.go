@@ -74,12 +74,23 @@ func (k Keeper) resolveAsset(ctx sdk.Context, asset string) (resolvedAsset, erro
 	return resolved, nil
 }
 
-// evmBalance reads balanceOf(account) on an ERC20 contract.
-func (k Keeper) evmBalance(ctx sdk.Context, token, account common.Address) (sdkmath.Int, error) {
-	stateDB := statedb.New(ctx, k.evmKeeper, statedb.NewEmptyTxConfig())
+// evmStateDB returns the stateDB to use, creating one when the call does not
+// originate from an EVM execution context.
+func (k Keeper) evmStateDB(ctx sdk.Context, stateDB *statedb.StateDB) *statedb.StateDB {
+	if stateDB != nil {
+		return stateDB
+	}
 
+	return statedb.New(ctx, k.evmKeeper, statedb.NewEmptyTxConfig())
+}
+
+// evmBalanceWith reads balanceOf(account) on an ERC20 contract.
+func (k Keeper) evmBalanceWith(
+	ctx sdk.Context, stateDB *statedb.StateDB, token, account common.Address,
+) (sdkmath.Int, error) {
 	res, err := k.evmKeeper.CallEVM(
-		ctx, stateDB, types.ERC20ABI, account, token, false, false, nil, "balanceOf", account,
+		ctx, k.evmStateDB(ctx, stateDB), types.ERC20ABI, account, token, false, false, nil,
+		"balanceOf", account,
 	)
 	if err != nil {
 		return sdkmath.Int{}, errorsmod.Wrap(err, "balanceOf call failed")
@@ -101,18 +112,20 @@ func (k Keeper) evmBalance(ctx sdk.Context, token, account common.Address) (sdkm
 	return sdkmath.NewIntFromBigInt(amount), nil
 }
 
-// evmTransfer moves `amount` of an ERC20 from `from` to `to` and verifies the
-// balance delta, which rejects fee-on-transfer and other non-standard tokens.
-func (k Keeper) evmTransfer(ctx sdk.Context, token, from, to common.Address, amount sdkmath.Int) error {
-	before, err := k.evmBalance(ctx, token, to)
+// evmTransferWith moves `amount` of an ERC20 from `from` to `to` and verifies
+// the balance delta, which rejects fee-on-transfer and other non-standard tokens.
+func (k Keeper) evmTransferWith(
+	ctx sdk.Context, stateDB *statedb.StateDB, fromPrecompile bool,
+	token, from, to common.Address, amount sdkmath.Int,
+) error {
+	before, err := k.evmBalanceWith(ctx, stateDB, token, to)
 	if err != nil {
 		return err
 	}
 
-	stateDB := statedb.New(ctx, k.evmKeeper, statedb.NewEmptyTxConfig())
-
 	res, err := k.evmKeeper.CallEVM(
-		ctx, stateDB, types.ERC20ABI, from, token, true, false, nil, "transfer", to, amount.BigInt(),
+		ctx, k.evmStateDB(ctx, stateDB), types.ERC20ABI, from, token, true, fromPrecompile, nil,
+		"transfer", to, amount.BigInt(),
 	)
 	if err != nil {
 		return types.ErrInsufficientFunds.Wrapf("transfer call failed: %s", err)
@@ -130,7 +143,7 @@ func (k Keeper) evmTransfer(ctx sdk.Context, token, from, to common.Address, amo
 		}
 	}
 
-	after, err := k.evmBalance(ctx, token, to)
+	after, err := k.evmBalanceWith(ctx, stateDB, token, to)
 	if err != nil {
 		return err
 	}
@@ -145,6 +158,14 @@ func (k Keeper) evmTransfer(ctx sdk.Context, token, from, to common.Address, amo
 
 // moveIn moves funds from an account into the module.
 func (k Keeper) moveIn(ctx sdk.Context, asset resolvedAsset, from common.Address, amount sdkmath.Int) error {
+	return k.moveInWith(ctx, nil, false, asset, from, amount)
+}
+
+// moveInWith is moveIn with an optional EVM execution context.
+func (k Keeper) moveInWith(
+	ctx sdk.Context, stateDB *statedb.StateDB, fromPrecompile bool,
+	asset resolvedAsset, from common.Address, amount sdkmath.Int,
+) error {
 	if !amount.IsPositive() {
 		return types.ErrInvalidAmount.Wrap("amount must be positive")
 	}
@@ -160,7 +181,7 @@ func (k Keeper) moveIn(ctx sdk.Context, asset resolvedAsset, from common.Address
 		return nil
 
 	case evmAsset:
-		return k.evmTransfer(ctx, asset.Contract, from, k.moduleAddress, amount)
+		return k.evmTransferWith(ctx, stateDB, fromPrecompile, asset.Contract, from, k.moduleAddress, amount)
 
 	default:
 		return types.ErrInvalidAsset.Wrap("unknown asset kind")
@@ -169,6 +190,14 @@ func (k Keeper) moveIn(ctx sdk.Context, asset resolvedAsset, from common.Address
 
 // moveOut moves funds from the module to an account.
 func (k Keeper) moveOut(ctx sdk.Context, asset resolvedAsset, to common.Address, amount sdkmath.Int) error {
+	return k.moveOutWith(ctx, nil, false, asset, to, amount)
+}
+
+// moveOutWith is moveOut with an optional EVM execution context.
+func (k Keeper) moveOutWith(
+	ctx sdk.Context, stateDB *statedb.StateDB, fromPrecompile bool,
+	asset resolvedAsset, to common.Address, amount sdkmath.Int,
+) error {
 	if !amount.IsPositive() {
 		return types.ErrInvalidAmount.Wrap("amount must be positive")
 	}
@@ -184,7 +213,7 @@ func (k Keeper) moveOut(ctx sdk.Context, asset resolvedAsset, to common.Address,
 		return nil
 
 	case evmAsset:
-		return k.evmTransfer(ctx, asset.Contract, k.moduleAddress, to, amount)
+		return k.evmTransferWith(ctx, stateDB, fromPrecompile, asset.Contract, k.moduleAddress, to, amount)
 
 	default:
 		return types.ErrInvalidAsset.Wrap("unknown asset kind")
@@ -198,7 +227,7 @@ func (k Keeper) assertCustody(ctx sdk.Context, asset resolvedAsset, reserve sdkm
 		return nil
 	}
 
-	balance, err := k.evmBalance(ctx, asset.Contract, k.moduleAddress)
+	balance, err := k.evmBalanceWith(ctx, nil, asset.Contract, k.moduleAddress)
 	if err != nil {
 		return err
 	}

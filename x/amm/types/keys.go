@@ -30,6 +30,9 @@ var (
 	ReentrancyKey = []byte{0x05}
 )
 
+// PrecompileAddress is the fixed EVM address of the AMM precompile.
+const PrecompileAddress = "0x0000000000000000000000000000000000000900"
+
 // PoolKey returns the store key for a pool id.
 func PoolKey(id uint64) []byte {
 	bz := make([]byte, 8)

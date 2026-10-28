@@ -55,6 +55,7 @@ import (
 	karsaconfig "github.com/karsahq/karsa/config"
 	"github.com/karsahq/karsa/x/amm"
 	ammkeeper "github.com/karsahq/karsa/x/amm/keeper"
+	ammprecompile "github.com/karsahq/karsa/x/amm/precompile"
 	ammtypes "github.com/karsahq/karsa/x/amm/types"
 
 	autocliv1 "cosmossdk.io/api/cosmos/autocli/v1"
@@ -481,19 +482,6 @@ func NewApp(
 		&app.Erc20Keeper,
 		evmChainID,
 		tracer,
-	).WithStaticPrecompiles(
-		precompiletypes.DefaultStaticPrecompiles(
-			*app.StakingKeeper,
-			app.DistrKeeper,
-			app.BankKeeper,
-			&app.Erc20Keeper,
-			app.TransferKeeper,
-			app.IBCKeeper.ChannelKeeper,
-			app.IBCKeeper.ClientKeeper,
-			app.GovKeeper,
-			app.SlashingKeeper,
-			appCodec,
-		),
 	)
 
 	// enable virtual fee collection
@@ -518,6 +506,22 @@ func NewApp(
 		app.EVMKeeper,
 		authtypes.NewModuleAddress(govtypes.ModuleName).String(),
 	)
+
+	// Register the AMM precompile so EVM contracts can quote and swap.
+	staticPrecompiles := precompiletypes.DefaultStaticPrecompiles(
+		*app.StakingKeeper,
+		app.DistrKeeper,
+		app.BankKeeper,
+		&app.Erc20Keeper,
+		app.TransferKeeper,
+		app.IBCKeeper.ChannelKeeper,
+		app.IBCKeeper.ClientKeeper,
+		app.GovKeeper,
+		app.SlashingKeeper,
+		appCodec,
+	)
+	staticPrecompiles[ammprecompile.Address] = ammprecompile.NewPrecompile(app.AmmKeeper)
+	app.EVMKeeper = app.EVMKeeper.WithStaticPrecompiles(staticPrecompiles)
 
 	/*
 		Create Transfer Stack

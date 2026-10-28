@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	karsa "github.com/karsahq/karsa"
+	ammprecompile "github.com/karsahq/karsa/x/amm/precompile"
 	ammtypes "github.com/karsahq/karsa/x/amm/types"
 
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
@@ -253,6 +254,66 @@ func erc20BalanceOf(t *testing.T, app *karsa.App, ctx sdk.Context, token, accoun
 	require.True(t, ok)
 
 	return sdkmath.NewIntFromBigInt(amount)
+}
+
+// TestAmmPrecompile exercises the EVM-facing precompile: quote and swap.
+func TestAmmPrecompile(t *testing.T) {
+	app, ctx := newTestApp(t)
+	registerTestUSDCPair(t, app, ctx)
+
+	caller := common.HexToAddress("0x00000000000000000000000000000000000000F1")
+	initial := sdkmath.NewInt(1_000_000_000)
+	fundTestDenoms(t, app, ctx, sdk.AccAddress(caller.Bytes()), initial)
+
+	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	_, _, err := app.AmmKeeper.CreatePool(
+		ctx, sdk.AccAddress(caller.Bytes()), akraAsset.Hex(), testUSDCPair.Hex(), 30,
+		sdkmath.NewInt(1_000_000), sdkmath.NewInt(1_000_000),
+	)
+	require.NoError(t, err)
+
+	path := []common.Address{akraAsset, testUSDCPair}
+	amountIn := big.NewInt(10_000)
+
+	// --- quote through the precompile -------------------------------------
+	quoteInput, err := ammprecompile.ABI.Pack("quote", path, amountIn)
+	require.NoError(t, err)
+
+	stateDB := statedb.New(ctx, app.EVMKeeper, statedb.NewEmptyTxConfig())
+	res, err := app.EVMKeeper.CallEVMWithData(ctx, stateDB, caller, &ammprecompile.Address, quoteInput, false, false, nil)
+	require.NoError(t, err)
+	require.False(t, res.Failed(), res.VmError)
+
+	quoteOut, err := ammprecompile.ABI.Unpack("quote", res.Ret)
+	require.NoError(t, err)
+	require.Len(t, quoteOut, 1)
+
+	expectedQuote, err := app.AmmKeeper.Quote(ctx, []string{akraAsset.Hex(), testUSDCPair.Hex()}, sdkmath.NewIntFromBigInt(amountIn))
+	require.NoError(t, err)
+	require.Equal(t, expectedQuote.BigInt(), quoteOut[0].(*big.Int))
+
+	// --- swap through the precompile --------------------------------------
+	before := app.BankKeeper.GetBalance(ctx, sdk.AccAddress(caller.Bytes()), testUSDCDenom).Amount
+
+	swapInput, err := ammprecompile.ABI.Pack(
+		"swapExactIn", path, amountIn, big.NewInt(1), common.Address{}, common.Address{}, big.NewInt(0),
+	)
+	require.NoError(t, err)
+
+	stateDB = statedb.New(ctx, app.EVMKeeper, statedb.NewEmptyTxConfig())
+	res, err = app.EVMKeeper.CallEVMWithData(ctx, stateDB, caller, &ammprecompile.Address, swapInput, true, false, nil)
+	require.NoError(t, err)
+	require.False(t, res.Failed(), res.VmError)
+
+	swapOut, err := ammprecompile.ABI.Unpack("swapExactIn", res.Ret)
+	require.NoError(t, err)
+	require.Len(t, swapOut, 2)
+
+	amountOut := swapOut[0].(*big.Int)
+	require.Equal(t, expectedQuote.BigInt(), amountOut)
+
+	after := app.BankKeeper.GetBalance(ctx, sdk.AccAddress(caller.Bytes()), testUSDCDenom).Amount
+	require.Equal(t, before.Add(sdkmath.NewIntFromBigInt(amountOut)), after)
 }
 
 // TestExternalERC20Pool exercises direct custody: the module holds the ERC20

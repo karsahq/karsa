@@ -10,6 +10,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/evm/x/vm/statedb"
 )
 
 // validatePath checks basic swap path constraints.
@@ -120,6 +121,41 @@ func (k Keeper) Swap(
 	integrator sdk.AccAddress,
 	integratorFeeBps uint32,
 ) (sdkmath.Int, sdkmath.Int, error) {
+	return k.swapExec(ctx, nil, false, sender, receiver, path, amountIn, minOut, integrator, integratorFeeBps)
+}
+
+// SwapFromPrecompile executes a swap on behalf of an EVM caller, reusing the
+// current EVM stateDB so nested ERC20 transfers are applied atomically.
+func (k Keeper) SwapFromPrecompile(
+	ctx sdk.Context,
+	stateDB *statedb.StateDB,
+	caller, receiver common.Address,
+	path []string,
+	amountIn, minOut sdkmath.Int,
+	integrator common.Address,
+	integratorFeeBps uint32,
+) (sdkmath.Int, sdkmath.Int, error) {
+	sender := sdk.AccAddress(caller.Bytes())
+	recv := sdk.AccAddress(receiver.Bytes())
+
+	var integratorAcc sdk.AccAddress
+	if integrator != (common.Address{}) {
+		integratorAcc = sdk.AccAddress(integrator.Bytes())
+	}
+
+	return k.swapExec(ctx, stateDB, true, sender, recv, path, amountIn, minOut, integratorAcc, integratorFeeBps)
+}
+
+func (k Keeper) swapExec(
+	ctx sdk.Context,
+	stateDB *statedb.StateDB,
+	fromPrecompile bool,
+	sender, receiver sdk.AccAddress,
+	path []string,
+	amountIn, minOut sdkmath.Int,
+	integrator sdk.AccAddress,
+	integratorFeeBps uint32,
+) (sdkmath.Int, sdkmath.Int, error) {
 	if err := k.validatePath(ctx, path); err != nil {
 		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
@@ -149,12 +185,12 @@ func (k Keeper) Swap(
 	}
 
 	// Pull the full input into the module account.
-	if err := k.moveIn(ctx, first, common.BytesToAddress(sender.Bytes()), amountIn); err != nil {
+	if err := k.moveInWith(ctx, stateDB, fromPrecompile, first, common.BytesToAddress(sender.Bytes()), amountIn); err != nil {
 		return sdkmath.Int{}, sdkmath.Int{}, types.ErrInsufficientFunds.Wrap(err.Error())
 	}
 
 	if integratorFee.IsPositive() {
-		if err := k.moveOut(ctx, first, common.BytesToAddress(integrator.Bytes()), integratorFee); err != nil {
+		if err := k.moveOutWith(ctx, stateDB, fromPrecompile, first, common.BytesToAddress(integrator.Bytes()), integratorFee); err != nil {
 			return sdkmath.Int{}, sdkmath.Int{}, err
 		}
 	}
@@ -199,7 +235,7 @@ func (k Keeper) Swap(
 		)
 	}
 
-	if err := k.moveOut(ctx, last, common.BytesToAddress(receiver.Bytes()), amount); err != nil {
+	if err := k.moveOutWith(ctx, stateDB, fromPrecompile, last, common.BytesToAddress(receiver.Bytes()), amount); err != nil {
 		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
 

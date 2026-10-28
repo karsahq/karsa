@@ -38,7 +38,9 @@ func BlockedAddresses() map[string]bool {
 		blockedAddrs[authtypes.NewModuleAddress(acc).String()] = true
 	}
 
-	blockedPrecompilesHex := vmtypes.AvailableStaticPrecompiles
+	blockedPrecompilesHex := make([]string, 0, len(vmtypes.AvailableStaticPrecompiles)+len(corevm.PrecompiledAddressesPrague)+1)
+	blockedPrecompilesHex = append(blockedPrecompilesHex, vmtypes.AvailableStaticPrecompiles...)
+	blockedPrecompilesHex = append(blockedPrecompilesHex, ammtypes.PrecompileAddress)
 	for _, addr := range corevm.PrecompiledAddressesPrague {
 		blockedPrecompilesHex = append(blockedPrecompilesHex, addr.Hex())
 	}

@@ -8,6 +8,7 @@ import (
 	feemarkettypes "github.com/cosmos/evm/x/feemarket/types"
 	evmtypes "github.com/cosmos/evm/x/vm/types"
 	"github.com/karsahq/karsa/config"
+	ammtypes "github.com/karsahq/karsa/x/amm/types"
 
 	minttypes "github.com/cosmos/cosmos-sdk/x/mint/types"
 )
@@ -29,7 +30,10 @@ func NewEVMGenesisState() *evmtypes.GenesisState {
 	evmGenState := evmtypes.DefaultGenesisState()
 	evmGenState.Params.EvmDenom = config.BaseDenom
 	evmGenState.Params.ExtendedDenomOptions = &evmtypes.ExtendedDenomOptions{ExtendedDenom: config.BaseDenom}
-	evmGenState.Params.ActiveStaticPrecompiles = evmtypes.AvailableStaticPrecompiles
+	evmGenState.Params.ActiveStaticPrecompiles = append(
+		append([]string{}, evmtypes.AvailableStaticPrecompiles...),
+		ammtypes.PrecompileAddress,
+	)
 	evmGenState.Preinstalls = evmtypes.DefaultPreinstalls
 
 	return evmGenState
