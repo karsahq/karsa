@@ -53,6 +53,9 @@ import (
 	ibctm "github.com/cosmos/ibc-go/v11/modules/light-clients/07-tendermint"
 	ibctesting "github.com/cosmos/ibc-go/v11/testing"
 	karsaconfig "github.com/karsahq/karsa/config"
+	"github.com/karsahq/karsa/x/amm"
+	ammkeeper "github.com/karsahq/karsa/x/amm/keeper"
+	ammtypes "github.com/karsahq/karsa/x/amm/types"
 
 	autocliv1 "cosmossdk.io/api/cosmos/autocli/v1"
 	reflectionv1 "cosmossdk.io/api/cosmos/reflection/v1"
@@ -189,6 +192,9 @@ type App struct {
 	Erc20Keeper     erc20keeper.Keeper
 	EVMMempool      sdkmempool.ExtMempool
 
+	// Karsa keepers
+	AmmKeeper ammkeeper.Keeper
+
 	// the module manager
 	ModuleManager      *module.Manager
 	BasicModuleManager module.BasicManager
@@ -244,6 +250,8 @@ func NewApp(
 		ibcexported.StoreKey, ibctransfertypes.StoreKey,
 		// Cosmos EVM store keys
 		evmtypes.StoreKey, feemarkettypes.StoreKey, erc20types.StoreKey,
+		// Karsa store keys
+		ammtypes.StoreKey,
 	)
 	oKeys := storetypes.NewObjectStoreKeys(banktypes.ObjectStoreKey, evmtypes.ObjectKey)
 
@@ -502,6 +510,14 @@ func NewApp(
 		app.TransferKeeper,
 	)
 
+	app.AmmKeeper = ammkeeper.NewKeeper(
+		keys[ammtypes.StoreKey],
+		appCodec,
+		app.BankKeeper,
+		app.Erc20Keeper,
+		authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+	)
+
 	/*
 		Create Transfer Stack
 
@@ -586,6 +602,8 @@ func NewApp(
 		vmModule,
 		feemarket.NewAppModule(app.FeeMarketKeeper),
 		erc20.NewAppModule(app.Erc20Keeper, app.AccountKeeper),
+		// Karsa modules
+		amm.NewAppModule(app.AmmKeeper),
 	)
 
 	// BasicModuleManager defines the module BasicManager which is in charge of setting up basic,
@@ -672,6 +690,7 @@ func NewApp(
 		evmtypes.ModuleName,
 		feemarkettypes.ModuleName,
 		erc20types.ModuleName,
+		ammtypes.ModuleName,
 
 		ibctransfertypes.ModuleName,
 		genutiltypes.ModuleName, evidencetypes.ModuleName, authz.ModuleName,

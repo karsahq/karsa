@@ -1,0 +1,60 @@
+syntax = "proto3";
+package karsa.amm.v1;
+
+import "gogoproto/gogo.proto";
+import "cosmos/base/query/v1beta1/pagination.proto";
+import "karsa/amm/v1/amm.proto";
+
+option go_package = "github.com/karsahq/karsa/x/amm/types";
+
+// Query defines the amm Query service.
+service Query {
+  rpc Pool(QueryPoolRequest) returns (QueryPoolResponse);
+  rpc Pools(QueryPoolsRequest) returns (QueryPoolsResponse);
+  rpc PoolByAssets(QueryPoolByAssetsRequest) returns (QueryPoolByAssetsResponse);
+  rpc Quote(QueryQuoteRequest) returns (QueryQuoteResponse);
+  rpc Params(QueryParamsRequest) returns (QueryParamsResponse);
+}
+
+message QueryPoolRequest {
+  uint64 pool_id = 1;
+}
+
+message QueryPoolResponse {
+  Pool pool = 1 [(gogoproto.nullable) = false];
+}
+
+message QueryPoolsRequest {
+  cosmos.base.query.v1beta1.PageRequest pagination = 1;
+}
+
+message QueryPoolsResponse {
+  repeated Pool pools = 1 [(gogoproto.nullable) = false];
+  cosmos.base.query.v1beta1.PageResponse pagination = 2;
+}
+
+message QueryPoolByAssetsRequest {
+  string asset_a = 1;
+  string asset_b = 2;
+}
+
+message QueryPoolByAssetsResponse {
+  Pool pool = 1 [(gogoproto.nullable) = false];
+}
+
+message QueryQuoteRequest {
+  repeated string path = 1;
+  string amount_in = 2
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+}
+
+message QueryQuoteResponse {
+  string amount_out = 1
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+}
+
+message QueryParamsRequest {}
+
+message QueryParamsResponse {
+  Params params = 1 [(gogoproto.nullable) = false];
+}

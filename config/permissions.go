@@ -15,6 +15,7 @@ import (
 	vmtypes "github.com/cosmos/evm/x/vm/types"
 	transfertypes "github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
 	corevm "github.com/ethereum/go-ethereum/core/vm"
+	ammtypes "github.com/karsahq/karsa/x/amm/types"
 )
 
 // BlockedAddresses returns all the app's blocked account addresses.
@@ -63,6 +64,9 @@ var maccPerms = map[string][]string{
 	vmtypes.ModuleName:        {authtypes.Minter, authtypes.Burner},
 	feemarkettypes.ModuleName: nil,
 	erc20types.ModuleName:     {authtypes.Minter, authtypes.Burner},
+
+	// Karsa modules
+	ammtypes.ModuleName: {authtypes.Minter, authtypes.Burner},
 }
 
 // GetMaccPerms returns a copy of the module account permissions

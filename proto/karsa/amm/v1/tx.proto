@@ -1,0 +1,108 @@
+syntax = "proto3";
+package karsa.amm.v1;
+
+import "gogoproto/gogo.proto";
+import "cosmos/msg/v1/msg.proto";
+import "karsa/amm/v1/amm.proto";
+
+option go_package = "github.com/karsahq/karsa/x/amm/types";
+
+// Msg defines the amm Msg service.
+service Msg {
+  option (cosmos.msg.v1.service) = true;
+
+  rpc CreatePool(MsgCreatePool) returns (MsgCreatePoolResponse);
+  rpc AddLiquidity(MsgAddLiquidity) returns (MsgAddLiquidityResponse);
+  rpc RemoveLiquidity(MsgRemoveLiquidity) returns (MsgRemoveLiquidityResponse);
+  rpc SwapExactIn(MsgSwapExactIn) returns (MsgSwapExactInResponse);
+  rpc UpdateParams(MsgUpdateParams) returns (MsgUpdateParamsResponse);
+}
+
+message MsgCreatePool {
+  option (cosmos.msg.v1.signer) = "sender";
+
+  string sender = 1;
+  string asset_a = 2;
+  string asset_b = 3;
+  uint32 fee_bps = 4;
+  string amount_a = 5
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  string amount_b = 6
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+}
+
+message MsgCreatePoolResponse {
+  uint64 pool_id = 1;
+}
+
+message MsgAddLiquidity {
+  option (cosmos.msg.v1.signer) = "sender";
+
+  string sender = 1;
+  uint64 pool_id = 2;
+  string amount_a = 3
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  string amount_b = 4
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  string min_shares = 5
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+}
+
+message MsgAddLiquidityResponse {
+  string shares = 1
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+}
+
+message MsgRemoveLiquidity {
+  option (cosmos.msg.v1.signer) = "sender";
+
+  string sender = 1;
+  uint64 pool_id = 2;
+  string shares = 3
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  string min_a = 4
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  string min_b = 5
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+}
+
+message MsgRemoveLiquidityResponse {
+  string amount_a = 1
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  string amount_b = 2
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+}
+
+message MsgSwapExactIn {
+  option (cosmos.msg.v1.signer) = "sender";
+
+  string sender = 1;
+  // Path of ERC20 addresses; len(path) >= 2.
+  repeated string path = 2;
+  string amount_in = 3
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  string min_out = 4
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  string receiver = 5;
+  // Unix seconds; 0 means no deadline.
+  int64 deadline = 6;
+  // Optional integrator that receives an extra fee on top of the pool fee.
+  string integrator = 7;
+  uint32 integrator_fee_bps = 8;
+}
+
+message MsgSwapExactInResponse {
+  string amount_out = 1
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  string integrator_fee = 2
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+}
+
+message MsgUpdateParams {
+  option (cosmos.msg.v1.signer) = "authority";
+
+  string authority = 1;
+  Params params = 2 [(gogoproto.nullable) = false];
+}
+
+message MsgUpdateParamsResponse {}

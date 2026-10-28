@@ -1,0 +1,53 @@
+syntax = "proto3";
+package karsa.amm.v1;
+
+import "gogoproto/gogo.proto";
+import "cosmos/base/v1beta1/coin.proto";
+
+option go_package = "github.com/karsahq/karsa/x/amm/types";
+
+// Pool is a constant-product liquidity pool keyed by two ERC20 addresses.
+message Pool {
+  uint64 id = 1;
+  // ERC20 addresses (lowercase hex) of the two assets, sorted ascending.
+  string asset_a = 2;
+  string asset_b = 3;
+  // Bank denoms resolved from the token pairs of asset_a / asset_b.
+  string denom_a = 4;
+  string denom_b = 5;
+  string reserve_a = 6
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  string reserve_b = 7
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  string total_shares = 8
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  // Shares minted to the module at creation and never redeemable.
+  string locked_shares = 9
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  uint32 fee_bps = 10;
+  string lp_denom = 11;
+}
+
+// Params defines the module parameters.
+message Params {
+  uint32 max_hops = 1;
+  uint32 default_fee_bps = 2;
+  // Cap on the fee an integrator may add on top of the pool fee.
+  uint32 max_integrator_fee_bps = 3;
+  string min_initial_liquidity = 4
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  string min_locked_shares = 5
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  repeated cosmos.base.v1beta1.Coin creation_fee = 6 [
+    (gogoproto.nullable) = false,
+    (gogoproto.castrepeated) = "github.com/cosmos/cosmos-sdk/types.Coins"
+  ];
+  uint32 fee_burn_bps = 7;
+}
+
+// GenesisState defines the module genesis state.
+message GenesisState {
+  Params params = 1 [(gogoproto.nullable) = false];
+  repeated Pool pools = 2 [(gogoproto.nullable) = false];
+  uint64 next_pool_id = 3;
+}
