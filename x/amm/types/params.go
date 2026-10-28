@@ -16,8 +16,11 @@ func DefaultParams() Params {
 		MaxIntegratorFeeBps: 100,
 		MinInitialLiquidity: sdkmath.NewInt(10_000),
 		MinLockedShares:     sdkmath.NewInt(1_000),
-		CreationFee:         sdk.NewCoins(),
-		FeeBurnBps:          0,
+		// Creation fee is a chain-level policy: 100 KRA. It matches
+		// config.BaseDenom; the module cannot import the config package
+		// without creating an import cycle.
+		CreationFee: sdk.NewCoins(sdk.NewCoin("akra", sdkmath.NewIntWithDecimal(100, 18))),
+		FeeBurnBps:  0,
 	}
 }
 

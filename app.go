@@ -504,6 +504,7 @@ func NewApp(
 		app.BankKeeper,
 		&app.Erc20Keeper,
 		app.EVMKeeper,
+		app.DistrKeeper,
 		authtypes.NewModuleAddress(govtypes.ModuleName).String(),
 	)
 

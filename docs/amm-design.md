@@ -180,6 +180,8 @@ Params (`MsgUpdateParams`, governance only):
 | `default_fee_bps` | 30 | 0.30% |
 | `protocol_fee_bps` | 0 | off in phase 1 |
 | `min_initial_liquidity` | 1000 | anti-spam, also locks a minimum share |
+| `creation_fee` | 100 `akra` | one-off fee paid by the pool creator, routed to the community pool (see §15) |
+| `fee_burn_bps` | 0 | share of `creation_fee` burned instead of pooled |
 | `max_price_impact_bps` | 1000 | guard on `quote`/`swap` |
 
 ## 5. Messages

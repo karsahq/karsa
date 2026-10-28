@@ -39,3 +39,8 @@ type Erc20Keeper interface {
 type EVMKeeper interface {
 	erc20types.EVMKeeper
 }
+
+// DistributionKeeper funds the community pool with the creation fee.
+type DistributionKeeper interface {
+	FundCommunityPool(ctx context.Context, amount sdk.Coins, sender sdk.AccAddress) error
+}

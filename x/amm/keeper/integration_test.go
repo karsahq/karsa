@@ -90,7 +90,7 @@ func TestCreatePoolAddRemoveAndSwap(t *testing.T) {
 	registerTestUSDCPair(t, app, ctx)
 
 	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AA").Bytes())
-	initial := sdkmath.NewInt(1_000_000_000)
+	initial := sdkmath.NewIntWithDecimal(1_000, 18)
 	fundTestDenoms(t, app, ctx, sender, initial)
 
 	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
@@ -175,7 +175,7 @@ func TestSwapWithIntegratorFee(t *testing.T) {
 
 	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000BB").Bytes())
 	integrator := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000CC").Bytes())
-	fundTestDenoms(t, app, ctx, sender, sdkmath.NewInt(1_000_000_000))
+	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
 
 	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
 	_, _, err := app.AmmKeeper.CreatePool(
@@ -257,6 +257,34 @@ func erc20BalanceOf(t *testing.T, app *karsa.App, ctx sdk.Context, token, accoun
 	return sdkmath.NewIntFromBigInt(amount)
 }
 
+// TestCreationFee verifies the fee is charged on pool creation.
+func TestCreationFee(t *testing.T) {
+	app, ctx := newTestApp(t)
+	registerTestUSDCPair(t, app, ctx)
+
+	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AC").Bytes())
+	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
+
+	params := app.AmmKeeper.GetParams(ctx)
+	require.False(t, params.CreationFee.IsZero(), "creation fee should default to a positive amount")
+
+	fee := params.CreationFee.AmountOf(karsaNativeDenom())
+	require.True(t, fee.IsPositive())
+
+	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	deposit := sdkmath.NewInt(1_000_000)
+
+	before := app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount
+
+	_, _, err := app.AmmKeeper.CreatePool(
+		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 30, deposit, deposit,
+	)
+	require.NoError(t, err)
+
+	after := app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount
+	require.Equal(t, before.Sub(fee).Sub(deposit), after)
+}
+
 // TestTwap checks the time-weighted price over a controlled window.
 func TestTwap(t *testing.T) {
 	app, ctx := newTestApp(t)
@@ -265,7 +293,7 @@ func TestTwap(t *testing.T) {
 	ctx = ctx.WithBlockTime(time.Unix(1_000, 0))
 
 	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AB").Bytes())
-	fundTestDenoms(t, app, ctx, sender, sdkmath.NewInt(1_000_000_000))
+	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
 
 	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
 	poolID, _, err := app.AmmKeeper.CreatePool(
@@ -294,7 +322,7 @@ func TestAmmPrecompile(t *testing.T) {
 	registerTestUSDCPair(t, app, ctx)
 
 	caller := common.HexToAddress("0x00000000000000000000000000000000000000F1")
-	initial := sdkmath.NewInt(1_000_000_000)
+	initial := sdkmath.NewIntWithDecimal(1_000, 18)
 	fundTestDenoms(t, app, ctx, sdk.AccAddress(caller.Bytes()), initial)
 
 	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
@@ -356,7 +384,7 @@ func TestExternalERC20Pool(t *testing.T) {
 	deployer := common.HexToAddress("0x00000000000000000000000000000000000000EE")
 
 	// Fund the deployer with the native denom for the other pool side.
-	nativeCoins := sdk.NewCoins(sdk.NewCoin(karsaNativeDenom(), sdkmath.NewInt(1_000_000_000)))
+	nativeCoins := sdk.NewCoins(sdk.NewCoin(karsaNativeDenom(), sdkmath.NewIntWithDecimal(1_000, 18)))
 	require.NoError(t, app.BankKeeper.MintCoins(ctx, ammtypes.ModuleName, nativeCoins))
 	require.NoError(t, app.BankKeeper.SendCoinsFromModuleToAccount(
 		ctx, ammtypes.ModuleName, sdk.AccAddress(deployer.Bytes()), nativeCoins,

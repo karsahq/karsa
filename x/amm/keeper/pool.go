@@ -136,8 +136,21 @@ func (k Keeper) CreatePool(
 	}
 
 	if !params.CreationFee.IsZero() {
-		if err := k.bankKeeper.SendCoinsFromAccountToModule(ctx, sender, types.ModuleName, params.CreationFee); err != nil {
-			return 0, sdkmath.Int{}, types.ErrInsufficientFunds.Wrapf("creation fee: %s", err)
+		burnCoins, poolCoins := splitFee(params.CreationFee, params.FeeBurnBps)
+
+		if !burnCoins.IsZero() {
+			if err := k.bankKeeper.SendCoinsFromAccountToModule(ctx, sender, types.ModuleName, burnCoins); err != nil {
+				return 0, sdkmath.Int{}, types.ErrInsufficientFunds.Wrapf("creation fee: %s", err)
+			}
+			if err := k.bankKeeper.BurnCoins(ctx, types.ModuleName, burnCoins); err != nil {
+				return 0, sdkmath.Int{}, err
+			}
+		}
+
+		if !poolCoins.IsZero() {
+			if err := k.distrKeeper.FundCommunityPool(ctx, poolCoins, sender); err != nil {
+				return 0, sdkmath.Int{}, types.ErrInsufficientFunds.Wrapf("creation fee: %s", err)
+			}
 		}
 	}
 
@@ -210,6 +223,32 @@ func (k Keeper) CreatePool(
 func sqrt(a, b *big.Int) *big.Int {
 	product := new(big.Int).Mul(a, b)
 	return new(big.Int).Sqrt(product)
+}
+
+// splitFee splits the creation fee into a burned part and a community-pool part.
+func splitFee(fee sdk.Coins, burnBps uint32) (burn, pool sdk.Coins) {
+	if burnBps >= 10_000 {
+		return fee, sdk.NewCoins()
+	}
+	if burnBps == 0 {
+		return sdk.NewCoins(), fee
+	}
+
+	burn = sdk.NewCoins()
+	pool = sdk.NewCoins()
+
+	for _, coin := range fee {
+		burned := coin.Amount.MulRaw(int64(burnBps)).QuoRaw(10_000)
+		if burned.IsPositive() {
+			burn = burn.Add(sdk.NewCoin(coin.Denom, burned))
+		}
+		remainder := coin.Amount.Sub(burned)
+		if remainder.IsPositive() {
+			pool = pool.Add(sdk.NewCoin(coin.Denom, remainder))
+		}
+	}
+
+	return burn, pool
 }
 
 // registerLPAsset creates bank metadata for the LP denom and registers it as a
