@@ -3,6 +3,7 @@ package keeper
 import (
 	"strconv"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/karsahq/karsa/x/amm/types"
 
 	sdkmath "cosmossdk.io/math"
@@ -50,9 +51,21 @@ func (k Keeper) AddLiquidity(
 		return sdkmath.Int{}, types.ErrInvalidAmount.Wrap("deposit does not match pool ratio")
 	}
 
-	deposit := sdk.NewCoins(sdk.NewCoin(pool.DenomA, usedA), sdk.NewCoin(pool.DenomB, usedB))
-	if err := k.bankKeeper.SendCoinsFromAccountToModule(ctx, sender, types.ModuleName, deposit); err != nil {
-		return sdkmath.Int{}, types.ErrInsufficientFunds.Wrap(err.Error())
+	depositA, err := k.resolveAsset(ctx, pool.AssetA)
+	if err != nil {
+		return sdkmath.Int{}, err
+	}
+	depositB, err := k.resolveAsset(ctx, pool.AssetB)
+	if err != nil {
+		return sdkmath.Int{}, err
+	}
+
+	senderAddr := common.BytesToAddress(sender.Bytes())
+	if err := k.moveIn(ctx, depositA, senderAddr, usedA); err != nil {
+		return sdkmath.Int{}, types.ErrInsufficientFunds.Wrapf("deposit %s: %s", pool.AssetA, err)
+	}
+	if err := k.moveIn(ctx, depositB, senderAddr, usedB); err != nil {
+		return sdkmath.Int{}, types.ErrInsufficientFunds.Wrapf("deposit %s: %s", pool.AssetB, err)
 	}
 
 	coins := sdk.NewCoins(sdk.NewCoin(pool.LpDenom, shares))
@@ -115,6 +128,16 @@ func (k Keeper) RemoveLiquidity(
 		return sdkmath.Int{}, sdkmath.Int{}, types.ErrSlippageExceeded.Wrap("output below minimum")
 	}
 
+	assetOutA, err := k.resolveAsset(ctx, pool.AssetA)
+	if err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
+	}
+	assetOutB, err := k.resolveAsset(ctx, pool.AssetB)
+	if err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
+	}
+
+	// Burn LP shares first so the withdrawal cannot be replayed.
 	coins := sdk.NewCoins(sdk.NewCoin(pool.LpDenom, shares))
 	if err := k.bankKeeper.SendCoinsFromAccountToModule(ctx, sender, types.ModuleName, coins); err != nil {
 		return sdkmath.Int{}, sdkmath.Int{}, types.ErrInsufficientFunds.Wrap(err.Error())
@@ -123,8 +146,11 @@ func (k Keeper) RemoveLiquidity(
 		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
 
-	out := sdk.NewCoins(sdk.NewCoin(pool.DenomA, outA), sdk.NewCoin(pool.DenomB, outB))
-	if err := k.bankKeeper.SendCoinsFromModuleToAccount(ctx, types.ModuleName, sender, out); err != nil {
+	senderAddr := common.BytesToAddress(sender.Bytes())
+	if err := k.moveOut(ctx, assetOutA, senderAddr, outA); err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
+	}
+	if err := k.moveOut(ctx, assetOutB, senderAddr, outB); err != nil {
 		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
 
@@ -132,6 +158,13 @@ func (k Keeper) RemoveLiquidity(
 	pool.ReserveB = pool.ReserveB.Sub(outB)
 	pool.TotalShares = pool.TotalShares.Sub(shares)
 	k.SetPool(ctx, pool)
+
+	if err := k.assertCustody(ctx, assetOutA, pool.ReserveA); err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
+	}
+	if err := k.assertCustody(ctx, assetOutB, pool.ReserveB); err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
+	}
 
 	ctx.EventManager().EmitEvent(sdk.NewEvent(
 		types.EventTypeRemoveLiquidity,

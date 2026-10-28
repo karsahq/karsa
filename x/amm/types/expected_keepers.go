@@ -33,3 +33,9 @@ type Erc20Keeper interface {
 	SetToken(ctx sdk.Context, pair erc20types.TokenPair) error
 	EnableDynamicPrecompile(ctx sdk.Context, address common.Address) error
 }
+
+// EVMKeeper is the subset of the EVM keeper needed to move external ERC20
+// tokens held by the module (direct custody).
+type EVMKeeper interface {
+	erc20types.EVMKeeper
+}

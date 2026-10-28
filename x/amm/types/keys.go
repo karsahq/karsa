@@ -26,6 +26,8 @@ var (
 	NextPoolIDKey = []byte{0x03}
 	// ParamsKey stores the module params.
 	ParamsKey = []byte{0x04}
+	// ReentrancyKey is set while a state-mutating message is executing.
+	ReentrancyKey = []byte{0x05}
 )
 
 // PoolKey returns the store key for a pool id.

@@ -17,4 +17,5 @@ var (
 	ErrDeadlineExceeded          = errorsmod.Register(ModuleName, 11, "deadline exceeded")
 	ErrUnauthorized              = errorsmod.Register(ModuleName, 12, "unauthorized")
 	ErrInvalidParams             = errorsmod.Register(ModuleName, 13, "invalid params")
+	ErrReentrancy                = errorsmod.Register(ModuleName, 14, "reentrant call")
 )

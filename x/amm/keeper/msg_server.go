@@ -35,6 +35,11 @@ func parseAddress(value string) (sdk.AccAddress, error) {
 func (m msgServer) CreatePool(goCtx context.Context, msg *types.MsgCreatePool) (*types.MsgCreatePoolResponse, error) {
 	ctx := sdk.UnwrapSDKContext(goCtx)
 
+	if err := m.acquireLock(ctx); err != nil {
+		return nil, err
+	}
+	defer m.releaseLock(ctx)
+
 	sender, err := sdk.AccAddressFromBech32(msg.Sender)
 	if err != nil {
 		return nil, types.ErrInvalidAmount.Wrapf("invalid sender: %s", err)
@@ -51,6 +56,11 @@ func (m msgServer) CreatePool(goCtx context.Context, msg *types.MsgCreatePool) (
 // AddLiquidity deposits liquidity into a pool.
 func (m msgServer) AddLiquidity(goCtx context.Context, msg *types.MsgAddLiquidity) (*types.MsgAddLiquidityResponse, error) {
 	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	if err := m.acquireLock(ctx); err != nil {
+		return nil, err
+	}
+	defer m.releaseLock(ctx)
 
 	sender, err := sdk.AccAddressFromBech32(msg.Sender)
 	if err != nil {
@@ -69,6 +79,11 @@ func (m msgServer) AddLiquidity(goCtx context.Context, msg *types.MsgAddLiquidit
 func (m msgServer) RemoveLiquidity(goCtx context.Context, msg *types.MsgRemoveLiquidity) (*types.MsgRemoveLiquidityResponse, error) {
 	ctx := sdk.UnwrapSDKContext(goCtx)
 
+	if err := m.acquireLock(ctx); err != nil {
+		return nil, err
+	}
+	defer m.releaseLock(ctx)
+
 	sender, err := sdk.AccAddressFromBech32(msg.Sender)
 	if err != nil {
 		return nil, types.ErrInvalidAmount.Wrapf("invalid sender: %s", err)
@@ -85,6 +100,11 @@ func (m msgServer) RemoveLiquidity(goCtx context.Context, msg *types.MsgRemoveLi
 // SwapExactIn executes an exact-input swap.
 func (m msgServer) SwapExactIn(goCtx context.Context, msg *types.MsgSwapExactIn) (*types.MsgSwapExactInResponse, error) {
 	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	if err := m.acquireLock(ctx); err != nil {
+		return nil, err
+	}
+	defer m.releaseLock(ctx)
 
 	sender, err := sdk.AccAddressFromBech32(msg.Sender)
 	if err != nil {

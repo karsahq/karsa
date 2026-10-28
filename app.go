@@ -515,6 +515,7 @@ func NewApp(
 		appCodec,
 		app.BankKeeper,
 		&app.Erc20Keeper,
+		app.EVMKeeper,
 		authtypes.NewModuleAddress(govtypes.ModuleName).String(),
 	)
 

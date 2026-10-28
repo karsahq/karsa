@@ -3,6 +3,7 @@
 package keeper_test
 
 import (
+	"math/big"
 	"strings"
 	"testing"
 
@@ -11,13 +12,16 @@ import (
 
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 
+	contracts "github.com/cosmos/evm/contracts"
 	testconstants "github.com/cosmos/evm/testutil/constants"
 	erc20types "github.com/cosmos/evm/x/erc20/types"
+	"github.com/cosmos/evm/x/vm/statedb"
 	evmtypes "github.com/cosmos/evm/x/vm/types"
 
 	sdkmath "cosmossdk.io/math"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
 
@@ -196,23 +200,109 @@ func TestSwapWithIntegratorFee(t *testing.T) {
 	require.ErrorIs(t, err, ammtypes.ErrInvalidFee)
 }
 
-// TestExternalERC20IsRejected documents the current boundary: pools only accept
-// bank-backed (module-owned) token pairs until direct custody is implemented.
-func TestExternalERC20IsRejected(t *testing.T) {
+// deployTestERC20 deploys the example ERC20 contract from the given address and
+// returns its address.
+func deployTestERC20(t *testing.T, app *karsa.App, ctx sdk.Context, deployer common.Address, name, symbol string, decimals uint8) common.Address {
+	t.Helper()
+
+	nonce, err := app.AccountKeeper.GetSequence(ctx, deployer.Bytes())
+	require.NoError(t, err)
+	expected := crypto.CreateAddress(deployer, nonce)
+
+	ctorArgs, err := contracts.ERC20MinterBurnerDecimalsContract.ABI.Pack("", name, symbol, decimals)
+	require.NoError(t, err)
+
+	initCode := append(append([]byte{}, contracts.ERC20MinterBurnerDecimalsContract.Bin...), ctorArgs...)
+
+	stateDB := statedb.New(ctx, app.EVMKeeper, statedb.NewEmptyTxConfig())
+	_, err = app.EVMKeeper.CallEVMWithData(ctx, stateDB, deployer, nil, initCode, true, false, nil)
+	require.NoError(t, err)
+	require.True(t, app.EVMKeeper.IsContract(ctx, expected), "contract not deployed")
+
+	return expected
+}
+
+func mintTestERC20(t *testing.T, app *karsa.App, ctx sdk.Context, token, to common.Address, amount sdkmath.Int) {
+	t.Helper()
+
+	stateDB := statedb.New(ctx, app.EVMKeeper, statedb.NewEmptyTxConfig())
+	res, err := app.EVMKeeper.CallEVM(
+		ctx, stateDB, contracts.ERC20MinterBurnerDecimalsContract.ABI, to, token, true, false, nil,
+		"mint", to, amount.BigInt(),
+	)
+	require.NoError(t, err)
+	require.False(t, res.Failed(), res.VmError)
+}
+
+func erc20BalanceOf(t *testing.T, app *karsa.App, ctx sdk.Context, token, account common.Address) sdkmath.Int {
+	t.Helper()
+
+	stateDB := statedb.New(ctx, app.EVMKeeper, statedb.NewEmptyTxConfig())
+	res, err := app.EVMKeeper.CallEVM(
+		ctx, stateDB, contracts.ERC20MinterBurnerDecimalsContract.ABI, account, token, false, false, nil,
+		"balanceOf", account,
+	)
+	require.NoError(t, err)
+	require.False(t, res.Failed(), res.VmError)
+
+	out, err := contracts.ERC20MinterBurnerDecimalsContract.ABI.Unpack("balanceOf", res.Ret)
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+
+	amount, ok := out[0].(*big.Int)
+	require.True(t, ok)
+
+	return sdkmath.NewIntFromBigInt(amount)
+}
+
+// TestExternalERC20Pool exercises direct custody: the module holds the ERC20
+// contract tokens itself and moves them with EVM transfers.
+func TestExternalERC20Pool(t *testing.T) {
 	app, ctx := newTestApp(t)
 
-	externalAddr := common.HexToAddress("0x2000000000000000000000000000000000000001")
-	externalDenom := "erc20:" + strings.ToLower(externalAddr.Hex())
+	deployer := common.HexToAddress("0x00000000000000000000000000000000000000EE")
+
+	// Fund the deployer with the native denom for the other pool side.
+	nativeCoins := sdk.NewCoins(sdk.NewCoin(karsaNativeDenom(), sdkmath.NewInt(1_000_000_000)))
+	require.NoError(t, app.BankKeeper.MintCoins(ctx, ammtypes.ModuleName, nativeCoins))
+	require.NoError(t, app.BankKeeper.SendCoinsFromModuleToAccount(
+		ctx, ammtypes.ModuleName, sdk.AccAddress(deployer.Bytes()), nativeCoins,
+	))
+
+	token := deployTestERC20(t, app, ctx, deployer, "Momo", "MOMO", 18)
+	mintTestERC20(t, app, ctx, token, deployer, sdkmath.NewInt(1_000_000))
+
+	denom := "erc20:" + strings.ToLower(token.Hex())
 	require.NoError(t, app.Erc20Keeper.SetToken(ctx, erc20types.NewTokenPair(
-		externalAddr, externalDenom, erc20types.OWNER_EXTERNAL,
+		token, denom, erc20types.OWNER_EXTERNAL,
 	)))
 
-	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000DD").Bytes())
 	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	sender := sdk.AccAddress(deployer.Bytes())
 
-	_, _, err := app.AmmKeeper.CreatePool(
-		ctx, sender, akraAsset.Hex(), externalAddr.Hex(), 30,
-		sdkmath.NewInt(1_000_000), sdkmath.NewInt(1_000_000),
+	poolID, shares, err := app.AmmKeeper.CreatePool(
+		ctx, sender, akraAsset.Hex(), token.Hex(), 30,
+		sdkmath.NewInt(100_000), sdkmath.NewInt(100_000),
 	)
-	require.ErrorIs(t, err, ammtypes.ErrUnsupportedAsset)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), poolID)
+	require.True(t, shares.IsPositive())
+
+	// The module must hold the ERC20 reserves itself.
+	moduleAddr := app.AmmKeeper.ModuleAddress()
+	require.Equal(t, sdkmath.NewInt(100_000), erc20BalanceOf(t, app, ctx, token, moduleAddr))
+	require.Equal(t, sdkmath.NewInt(900_000), erc20BalanceOf(t, app, ctx, token, deployer))
+
+	// Swap native -> ERC20: output is transferred out of module custody.
+	path := []string{akraAsset.Hex(), token.Hex()}
+	before := erc20BalanceOf(t, app, ctx, token, deployer)
+
+	amountOut, _, err := app.AmmKeeper.Swap(
+		ctx, sender, sender, path, sdkmath.NewInt(1_000), sdkmath.NewInt(1), nil, 0,
+	)
+	require.NoError(t, err)
+
+	after := erc20BalanceOf(t, app, ctx, token, deployer)
+	require.Equal(t, before.Add(amountOut), after)
+	require.Equal(t, sdkmath.NewInt(100_000).Sub(amountOut), erc20BalanceOf(t, app, ctx, token, moduleAddr))
 }

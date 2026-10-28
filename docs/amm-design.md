@@ -1,6 +1,9 @@
 # Karsa AMM — Design
 
-Status: **draft / not implemented**
+Status: **in progress** — `x/amm` implements constant-product pools, integrator
+fees, LP shares with an ERC20 precompile, and direct custody for external ERC20
+contracts. Pending: AMM precompile, TWAP, fee abstraction, conversion-free
+whitelisting policy.
 
 ## 1. Goals
 

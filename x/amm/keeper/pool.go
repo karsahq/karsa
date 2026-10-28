@@ -20,44 +20,6 @@ import (
 	sdk "github.com/cosmos/cosmos-sdk/types"
 )
 
-// resolvedAsset is an ERC20 address mapped to its bank denom.
-type resolvedAsset struct {
-	Address string // lowercase hex
-	Denom   string
-}
-
-// resolveAsset validates that the given ERC20 address has an enabled,
-// bank-backed token pair and returns its normalized address and denom.
-//
-// NOTE: pools for external (contract-owned) ERC20 tokens are not supported yet;
-// transferring those requires executing EVM calls, which is a later phase.
-func (k Keeper) resolveAsset(ctx sdk.Context, asset string) (resolvedAsset, error) {
-	if !common.IsHexAddress(asset) {
-		return resolvedAsset{}, types.ErrInvalidAsset.Wrapf("asset %q is not an ERC20 address", asset)
-	}
-
-	addr := common.HexToAddress(asset)
-	pairID := k.erc20Keeper.GetTokenPairID(ctx, addr.Hex())
-	if len(pairID) == 0 {
-		return resolvedAsset{}, types.ErrInvalidAsset.Wrapf("asset %s has no registered token pair", asset)
-	}
-
-	pair, found := k.erc20Keeper.GetTokenPair(ctx, pairID)
-	if !found {
-		return resolvedAsset{}, types.ErrInvalidAsset.Wrapf("token pair not found for asset %s", asset)
-	}
-	if !pair.Enabled {
-		return resolvedAsset{}, types.ErrInvalidAsset.Wrapf("token pair for asset %s is disabled", asset)
-	}
-	if !pair.IsNativeCoin() {
-		return resolvedAsset{}, types.ErrUnsupportedAsset.Wrapf(
-			"asset %s is an external ERC20; only bank-backed token pairs are poolable for now", asset,
-		)
-	}
-
-	return resolvedAsset{Address: strings.ToLower(addr.Hex()), Denom: pair.Denom}, nil
-}
-
 // GetNextPoolID returns the id that will be assigned to the next pool.
 func (k Keeper) GetNextPoolID(ctx sdk.Context) uint64 {
 	bz := k.Store(ctx).Get(types.NextPoolIDKey)
@@ -179,9 +141,11 @@ func (k Keeper) CreatePool(
 		}
 	}
 
-	deposit := sdk.NewCoins(sdk.NewCoin(a.Denom, amountA), sdk.NewCoin(b.Denom, amountB))
-	if err := k.bankKeeper.SendCoinsFromAccountToModule(ctx, sender, types.ModuleName, deposit); err != nil {
-		return 0, sdkmath.Int{}, types.ErrInsufficientFunds.Wrapf("initial liquidity: %s", err)
+	if err := k.moveIn(ctx, a, common.BytesToAddress(sender.Bytes()), amountA); err != nil {
+		return 0, sdkmath.Int{}, types.ErrInsufficientFunds.Wrapf("initial liquidity %s: %s", a.Address, err)
+	}
+	if err := k.moveIn(ctx, b, common.BytesToAddress(sender.Bytes()), amountB); err != nil {
+		return 0, sdkmath.Int{}, types.ErrInsufficientFunds.Wrapf("initial liquidity %s: %s", b.Address, err)
 	}
 
 	id := k.GetNextPoolID(ctx)
@@ -220,6 +184,13 @@ func (k Keeper) CreatePool(
 	k.SetPool(ctx, pool)
 	k.SetPoolIDByAssets(ctx, a.Address, b.Address, id)
 	k.SetNextPoolID(ctx, id+1)
+
+	if err := k.assertCustody(ctx, a, pool.ReserveA); err != nil {
+		return 0, sdkmath.Int{}, err
+	}
+	if err := k.assertCustody(ctx, b, pool.ReserveB); err != nil {
+		return 0, sdkmath.Int{}, err
+	}
 
 	ctx.EventManager().EmitEvent(sdk.NewEvent(
 		types.EventTypeCreatePool,

@@ -149,16 +149,12 @@ func (k Keeper) Swap(
 	}
 
 	// Pull the full input into the module account.
-	if err := k.bankKeeper.SendCoinsFromAccountToModule(
-		ctx, sender, types.ModuleName, sdk.NewCoins(sdk.NewCoin(first.Denom, amountIn)),
-	); err != nil {
+	if err := k.moveIn(ctx, first, common.BytesToAddress(sender.Bytes()), amountIn); err != nil {
 		return sdkmath.Int{}, sdkmath.Int{}, types.ErrInsufficientFunds.Wrap(err.Error())
 	}
 
 	if integratorFee.IsPositive() {
-		if err := k.bankKeeper.SendCoinsFromModuleToAccount(
-			ctx, types.ModuleName, integrator, sdk.NewCoins(sdk.NewCoin(first.Denom, integratorFee)),
-		); err != nil {
+		if err := k.moveOut(ctx, first, common.BytesToAddress(integrator.Bytes()), integratorFee); err != nil {
 			return sdkmath.Int{}, sdkmath.Int{}, err
 		}
 	}
@@ -203,9 +199,7 @@ func (k Keeper) Swap(
 		)
 	}
 
-	if err := k.bankKeeper.SendCoinsFromModuleToAccount(
-		ctx, types.ModuleName, receiver, sdk.NewCoins(sdk.NewCoin(last.Denom, amount)),
-	); err != nil {
+	if err := k.moveOut(ctx, last, common.BytesToAddress(receiver.Bytes()), amount); err != nil {
 		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
 
