@@ -12,6 +12,10 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 
+	erc20types "github.com/cosmos/evm/x/erc20/types"
+
+	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+
 	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 )
@@ -193,6 +197,12 @@ func (k Keeper) CreatePool(
 		return 0, sdkmath.Int{}, err
 	}
 
+	// Register the LP share as an ERC20 precompile so EVM contracts can hold it.
+	lpAssetID, err := k.registerLPAsset(ctx, id, lpDenom)
+	if err != nil {
+		return 0, sdkmath.Int{}, err
+	}
+
 	pool := types.Pool{
 		Id:           id,
 		AssetA:       a.Address,
@@ -205,6 +215,7 @@ func (k Keeper) CreatePool(
 		LockedShares: params.MinLockedShares,
 		FeeBps:       feeBps,
 		LpDenom:      lpDenom,
+		LpAssetId:    lpAssetID,
 	}
 	k.SetPool(ctx, pool)
 	k.SetPoolIDByAssets(ctx, a.Address, b.Address, id)
@@ -227,4 +238,45 @@ func (k Keeper) CreatePool(
 func sqrt(a, b *big.Int) *big.Int {
 	product := new(big.Int).Mul(a, b)
 	return new(big.Int).Sqrt(product)
+}
+
+// registerLPAsset creates bank metadata for the LP denom and registers it as a
+// module-owned ERC20 precompile. Returns the lowercase hex ERC20 address.
+func (k Keeper) registerLPAsset(ctx sdk.Context, poolID uint64, lpDenom string) (string, error) {
+	addr := types.LPAssetAddress(lpDenom)
+	if k.erc20Keeper.IsDenomRegistered(ctx, lpDenom) {
+		return "", types.ErrInvalidAsset.Wrapf("denom %s is already registered", lpDenom)
+	}
+	if k.erc20Keeper.IsERC20Registered(ctx, addr) {
+		return "", types.ErrInvalidAsset.Wrapf("erc20 address %s is already registered", addr.Hex())
+	}
+
+	symbol := "KLP-" + strconv.FormatUint(poolID, 10)
+	display := "klp-" + strconv.FormatUint(poolID, 10)
+
+	metadata := banktypes.Metadata{
+		Description: "Karsa AMM pool share",
+		DenomUnits: []*banktypes.DenomUnit{
+			{Denom: lpDenom, Exponent: 0},
+			{Denom: display, Exponent: 18},
+		},
+		Base:    lpDenom,
+		Display: display,
+		Name:    symbol,
+		Symbol:  symbol,
+	}
+	if err := metadata.Validate(); err != nil {
+		return "", types.ErrInvalidAsset.Wrapf("invalid lp metadata: %s", err)
+	}
+	k.bankKeeper.SetDenomMetaData(ctx, metadata)
+
+	pair := erc20types.NewTokenPair(addr, lpDenom, erc20types.OWNER_MODULE)
+	if err := k.erc20Keeper.SetToken(ctx, pair); err != nil {
+		return "", err
+	}
+	if err := k.erc20Keeper.EnableDynamicPrecompile(ctx, addr); err != nil {
+		return "", err
+	}
+
+	return strings.ToLower(addr.Hex()), nil
 }

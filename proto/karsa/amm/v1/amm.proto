@@ -24,8 +24,10 @@ message Pool {
   // Shares minted to the module at creation and never redeemable.
   string locked_shares = 9
       [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
-  uint32 fee_bps = 10;
-  string lp_denom = 11;
+  	uint32 fee_bps = 10;
+  	string lp_denom = 11;
+  	// ERC20 precompile address of the LP share (lowercase hex).
+  	string lp_asset_id = 12;
 }
 
 // Params defines the module parameters.

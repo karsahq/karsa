@@ -1,8 +1,11 @@
 package types
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"strconv"
+
+	"github.com/ethereum/go-ethereum/common"
 )
 
 const (
@@ -43,4 +46,14 @@ func PoolByAssetsKey(assetA, assetB string) []byte {
 // LPDenom returns the bank denom of the LP share for a pool.
 func LPDenom(id uint64) string {
 	return "amm/pool/" + strconv.FormatUint(id, 10)
+}
+
+// LPAssetAddress derives the deterministic ERC20 precompile address of an LP denom.
+//
+// The x/erc20 helper used for IBC vouchers (GetIBCDenomAddress) only accepts
+// "ibc/…" denoms, so LP shares need their own namespaced derivation. The
+// "amm/lp/" prefix keeps it disjoint from IBC trace hashes.
+func LPAssetAddress(lpDenom string) common.Address {
+	hash := sha256.Sum256([]byte("amm/lp/" + lpDenom))
+	return common.BytesToAddress(hash[12:])
 }
