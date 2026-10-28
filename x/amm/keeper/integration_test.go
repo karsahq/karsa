@@ -381,6 +381,27 @@ func TestStableSwapPool(t *testing.T) {
 	require.Equal(t, uint64(1_000_000_000_000), pool.ScalingFactorA)
 	require.Equal(t, uint64(1_000_000_000_000), pool.ScalingFactorB)
 
+	// The precompile must expose the stableswap configuration.
+	getPoolInput, err := ammprecompile.ABI.Pack("getPool", testUSDCPair, testUSDTPair)
+	require.NoError(t, err)
+
+	stateDB := statedb.New(ctx, app.EVMKeeper, statedb.NewEmptyTxConfig())
+	res, err := app.EVMKeeper.CallEVMWithData(
+		ctx, stateDB, common.BytesToAddress(sender.Bytes()), &ammprecompile.Address, getPoolInput, false, false, nil,
+	)
+	require.NoError(t, err)
+	require.False(t, res.Failed(), res.VmError)
+
+	info, err := ammprecompile.ABI.Unpack("getPool", res.Ret)
+	require.NoError(t, err)
+	require.Len(t, info, 9)
+	require.Equal(t, uint8(1), info[5], "pool type")
+	require.Equal(t, uint64(100), info[6], "amplification")
+	require.ElementsMatch(t,
+		[]uint64{1_000_000_000_000, 1_000_000_000_000},
+		[]uint64{info[7].(*big.Int).Uint64(), info[8].(*big.Int).Uint64()},
+	)
+
 	path := []string{testUSDCPair.Hex(), testUSDTPair.Hex()}
 	amountIn := sdkmath.NewInt(10_000)
 

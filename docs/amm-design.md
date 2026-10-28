@@ -221,6 +221,9 @@ Risk note: `A` is chosen by the creator and is immutable. A depeg can make the
 pool absorb the falling asset at near-par; LPs bear that risk. There is no
 protocol backstop and no curation list.
 
+The EVM precompile's `getPool` returns `poolType`, `amplification` and both
+scaling factors alongside the reserves, so contracts can tell the curves apart.
+
 ## 5. Messages
 
 | Message | Who | Notes |

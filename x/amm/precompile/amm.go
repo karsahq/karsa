@@ -56,7 +56,11 @@ const abiJSON = `[
       {"name": "reserveA", "type": "uint256"},
       {"name": "reserveB", "type": "uint256"},
       {"name": "totalShares", "type": "uint256"},
-      {"name": "feeBps", "type": "uint32"}
+      {"name": "feeBps", "type": "uint32"},
+      {"name": "poolType", "type": "uint8"},
+      {"name": "amplification", "type": "uint64"},
+      {"name": "scalingFactorA", "type": "uint256"},
+      {"name": "scalingFactorB", "type": "uint256"}
     ]
   },
   {
@@ -225,6 +229,9 @@ func (p Precompile) getPool(ctx sdk.Context, method *abi.Method, args []interfac
 
 	return method.Outputs.Pack(
 		id, pool.ReserveA.BigInt(), pool.ReserveB.BigInt(), pool.TotalShares.BigInt(), pool.FeeBps,
+		uint8(pool.PoolType), pool.Amplification,
+		new(big.Int).SetUint64(pool.ScalingFactorA),
+		new(big.Int).SetUint64(pool.ScalingFactorB),
 	)
 }
 

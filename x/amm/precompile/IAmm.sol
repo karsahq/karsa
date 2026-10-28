@@ -24,6 +24,10 @@ interface IAmm {
     /// @return reserveB Reserve of assetB, in its own base units.
     /// @return totalShares Total LP shares, including the permanently locked share.
     /// @return feeBps Pool fee in basis points (30 = 0.30%).
+    /// @return poolType 0 = constant product, 1 = stableswap.
+    /// @return amplification Amplification coefficient A (stableswap only, 0 otherwise).
+    /// @return scalingFactorA Factor normalising assetA to 18 decimals (0 means 1).
+    /// @return scalingFactorB Factor normalising assetB to 18 decimals (0 means 1).
     function getPool(address assetA, address assetB)
         external
         view
@@ -32,7 +36,11 @@ interface IAmm {
             uint256 reserveA,
             uint256 reserveB,
             uint256 totalShares,
-            uint32 feeBps
+            uint32 feeBps,
+            uint8 poolType,
+            uint64 amplification,
+            uint256 scalingFactorA,
+            uint256 scalingFactorB
         );
 
     /// @notice Swaps an exact amount of path[0] for the last asset in `path`.
