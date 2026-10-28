@@ -28,6 +28,8 @@ var (
 	ParamsKey = []byte{0x04}
 	// ReentrancyKey is set while a state-mutating message is executing.
 	ReentrancyKey = []byte{0x05}
+	// ObservationsKeyPrefix stores TWAP observations per pool.
+	ObservationsKeyPrefix = []byte{0x06}
 )
 
 // PrecompileAddress is the fixed EVM address of the AMM precompile.

@@ -2,8 +2,9 @@
 
 Status: **in progress** — `x/amm` implements constant-product pools, integrator
 fees, LP shares with an ERC20 precompile, direct custody for external ERC20
-contracts, and an EVM precompile (`quote`, `getPool`, `swapExactIn`). Pending:
-TWAP. Fee abstraction (paying gas in a token) is **descoped**.
+contracts, an EVM precompile (`quote`, `getPool`, `swapExactIn`), and a
+cumulative-price TWAP. Remaining: stableswap pools, `SwapExactOut`, on-chain
+route search. Fee abstraction (paying gas in a token) is **descoped**.
 
 ## 1. Goals
 

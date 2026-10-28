@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"strings"
 	"testing"
+	"time"
 
 	karsa "github.com/karsahq/karsa"
 	ammprecompile "github.com/karsahq/karsa/x/amm/precompile"
@@ -254,6 +255,37 @@ func erc20BalanceOf(t *testing.T, app *karsa.App, ctx sdk.Context, token, accoun
 	require.True(t, ok)
 
 	return sdkmath.NewIntFromBigInt(amount)
+}
+
+// TestTwap checks the time-weighted price over a controlled window.
+func TestTwap(t *testing.T) {
+	app, ctx := newTestApp(t)
+	registerTestUSDCPair(t, app, ctx)
+
+	ctx = ctx.WithBlockTime(time.Unix(1_000, 0))
+
+	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AB").Bytes())
+	fundTestDenoms(t, app, ctx, sender, sdkmath.NewInt(1_000_000_000))
+
+	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	poolID, _, err := app.AmmKeeper.CreatePool(
+		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 30,
+		sdkmath.NewInt(1_000_000), sdkmath.NewInt(1_000_000),
+	)
+	require.NoError(t, err)
+
+	// Advance the clock and add liquidity at the same price (1:1).
+	ctx = ctx.WithBlockTime(time.Unix(1_100, 0))
+	_, err = app.AmmKeeper.AddLiquidity(
+		ctx, sender, poolID, sdkmath.NewInt(1_000), sdkmath.NewInt(1_000), sdkmath.NewInt(1),
+	)
+	require.NoError(t, err)
+
+	priceA, priceB, window, err := app.AmmKeeper.Twap(ctx, poolID, 100)
+	require.NoError(t, err)
+	require.Equal(t, int64(100), window)
+	require.True(t, priceA.Equal(sdkmath.LegacyOneDec()), "priceA = %s", priceA)
+	require.True(t, priceB.Equal(sdkmath.LegacyOneDec()), "priceB = %s", priceB)
 }
 
 // TestAmmPrecompile exercises the EVM-facing precompile: quote and swap.

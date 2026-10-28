@@ -119,6 +119,22 @@ func (q queryServer) Quote(goCtx context.Context, req *types.QueryQuoteRequest) 
 }
 
 // Params returns the module params.
+func (q queryServer) Twap(goCtx context.Context, req *types.QueryTwapRequest) (*types.QueryTwapResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "empty request")
+	}
+
+	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	priceA, priceB, window, err := q.Keeper.Twap(ctx, req.PoolId, req.WindowSeconds)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	return &types.QueryTwapResponse{PriceA: priceA, PriceB: priceB, EffectiveWindow: window}, nil
+}
+
+// Params returns the module params.
 func (q queryServer) Params(goCtx context.Context, _ *types.QueryParamsRequest) (*types.QueryParamsResponse, error) {
 	ctx := sdk.UnwrapSDKContext(goCtx)
 	return &types.QueryParamsResponse{Params: q.GetParams(ctx)}, nil

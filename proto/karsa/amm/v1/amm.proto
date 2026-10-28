@@ -53,3 +53,17 @@ message GenesisState {
   repeated Pool pools = 2 [(gogoproto.nullable) = false];
   uint64 next_pool_id = 3;
 }
+
+// Observation is a cumulative-price checkpoint used for TWAP.
+message Observation {
+  int64 timestamp = 1;
+  string cumulative_a = 2
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  string cumulative_b = 3
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+}
+
+// Observations is the ordered ring of observations for a pool.
+message Observations {
+  repeated Observation items = 1 [(gogoproto.nullable) = false];
+}

@@ -225,6 +225,7 @@ func (k Keeper) swapExec(
 			pool.ReserveA = pool.ReserveA.Sub(out)
 		}
 		k.SetPool(ctx, pool)
+		k.updateOracle(ctx, pool)
 
 		amount = out
 	}

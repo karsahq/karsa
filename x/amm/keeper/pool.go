@@ -182,6 +182,7 @@ func (k Keeper) CreatePool(
 		LpAssetId:    lpAssetID,
 	}
 	k.SetPool(ctx, pool)
+	k.updateOracle(ctx, pool)
 	k.SetPoolIDByAssets(ctx, a.Address, b.Address, id)
 	k.SetNextPoolID(ctx, id+1)
 

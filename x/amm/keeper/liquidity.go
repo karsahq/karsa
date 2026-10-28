@@ -80,6 +80,7 @@ func (k Keeper) AddLiquidity(
 	pool.ReserveB = pool.ReserveB.Add(usedB)
 	pool.TotalShares = pool.TotalShares.Add(shares)
 	k.SetPool(ctx, pool)
+	k.updateOracle(ctx, pool)
 
 	ctx.EventManager().EmitEvent(sdk.NewEvent(
 		types.EventTypeAddLiquidity,
@@ -158,6 +159,7 @@ func (k Keeper) RemoveLiquidity(
 	pool.ReserveB = pool.ReserveB.Sub(outB)
 	pool.TotalShares = pool.TotalShares.Sub(shares)
 	k.SetPool(ctx, pool)
+	k.updateOracle(ctx, pool)
 
 	if err := k.assertCustody(ctx, assetOutA, pool.ReserveA); err != nil {
 		return sdkmath.Int{}, sdkmath.Int{}, err

@@ -13,6 +13,7 @@ service Query {
   rpc Pools(QueryPoolsRequest) returns (QueryPoolsResponse);
   rpc PoolByAssets(QueryPoolByAssetsRequest) returns (QueryPoolByAssetsResponse);
   rpc Quote(QueryQuoteRequest) returns (QueryQuoteResponse);
+  rpc Twap(QueryTwapRequest) returns (QueryTwapResponse);
   rpc Params(QueryParamsRequest) returns (QueryParamsResponse);
 }
 
@@ -54,6 +55,22 @@ message QueryQuoteResponse {
 }
 
 message QueryParamsRequest {}
+
+message QueryTwapRequest {
+  uint64 pool_id = 1;
+  int64 window_seconds = 2;
+}
+
+message QueryTwapResponse {
+  // Price of asset A denominated in asset B.
+  string price_a = 1
+      [(gogoproto.customtype) = "cosmossdk.io/math.LegacyDec", (gogoproto.nullable) = false];
+  // Price of asset B denominated in asset A.
+  string price_b = 2
+      [(gogoproto.customtype) = "cosmossdk.io/math.LegacyDec", (gogoproto.nullable) = false];
+  // Window actually used, in seconds.
+  int64 effective_window = 3;
+}
 
 message QueryParamsResponse {
   Params params = 1 [(gogoproto.nullable) = false];
