@@ -4,7 +4,7 @@ Status: **in progress** — `x/amm` implements constant-product and two-asset
 stableswap pools, **bank-backed custody with automatic ERC20 ↔ bank conversion at
 the swap/liquidity boundary**, multiple pools per pair selected by fee tier,
 integrator fees, exact-in and exact-out swaps, LP shares with an ERC20 precompile,
-an EVM precompile (`quote`, `getPool`, `swapExactIn`), and a cumulative-price TWAP.
+an EVM precompile (`quote`, `getPool`, `getPoolById`, `getPools`, `swapExactIn`), and a cumulative-price TWAP.
 Remaining: bounded route search, conversion hardening, and precompile pool discovery.
 Fee abstraction (paying gas in a token) is **descoped**.
 
@@ -236,8 +236,8 @@ Risk note: `A` is chosen by the creator and is immutable. A depeg can make the
 pool absorb the falling asset at near-par; LPs bear that risk. There is no
 protocol backstop and no curation list.
 
-The EVM precompile's `getPool` returns `poolType`, `amplification` and both
-scaling factors alongside the reserves, so contracts can tell the curves apart.
+The EVM precompile's `getPool` and `getPoolById` return `poolType`, `amplification`,
+both scaling factors and `status`; `getPools` returns every pool id for a pair.
 
 ### Fee tiers
 

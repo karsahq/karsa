@@ -29,6 +29,7 @@ interface IAmm {
     /// @return amplification Amplification coefficient A (stableswap only, 0 otherwise).
     /// @return scalingFactorA Factor normalising assetA to 18 decimals (0 means 1).
     /// @return scalingFactorB Factor normalising assetB to 18 decimals (0 means 1).
+    /// @return status 0 = active, 1 = withdraw-only.
     function getPool(address assetA, address assetB)
         external
         view
@@ -41,8 +42,32 @@ interface IAmm {
             uint8 poolType,
             uint64 amplification,
             uint256 scalingFactorA,
-            uint256 scalingFactorB
+            uint256 scalingFactorB,
+            uint8 status
         );
+
+    /// @notice Returns a pool by id.
+    function getPoolById(uint64 id)
+        external
+        view
+        returns (
+            uint64 poolId,
+            uint256 reserveA,
+            uint256 reserveB,
+            uint256 totalShares,
+            uint32 feeBps,
+            uint8 poolType,
+            uint64 amplification,
+            uint256 scalingFactorA,
+            uint256 scalingFactorB,
+            uint8 status
+        );
+
+    /// @notice Returns every pool id for an unordered asset pair.
+    function getPools(address assetA, address assetB)
+        external
+        view
+        returns (uint64[] memory ids);
 
     /// @notice Swaps an exact amount of path[0] for the last asset in `path`.
     /// @dev The caller must hold `amountIn` of path[0]; the module moves those

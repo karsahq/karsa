@@ -13,6 +13,8 @@ func TestABIMatchesInterface(t *testing.T) {
 	expected := map[string]string{
 		"quote":       "quote(address[],uint64[],uint256)",
 		"getPool":     "getPool(address,address)",
+		"getPoolById": "getPoolById(uint64)",
+		"getPools":    "getPools(address,address)",
 		"swapExactIn": "swapExactIn(address[],uint64[],uint256,uint256,address,address,uint256)",
 	}
 

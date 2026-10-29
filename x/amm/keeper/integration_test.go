@@ -395,13 +395,14 @@ func TestStableSwapPool(t *testing.T) {
 
 	info, err := ammprecompile.ABI.Unpack("getPool", res.Ret)
 	require.NoError(t, err)
-	require.Len(t, info, 9)
+	require.Len(t, info, 10)
 	require.Equal(t, uint8(1), info[5], "pool type")
 	require.Equal(t, uint64(100), info[6], "amplification")
 	require.ElementsMatch(t,
 		[]uint64{1_000_000_000_000, 1_000_000_000_000},
 		[]uint64{info[7].(*big.Int).Uint64(), info[8].(*big.Int).Uint64()},
 	)
+	require.Equal(t, uint8(ammtypes.PoolStatus_ACTIVE), info[9], "status")
 
 	path := []string{testUSDCPair.Hex(), testUSDTPair.Hex()}
 	amountIn := sdkmath.NewInt(10_000)
@@ -825,6 +826,33 @@ func TestMultiPoolRouting(t *testing.T) {
 	quoteOut, err := ammprecompile.ABI.Unpack("quote", quoteRes.Ret)
 	require.NoError(t, err)
 	require.Equal(t, quoted.BigInt(), quoteOut[0].(*big.Int))
+
+	// Discovery: getPools lists all fee tiers, getPoolById returns one pool.
+	poolsInput, err := ammprecompile.ABI.Pack("getPools", akraAsset, testUSDCPair)
+	require.NoError(t, err)
+	poolsStateDB := statedb.New(ctx, app.EVMKeeper, statedb.NewEmptyTxConfig())
+	poolsRes, err := app.EVMKeeper.CallEVMWithData(
+		ctx, poolsStateDB, common.BytesToAddress(sender.Bytes()), &ammprecompile.Address, poolsInput, false, false, nil,
+	)
+	require.NoError(t, err)
+	require.False(t, poolsRes.Failed(), poolsRes.VmError)
+	poolsOut, err := ammprecompile.ABI.Unpack("getPools", poolsRes.Ret)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []uint64{pool5, pool10, pool30}, poolsOut[0].([]uint64))
+
+	byIDInput, err := ammprecompile.ABI.Pack("getPoolById", pool5)
+	require.NoError(t, err)
+	byIDStateDB := statedb.New(ctx, app.EVMKeeper, statedb.NewEmptyTxConfig())
+	byIDRes, err := app.EVMKeeper.CallEVMWithData(
+		ctx, byIDStateDB, common.BytesToAddress(sender.Bytes()), &ammprecompile.Address, byIDInput, false, false, nil,
+	)
+	require.NoError(t, err)
+	require.False(t, byIDRes.Failed(), byIDRes.VmError)
+	byIDOut, err := ammprecompile.ABI.Unpack("getPoolById", byIDRes.Ret)
+	require.NoError(t, err)
+	require.Len(t, byIDOut, 10)
+	require.Equal(t, pool5, byIDOut[0].(uint64))
+	require.Equal(t, uint8(ammtypes.PoolStatus_ACTIVE), byIDOut[9].(uint8))
 
 	// Ambiguous route without pool ids is rejected.
 	_, err = app.AmmKeeper.Quote(ctx, path, amountIn)

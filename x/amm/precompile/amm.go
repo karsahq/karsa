@@ -29,6 +29,8 @@ const PrecompileAddress = ammtypes.PrecompileAddress
 const (
 	QuoteMethod       = "quote"
 	GetPoolMethod     = "getPool"
+	GetPoolByIDMethod = "getPoolById"
+	GetPoolsMethod    = "getPools"
 	SwapExactInMethod = "swapExactIn"
 )
 
@@ -61,8 +63,39 @@ const abiJSON = `[
       {"name": "poolType", "type": "uint8"},
       {"name": "amplification", "type": "uint64"},
       {"name": "scalingFactorA", "type": "uint256"},
-      {"name": "scalingFactorB", "type": "uint256"}
+      {"name": "scalingFactorB", "type": "uint256"},
+      {"name": "status", "type": "uint8"}
     ]
+  },
+  {
+    "name": "getPoolById",
+    "type": "function",
+    "stateMutability": "view",
+    "inputs": [
+      {"name": "id", "type": "uint64"}
+    ],
+    "outputs": [
+      {"name": "id", "type": "uint64"},
+      {"name": "reserveA", "type": "uint256"},
+      {"name": "reserveB", "type": "uint256"},
+      {"name": "totalShares", "type": "uint256"},
+      {"name": "feeBps", "type": "uint32"},
+      {"name": "poolType", "type": "uint8"},
+      {"name": "amplification", "type": "uint64"},
+      {"name": "scalingFactorA", "type": "uint256"},
+      {"name": "scalingFactorB", "type": "uint256"},
+      {"name": "status", "type": "uint8"}
+    ]
+  },
+  {
+    "name": "getPools",
+    "type": "function",
+    "stateMutability": "view",
+    "inputs": [
+      {"name": "assetA", "type": "address"},
+      {"name": "assetB", "type": "address"}
+    ],
+    "outputs": [{"name": "ids", "type": "uint64[]"}]
   },
   {
     "name": "swapExactIn",
@@ -104,6 +137,7 @@ type Keeper interface {
 	QuoteWithPools(ctx sdk.Context, path []string, poolIDs []uint64, amountIn sdkmath.Int) (sdkmath.Int, error)
 	GetPool(ctx sdk.Context, id uint64) (ammtypes.Pool, bool)
 	GetPoolIDByAssets(ctx sdk.Context, assetA, assetB string) (uint64, bool)
+	GetPoolIDsByAssets(ctx sdk.Context, assetA, assetB string) []uint64
 	SwapFromPrecompileWithPools(
 		ctx sdk.Context,
 		stateDB *statedb.StateDB,
@@ -179,6 +213,10 @@ func (p Precompile) Execute(ctx sdk.Context, stateDB vm.StateDB, contract *vm.Co
 		return p.quote(ctx, method, args)
 	case GetPoolMethod:
 		return p.getPool(ctx, method, args)
+	case GetPoolByIDMethod:
+		return p.getPoolById(ctx, method, args)
+	case GetPoolsMethod:
+		return p.getPools(ctx, method, args)
 	case SwapExactInMethod:
 		return p.swapExactIn(ctx, stateDB, contract, method, args)
 	default:
@@ -230,12 +268,70 @@ func (p Precompile) getPool(ctx sdk.Context, method *abi.Method, args []interfac
 		return nil, ammtypes.ErrPoolNotFound.Wrapf("pool %d", id)
 	}
 
+	return packPool(method, pool)
+}
+
+func (p Precompile) getPoolById(ctx sdk.Context, method *abi.Method, args []interface{}) ([]byte, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("invalid number of arguments: expected 1, got %d", len(args))
+	}
+
+	id, err := parsePoolID(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	pool, found := p.keeper.GetPool(ctx, id)
+	if !found {
+		return nil, ammtypes.ErrPoolNotFound.Wrapf("pool %d", id)
+	}
+
+	return packPool(method, pool)
+}
+
+func (p Precompile) getPools(ctx sdk.Context, method *abi.Method, args []interface{}) ([]byte, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("invalid number of arguments: expected 2, got %d", len(args))
+	}
+
+	assetA, ok := args[0].(common.Address)
+	if !ok {
+		return nil, fmt.Errorf("invalid assetA")
+	}
+	assetB, ok := args[1].(common.Address)
+	if !ok {
+		return nil, fmt.Errorf("invalid assetB")
+	}
+
+	ids := p.keeper.GetPoolIDsByAssets(
+		ctx, strings.ToLower(assetA.Hex()), strings.ToLower(assetB.Hex()),
+	)
+
+	return method.Outputs.Pack(ids)
+}
+
+func packPool(method *abi.Method, pool ammtypes.Pool) ([]byte, error) {
 	return method.Outputs.Pack(
-		id, pool.ReserveA.BigInt(), pool.ReserveB.BigInt(), pool.TotalShares.BigInt(), pool.FeeBps,
+		pool.Id, pool.ReserveA.BigInt(), pool.ReserveB.BigInt(), pool.TotalShares.BigInt(), pool.FeeBps,
 		uint8(pool.PoolType), pool.Amplification,
 		new(big.Int).SetUint64(pool.ScalingFactorA),
 		new(big.Int).SetUint64(pool.ScalingFactorB),
+		uint8(pool.Status),
 	)
+}
+
+func parsePoolID(value interface{}) (uint64, error) {
+	switch v := value.(type) {
+	case uint64:
+		return v, nil
+	case *big.Int:
+		if v == nil || !v.IsUint64() {
+			return 0, fmt.Errorf("invalid pool id")
+		}
+		return v.Uint64(), nil
+	default:
+		return 0, fmt.Errorf("invalid pool id")
+	}
 }
 
 func (p Precompile) swapExactIn(
