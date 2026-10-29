@@ -1105,6 +1105,63 @@ func TestExternalIntegratorFee(t *testing.T) {
 		app.BankKeeper.GetBalance(ctx, ammModule, denom).Amount)
 }
 
+// TestExternalExactOutAndRemove covers exact-out with an external input plus
+// integrator fee, then removes liquidity through the conversion boundary.
+func TestExternalExactOutAndRemove(t *testing.T) {
+	app, ctx := newTestApp(t)
+
+	deployer := common.HexToAddress("0x00000000000000000000000000000000000000E5")
+	integrator := common.HexToAddress("0x00000000000000000000000000000000000000E6")
+
+	nativeCoins := sdk.NewCoins(sdk.NewCoin(karsaNativeDenom(), sdkmath.NewIntWithDecimal(1_000, 18)))
+	require.NoError(t, app.BankKeeper.MintCoins(ctx, ammtypes.ModuleName, nativeCoins))
+	require.NoError(t, app.BankKeeper.SendCoinsFromModuleToAccount(
+		ctx, ammtypes.ModuleName, sdk.AccAddress(deployer.Bytes()), nativeCoins,
+	))
+
+	token := deployTestERC20(t, app, ctx, deployer, "Momo", "MOMO", 18)
+	mintTestERC20(t, app, ctx, token, deployer, sdkmath.NewInt(1_000_000))
+
+	denom := "erc20:" + strings.ToLower(token.Hex())
+	require.NoError(t, app.Erc20Keeper.SetToken(ctx, erc20types.NewTokenPair(
+		token, denom, erc20types.OWNER_EXTERNAL,
+	)))
+
+	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	sender := sdk.AccAddress(deployer.Bytes())
+	poolID, shares, err := app.AmmKeeper.CreatePool(
+		ctx, sender, akraAsset.Hex(), token.Hex(), 30,
+		sdkmath.NewInt(100_000), sdkmath.NewInt(100_000),
+	)
+	require.NoError(t, err)
+
+	path := []string{token.Hex(), akraAsset.Hex()}
+	amountOut := sdkmath.NewInt(5_000)
+	quotedIn, err := app.AmmKeeper.QuoteExactOut(ctx, path, amountOut)
+	require.NoError(t, err)
+
+	feeBps := uint32(20)
+	expectedFee := quotedIn.MulRaw(int64(feeBps)).AddRaw(9_980 - 1).QuoRaw(9_980)
+	totalIn := quotedIn.Add(expectedFee)
+
+	akraBefore := app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount
+	amountIn, integratorFee, err := app.AmmKeeper.SwapExactOut(
+		ctx, sender, sender, path, amountOut, totalIn,
+		sdk.AccAddress(integrator.Bytes()), feeBps,
+	)
+	require.NoError(t, err)
+	require.Equal(t, totalIn, amountIn)
+	require.Equal(t, expectedFee, integratorFee)
+	require.Equal(t, expectedFee, erc20BalanceOf(t, app, ctx, token, integrator))
+	require.Equal(t, akraBefore.Add(amountOut), app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount)
+
+	// Removing all redeemable shares releases the ERC20 side through conversion.
+	tokenBefore := erc20BalanceOf(t, app, ctx, token, deployer)
+	_, _, err = app.AmmKeeper.RemoveLiquidity(ctx, sender, poolID, shares, sdkmath.ZeroInt(), sdkmath.ZeroInt())
+	require.NoError(t, err)
+	require.True(t, erc20BalanceOf(t, app, ctx, token, deployer).GT(tokenBefore))
+}
+
 // TestStableSwapExternalERC20 checks that a stableswap pool can resolve the
 // decimals of an external ERC20 contract through the on-chain decimals() call.
 func TestStableSwapExternalERC20(t *testing.T) {

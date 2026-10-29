@@ -169,7 +169,11 @@ func (k Keeper) moveInWith(
 			true,
 			fromPrecompile,
 		)
-		return err
+		if err != nil {
+			return err
+		}
+		emitConversion(ctx, types.EventTypeConvertIn, asset, types.AttributeKeySender, from, amount)
+		return nil
 	}
 
 	coins := sdk.NewCoins(sdk.NewCoin(asset.Denom, amount))
@@ -227,7 +231,25 @@ func (k Keeper) convertOutWith(
 		return err
 	}
 
-	return k.evmTransferWith(
+	if err := k.evmTransferWith(
 		ctx, stateDB, fromPrecompile, asset.ConvertContract, erc20types.ModuleAddress, to, amount,
-	)
+	); err != nil {
+		return err
+	}
+
+	emitConversion(ctx, types.EventTypeConvertOut, asset, types.AttributeKeyReceiver, to, amount)
+	return nil
+}
+
+func emitConversion(
+	ctx sdk.Context, eventType string, asset resolvedAsset, partyKey string, party common.Address, amount sdkmath.Int,
+) {
+	ctx.EventManager().EmitEvent(sdk.NewEvent(
+		eventType,
+		sdk.NewAttribute(types.AttributeKeyAsset, asset.Address),
+		sdk.NewAttribute(types.AttributeKeyDenom, asset.Denom),
+		sdk.NewAttribute(types.AttributeKeyContract, asset.ConvertContract.Hex()),
+		sdk.NewAttribute(types.AttributeKeyAmount, amount.String()),
+		sdk.NewAttribute(partyKey, party.Hex()),
+	))
 }
