@@ -827,6 +827,21 @@ func TestMultiPoolRouting(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, quoted.BigInt(), quoteOut[0].(*big.Int))
 
+	// Empty poolIds auto-selects the best single pool in the precompile too.
+	autoInput, err := ammprecompile.ABI.Pack(
+		"quote", []common.Address{akraAsset, testUSDCPair}, []uint64{}, amountIn.BigInt(),
+	)
+	require.NoError(t, err)
+	autoStateDB := statedb.New(ctx, app.EVMKeeper, statedb.NewEmptyTxConfig())
+	autoRes, err := app.EVMKeeper.CallEVMWithData(
+		ctx, autoStateDB, common.BytesToAddress(sender.Bytes()), &ammprecompile.Address, autoInput, false, false, nil,
+	)
+	require.NoError(t, err)
+	require.False(t, autoRes.Failed(), autoRes.VmError)
+	autoOut, err := ammprecompile.ABI.Unpack("quote", autoRes.Ret)
+	require.NoError(t, err)
+	require.Equal(t, quoted.BigInt(), autoOut[0].(*big.Int))
+
 	// Discovery: getPools lists all fee tiers, getPoolById returns one pool.
 	poolsInput, err := ammprecompile.ABI.Pack("getPools", akraAsset, testUSDCPair)
 	require.NoError(t, err)
@@ -854,9 +869,17 @@ func TestMultiPoolRouting(t *testing.T) {
 	require.Equal(t, pool5, byIDOut[0].(uint64))
 	require.Equal(t, uint8(ammtypes.PoolStatus_ACTIVE), byIDOut[9].(uint8))
 
-	// Ambiguous route without pool ids is rejected.
-	_, err = app.AmmKeeper.Quote(ctx, path, amountIn)
-	require.ErrorIs(t, err, ammtypes.ErrInvalidPath)
+	// Ambiguous route without pool ids is resolved by auto-best selection.
+	autoQuoted, err := app.AmmKeeper.Quote(ctx, path, amountIn)
+	require.NoError(t, err)
+	require.Equal(t, quoted, autoQuoted)
+
+	exactOut := sdkmath.NewInt(5_000)
+	autoExactIn, err := app.AmmKeeper.QuoteExactOut(ctx, path, exactOut)
+	require.NoError(t, err)
+	explicitExactIn, err := app.AmmKeeper.QuoteExactOutWithPools(ctx, path, []uint64{pool5}, exactOut)
+	require.NoError(t, err)
+	require.Equal(t, explicitExactIn, autoExactIn)
 
 	before5, found := app.AmmKeeper.GetPool(ctx, pool5)
 	require.True(t, found)
@@ -865,8 +888,8 @@ func TestMultiPoolRouting(t *testing.T) {
 	before30, found := app.AmmKeeper.GetPool(ctx, pool30)
 	require.True(t, found)
 
-	_, _, err = app.AmmKeeper.SwapWithPools(
-		ctx, []uint64{pool5}, sender, sender, path, amountIn, sdkmath.NewInt(1), nil, 0,
+	_, _, err = app.AmmKeeper.Swap(
+		ctx, sender, sender, path, amountIn, sdkmath.NewInt(1), nil, 0,
 	)
 	require.NoError(t, err)
 

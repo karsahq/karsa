@@ -5,7 +5,7 @@ stableswap pools, **bank-backed custody with automatic ERC20 ↔ bank conversion
 the swap/liquidity boundary**, multiple pools per pair selected by fee tier,
 integrator fees, exact-in and exact-out swaps, LP shares with an ERC20 precompile,
 an EVM precompile (`quote`, `getPool`, `getPoolById`, `getPools`, `swapExactIn`), and a cumulative-price TWAP.
-Remaining: bounded route search, conversion hardening, and precompile pool discovery.
+Remaining: bounded multi-hop route search and conversion hardening.
 Fee abstraction (paying gas in a token) is **descoped**.
 
 ## 1. Goals
@@ -295,7 +295,7 @@ output: erc20:0x… at AMM module --x/erc20 convert--> user ERC20
 | `MsgCreatePool{asset_a, asset_b, fee_bps, amount_a, amount_b, pool_type, amplification}` | anyone | fee must be an allowed tier for the pool type; uniqueness is `(assetA, assetB, poolType, feeBps)` |
 | `MsgAddLiquidity{pool_id, max_a, max_b, min_shares}` | LP | proportional deposit; pool must be `ACTIVE` |
 | `MsgRemoveLiquidity{pool_id, shares, min_a, min_b}` | LP | proportional withdrawal; allowed in `ACTIVE` or `WITHDRAW_ONLY` |
-| `MsgSwapExactIn{sender, path[], pool_ids[], amount_in, min_out, receiver, deadline, integrator, integrator_fee_bps}` | user | `path` is a list of `AssetID`; `pool_ids[i]` selects the pool for hop `i`; empty `pool_ids` may auto-select later |
+| `MsgSwapExactIn{sender, path[], pool_ids[], amount_in, min_out, receiver, deadline, integrator, integrator_fee_bps}` | user | `path` is a list of `AssetID`; `pool_ids[i]` selects the pool for hop `i`; empty `pool_ids` auto-selects the best single pool |
 | `MsgSwapExactOut{sender, path[], pool_ids[], amount_out, max_amount_in, receiver, deadline, integrator, integrator_fee_bps}` | user | bounded by `max_amount_in`; integrator fee is grossed up on top of the pool input |
 | `MsgSetPoolStatus{authority, pool_id, status}` | governance | `ACTIVE` / `WITHDRAW_ONLY`; guard rules in §4 |
 | `MsgUpdateParams{authority, params}` | governance | fee tiers, caps, `max_pools_per_pair` |
@@ -308,7 +308,6 @@ All messages reject `deadline` in the past and `min_out == 0`.
 |---|---|
 | `Pool{id}` / `Pools{pagination}` | pool state |
 | `PoolsByAssets{a,b}` | all pools for the pair (id, type, fee, status, reserves) |
-| `BestPool{a,b,amount_in}` | best pool by output for the amount (bounded candidate set) |
 | `Quote{path, pool_ids, amount_in, integrator, integrator_fee_bps}` | `amount_out`, `pool_fee`, `integrator_fee`, `total_fee`, per-hop impact |
 | `QuoteExactOut{path, pool_ids, amount_out}` | `amount_in` required (including pool fees) |
 | `PoolsByAsset{asset}` | candidate pools for routing |
@@ -352,7 +351,9 @@ Rules:
 ## 8. Routing
 
 - Caller-provided path, Uniswap v2 style: `[MOMO, USDT, akra]`.
-- Each hop selects a pool. `pool_ids[i]` is explicit; empty `pool_ids` may auto-select later.
+- Each hop selects a pool. `pool_ids[i]` is explicit; empty `pool_ids` selects the best single pool
+  (largest output for exact-in, smallest input for exact-out).
+- No split routing: one pool per hop. Integrators may split off-chain with multiple swaps.
 - Hard cap `len(path) - 1 <= max_hops` (default 2).
 - Candidate set per hop is bounded by `max_pools_per_pair` (6).
 - Auto-selection compares output (exact-in) or required input (exact-out) across candidate pools and
@@ -455,7 +456,7 @@ Open design points (ante path):
 |---|---|
 | 1 | Module skeleton, constant product, create/add/remove, exact-in and exact-out swap, `Quote`, integrator fee, 1–2 hop path, LP as bank denom + ERC20 precompile, precompile for `swap`/`quote`, TWAP |
 | 2 | Bank-backed custody for external ERC20 with automatic conversion, multiple fee-tier pools per pair, pool status and governance guard |
-| 3 | Bounded route search / auto-best pool selection, conversion hardening and failure-mode tests |
+| 3 | Bounded multi-hop route search; conversion hardening and failure-mode tests |
 | 4 | ERC-4337 paymaster for ERC20 contracts (separate project) |
 
 Fee abstraction remains descoped (see §10).

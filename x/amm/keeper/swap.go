@@ -102,6 +102,128 @@ func (k Keeper) poolForHop(
 	return pool, in == pool.AssetA, nil
 }
 
+// poolCandidate is a candidate pool for one hop.
+type poolCandidate struct {
+	pool types.Pool
+	aIsA bool
+}
+
+// candidatePools returns all active pools for a pair.
+func (k Keeper) candidatePools(ctx sdk.Context, assetIn, assetOut string) ([]poolCandidate, error) {
+	in := strings.ToLower(assetIn)
+	out := strings.ToLower(assetOut)
+	if in == out {
+		return nil, types.ErrInvalidPath.Wrap("duplicate asset in path")
+	}
+
+	keyA, keyB := in, out
+	if keyA > keyB {
+		keyA, keyB = keyB, keyA
+	}
+
+	ids := k.GetPoolIDsByAssets(ctx, keyA, keyB)
+	if len(ids) == 0 {
+		return nil, types.ErrPoolNotFound.Wrapf("no pool for %s/%s", keyA, keyB)
+	}
+
+	candidates := make([]poolCandidate, 0, len(ids))
+	foundPool := false
+	for _, id := range ids {
+		pool, found := k.GetPool(ctx, id)
+		if !found {
+			continue
+		}
+		foundPool = true
+		if pool.Status != types.PoolStatus_ACTIVE {
+			continue
+		}
+		if (pool.AssetA != keyA || pool.AssetB != keyB) && (pool.AssetA != keyB || pool.AssetB != keyA) {
+			continue
+		}
+		candidates = append(candidates, poolCandidate{pool: pool, aIsA: in == pool.AssetA})
+	}
+
+	if len(candidates) == 0 {
+		if foundPool {
+			return nil, types.ErrPoolInactive.Wrapf("no active pool for %s/%s", keyA, keyB)
+		}
+		return nil, types.ErrPoolNotFound.Wrapf("no pool for %s/%s", keyA, keyB)
+	}
+
+	return candidates, nil
+}
+
+// bestPoolForExactIn selects the pool with the largest output for amountIn.
+// A non-zero poolID forces a specific pool.
+func (k Keeper) bestPoolForExactIn(
+	ctx sdk.Context, assetIn, assetOut string, amountIn sdkmath.Int, poolID uint64,
+) (types.Pool, bool, error) {
+	if poolID != 0 {
+		return k.poolForHop(ctx, assetIn, assetOut, poolID)
+	}
+
+	candidates, err := k.candidatePools(ctx, assetIn, assetOut)
+	if err != nil {
+		return types.Pool{}, false, err
+	}
+
+	var best types.Pool
+	var bestA bool
+	bestOut := sdkmath.ZeroInt()
+
+	for _, candidate := range candidates {
+		out := k.poolAmountOut(candidate.pool, candidate.aIsA, amountIn)
+		if out.GT(bestOut) {
+			best = candidate.pool
+			bestA = candidate.aIsA
+			bestOut = out
+		}
+	}
+
+	if !bestOut.IsPositive() {
+		return types.Pool{}, false, types.ErrInvalidAmount.Wrap("no pool can satisfy the input")
+	}
+
+	return best, bestA, nil
+}
+
+// bestPoolForExactOut selects the pool with the smallest required input.
+// A non-zero poolID forces a specific pool.
+func (k Keeper) bestPoolForExactOut(
+	ctx sdk.Context, assetIn, assetOut string, amountOut sdkmath.Int, poolID uint64,
+) (types.Pool, bool, error) {
+	if poolID != 0 {
+		return k.poolForHop(ctx, assetIn, assetOut, poolID)
+	}
+
+	candidates, err := k.candidatePools(ctx, assetIn, assetOut)
+	if err != nil {
+		return types.Pool{}, false, err
+	}
+
+	var best types.Pool
+	var bestA bool
+	bestIn := sdkmath.ZeroInt()
+
+	for _, candidate := range candidates {
+		in := k.poolAmountIn(candidate.pool, candidate.aIsA, amountOut)
+		if !in.IsPositive() {
+			continue
+		}
+		if !bestIn.IsPositive() || in.LT(bestIn) {
+			best = candidate.pool
+			bestA = candidate.aIsA
+			bestIn = in
+		}
+	}
+
+	if !bestIn.IsPositive() {
+		return types.Pool{}, false, types.ErrInvalidAmount.Wrap("no pool can satisfy the output")
+	}
+
+	return best, bestA, nil
+}
+
 // calcAmountOut applies the constant-product formula with a fee.
 func calcAmountOut(amountIn, reserveIn, reserveOut sdkmath.Int, feeBps uint32) sdkmath.Int {
 	if !amountIn.IsPositive() || !reserveIn.IsPositive() || !reserveOut.IsPositive() {
@@ -162,7 +284,7 @@ func (k Keeper) QuoteExactOutWithPools(
 		if len(poolIDs) > 0 {
 			poolID = poolIDs[i-1]
 		}
-		pool, aIsA, err := k.poolForHop(ctx, path[i-1], path[i], poolID)
+		pool, aIsA, err := k.bestPoolForExactOut(ctx, path[i-1], path[i], need, poolID)
 		if err != nil {
 			return sdkmath.Int{}, err
 		}
@@ -203,7 +325,7 @@ func (k Keeper) QuoteWithPools(
 		if len(poolIDs) > 0 {
 			poolID = poolIDs[i]
 		}
-		pool, aIsA, err := k.poolForHop(ctx, path[i], path[i+1], poolID)
+		pool, aIsA, err := k.bestPoolForExactIn(ctx, path[i], path[i+1], amount, poolID)
 		if err != nil {
 			return sdkmath.Int{}, err
 		}
@@ -355,7 +477,7 @@ func (k Keeper) swapExec(
 		if len(poolIDs) > 0 {
 			poolID = poolIDs[i]
 		}
-		pool, aIsA, err := k.poolForHop(ctx, path[i], path[i+1], poolID)
+		pool, aIsA, err := k.bestPoolForExactIn(ctx, path[i], path[i+1], amount, poolID)
 		if err != nil {
 			return sdkmath.Int{}, sdkmath.Int{}, err
 		}
@@ -500,7 +622,7 @@ func (k Keeper) SwapExactOutWithPools(
 		if len(poolIDs) > 0 {
 			poolID = poolIDs[i-1]
 		}
-		pool, aIsA, err := k.poolForHop(ctx, path[i-1], path[i], poolID)
+		pool, aIsA, err := k.bestPoolForExactOut(ctx, path[i-1], path[i], need, poolID)
 		if err != nil {
 			return sdkmath.Int{}, sdkmath.Int{}, err
 		}
