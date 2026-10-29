@@ -57,6 +57,17 @@ makes the terminal supply deterministic.
 If the target block time changes, update this value. Otherwise inflation per block
 is wrong even though the annual percentage is correct.
 
+## Block limits
+
+| Param | Value |
+|---|---:|
+| `consensus.params.block.max_bytes` | 3,000,000 (~2.86 MiB) |
+| `consensus.params.block.max_gas` | 100,000,000 |
+
+At ~1.5s blocks this is roughly 66.7M gas/second. `max_gas` is the practical
+limiter for AMM traffic; `max_bytes` caps oversized blocks and stays well above the
+1 MiB per-transaction limit.
+
 ## Where inflation goes
 
 The `x/mint` module mints to the fee collector account; `x/distribution` then
