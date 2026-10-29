@@ -20,6 +20,7 @@ func RegisterInterfaces(registry codectypes.InterfaceRegistry) {
 		&MsgRemoveLiquidity{},
 		&MsgSwapExactIn{},
 		&MsgSwapExactOut{},
+		&MsgSetPoolStatus{},
 		&MsgUpdateParams{},
 	)
 

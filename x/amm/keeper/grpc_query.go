@@ -102,6 +102,27 @@ func (q queryServer) PoolByAssets(goCtx context.Context, req *types.QueryPoolByA
 	return &types.QueryPoolByAssetsResponse{Pool: pool}, nil
 }
 
+// PoolsByAssets returns every pool for an unordered asset pair.
+func (q queryServer) PoolsByAssets(goCtx context.Context, req *types.QueryPoolsByAssetsRequest) (*types.QueryPoolsByAssetsResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "empty request")
+	}
+
+	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	ids := q.GetPoolIDsByAssets(ctx, req.AssetA, req.AssetB)
+	pools := make([]types.Pool, 0, len(ids))
+	for _, id := range ids {
+		pool, found := q.GetPool(ctx, id)
+		if !found {
+			return nil, status.Errorf(codes.NotFound, "pool %d not found", id)
+		}
+		pools = append(pools, pool)
+	}
+
+	return &types.QueryPoolsByAssetsResponse{Pools: pools}, nil
+}
+
 // Quote returns the expected output for a swap path.
 func (q queryServer) Quote(goCtx context.Context, req *types.QueryQuoteRequest) (*types.QueryQuoteResponse, error) {
 	if req == nil {
@@ -110,7 +131,7 @@ func (q queryServer) Quote(goCtx context.Context, req *types.QueryQuoteRequest) 
 
 	ctx := sdk.UnwrapSDKContext(goCtx)
 
-	amountOut, err := q.Keeper.Quote(ctx, req.Path, req.AmountIn)
+	amountOut, err := q.Keeper.QuoteWithPools(ctx, req.Path, req.PoolIds, req.AmountIn)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -126,7 +147,7 @@ func (q queryServer) QuoteExactOut(goCtx context.Context, req *types.QueryQuoteE
 
 	ctx := sdk.UnwrapSDKContext(goCtx)
 
-	amountIn, err := q.Keeper.QuoteExactOut(ctx, req.Path, req.AmountOut)
+	amountIn, err := q.Keeper.QuoteExactOutWithPools(ctx, req.Path, req.PoolIds, req.AmountOut)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}

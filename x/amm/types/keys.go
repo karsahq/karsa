@@ -20,7 +20,7 @@ const (
 var (
 	// PoolKeyPrefix is the prefix for pools stored by id.
 	PoolKeyPrefix = []byte{0x01}
-	// PoolByAssetsPrefix maps an unordered pair of assets to a pool id.
+	// PoolByAssetsPrefix maps an unordered pair of assets to a list of pool ids.
 	PoolByAssetsPrefix = []byte{0x02}
 	// NextPoolIDKey stores the next pool id.
 	NextPoolIDKey = []byte{0x03}
@@ -30,6 +30,8 @@ var (
 	ReentrancyKey = []byte{0x05}
 	// ObservationsKeyPrefix stores TWAP observations per pool.
 	ObservationsKeyPrefix = []byte{0x06}
+	// PoolKeyByParamsPrefix maps (pair, pool type, fee) to a pool id.
+	PoolKeyByParamsPrefix = []byte{0x07}
 )
 
 // PrecompileAddress is the fixed EVM address of the AMM precompile.
@@ -47,6 +49,16 @@ func PoolKey(id uint64) []byte {
 func PoolByAssetsKey(assetA, assetB string) []byte {
 	key := append([]byte{}, PoolByAssetsPrefix...)
 	key = append(key, []byte(assetA+"|"+assetB)...)
+	return key
+}
+
+// PoolKeyByParamsKey returns the uniqueness key for a pool configuration.
+// Callers must pass the assets already sorted ascending.
+func PoolKeyByParamsKey(assetA, assetB string, poolType PoolType, feeBps uint32) []byte {
+	key := append([]byte{}, PoolKeyByParamsPrefix...)
+	key = append(key, []byte(assetA+"|"+assetB+"|")...)
+	key = append(key, []byte(strconv.FormatInt(int64(poolType), 10)+"|")...)
+	key = append(key, []byte(strconv.FormatUint(uint64(feeBps), 10))...)
 	return key
 }
 

@@ -6,6 +6,7 @@ const (
 	EventTypeAddLiquidity    = "add_liquidity"
 	EventTypeRemoveLiquidity = "remove_liquidity"
 	EventTypeSwap            = "swap"
+	EventTypePoolStatus      = "pool_status"
 )
 
 // Attribute keys used by the module events.
@@ -22,4 +23,5 @@ const (
 	AttributeKeyAmountOut     = "amount_out"
 	AttributeKeyIntegrator    = "integrator"
 	AttributeKeyIntegratorFee = "integrator_fee"
+	AttributeKeyStatus        = "status"
 )

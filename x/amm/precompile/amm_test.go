@@ -11,9 +11,9 @@ import (
 // TestABIMatchesInterface keeps the Go ABI in sync with IAmm.sol.
 func TestABIMatchesInterface(t *testing.T) {
 	expected := map[string]string{
-		"quote":       "quote(address[],uint256)",
+		"quote":       "quote(address[],uint64[],uint256)",
 		"getPool":     "getPool(address,address)",
-		"swapExactIn": "swapExactIn(address[],uint256,uint256,address,address,uint256)",
+		"swapExactIn": "swapExactIn(address[],uint64[],uint256,uint256,address,address,uint256)",
 	}
 
 	require.Len(t, precompile.ABI.Methods, len(expected))

@@ -134,8 +134,8 @@ func (m msgServer) SwapExactIn(goCtx context.Context, msg *types.MsgSwapExactIn)
 		return nil, types.ErrDeadlineExceeded
 	}
 
-	amountOut, integratorFee, err := m.Keeper.Swap(
-		ctx, sender, receiver, msg.Path, msg.AmountIn, msg.MinOut, integrator, msg.IntegratorFeeBps,
+	amountOut, integratorFee, err := m.Keeper.SwapWithPools(
+		ctx, msg.PoolIds, sender, receiver, msg.Path, msg.AmountIn, msg.MinOut, integrator, msg.IntegratorFeeBps,
 	)
 	if err != nil {
 		return nil, err
@@ -178,14 +178,34 @@ func (m msgServer) SwapExactOut(goCtx context.Context, msg *types.MsgSwapExactOu
 		return nil, types.ErrDeadlineExceeded
 	}
 
-	amountIn, integratorFee, err := m.Keeper.SwapExactOut(
-		ctx, sender, receiver, msg.Path, msg.AmountOut, msg.MaxAmountIn, integrator, msg.IntegratorFeeBps,
+	amountIn, integratorFee, err := m.Keeper.SwapExactOutWithPools(
+		ctx, msg.PoolIds, sender, receiver, msg.Path, msg.AmountOut, msg.MaxAmountIn, integrator, msg.IntegratorFeeBps,
 	)
 	if err != nil {
 		return nil, err
 	}
 
 	return &types.MsgSwapExactOutResponse{AmountIn: amountIn, IntegratorFee: integratorFee}, nil
+}
+
+// SetPoolStatus changes a pool's operational status. Only the authority may call it.
+func (m msgServer) SetPoolStatus(goCtx context.Context, msg *types.MsgSetPoolStatus) (*types.MsgSetPoolStatusResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	if err := m.acquireLock(ctx); err != nil {
+		return nil, err
+	}
+	defer m.releaseLock(ctx)
+
+	if m.Authority() != msg.Authority {
+		return nil, types.ErrUnauthorized.Wrapf("expected authority %s", m.Authority())
+	}
+
+	if err := m.Keeper.SetPoolStatus(ctx, msg.PoolId, msg.Status); err != nil {
+		return nil, err
+	}
+
+	return &types.MsgSetPoolStatusResponse{}, nil
 }
 
 // UpdateParams updates the module params. Only the authority may call it.

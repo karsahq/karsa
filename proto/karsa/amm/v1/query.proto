@@ -12,6 +12,7 @@ service Query {
   rpc Pool(QueryPoolRequest) returns (QueryPoolResponse);
   rpc Pools(QueryPoolsRequest) returns (QueryPoolsResponse);
   rpc PoolByAssets(QueryPoolByAssetsRequest) returns (QueryPoolByAssetsResponse);
+  rpc PoolsByAssets(QueryPoolsByAssetsRequest) returns (QueryPoolsByAssetsResponse);
   rpc Quote(QueryQuoteRequest) returns (QueryQuoteResponse);
   rpc QuoteExactOut(QueryQuoteExactOutRequest) returns (QueryQuoteExactOutResponse);
   rpc Twap(QueryTwapRequest) returns (QueryTwapResponse);
@@ -44,10 +45,21 @@ message QueryPoolByAssetsResponse {
   Pool pool = 1 [(gogoproto.nullable) = false];
 }
 
+message QueryPoolsByAssetsRequest {
+  string asset_a = 1;
+  string asset_b = 2;
+}
+
+message QueryPoolsByAssetsResponse {
+  repeated Pool pools = 1 [(gogoproto.nullable) = false];
+}
+
 message QueryQuoteRequest {
   repeated string path = 1;
   string amount_in = 2
       [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  // Optional pool id per hop. Empty means the unique pool for the pair.
+  repeated uint64 pool_ids = 3;
 }
 
 message QueryQuoteResponse {
@@ -59,6 +71,8 @@ message QueryQuoteExactOutRequest {
   repeated string path = 1;
   string amount_out = 2
       [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+  // Optional pool id per hop. Empty means the unique pool for the pair.
+  repeated uint64 pool_ids = 3;
 }
 
 message QueryQuoteExactOutResponse {

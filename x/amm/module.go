@@ -27,9 +27,10 @@ var (
 	_ module.AppModuleBasic   = AppModuleBasic{}
 	_ module.HasGenesisBasics = AppModuleBasic{}
 
-	_ appmodule.AppModule = AppModule{}
-	_ module.HasServices  = AppModule{}
-	_ module.HasGenesis   = AppModule{}
+	_ appmodule.AppModule     = AppModule{}
+	_ module.HasServices      = AppModule{}
+	_ module.HasGenesis       = AppModule{}
+	_ appmodule.HasEndBlocker = AppModule{}
 )
 
 // AppModuleBasic implements the module's stateless methods.
@@ -106,6 +107,13 @@ func (am AppModule) InitGenesis(ctx sdk.Context, cdc codec.JSONCodec, data json.
 func (am AppModule) ExportGenesis(ctx sdk.Context, cdc codec.JSONCodec) json.RawMessage {
 	genesisState := am.keeper.ExportGenesis(ctx)
 	return cdc.MustMarshalJSON(&genesisState)
+}
+
+// EndBlock downgrades active external pools to withdraw-only when conversion
+// becomes unavailable. It never upgrades a pool automatically.
+func (am AppModule) EndBlock(ctx context.Context) error {
+	am.keeper.SyncPoolStatuses(sdk.UnwrapSDKContext(ctx))
+	return nil
 }
 
 // GetTxCmd is not implemented; the module is used through the generated Msg service.

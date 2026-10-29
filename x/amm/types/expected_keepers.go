@@ -3,7 +3,10 @@ package types
 import (
 	"context"
 
+	sdkmath "cosmossdk.io/math"
+
 	erc20types "github.com/cosmos/evm/x/erc20/types"
+	"github.com/cosmos/evm/x/vm/statedb"
 
 	"github.com/ethereum/go-ethereum/common"
 
@@ -31,8 +34,19 @@ type Erc20Keeper interface {
 	GetTokenPair(ctx sdk.Context, id []byte) (erc20types.TokenPair, bool)
 	IsDenomRegistered(ctx sdk.Context, denom string) bool
 	IsERC20Registered(ctx sdk.Context, erc20 common.Address) bool
+	IsERC20Enabled(ctx sdk.Context) bool
 	SetToken(ctx sdk.Context, pair erc20types.TokenPair) error
 	EnableDynamicPrecompile(ctx sdk.Context, address common.Address) error
+	ConvertERC20IntoCoinsForNativeToken(
+		ctx sdk.Context,
+		stateDB *statedb.StateDB,
+		contract common.Address,
+		amount sdkmath.Int,
+		receiver sdk.AccAddress,
+		sender common.Address,
+		commit bool,
+		callFromPrecompile bool,
+	) (*erc20types.MsgConvertERC20Response, error)
 }
 
 // EVMKeeper is the subset of the EVM keeper needed to move external ERC20

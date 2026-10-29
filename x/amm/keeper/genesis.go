@@ -14,7 +14,8 @@ func (k Keeper) InitGenesis(ctx sdk.Context, gs types.GenesisState) {
 
 	for _, pool := range gs.Pools {
 		k.SetPool(ctx, pool)
-		k.SetPoolIDByAssets(ctx, pool.AssetA, pool.AssetB, pool.Id)
+		k.AddPoolIDByAssets(ctx, pool.AssetA, pool.AssetB, pool.Id)
+		k.SetPoolIDByKey(ctx, pool.AssetA, pool.AssetB, pool.PoolType, pool.FeeBps, pool.Id)
 	}
 
 	k.SetNextPoolID(ctx, gs.NextPoolId)

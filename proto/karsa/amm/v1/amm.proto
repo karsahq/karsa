@@ -12,6 +12,12 @@ enum PoolType {
   POOL_TYPE_STABLESWAP = 1;
 }
 
+// PoolStatus controls whether a pool can be used.
+enum PoolStatus {
+  ACTIVE = 0;
+  WITHDRAW_ONLY = 1;
+}
+
 // Pool is a liquidity pool keyed by two ERC20 addresses.
 message Pool {
   uint64 id = 1;
@@ -42,6 +48,8 @@ message Pool {
 	// (10^(18-decimals)). A zero value means 1.
 	uint64 scaling_factor_a = 15;
 	uint64 scaling_factor_b = 16;
+	// Operational status.
+	PoolStatus status = 17;
 }
 
 // Params defines the module parameters.
@@ -59,6 +67,16 @@ message Params {
     (gogoproto.castrepeated) = "github.com/cosmos/cosmos-sdk/types.Coins"
   ];
   uint32 fee_burn_bps = 7;
+  // Maximum number of pools for one unordered asset pair.
+  uint32 max_pools_per_pair = 8;
+  // Allowed constant-product fee tiers, in basis points.
+  repeated uint32 cp_fee_tiers_bps = 9;
+  // Allowed stableswap fee tiers, in basis points.
+  repeated uint32 stable_fee_tiers_bps = 10;
+  // Hard cap on any pool fee, in basis points.
+  uint32 max_fee_bps = 11;
+  // Cap on pool fee + integrator fee, in basis points.
+  uint32 max_total_fee_bps = 12;
 }
 
 // GenesisState defines the module genesis state.

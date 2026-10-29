@@ -54,9 +54,61 @@ func (k Keeper) SetPool(ctx sdk.Context, pool types.Pool) {
 	k.Store(ctx).Set(types.PoolKey(pool.Id), k.cdc.MustMarshal(&pool))
 }
 
-// GetPoolIDByAssets returns the pool id for an unordered asset pair.
+// GetPoolIDsByAssets returns all pool ids for an unordered asset pair.
+func (k Keeper) GetPoolIDsByAssets(ctx sdk.Context, assetA, assetB string) []uint64 {
+	a := strings.ToLower(assetA)
+	b := strings.ToLower(assetB)
+	if a > b {
+		a, b = b, a
+	}
+
+	bz := k.Store(ctx).Get(types.PoolByAssetsKey(a, b))
+	if bz == nil {
+		return nil
+	}
+
+	return decodePoolIDs(bz)
+}
+
+// GetPoolIDByAssets returns the first pool id for an unordered asset pair.
+// Callers that need to disambiguate multiple fee-tier pools must use
+// GetPoolIDsByAssets or GetPoolIDByKey.
 func (k Keeper) GetPoolIDByAssets(ctx sdk.Context, assetA, assetB string) (uint64, bool) {
-	bz := k.Store(ctx).Get(types.PoolByAssetsKey(assetA, assetB))
+	ids := k.GetPoolIDsByAssets(ctx, assetA, assetB)
+	if len(ids) == 0 {
+		return 0, false
+	}
+	return ids[0], true
+}
+
+// AddPoolIDByAssets appends a pool id to the pair index.
+func (k Keeper) AddPoolIDByAssets(ctx sdk.Context, assetA, assetB string, id uint64) {
+	a := strings.ToLower(assetA)
+	b := strings.ToLower(assetB)
+	if a > b {
+		a, b = b, a
+	}
+
+	ids := k.GetPoolIDsByAssets(ctx, a, b)
+	for _, existing := range ids {
+		if existing == id {
+			return
+		}
+	}
+	k.Store(ctx).Set(types.PoolByAssetsKey(a, b), encodePoolIDs(append(ids, id)))
+}
+
+// GetPoolIDByKey returns the pool id for a specific (pair, type, fee) tuple.
+func (k Keeper) GetPoolIDByKey(
+	ctx sdk.Context, assetA, assetB string, poolType types.PoolType, feeBps uint32,
+) (uint64, bool) {
+	a := strings.ToLower(assetA)
+	b := strings.ToLower(assetB)
+	if a > b {
+		a, b = b, a
+	}
+
+	bz := k.Store(ctx).Get(types.PoolKeyByParamsKey(a, b, poolType, feeBps))
 	if bz == nil {
 		return 0, false
 	}
@@ -64,11 +116,19 @@ func (k Keeper) GetPoolIDByAssets(ctx sdk.Context, assetA, assetB string) (uint6
 	return binary.BigEndian.Uint64(bz), true
 }
 
-// SetPoolIDByAssets indexes a pool by its unordered asset pair.
-func (k Keeper) SetPoolIDByAssets(ctx sdk.Context, assetA, assetB string, id uint64) {
+// SetPoolIDByKey indexes a pool by its uniqueness key.
+func (k Keeper) SetPoolIDByKey(
+	ctx sdk.Context, assetA, assetB string, poolType types.PoolType, feeBps uint32, id uint64,
+) {
+	a := strings.ToLower(assetA)
+	b := strings.ToLower(assetB)
+	if a > b {
+		a, b = b, a
+	}
+
 	bz := make([]byte, 8)
 	binary.BigEndian.PutUint64(bz, id)
-	k.Store(ctx).Set(types.PoolByAssetsKey(assetA, assetB), bz)
+	k.Store(ctx).Set(types.PoolKeyByParamsKey(a, b, poolType, feeBps), bz)
 }
 
 // IteratePools iterates over all pools. Returning true from cb stops the iteration.
@@ -83,6 +143,30 @@ func (k Keeper) IteratePools(ctx sdk.Context, cb func(types.Pool) bool) {
 			return
 		}
 	}
+}
+
+// CountPoolsForAssets returns the number of pools for an unordered asset pair.
+func (k Keeper) CountPoolsForAssets(ctx sdk.Context, assetA, assetB string) uint32 {
+	return uint32(len(k.GetPoolIDsByAssets(ctx, assetA, assetB)))
+}
+
+func encodePoolIDs(ids []uint64) []byte {
+	bz := make([]byte, 8*len(ids))
+	for i, id := range ids {
+		binary.BigEndian.PutUint64(bz[i*8:], id)
+	}
+	return bz
+}
+
+func decodePoolIDs(bz []byte) []uint64 {
+	if len(bz)%8 != 0 {
+		return nil
+	}
+	ids := make([]uint64, len(bz)/8)
+	for i := range ids {
+		ids[i] = binary.BigEndian.Uint64(bz[i*8:])
+	}
+	return ids
 }
 
 // CreatePool creates a constant-product pool. It is a convenience wrapper
@@ -130,8 +214,11 @@ func (k Keeper) CreatePoolWithType(
 	if feeBps == 0 {
 		feeBps = params.DefaultFeeBps
 	}
-	if feeBps > 1_000 {
-		return 0, sdkmath.Int{}, types.ErrInvalidFee.Wrapf("fee_bps must be <= 1000, got %d", feeBps)
+	if !params.IsAllowedFeeBps(poolType, feeBps) {
+		return 0, sdkmath.Int{}, types.ErrInvalidFee.Wrapf(
+			"fee %d bps is not an allowed tier for %s (allowed: %v)",
+			feeBps, poolType, params.FeeTiers(poolType),
+		)
 	}
 	if !amountA.IsPositive() || !amountB.IsPositive() {
 		return 0, sdkmath.Int{}, types.ErrInvalidAmount.Wrap("initial amounts must be positive")
@@ -155,8 +242,16 @@ func (k Keeper) CreatePoolWithType(
 	if a.Denom == b.Denom {
 		return 0, sdkmath.Int{}, types.ErrInvalidAsset.Wrap("assets resolve to the same denom")
 	}
-	if _, found := k.GetPoolIDByAssets(ctx, a.Address, b.Address); found {
-		return 0, sdkmath.Int{}, types.ErrPoolExists.Wrapf("pool %s/%s already exists", a.Address, b.Address)
+	if _, found := k.GetPoolIDByKey(ctx, a.Address, b.Address, poolType, feeBps); found {
+		return 0, sdkmath.Int{}, types.ErrPoolExists.Wrapf(
+			"pool %s/%s type=%d fee=%d already exists", a.Address, b.Address, poolType, feeBps,
+		)
+	}
+	if k.CountPoolsForAssets(ctx, a.Address, b.Address) >= params.MaxPoolsPerPair {
+		return 0, sdkmath.Int{}, types.ErrPoolExists.Wrapf(
+			"pair %s/%s already has the maximum of %d pools",
+			a.Address, b.Address, params.MaxPoolsPerPair,
+		)
 	}
 
 	var scalingA, scalingB uint64
@@ -256,18 +351,13 @@ func (k Keeper) CreatePoolWithType(
 		Amplification:  amplification,
 		ScalingFactorA: scalingA,
 		ScalingFactorB: scalingB,
+		Status:         types.PoolStatus_ACTIVE,
 	}
 	k.SetPool(ctx, pool)
 	k.updateOracle(ctx, pool)
-	k.SetPoolIDByAssets(ctx, a.Address, b.Address, id)
+	k.AddPoolIDByAssets(ctx, a.Address, b.Address, id)
+	k.SetPoolIDByKey(ctx, a.Address, b.Address, poolType, feeBps, id)
 	k.SetNextPoolID(ctx, id+1)
-
-	if err := k.assertCustody(ctx, a, pool.ReserveA); err != nil {
-		return 0, sdkmath.Int{}, err
-	}
-	if err := k.assertCustody(ctx, b, pool.ReserveB); err != nil {
-		return 0, sdkmath.Int{}, err
-	}
 
 	ctx.EventManager().EmitEvent(sdk.NewEvent(
 		types.EventTypeCreatePool,

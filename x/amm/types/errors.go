@@ -18,4 +18,5 @@ var (
 	ErrUnauthorized              = errorsmod.Register(ModuleName, 12, "unauthorized")
 	ErrInvalidParams             = errorsmod.Register(ModuleName, 13, "invalid params")
 	ErrReentrancy                = errorsmod.Register(ModuleName, 14, "reentrant call")
+	ErrPoolInactive              = errorsmod.Register(ModuleName, 15, "pool inactive")
 )

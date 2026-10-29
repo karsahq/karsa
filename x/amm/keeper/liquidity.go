@@ -27,6 +27,9 @@ func (k Keeper) AddLiquidity(
 	if !found {
 		return sdkmath.Int{}, types.ErrPoolNotFound.Wrapf("pool %d", poolID)
 	}
+	if pool.Status != types.PoolStatus_ACTIVE {
+		return sdkmath.Int{}, types.ErrPoolInactive.Wrapf("pool %d status is %s", poolID, pool.Status)
+	}
 	if !amountA.IsPositive() || !amountB.IsPositive() {
 		return sdkmath.Int{}, types.ErrInvalidAmount.Wrap("amounts must be positive")
 	}
@@ -160,13 +163,6 @@ func (k Keeper) RemoveLiquidity(
 	pool.TotalShares = pool.TotalShares.Sub(shares)
 	k.SetPool(ctx, pool)
 	k.updateOracle(ctx, pool)
-
-	if err := k.assertCustody(ctx, assetOutA, pool.ReserveA); err != nil {
-		return sdkmath.Int{}, sdkmath.Int{}, err
-	}
-	if err := k.assertCustody(ctx, assetOutB, pool.ReserveB); err != nil {
-		return sdkmath.Int{}, sdkmath.Int{}, err
-	}
 
 	ctx.EventManager().EmitEvent(sdk.NewEvent(
 		types.EventTypeRemoveLiquidity,

@@ -5,9 +5,12 @@ import (
 	"strings"
 	"testing"
 
+	sdkmath "cosmossdk.io/math"
+
 	"github.com/karsahq/karsa/x/amm/types"
 
 	erc20types "github.com/cosmos/evm/x/erc20/types"
+	"github.com/cosmos/evm/x/vm/statedb"
 
 	"github.com/ethereum/go-ethereum/common"
 
@@ -66,6 +69,8 @@ func (m *mockErc20Keeper) IsDenomRegistered(sdk.Context, string) bool { return f
 
 func (m *mockErc20Keeper) IsERC20Registered(sdk.Context, common.Address) bool { return false }
 
+func (m *mockErc20Keeper) IsERC20Enabled(sdk.Context) bool { return true }
+
 func (m *mockErc20Keeper) SetToken(_ sdk.Context, pair erc20types.TokenPair) error {
 	m.tokenSet = true
 	return nil
@@ -75,6 +80,19 @@ func (m *mockErc20Keeper) EnableDynamicPrecompile(_ sdk.Context, address common.
 	m.dynamicEnabled = true
 	m.registeredAddr = address
 	return nil
+}
+
+func (m *mockErc20Keeper) ConvertERC20IntoCoinsForNativeToken(
+	_ sdk.Context,
+	_ *statedb.StateDB,
+	_ common.Address,
+	_ sdkmath.Int,
+	_ sdk.AccAddress,
+	_ common.Address,
+	_ bool,
+	_ bool,
+) (*erc20types.MsgConvertERC20Response, error) {
+	return &erc20types.MsgConvertERC20Response{}, nil
 }
 
 func TestRegisterLPAsset(t *testing.T) {

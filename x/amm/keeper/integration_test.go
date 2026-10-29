@@ -9,6 +9,7 @@ import (
 	"time"
 
 	karsa "github.com/karsahq/karsa"
+	ammkeeper "github.com/karsahq/karsa/x/amm/keeper"
 	ammprecompile "github.com/karsahq/karsa/x/amm/precompile"
 	ammtypes "github.com/karsahq/karsa/x/amm/types"
 
@@ -368,7 +369,7 @@ func TestStableSwapPool(t *testing.T) {
 
 	deposit := sdkmath.NewInt(1_000_000)
 	poolID, _, err := app.AmmKeeper.CreatePoolWithType(
-		ctx, sender, testUSDCPair.Hex(), testUSDTPair.Hex(), 30, deposit, deposit,
+		ctx, sender, testUSDCPair.Hex(), testUSDTPair.Hex(), 3, deposit, deposit,
 		ammtypes.PoolType_POOL_TYPE_STABLESWAP, 100,
 	)
 	require.NoError(t, err)
@@ -456,7 +457,7 @@ func TestStableSwapMixedDecimals(t *testing.T) {
 
 	// 1e18 raw akra and 1e6 raw USDC are both one whole token after scaling.
 	poolID, _, err := app.AmmKeeper.CreatePoolWithType(
-		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 30,
+		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 3,
 		sdkmath.NewIntWithDecimal(1, 18), sdkmath.NewIntWithDecimal(1, 6),
 		ammtypes.PoolType_POOL_TYPE_STABLESWAP, 100,
 	)
@@ -488,6 +489,39 @@ func TestStableSwapMixedDecimals(t *testing.T) {
 	require.Equal(t, quoted, amountOut)
 	require.Equal(t, usdcBefore.Sub(amountIn), app.BankKeeper.GetBalance(ctx, sender, testUSDCDenom).Amount)
 	require.Equal(t, akraBefore.Add(amountOut), app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount)
+}
+
+// TestCreatePoolFeeTiers checks fixed tier validation for both pool types.
+func TestCreatePoolFeeTiers(t *testing.T) {
+	app, ctx := newTestApp(t)
+	registerTestUSDCPair(t, app, ctx)
+
+	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000D4").Bytes())
+	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
+
+	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	deposit := sdkmath.NewInt(1_000_000)
+
+	// Constant product does not allow 7 bps.
+	_, _, err := app.AmmKeeper.CreatePool(
+		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 7, deposit, deposit,
+	)
+	require.ErrorIs(t, err, ammtypes.ErrInvalidFee)
+
+	// Stableswap does not allow the constant-product 30 bps tier.
+	_, _, err = app.AmmKeeper.CreatePoolWithType(
+		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 30, deposit, deposit,
+		ammtypes.PoolType_POOL_TYPE_STABLESWAP, 100,
+	)
+	require.ErrorIs(t, err, ammtypes.ErrInvalidFee)
+
+	// 3 bps is the valid stableswap tier.
+	_, _, err = app.AmmKeeper.CreatePoolWithType(
+		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 3, deposit, deposit,
+		ammtypes.PoolType_POOL_TYPE_STABLESWAP, 100,
+	)
+	require.NoError(t, err)
+	require.Equal(t, uint32(1), app.AmmKeeper.CountPoolsForAssets(ctx, akraAsset.Hex(), testUSDCPair.Hex()))
 }
 
 // deployTestERC20 deploys the example ERC20 contract from the given address and
@@ -529,7 +563,7 @@ func erc20BalanceOf(t *testing.T, app *karsa.App, ctx sdk.Context, token, accoun
 
 	stateDB := statedb.New(ctx, app.EVMKeeper, statedb.NewEmptyTxConfig())
 	res, err := app.EVMKeeper.CallEVM(
-		ctx, stateDB, contracts.ERC20MinterBurnerDecimalsContract.ABI, account, token, false, false, nil,
+		ctx, stateDB, contracts.ERC20MinterBurnerDecimalsContract.ABI, app.AmmKeeper.ModuleAddress(), token, false, false, nil,
 		"balanceOf", account,
 	)
 	require.NoError(t, err)
@@ -624,7 +658,7 @@ func TestAmmPrecompile(t *testing.T) {
 	amountIn := big.NewInt(10_000)
 
 	// --- quote through the precompile -------------------------------------
-	quoteInput, err := ammprecompile.ABI.Pack("quote", path, amountIn)
+	quoteInput, err := ammprecompile.ABI.Pack("quote", path, []uint64{}, amountIn)
 	require.NoError(t, err)
 
 	stateDB := statedb.New(ctx, app.EVMKeeper, statedb.NewEmptyTxConfig())
@@ -644,7 +678,7 @@ func TestAmmPrecompile(t *testing.T) {
 	before := app.BankKeeper.GetBalance(ctx, sdk.AccAddress(caller.Bytes()), testUSDCDenom).Amount
 
 	swapInput, err := ammprecompile.ABI.Pack(
-		"swapExactIn", path, amountIn, big.NewInt(1), common.Address{}, common.Address{}, big.NewInt(0),
+		"swapExactIn", path, []uint64{}, amountIn, big.NewInt(1), common.Address{}, common.Address{}, big.NewInt(0),
 	)
 	require.NoError(t, err)
 
@@ -664,8 +698,260 @@ func TestAmmPrecompile(t *testing.T) {
 	require.Equal(t, before.Add(sdkmath.NewIntFromBigInt(amountOut)), after)
 }
 
-// TestExternalERC20Pool exercises direct custody: the module holds the ERC20
-// contract tokens itself and moves them with EVM transfers.
+// TestAmmPrecompileExternal exercises auto-conversion through the EVM precompile:
+// bank -> ERC20 output and ERC20 -> bank input.
+func TestAmmPrecompileExternal(t *testing.T) {
+	app, ctx := newTestApp(t)
+
+	caller := common.HexToAddress("0x00000000000000000000000000000000000000F2")
+	nativeCoins := sdk.NewCoins(sdk.NewCoin(karsaNativeDenom(), sdkmath.NewIntWithDecimal(1_000, 18)))
+	require.NoError(t, app.BankKeeper.MintCoins(ctx, ammtypes.ModuleName, nativeCoins))
+	require.NoError(t, app.BankKeeper.SendCoinsFromModuleToAccount(
+		ctx, ammtypes.ModuleName, sdk.AccAddress(caller.Bytes()), nativeCoins,
+	))
+
+	token := deployTestERC20(t, app, ctx, caller, "Momo", "MOMO", 18)
+	mintTestERC20(t, app, ctx, token, caller, sdkmath.NewInt(1_000_000))
+
+	denom := "erc20:" + strings.ToLower(token.Hex())
+	require.NoError(t, app.Erc20Keeper.SetToken(ctx, erc20types.NewTokenPair(
+		token, denom, erc20types.OWNER_EXTERNAL,
+	)))
+
+	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	sender := sdk.AccAddress(caller.Bytes())
+	_, _, err := app.AmmKeeper.CreatePool(
+		ctx, sender, akraAsset.Hex(), token.Hex(), 30,
+		sdkmath.NewInt(100_000), sdkmath.NewInt(100_000),
+	)
+	require.NoError(t, err)
+
+	amountIn := big.NewInt(1_000)
+
+	// Bank -> ERC20: output conversion inside the precompile.
+	tokenBefore := erc20BalanceOf(t, app, ctx, token, caller)
+	outPath := []common.Address{akraAsset, token}
+	outInput, err := ammprecompile.ABI.Pack(
+		"swapExactIn", outPath, []uint64{}, amountIn, big.NewInt(1), common.Address{}, common.Address{}, big.NewInt(0),
+	)
+	require.NoError(t, err)
+
+	stateDB := statedb.New(ctx, app.EVMKeeper, statedb.NewEmptyTxConfig())
+	res, err := app.EVMKeeper.CallEVMWithData(ctx, stateDB, caller, &ammprecompile.Address, outInput, true, false, nil)
+	require.NoError(t, err)
+	require.False(t, res.Failed(), res.VmError)
+
+	out, err := ammprecompile.ABI.Unpack("swapExactIn", res.Ret)
+	require.NoError(t, err)
+	amountOut := out[0].(*big.Int)
+	require.True(t, amountOut.Sign() > 0)
+	require.Equal(t, tokenBefore.Add(sdkmath.NewIntFromBigInt(amountOut)), erc20BalanceOf(t, app, ctx, token, caller))
+
+	// ERC20 -> bank: input conversion inside the precompile.
+	akraBefore := app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount
+	inPath := []common.Address{token, akraAsset}
+	inInput, err := ammprecompile.ABI.Pack(
+		"swapExactIn", inPath, []uint64{}, amountIn, big.NewInt(1), common.Address{}, common.Address{}, big.NewInt(0),
+	)
+	require.NoError(t, err)
+
+	stateDB = statedb.New(ctx, app.EVMKeeper, statedb.NewEmptyTxConfig())
+	res, err = app.EVMKeeper.CallEVMWithData(ctx, stateDB, caller, &ammprecompile.Address, inInput, true, false, nil)
+	require.NoError(t, err)
+	require.False(t, res.Failed(), res.VmError)
+
+	out, err = ammprecompile.ABI.Unpack("swapExactIn", res.Ret)
+	require.NoError(t, err)
+	akraOut := out[0].(*big.Int)
+	require.True(t, akraOut.Sign() > 0)
+	require.Equal(t, akraBefore.Add(sdkmath.NewIntFromBigInt(akraOut)),
+		app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount)
+}
+
+// TestMultiPoolRouting exercises several fee-tier pools for the same pair.
+func TestMultiPoolRouting(t *testing.T) {
+	app, ctx := newTestApp(t)
+	registerTestUSDCPair(t, app, ctx)
+
+	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000D5").Bytes())
+	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
+
+	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	deposit := sdkmath.NewInt(1_000_000)
+
+	pool5, _, err := app.AmmKeeper.CreatePool(
+		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 5, deposit, deposit,
+	)
+	require.NoError(t, err)
+	pool10, _, err := app.AmmKeeper.CreatePool(
+		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 10, deposit, deposit,
+	)
+	require.NoError(t, err)
+	pool30, _, err := app.AmmKeeper.CreatePool(
+		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 30, deposit, deposit,
+	)
+	require.NoError(t, err)
+
+	require.Equal(t, uint32(3), app.AmmKeeper.CountPoolsForAssets(ctx, akraAsset.Hex(), testUSDCPair.Hex()))
+	require.ElementsMatch(t,
+		[]uint64{pool5, pool10, pool30},
+		app.AmmKeeper.GetPoolIDsByAssets(ctx, akraAsset.Hex(), testUSDCPair.Hex()),
+	)
+
+	// The same (pair, type, fee) cannot be created twice.
+	_, _, err = app.AmmKeeper.CreatePool(
+		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 10, deposit, deposit,
+	)
+	require.ErrorIs(t, err, ammtypes.ErrPoolExists)
+
+	path := []string{akraAsset.Hex(), testUSDCPair.Hex()}
+	amountIn := sdkmath.NewInt(10_000)
+
+	quoted, err := app.AmmKeeper.QuoteWithPools(ctx, path, []uint64{pool5}, amountIn)
+	require.NoError(t, err)
+	require.True(t, quoted.IsPositive())
+
+	// The precompile accepts the same explicit pool id.
+	quoteInput, err := ammprecompile.ABI.Pack(
+		"quote", []common.Address{akraAsset, testUSDCPair}, []uint64{pool5}, amountIn.BigInt(),
+	)
+	require.NoError(t, err)
+	quoteStateDB := statedb.New(ctx, app.EVMKeeper, statedb.NewEmptyTxConfig())
+	quoteRes, err := app.EVMKeeper.CallEVMWithData(
+		ctx, quoteStateDB, common.BytesToAddress(sender.Bytes()), &ammprecompile.Address, quoteInput, false, false, nil,
+	)
+	require.NoError(t, err)
+	require.False(t, quoteRes.Failed(), quoteRes.VmError)
+	quoteOut, err := ammprecompile.ABI.Unpack("quote", quoteRes.Ret)
+	require.NoError(t, err)
+	require.Equal(t, quoted.BigInt(), quoteOut[0].(*big.Int))
+
+	// Ambiguous route without pool ids is rejected.
+	_, err = app.AmmKeeper.Quote(ctx, path, amountIn)
+	require.ErrorIs(t, err, ammtypes.ErrInvalidPath)
+
+	before5, found := app.AmmKeeper.GetPool(ctx, pool5)
+	require.True(t, found)
+	before10, found := app.AmmKeeper.GetPool(ctx, pool10)
+	require.True(t, found)
+	before30, found := app.AmmKeeper.GetPool(ctx, pool30)
+	require.True(t, found)
+
+	_, _, err = app.AmmKeeper.SwapWithPools(
+		ctx, []uint64{pool5}, sender, sender, path, amountIn, sdkmath.NewInt(1), nil, 0,
+	)
+	require.NoError(t, err)
+
+	after10, found := app.AmmKeeper.GetPool(ctx, pool10)
+	require.True(t, found)
+	after30, found := app.AmmKeeper.GetPool(ctx, pool30)
+	require.True(t, found)
+	require.Equal(t, before10.ReserveA, after10.ReserveA)
+	require.Equal(t, before10.ReserveB, after10.ReserveB)
+	require.Equal(t, before30.ReserveA, after30.ReserveA)
+	require.Equal(t, before30.ReserveB, after30.ReserveB)
+
+	after5, found := app.AmmKeeper.GetPool(ctx, pool5)
+	require.True(t, found)
+	require.NotEqual(t, before5.ReserveA, after5.ReserveA)
+}
+
+// TestPoolStatusTransitions checks ACTIVE / WITHDRAW_ONLY behavior.
+func TestPoolStatusTransitions(t *testing.T) {
+	app, ctx := newTestApp(t)
+	registerTestUSDCPair(t, app, ctx)
+
+	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000D6").Bytes())
+	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
+
+	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	deposit := sdkmath.NewInt(1_000_000)
+	poolID, shares, err := app.AmmKeeper.CreatePool(
+		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 30, deposit, deposit,
+	)
+	require.NoError(t, err)
+
+	path := []string{akraAsset.Hex(), testUSDCPair.Hex()}
+
+	msgSrv := ammkeeper.NewMsgServerImpl(app.AmmKeeper)
+	_, err = msgSrv.SetPoolStatus(ctx, &ammtypes.MsgSetPoolStatus{
+		Authority: sender.String(), PoolId: poolID, Status: ammtypes.PoolStatus_WITHDRAW_ONLY,
+	})
+	require.ErrorIs(t, err, ammtypes.ErrUnauthorized)
+
+	_, err = msgSrv.SetPoolStatus(ctx, &ammtypes.MsgSetPoolStatus{
+		Authority: app.AmmKeeper.Authority(), PoolId: poolID, Status: ammtypes.PoolStatus_WITHDRAW_ONLY,
+	})
+	require.NoError(t, err)
+
+	_, _, err = app.AmmKeeper.Swap(
+		ctx, sender, sender, path, sdkmath.NewInt(10_000), sdkmath.NewInt(1), nil, 0,
+	)
+	require.ErrorIs(t, err, ammtypes.ErrPoolInactive)
+
+	_, err = app.AmmKeeper.AddLiquidity(ctx, sender, poolID, sdkmath.NewInt(1_000), sdkmath.NewInt(1_000), sdkmath.NewInt(1))
+	require.ErrorIs(t, err, ammtypes.ErrPoolInactive)
+
+	// Withdrawals stay available in WITHDRAW_ONLY.
+	_, _, err = app.AmmKeeper.RemoveLiquidity(ctx, sender, poolID, shares, sdkmath.ZeroInt(), sdkmath.ZeroInt())
+	require.NoError(t, err)
+
+	// There is no CLOSED state; governance can reactivate the pool.
+	require.NoError(t, app.AmmKeeper.SetPoolStatus(ctx, poolID, ammtypes.PoolStatus_ACTIVE))
+	require.ErrorIs(t,
+		app.AmmKeeper.SetPoolStatus(ctx, poolID, ammtypes.PoolStatus(99)),
+		ammtypes.ErrInvalidParams,
+	)
+}
+
+// TestSyncPoolStatuses checks that disabling an external token pair downgrades
+// the pool to WITHDRAW_ONLY automatically.
+func TestSyncPoolStatuses(t *testing.T) {
+	app, ctx := newTestApp(t)
+
+	deployer := common.HexToAddress("0x00000000000000000000000000000000000000D7")
+	nativeCoins := sdk.NewCoins(sdk.NewCoin(karsaNativeDenom(), sdkmath.NewIntWithDecimal(1_000, 18)))
+	require.NoError(t, app.BankKeeper.MintCoins(ctx, ammtypes.ModuleName, nativeCoins))
+	require.NoError(t, app.BankKeeper.SendCoinsFromModuleToAccount(
+		ctx, ammtypes.ModuleName, sdk.AccAddress(deployer.Bytes()), nativeCoins,
+	))
+
+	token := deployTestERC20(t, app, ctx, deployer, "Momo", "MOMO", 18)
+	mintTestERC20(t, app, ctx, token, deployer, sdkmath.NewInt(1_000_000))
+
+	denom := "erc20:" + strings.ToLower(token.Hex())
+	require.NoError(t, app.Erc20Keeper.SetToken(ctx, erc20types.NewTokenPair(
+		token, denom, erc20types.OWNER_EXTERNAL,
+	)))
+
+	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	sender := sdk.AccAddress(deployer.Bytes())
+	poolID, _, err := app.AmmKeeper.CreatePool(
+		ctx, sender, akraAsset.Hex(), token.Hex(), 30,
+		sdkmath.NewInt(100_000), sdkmath.NewInt(100_000),
+	)
+	require.NoError(t, err)
+
+	params := app.Erc20Keeper.GetParams(ctx)
+	params.EnableErc20 = false
+	require.NoError(t, app.Erc20Keeper.SetParams(ctx, params))
+
+	app.AmmKeeper.SyncPoolStatuses(ctx)
+
+	pool, found := app.AmmKeeper.GetPool(ctx, poolID)
+	require.True(t, found)
+	require.Equal(t, ammtypes.PoolStatus_WITHDRAW_ONLY, pool.Status)
+
+	require.ErrorIs(t, app.AmmKeeper.SetPoolStatus(ctx, poolID, ammtypes.PoolStatus_ACTIVE), ammtypes.ErrPoolInactive)
+	_, _, err = app.AmmKeeper.Swap(
+		ctx, sender, sender, []string{akraAsset.Hex(), token.Hex()},
+		sdkmath.NewInt(1_000), sdkmath.NewInt(1), nil, 0,
+	)
+	require.ErrorIs(t, err, ammtypes.ErrPoolInactive)
+}
+
+// TestExternalERC20Pool exercises bank-backed custody: the pool holds the
+// erc20:0x… bank denom while x/erc20 escrows the contract tokens.
 func TestExternalERC20Pool(t *testing.T) {
 	app, ctx := newTestApp(t)
 
@@ -697,12 +983,14 @@ func TestExternalERC20Pool(t *testing.T) {
 	require.Equal(t, uint64(1), poolID)
 	require.True(t, shares.IsPositive())
 
-	// The module must hold the ERC20 reserves itself.
+	// The pool must hold the bank denom; x/erc20 escrows the contract tokens.
 	moduleAddr := app.AmmKeeper.ModuleAddress()
-	require.Equal(t, sdkmath.NewInt(100_000), erc20BalanceOf(t, app, ctx, token, moduleAddr))
+	ammModule := sdk.AccAddress(moduleAddr.Bytes())
+	require.Equal(t, sdkmath.NewInt(100_000), app.BankKeeper.GetBalance(ctx, ammModule, denom).Amount)
+	require.Equal(t, sdkmath.NewInt(100_000), erc20BalanceOf(t, app, ctx, token, erc20types.ModuleAddress))
 	require.Equal(t, sdkmath.NewInt(900_000), erc20BalanceOf(t, app, ctx, token, deployer))
 
-	// Swap native -> ERC20: output is transferred out of module custody.
+	// Swap native -> ERC20: bank denom is burned and the ERC20 is released.
 	path := []string{akraAsset.Hex(), token.Hex()}
 	before := erc20BalanceOf(t, app, ctx, token, deployer)
 
@@ -713,7 +1001,57 @@ func TestExternalERC20Pool(t *testing.T) {
 
 	after := erc20BalanceOf(t, app, ctx, token, deployer)
 	require.Equal(t, before.Add(amountOut), after)
-	require.Equal(t, sdkmath.NewInt(100_000).Sub(amountOut), erc20BalanceOf(t, app, ctx, token, moduleAddr))
+	require.Equal(t, sdkmath.NewInt(100_000).Sub(amountOut), app.BankKeeper.GetBalance(ctx, ammModule, denom).Amount)
+	require.Equal(t, sdkmath.NewInt(100_000).Sub(amountOut), erc20BalanceOf(t, app, ctx, token, erc20types.ModuleAddress))
+}
+
+// TestExternalIntegratorFee checks that an integrator fee on an external ERC20
+// input is paid directly in the contract token, before conversion to bank denom.
+func TestExternalIntegratorFee(t *testing.T) {
+	app, ctx := newTestApp(t)
+
+	deployer := common.HexToAddress("0x00000000000000000000000000000000000000E2")
+	integrator := common.HexToAddress("0x00000000000000000000000000000000000000E3")
+
+	nativeCoins := sdk.NewCoins(sdk.NewCoin(karsaNativeDenom(), sdkmath.NewIntWithDecimal(1_000, 18)))
+	require.NoError(t, app.BankKeeper.MintCoins(ctx, ammtypes.ModuleName, nativeCoins))
+	require.NoError(t, app.BankKeeper.SendCoinsFromModuleToAccount(
+		ctx, ammtypes.ModuleName, sdk.AccAddress(deployer.Bytes()), nativeCoins,
+	))
+
+	token := deployTestERC20(t, app, ctx, deployer, "Momo", "MOMO", 18)
+	mintTestERC20(t, app, ctx, token, deployer, sdkmath.NewInt(1_000_000))
+
+	denom := "erc20:" + strings.ToLower(token.Hex())
+	require.NoError(t, app.Erc20Keeper.SetToken(ctx, erc20types.NewTokenPair(
+		token, denom, erc20types.OWNER_EXTERNAL,
+	)))
+
+	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	sender := sdk.AccAddress(deployer.Bytes())
+	_, _, err := app.AmmKeeper.CreatePool(
+		ctx, sender, akraAsset.Hex(), token.Hex(), 30,
+		sdkmath.NewInt(100_000), sdkmath.NewInt(100_000),
+	)
+	require.NoError(t, err)
+
+	path := []string{token.Hex(), akraAsset.Hex()}
+	amountIn := sdkmath.NewInt(10_000)
+	feeBps := uint32(20)
+	expectedFee := amountIn.MulRaw(int64(feeBps)).QuoRaw(10_000)
+
+	_, integratorFee, err := app.AmmKeeper.Swap(
+		ctx, sender, sender, path, amountIn, sdkmath.NewInt(1),
+		sdk.AccAddress(integrator.Bytes()), feeBps,
+	)
+	require.NoError(t, err)
+	require.Equal(t, expectedFee, integratorFee)
+	require.Equal(t, expectedFee, erc20BalanceOf(t, app, ctx, token, integrator))
+
+	// The net amount is converted, not the gross input.
+	ammModule := sdk.AccAddress(app.AmmKeeper.ModuleAddress().Bytes())
+	require.Equal(t, sdkmath.NewInt(100_000).Add(amountIn.Sub(expectedFee)),
+		app.BankKeeper.GetBalance(ctx, ammModule, denom).Amount)
 }
 
 // TestStableSwapExternalERC20 checks that a stableswap pool can resolve the
@@ -740,7 +1078,7 @@ func TestStableSwapExternalERC20(t *testing.T) {
 	sender := sdk.AccAddress(deployer.Bytes())
 
 	poolID, _, err := app.AmmKeeper.CreatePoolWithType(
-		ctx, sender, akraAsset.Hex(), token.Hex(), 30,
+		ctx, sender, akraAsset.Hex(), token.Hex(), 3,
 		sdkmath.NewInt(100_000), sdkmath.NewInt(100_000),
 		ammtypes.PoolType_POOL_TYPE_STABLESWAP, 100,
 	)

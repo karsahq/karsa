@@ -1,6 +1,9 @@
 package types
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+)
 
 // DefaultGenesisState returns the default genesis state of the module.
 func DefaultGenesisState() *GenesisState {
@@ -18,6 +21,8 @@ func (gs GenesisState) Validate() error {
 	}
 
 	seen := make(map[uint64]bool, len(gs.Pools))
+	seenKey := make(map[string]bool, len(gs.Pools))
+	pairCounts := make(map[string]uint32, len(gs.Pools))
 	var maxID uint64
 
 	for _, pool := range gs.Pools {
@@ -50,8 +55,28 @@ func (gs GenesisState) Validate() error {
 		if pool.LpDenom != LPDenom(pool.Id) {
 			return fmt.Errorf("pool %d: lp denom must be %q, got %q", pool.Id, LPDenom(pool.Id), pool.LpDenom)
 		}
+
+		pairKey := pool.AssetA + "|" + pool.AssetB
+		uniqueKey := pairKey + "|" + strconv.Itoa(int(pool.PoolType)) + "|" +
+			strconv.FormatUint(uint64(pool.FeeBps), 10)
+		if seenKey[uniqueKey] {
+			return fmt.Errorf("pool %d: duplicate (pair, type, fee) configuration", pool.Id)
+		}
+		seenKey[uniqueKey] = true
+
+		pairCounts[pairKey]++
+		if pairCounts[pairKey] > gs.Params.MaxPoolsPerPair {
+			return fmt.Errorf(
+				"pool %d: pair %s exceeds max_pools_per_pair %d",
+				pool.Id, pairKey, gs.Params.MaxPoolsPerPair,
+			)
+		}
+
 		switch pool.PoolType {
 		case PoolType_POOL_TYPE_CONSTANT_PRODUCT:
+			if pool.Amplification != 0 {
+				return fmt.Errorf("pool %d: constant-product amplification must be 0", pool.Id)
+			}
 		case PoolType_POOL_TYPE_STABLESWAP:
 			if pool.Amplification < MinAmplification || pool.Amplification > MaxAmplification {
 				return fmt.Errorf("pool %d: amplification must be in [%d,%d], got %d",
@@ -59,6 +84,16 @@ func (gs GenesisState) Validate() error {
 			}
 		default:
 			return fmt.Errorf("pool %d: unknown pool type %d", pool.Id, pool.PoolType)
+		}
+
+		if !gs.Params.IsAllowedFeeBps(pool.PoolType, pool.FeeBps) {
+			return fmt.Errorf("pool %d: fee %d bps is not an allowed tier", pool.Id, pool.FeeBps)
+		}
+
+		switch pool.Status {
+		case PoolStatus_ACTIVE, PoolStatus_WITHDRAW_ONLY:
+		default:
+			return fmt.Errorf("pool %d: unknown status %d", pool.Id, pool.Status)
 		}
 	}
 

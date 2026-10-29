@@ -16,6 +16,7 @@ service Msg {
   rpc RemoveLiquidity(MsgRemoveLiquidity) returns (MsgRemoveLiquidityResponse);
   rpc SwapExactIn(MsgSwapExactIn) returns (MsgSwapExactInResponse);
   rpc SwapExactOut(MsgSwapExactOut) returns (MsgSwapExactOutResponse);
+  rpc SetPoolStatus(MsgSetPoolStatus) returns (MsgSetPoolStatusResponse);
   rpc UpdateParams(MsgUpdateParams) returns (MsgUpdateParamsResponse);
 }
 
@@ -94,6 +95,8 @@ message MsgSwapExactIn {
   // Optional integrator that receives an extra fee on top of the pool fee.
   string integrator = 7;
   uint32 integrator_fee_bps = 8;
+  // Optional pool id per hop. Empty means the unique pool for the pair.
+  repeated uint64 pool_ids = 9;
 }
 
 message MsgSwapExactInResponse {
@@ -118,6 +121,8 @@ message MsgSwapExactOut {
   int64 deadline = 6;
   string integrator = 7;
   uint32 integrator_fee_bps = 8;
+  // Optional pool id per hop. Empty means the unique pool for the pair.
+  repeated uint64 pool_ids = 9;
 }
 
 message MsgSwapExactOutResponse {
@@ -126,6 +131,16 @@ message MsgSwapExactOutResponse {
   string integrator_fee = 2
       [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
 }
+
+message MsgSetPoolStatus {
+  option (cosmos.msg.v1.signer) = "authority";
+
+  string authority = 1;
+  uint64 pool_id = 2;
+  PoolStatus status = 3;
+}
+
+message MsgSetPoolStatusResponse {}
 
 message MsgUpdateParams {
   option (cosmos.msg.v1.signer) = "authority";

@@ -9,9 +9,10 @@ pragma solidity ^0.8.20;
 interface IAmm {
     /// @notice Returns the expected output amount for an exact-input swap.
     /// @param path Ordered list of assets, length >= 2 (e.g. [MOMO, USDT, akra]).
+    /// @param poolIds Optional pool id per hop; empty means the unique pool for the pair.
     /// @param amountIn Amount of path[0] to swap.
     /// @return amountOut Expected amount of the last asset in `path`.
-    function quote(address[] calldata path, uint256 amountIn)
+    function quote(address[] calldata path, uint64[] calldata poolIds, uint256 amountIn)
         external
         view
         returns (uint256 amountOut);
@@ -49,6 +50,7 @@ interface IAmm {
     ///      module params (1% by default) and is paid to `integrator` in the
     ///      input token. Pass `receiver = address(0)` to receive at the caller.
     /// @param path Ordered list of assets, length >= 2.
+    /// @param poolIds Optional pool id per hop; empty means the unique pool for the pair.
     /// @param amountIn Amount of path[0] to swap.
     /// @param minOut Minimum acceptable amount of the last asset (slippage guard).
     /// @param receiver Recipient of the output, or address(0) for the caller.
@@ -58,6 +60,7 @@ interface IAmm {
     /// @return integratorFee Fee paid to `integrator`, in the input token.
     function swapExactIn(
         address[] calldata path,
+        uint64[] calldata poolIds,
         uint256 amountIn,
         uint256 minOut,
         address receiver,

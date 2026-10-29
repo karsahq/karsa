@@ -39,6 +39,7 @@ const abiJSON = `[
     "stateMutability": "view",
     "inputs": [
       {"name": "path", "type": "address[]"},
+      {"name": "poolIds", "type": "uint64[]"},
       {"name": "amountIn", "type": "uint256"}
     ],
     "outputs": [{"name": "amountOut", "type": "uint256"}]
@@ -69,6 +70,7 @@ const abiJSON = `[
     "stateMutability": "nonpayable",
     "inputs": [
       {"name": "path", "type": "address[]"},
+      {"name": "poolIds", "type": "uint64[]"},
       {"name": "amountIn", "type": "uint256"},
       {"name": "minOut", "type": "uint256"},
       {"name": "receiver", "type": "address"},
@@ -99,14 +101,15 @@ func init() {
 
 // Keeper is the module functionality exposed to EVM contracts.
 type Keeper interface {
-	Quote(ctx sdk.Context, path []string, amountIn sdkmath.Int) (sdkmath.Int, error)
+	QuoteWithPools(ctx sdk.Context, path []string, poolIDs []uint64, amountIn sdkmath.Int) (sdkmath.Int, error)
 	GetPool(ctx sdk.Context, id uint64) (ammtypes.Pool, bool)
 	GetPoolIDByAssets(ctx sdk.Context, assetA, assetB string) (uint64, bool)
-	SwapFromPrecompile(
+	SwapFromPrecompileWithPools(
 		ctx sdk.Context,
 		stateDB *statedb.StateDB,
 		caller, receiver common.Address,
 		path []string,
+		poolIDs []uint64,
 		amountIn, minOut sdkmath.Int,
 		integrator common.Address,
 		integratorFeeBps uint32,
@@ -184,12 +187,12 @@ func (p Precompile) Execute(ctx sdk.Context, stateDB vm.StateDB, contract *vm.Co
 }
 
 func (p Precompile) quote(ctx sdk.Context, method *abi.Method, args []interface{}) ([]byte, error) {
-	path, amountIn, err := parsePathAndAmount(args, 0, 1)
+	path, poolIDs, amountIn, err := parsePathPoolIDsAndAmount(args, 0, 1, 2)
 	if err != nil {
 		return nil, err
 	}
 
-	amountOut, err := p.keeper.Quote(ctx, path, sdkmath.NewIntFromBigInt(amountIn))
+	amountOut, err := p.keeper.QuoteWithPools(ctx, path, poolIDs, sdkmath.NewIntFromBigInt(amountIn))
 	if err != nil {
 		return nil, err
 	}
@@ -242,8 +245,8 @@ func (p Precompile) swapExactIn(
 	method *abi.Method,
 	args []interface{},
 ) ([]byte, error) {
-	if len(args) != 6 {
-		return nil, fmt.Errorf("invalid number of arguments: expected 6, got %d", len(args))
+	if len(args) != 7 {
+		return nil, fmt.Errorf("invalid number of arguments: expected 7, got %d", len(args))
 	}
 
 	evmStateDB, ok := stateDB.(*statedb.StateDB)
@@ -251,17 +254,17 @@ func (p Precompile) swapExactIn(
 		return nil, fmt.Errorf(cmn.ErrNotRunInEvm)
 	}
 
-	path, amountIn, err := parsePathAndAmount(args, 0, 1)
+	path, poolIDs, amountIn, err := parsePathPoolIDsAndAmount(args, 0, 1, 2)
 	if err != nil {
 		return nil, err
 	}
 
-	minOut, ok := args[2].(*big.Int)
+	minOut, ok := args[3].(*big.Int)
 	if !ok {
 		return nil, fmt.Errorf("invalid minOut")
 	}
 
-	receiver, ok := args[3].(common.Address)
+	receiver, ok := args[4].(common.Address)
 	if !ok {
 		return nil, fmt.Errorf("invalid receiver")
 	}
@@ -269,18 +272,18 @@ func (p Precompile) swapExactIn(
 		receiver = contract.Caller()
 	}
 
-	integrator, ok := args[4].(common.Address)
+	integrator, ok := args[5].(common.Address)
 	if !ok {
 		return nil, fmt.Errorf("invalid integrator")
 	}
 
-	feeBps, ok := args[5].(*big.Int)
+	feeBps, ok := args[6].(*big.Int)
 	if !ok || !feeBps.IsUint64() {
 		return nil, fmt.Errorf("invalid integratorFeeBps")
 	}
 
-	amountOut, integratorFee, err := p.keeper.SwapFromPrecompile(
-		ctx, evmStateDB, contract.Caller(), receiver, path,
+	amountOut, integratorFee, err := p.keeper.SwapFromPrecompileWithPools(
+		ctx, evmStateDB, contract.Caller(), receiver, path, poolIDs,
 		sdkmath.NewIntFromBigInt(amountIn), sdkmath.NewIntFromBigInt(minOut),
 		integrator, uint32(feeBps.Uint64()),
 	)
@@ -291,15 +294,19 @@ func (p Precompile) swapExactIn(
 	return method.Outputs.Pack(amountOut.BigInt(), integratorFee.BigInt())
 }
 
-// parsePathAndAmount decodes a `(address[] path, uint256 amount)` argument pair.
-func parsePathAndAmount(args []interface{}, pathIdx, amountIdx int) ([]string, *big.Int, error) {
+// parsePathPoolIDsAndAmount decodes `(address[] path, uint64[] poolIds, uint256 amount)`.
+func parsePathPoolIDsAndAmount(
+	args []interface{}, pathIdx, poolIdx, amountIdx int,
+) ([]string, []uint64, *big.Int, error) {
 	if len(args) <= amountIdx {
-		return nil, nil, fmt.Errorf("invalid number of arguments: expected at least %d, got %d", amountIdx+1, len(args))
+		return nil, nil, nil, fmt.Errorf(
+			"invalid number of arguments: expected at least %d, got %d", amountIdx+1, len(args),
+		)
 	}
 
 	addrs, ok := args[pathIdx].([]common.Address)
 	if !ok || len(addrs) < 2 {
-		return nil, nil, ammtypes.ErrInvalidPath.Wrap("path must contain at least 2 addresses")
+		return nil, nil, nil, ammtypes.ErrInvalidPath.Wrap("path must contain at least 2 addresses")
 	}
 
 	path := make([]string, len(addrs))
@@ -307,10 +314,33 @@ func parsePathAndAmount(args []interface{}, pathIdx, amountIdx int) ([]string, *
 		path[i] = strings.ToLower(addr.Hex())
 	}
 
-	amount, ok := args[amountIdx].(*big.Int)
-	if !ok {
-		return nil, nil, ammtypes.ErrInvalidAmount.Wrap("invalid amount")
+	poolIDs, err := parsePoolIDs(args[poolIdx])
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
-	return path, amount, nil
+	amount, ok := args[amountIdx].(*big.Int)
+	if !ok {
+		return nil, nil, nil, ammtypes.ErrInvalidAmount.Wrap("invalid amount")
+	}
+
+	return path, poolIDs, amount, nil
+}
+
+func parsePoolIDs(value interface{}) ([]uint64, error) {
+	switch ids := value.(type) {
+	case []uint64:
+		return ids, nil
+	case []*big.Int:
+		out := make([]uint64, len(ids))
+		for i, id := range ids {
+			if id == nil || !id.IsUint64() {
+				return nil, ammtypes.ErrInvalidPath.Wrap("invalid pool id")
+			}
+			out[i] = id.Uint64()
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("invalid poolIds")
+	}
 }

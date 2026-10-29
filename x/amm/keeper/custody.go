@@ -9,35 +9,24 @@ import (
 
 	"github.com/karsahq/karsa/x/amm/types"
 
-	"github.com/ethereum/go-ethereum/common"
-
+	erc20types "github.com/cosmos/evm/x/erc20/types"
 	"github.com/cosmos/evm/x/vm/statedb"
+
+	"github.com/ethereum/go-ethereum/common"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
 )
 
-// assetKind describes how the module moves an asset's funds.
-type assetKind int
-
-const (
-	// bankAsset is a bank-backed (module-owned) token pair: reserves live in the
-	// x/amm module account as a bank denom.
-	bankAsset assetKind = iota
-	// evmAsset is an external ERC20 contract: reserves live in the token contract
-	// under the module's EVM address.
-	evmAsset
-)
-
-// resolvedAsset is an ERC20 address mapped to its bank denom and custody kind.
+// resolvedAsset maps an ERC20 address to its bank denom and, for external
+// ERC20 contracts, the conversion pair needed at the custody boundary.
 type resolvedAsset struct {
-	Address  string // lowercase hex
-	Denom    string // bank denom ("akra", "ibc/…", "erc20:0x…")
-	Kind     assetKind
-	Contract common.Address // ERC20 contract address (evmAsset only)
+	Address         string // lowercase hex
+	Denom           string // bank denom ("akra", "ibc/…", "erc20:0x…")
+	ConvertContract common.Address
 }
 
 // resolveAsset validates that the given ERC20 address has an enabled token pair
-// and returns how the module should custody it.
+// and returns the bank denom used by pool reserves.
 func (k Keeper) resolveAsset(ctx sdk.Context, asset string) (resolvedAsset, error) {
 	if !common.IsHexAddress(asset) {
 		return resolvedAsset{}, types.ErrInvalidAsset.Wrapf("asset %q is not an ERC20 address", asset)
@@ -60,15 +49,14 @@ func (k Keeper) resolveAsset(ctx sdk.Context, asset string) (resolvedAsset, erro
 	resolved := resolvedAsset{
 		Address: strings.ToLower(addr.Hex()),
 		Denom:   pair.Denom,
-		Kind:    bankAsset,
 	}
 
 	if !pair.IsNativeCoin() {
-		resolved.Kind = evmAsset
-		resolved.Contract = pair.GetERC20Contract()
-		if resolved.Contract == (common.Address{}) {
+		contract := pair.GetERC20Contract()
+		if contract == (common.Address{}) {
 			return resolvedAsset{}, types.ErrInvalidAsset.Wrapf("asset %s has no contract address", asset)
 		}
+		resolved.ConvertContract = contract
 	}
 
 	return resolved, nil
@@ -89,7 +77,7 @@ func (k Keeper) evmBalanceWith(
 	ctx sdk.Context, stateDB *statedb.StateDB, token, account common.Address,
 ) (sdkmath.Int, error) {
 	res, err := k.evmKeeper.CallEVM(
-		ctx, k.evmStateDB(ctx, stateDB), types.ERC20ABI, account, token, false, false, nil,
+		ctx, k.evmStateDB(ctx, stateDB), types.ERC20ABI, k.moduleAddress, token, false, false, nil,
 		"balanceOf", account,
 	)
 	if err != nil {
@@ -170,22 +158,27 @@ func (k Keeper) moveInWith(
 		return types.ErrInvalidAmount.Wrap("amount must be positive")
 	}
 
-	switch asset.Kind {
-	case bankAsset:
-		coins := sdk.NewCoins(sdk.NewCoin(asset.Denom, amount))
-		if err := k.bankKeeper.SendCoinsFromAccountToModule(
-			ctx, sdk.AccAddress(from.Bytes()), types.ModuleName, coins,
-		); err != nil {
-			return types.ErrInsufficientFunds.Wrap(err.Error())
-		}
-		return nil
-
-	case evmAsset:
-		return k.evmTransferWith(ctx, stateDB, fromPrecompile, asset.Contract, from, k.moduleAddress, amount)
-
-	default:
-		return types.ErrInvalidAsset.Wrap("unknown asset kind")
+	if asset.ConvertContract != (common.Address{}) {
+		_, err := k.erc20Keeper.ConvertERC20IntoCoinsForNativeToken(
+			ctx,
+			k.evmStateDB(ctx, stateDB),
+			asset.ConvertContract,
+			amount,
+			sdk.AccAddress(k.moduleAddress.Bytes()),
+			from,
+			true,
+			fromPrecompile,
+		)
+		return err
 	}
+
+	coins := sdk.NewCoins(sdk.NewCoin(asset.Denom, amount))
+	if err := k.bankKeeper.SendCoinsFromAccountToModule(
+		ctx, sdk.AccAddress(from.Bytes()), types.ModuleName, coins,
+	); err != nil {
+		return types.ErrInsufficientFunds.Wrap(err.Error())
+	}
+	return nil
 }
 
 // moveOut moves funds from the module to an account.
@@ -202,40 +195,39 @@ func (k Keeper) moveOutWith(
 		return types.ErrInvalidAmount.Wrap("amount must be positive")
 	}
 
-	switch asset.Kind {
-	case bankAsset:
-		coins := sdk.NewCoins(sdk.NewCoin(asset.Denom, amount))
-		if err := k.bankKeeper.SendCoinsFromModuleToAccount(
-			ctx, types.ModuleName, sdk.AccAddress(to.Bytes()), coins,
-		); err != nil {
-			return err
-		}
-		return nil
-
-	case evmAsset:
-		return k.evmTransferWith(ctx, stateDB, fromPrecompile, asset.Contract, k.moduleAddress, to, amount)
-
-	default:
-		return types.ErrInvalidAsset.Wrap("unknown asset kind")
-	}
-}
-
-// assertCustody checks that the module actually holds at least the tracked
-// reserves for an external asset.
-func (k Keeper) assertCustody(ctx sdk.Context, asset resolvedAsset, reserve sdkmath.Int) error {
-	if asset.Kind != evmAsset {
-		return nil
+	if asset.ConvertContract != (common.Address{}) {
+		return k.convertOutWith(ctx, stateDB, fromPrecompile, asset, to, amount)
 	}
 
-	balance, err := k.evmBalanceWith(ctx, nil, asset.Contract, k.moduleAddress)
-	if err != nil {
+	coins := sdk.NewCoins(sdk.NewCoin(asset.Denom, amount))
+	if err := k.bankKeeper.SendCoinsFromModuleToAccount(
+		ctx, types.ModuleName, sdk.AccAddress(to.Bytes()), coins,
+	); err != nil {
 		return err
 	}
-	if balance.LT(reserve) {
-		return types.ErrInvalidAsset.Wrapf(
-			"custody invariant broken for %s: have %s, need %s", asset.Address, balance, reserve,
-		)
+	return nil
+}
+
+// convertOutWith burns the bank denom held by the AMM module and releases the
+// escrowed ERC20 to the user. It uses the caller's stateDB so the release stays
+// atomic inside the EVM execution context (x/erc20's helper creates its own
+// stateDB, which is not valid from a precompile).
+func (k Keeper) convertOutWith(
+	ctx sdk.Context, stateDB *statedb.StateDB, fromPrecompile bool,
+	asset resolvedAsset, to common.Address, amount sdkmath.Int,
+) error {
+	coins := sdk.NewCoins(sdk.NewCoin(asset.Denom, amount))
+
+	if err := k.bankKeeper.SendCoinsFromAccountToModule(
+		ctx, sdk.AccAddress(k.moduleAddress.Bytes()), erc20types.ModuleName, coins,
+	); err != nil {
+		return types.ErrInsufficientFunds.Wrap(err.Error())
+	}
+	if err := k.bankKeeper.BurnCoins(ctx, erc20types.ModuleName, coins); err != nil {
+		return err
 	}
 
-	return nil
+	return k.evmTransferWith(
+		ctx, stateDB, fromPrecompile, asset.ConvertContract, erc20types.ModuleAddress, to, amount,
+	)
 }

@@ -38,6 +38,12 @@ func BlockedAddresses() map[string]bool {
 		blockedAddrs[authtypes.NewModuleAddress(acc).String()] = true
 	}
 
+	// The AMM module must receive minted bank denom when converting an external
+	// ERC20 to its bank-backed form. Keeping the module address unblocked is what
+	// lets x/erc20 mint directly to the pool's custody account. The AMM precompile
+	// address below remains blocked.
+	delete(blockedAddrs, authtypes.NewModuleAddress(ammtypes.ModuleName).String())
+
 	blockedPrecompilesHex := make([]string, 0, len(vmtypes.AvailableStaticPrecompiles)+len(corevm.PrecompiledAddressesPrague)+1)
 	blockedPrecompilesHex = append(blockedPrecompilesHex, vmtypes.AvailableStaticPrecompiles...)
 	blockedPrecompilesHex = append(blockedPrecompilesHex, ammtypes.PrecompileAddress)

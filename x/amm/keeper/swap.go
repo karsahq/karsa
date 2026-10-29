@@ -36,9 +36,25 @@ func (k Keeper) validatePath(ctx sdk.Context, path []string) error {
 	return nil
 }
 
+// validatePoolIDs checks that an optional pool-id list has one entry per hop.
+func validatePoolIDs(path []string, poolIDs []uint64) error {
+	if len(poolIDs) == 0 {
+		return nil
+	}
+	if len(poolIDs) != len(path)-1 {
+		return types.ErrInvalidPath.Wrapf(
+			"pool_ids has %d entries, path needs %d", len(poolIDs), len(path)-1,
+		)
+	}
+	return nil
+}
+
 // poolForHop returns the pool connecting assetIn and assetOut and whether
-// assetIn is the pool's asset A.
-func (k Keeper) poolForHop(ctx sdk.Context, assetIn, assetOut string) (types.Pool, bool, error) {
+// assetIn is the pool's asset A. A zero poolID means the pair must have exactly
+// one pool; otherwise the caller must disambiguate by pool id.
+func (k Keeper) poolForHop(
+	ctx sdk.Context, assetIn, assetOut string, poolID uint64,
+) (types.Pool, bool, error) {
 	in := strings.ToLower(assetIn)
 	out := strings.ToLower(assetOut)
 	if in == out {
@@ -50,14 +66,37 @@ func (k Keeper) poolForHop(ctx sdk.Context, assetIn, assetOut string) (types.Poo
 		keyA, keyB = keyB, keyA
 	}
 
-	id, found := k.GetPoolIDByAssets(ctx, keyA, keyB)
-	if !found {
-		return types.Pool{}, false, types.ErrPoolNotFound.Wrapf("no pool for %s/%s", keyA, keyB)
+	var pool types.Pool
+	var found bool
+
+	if poolID != 0 {
+		pool, found = k.GetPool(ctx, poolID)
+		if !found {
+			return types.Pool{}, false, types.ErrPoolNotFound.Wrapf("pool %d", poolID)
+		}
+		if (pool.AssetA != keyA || pool.AssetB != keyB) && (pool.AssetA != keyB || pool.AssetB != keyA) {
+			return types.Pool{}, false, types.ErrInvalidPath.Wrapf(
+				"pool %d does not connect %s/%s", poolID, keyA, keyB,
+			)
+		}
+	} else {
+		ids := k.GetPoolIDsByAssets(ctx, keyA, keyB)
+		if len(ids) == 0 {
+			return types.Pool{}, false, types.ErrPoolNotFound.Wrapf("no pool for %s/%s", keyA, keyB)
+		}
+		if len(ids) > 1 {
+			return types.Pool{}, false, types.ErrInvalidPath.Wrapf(
+				"multiple pools for %s/%s; specify pool_id", keyA, keyB,
+			)
+		}
+		pool, found = k.GetPool(ctx, ids[0])
+		if !found {
+			return types.Pool{}, false, types.ErrPoolNotFound.Wrapf("pool %d", ids[0])
+		}
 	}
 
-	pool, found := k.GetPool(ctx, id)
-	if !found {
-		return types.Pool{}, false, types.ErrPoolNotFound.Wrapf("pool %d", id)
+	if pool.Status != types.PoolStatus_ACTIVE {
+		return types.Pool{}, false, types.ErrPoolInactive.Wrapf("pool %d status is %s", pool.Id, pool.Status)
 	}
 
 	return pool, in == pool.AssetA, nil
@@ -100,7 +139,17 @@ func calcAmountInExactOut(amountOut, reserveIn, reserveOut sdkmath.Int, feeBps u
 
 // QuoteExactOut computes the input required to receive exactly amountOut.
 func (k Keeper) QuoteExactOut(ctx sdk.Context, path []string, amountOut sdkmath.Int) (sdkmath.Int, error) {
+	return k.QuoteExactOutWithPools(ctx, path, nil, amountOut)
+}
+
+// QuoteExactOutWithPools is QuoteExactOut with optional explicit pool ids.
+func (k Keeper) QuoteExactOutWithPools(
+	ctx sdk.Context, path []string, poolIDs []uint64, amountOut sdkmath.Int,
+) (sdkmath.Int, error) {
 	if err := k.validatePath(ctx, path); err != nil {
+		return sdkmath.Int{}, err
+	}
+	if err := validatePoolIDs(path, poolIDs); err != nil {
 		return sdkmath.Int{}, err
 	}
 	if !amountOut.IsPositive() {
@@ -109,7 +158,11 @@ func (k Keeper) QuoteExactOut(ctx sdk.Context, path []string, amountOut sdkmath.
 
 	need := amountOut
 	for i := len(path) - 1; i > 0; i-- {
-		pool, aIsA, err := k.poolForHop(ctx, path[i-1], path[i])
+		poolID := uint64(0)
+		if len(poolIDs) > 0 {
+			poolID = poolIDs[i-1]
+		}
+		pool, aIsA, err := k.poolForHop(ctx, path[i-1], path[i], poolID)
 		if err != nil {
 			return sdkmath.Int{}, err
 		}
@@ -127,7 +180,17 @@ func (k Keeper) QuoteExactOut(ctx sdk.Context, path []string, amountOut sdkmath.
 
 // Quote computes the output amount for a swap path without changing state.
 func (k Keeper) Quote(ctx sdk.Context, path []string, amountIn sdkmath.Int) (sdkmath.Int, error) {
+	return k.QuoteWithPools(ctx, path, nil, amountIn)
+}
+
+// QuoteWithPools is Quote with optional explicit pool ids.
+func (k Keeper) QuoteWithPools(
+	ctx sdk.Context, path []string, poolIDs []uint64, amountIn sdkmath.Int,
+) (sdkmath.Int, error) {
 	if err := k.validatePath(ctx, path); err != nil {
+		return sdkmath.Int{}, err
+	}
+	if err := validatePoolIDs(path, poolIDs); err != nil {
 		return sdkmath.Int{}, err
 	}
 	if !amountIn.IsPositive() {
@@ -136,7 +199,11 @@ func (k Keeper) Quote(ctx sdk.Context, path []string, amountIn sdkmath.Int) (sdk
 
 	amount := amountIn
 	for i := 0; i < len(path)-1; i++ {
-		pool, aIsA, err := k.poolForHop(ctx, path[i], path[i+1])
+		poolID := uint64(0)
+		if len(poolIDs) > 0 {
+			poolID = poolIDs[i]
+		}
+		pool, aIsA, err := k.poolForHop(ctx, path[i], path[i+1], poolID)
 		if err != nil {
 			return sdkmath.Int{}, err
 		}
@@ -163,7 +230,24 @@ func (k Keeper) Swap(
 	integrator sdk.AccAddress,
 	integratorFeeBps uint32,
 ) (sdkmath.Int, sdkmath.Int, error) {
-	return k.swapExec(ctx, nil, false, sender, receiver, path, amountIn, minOut, integrator, integratorFeeBps)
+	return k.SwapWithPools(
+		ctx, nil, sender, receiver, path, amountIn, minOut, integrator, integratorFeeBps,
+	)
+}
+
+// SwapWithPools executes an exact-input swap with optional explicit pool ids.
+func (k Keeper) SwapWithPools(
+	ctx sdk.Context,
+	poolIDs []uint64,
+	sender, receiver sdk.AccAddress,
+	path []string,
+	amountIn, minOut sdkmath.Int,
+	integrator sdk.AccAddress,
+	integratorFeeBps uint32,
+) (sdkmath.Int, sdkmath.Int, error) {
+	return k.swapExec(
+		ctx, nil, false, poolIDs, sender, receiver, path, amountIn, minOut, integrator, integratorFeeBps,
+	)
 }
 
 // SwapFromPrecompile executes a swap on behalf of an EVM caller, reusing the
@@ -177,6 +261,27 @@ func (k Keeper) SwapFromPrecompile(
 	integrator common.Address,
 	integratorFeeBps uint32,
 ) (sdkmath.Int, sdkmath.Int, error) {
+	return k.SwapFromPrecompileWithPools(
+		ctx, stateDB, caller, receiver, path, nil, amountIn, minOut, integrator, integratorFeeBps,
+	)
+}
+
+// SwapFromPrecompileWithPools is SwapFromPrecompile with explicit pool ids.
+func (k Keeper) SwapFromPrecompileWithPools(
+	ctx sdk.Context,
+	stateDB *statedb.StateDB,
+	caller, receiver common.Address,
+	path []string,
+	poolIDs []uint64,
+	amountIn, minOut sdkmath.Int,
+	integrator common.Address,
+	integratorFeeBps uint32,
+) (sdkmath.Int, sdkmath.Int, error) {
+	if err := k.acquireLock(ctx); err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
+	}
+	defer k.releaseLock(ctx)
+
 	sender := sdk.AccAddress(caller.Bytes())
 	recv := sdk.AccAddress(receiver.Bytes())
 
@@ -185,13 +290,16 @@ func (k Keeper) SwapFromPrecompile(
 		integratorAcc = sdk.AccAddress(integrator.Bytes())
 	}
 
-	return k.swapExec(ctx, stateDB, true, sender, recv, path, amountIn, minOut, integratorAcc, integratorFeeBps)
+	return k.swapExec(
+		ctx, stateDB, true, poolIDs, sender, recv, path, amountIn, minOut, integratorAcc, integratorFeeBps,
+	)
 }
 
 func (k Keeper) swapExec(
 	ctx sdk.Context,
 	stateDB *statedb.StateDB,
 	fromPrecompile bool,
+	poolIDs []uint64,
 	sender, receiver sdk.AccAddress,
 	path []string,
 	amountIn, minOut sdkmath.Int,
@@ -199,6 +307,9 @@ func (k Keeper) swapExec(
 	integratorFeeBps uint32,
 ) (sdkmath.Int, sdkmath.Int, error) {
 	if err := k.validatePath(ctx, path); err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
+	}
+	if err := validatePoolIDs(path, poolIDs); err != nil {
 		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
 	if !amountIn.IsPositive() {
@@ -222,24 +333,29 @@ func (k Keeper) swapExec(
 	}
 
 	integratorFee := sdkmath.ZeroInt()
-	if integrator != nil && integratorFeeBps > 0 {
+	if integrator != nil && !integrator.Equals(sender) && integratorFeeBps > 0 {
 		integratorFee = amountIn.MulRaw(int64(integratorFeeBps)).QuoRaw(10_000)
 	}
 
-	// Pull the full input into the module account.
-	if err := k.moveInWith(ctx, stateDB, fromPrecompile, first, common.BytesToAddress(sender.Bytes()), amountIn); err != nil {
-		return sdkmath.Int{}, sdkmath.Int{}, types.ErrInsufficientFunds.Wrap(err.Error())
-	}
-
-	if integratorFee.IsPositive() {
-		if err := k.moveOutWith(ctx, stateDB, fromPrecompile, first, common.BytesToAddress(integrator.Bytes()), integratorFee); err != nil {
-			return sdkmath.Int{}, sdkmath.Int{}, err
-		}
+	if err := k.payIntegratorFee(ctx, stateDB, fromPrecompile, first, sender, integrator, integratorFee); err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
 
 	amount := amountIn.Sub(integratorFee)
+	if !amount.IsPositive() {
+		return sdkmath.Int{}, sdkmath.Int{}, types.ErrInvalidAmount.Wrap("integrator fee consumes the full input")
+	}
+
+	// Pull the pool input into the module account.
+	if err := k.moveInWith(ctx, stateDB, fromPrecompile, first, common.BytesToAddress(sender.Bytes()), amount); err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
+	}
 	for i := 0; i < len(path)-1; i++ {
-		pool, aIsA, err := k.poolForHop(ctx, path[i], path[i+1])
+		poolID := uint64(0)
+		if len(poolIDs) > 0 {
+			poolID = poolIDs[i]
+		}
+		pool, aIsA, err := k.poolForHop(ctx, path[i], path[i+1], poolID)
 		if err != nil {
 			return sdkmath.Int{}, sdkmath.Int{}, err
 		}
@@ -292,6 +408,32 @@ func (k Keeper) swapExec(
 	return amount, integratorFee, nil
 }
 
+// payIntegratorFee pays the integrator in the input token before conversion.
+// For bank assets this is a bank send; for external ERC20 it is a direct
+// contract transfer, so the fee is never converted to bank denom.
+func (k Keeper) payIntegratorFee(
+	ctx sdk.Context,
+	stateDB *statedb.StateDB,
+	fromPrecompile bool,
+	asset resolvedAsset,
+	sender, integrator sdk.AccAddress,
+	amount sdkmath.Int,
+) error {
+	if !amount.IsPositive() || integrator == nil || sender.Equals(integrator) {
+		return nil
+	}
+
+	from := common.BytesToAddress(sender.Bytes())
+	to := common.BytesToAddress(integrator.Bytes())
+
+	if asset.ConvertContract != (common.Address{}) {
+		return k.evmTransferWith(ctx, stateDB, fromPrecompile, asset.ConvertContract, from, to, amount)
+	}
+
+	coins := sdk.NewCoins(sdk.NewCoin(asset.Denom, amount))
+	return k.bankKeeper.SendCoins(ctx, sender, integrator, coins)
+}
+
 // SwapExactOut executes a swap for an exact output amount, bounded by maxAmountIn.
 func (k Keeper) SwapExactOut(
 	ctx sdk.Context,
@@ -301,7 +443,25 @@ func (k Keeper) SwapExactOut(
 	integrator sdk.AccAddress,
 	integratorFeeBps uint32,
 ) (sdkmath.Int, sdkmath.Int, error) {
+	return k.SwapExactOutWithPools(
+		ctx, nil, sender, receiver, path, amountOut, maxAmountIn, integrator, integratorFeeBps,
+	)
+}
+
+// SwapExactOutWithPools is SwapExactOut with optional explicit pool ids.
+func (k Keeper) SwapExactOutWithPools(
+	ctx sdk.Context,
+	poolIDs []uint64,
+	sender, receiver sdk.AccAddress,
+	path []string,
+	amountOut, maxAmountIn sdkmath.Int,
+	integrator sdk.AccAddress,
+	integratorFeeBps uint32,
+) (sdkmath.Int, sdkmath.Int, error) {
 	if err := k.validatePath(ctx, path); err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
+	}
+	if err := validatePoolIDs(path, poolIDs); err != nil {
 		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
 	if !amountOut.IsPositive() || !maxAmountIn.IsPositive() {
@@ -336,7 +496,11 @@ func (k Keeper) SwapExactOut(
 
 	// Walk the path backwards to find the input required at each hop.
 	for i := len(path) - 1; i > 0; i-- {
-		pool, aIsA, err := k.poolForHop(ctx, path[i-1], path[i])
+		poolID := uint64(0)
+		if len(poolIDs) > 0 {
+			poolID = poolIDs[i-1]
+		}
+		pool, aIsA, err := k.poolForHop(ctx, path[i-1], path[i], poolID)
 		if err != nil {
 			return sdkmath.Int{}, sdkmath.Int{}, err
 		}
@@ -358,7 +522,7 @@ func (k Keeper) SwapExactOut(
 	}
 
 	integratorFee := sdkmath.ZeroInt()
-	if integrator != nil && integratorFeeBps > 0 {
+	if integrator != nil && !integrator.Equals(sender) && integratorFeeBps > 0 {
 		// Fee is bps of the total amount paid, so it is grossed up.
 		feeFactor := sdkmath.NewInt(int64(10_000 - integratorFeeBps))
 		integratorFee = ceilDiv(need.MulRaw(int64(integratorFeeBps)), feeFactor)
@@ -371,14 +535,12 @@ func (k Keeper) SwapExactOut(
 		)
 	}
 
-	if err := k.moveIn(ctx, first, common.BytesToAddress(sender.Bytes()), totalIn); err != nil {
-		return sdkmath.Int{}, sdkmath.Int{}, types.ErrInsufficientFunds.Wrap(err.Error())
+	if err := k.payIntegratorFee(ctx, nil, false, first, sender, integrator, integratorFee); err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
 
-	if integratorFee.IsPositive() {
-		if err := k.moveOut(ctx, first, common.BytesToAddress(integrator.Bytes()), integratorFee); err != nil {
-			return sdkmath.Int{}, sdkmath.Int{}, err
-		}
+	if err := k.moveIn(ctx, first, common.BytesToAddress(sender.Bytes()), need); err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
 
 	for _, h := range hops {
