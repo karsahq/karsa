@@ -198,6 +198,38 @@ func (k Keeper) moveInWith(
 	return nil
 }
 
+// evmSendWith moves `amount` from `from` to `to` without checking the balance
+// delta. It is only used for outbound transfers: the pool has already debited
+// `amount` from its reserve, so what the receiver actually gets is the token's
+// business. For inbound transfers the delta must be verified, otherwise a
+// donation to custody would be credited to the sender as swap input.
+func (k Keeper) evmSendWith(
+	ctx sdk.Context, stateDB *statedb.StateDB, fromPrecompile bool,
+	token, from, to common.Address, amount sdkmath.Int,
+) error {
+	res, err := k.evmKeeper.CallEVM(
+		ctx, k.evmStateDB(ctx, stateDB), types.ERC20ABI, from, token, true, fromPrecompile, nil,
+		"transfer", to, amount.BigInt(),
+	)
+	if err != nil {
+		return types.ErrInsufficientFunds.Wrapf("transfer call failed: %s", err)
+	}
+	if res.Failed() {
+		return types.ErrInsufficientFunds.Wrapf("transfer reverted: %s", res.VmError)
+	}
+
+	if len(res.Ret) > 0 {
+		out, err := types.ERC20ABI.Unpack("transfer", res.Ret)
+		if err == nil && len(out) == 1 {
+			if ok, isBool := out[0].(bool); isBool && !ok {
+				return types.ErrInsufficientFunds.Wrap("transfer returned false")
+			}
+		}
+	}
+
+	return nil
+}
+
 // moveOut moves funds for a pool from custody to an account.
 func (k Keeper) moveOut(
 	ctx sdk.Context, poolID uint64, asset resolvedAsset, to common.Address, amount sdkmath.Int,
@@ -217,7 +249,7 @@ func (k Keeper) moveOutWith(
 	if asset.DirectCustody {
 		custody := types.CustodyAddress(poolID)
 
-		return k.evmTransferWith(
+		return k.evmSendWith(
 			ctx, k.evmStateDB(ctx, stateDB), fromPrecompile,
 			common.HexToAddress(asset.Address), custody, to, amount,
 		)
