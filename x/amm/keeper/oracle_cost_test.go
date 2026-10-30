@@ -4,12 +4,14 @@ package keeper_test
 
 import (
 	"testing"
+	"time"
 
 	ammtypes "github.com/karsahq/karsa/x/amm/types"
 
 	sdkmath "cosmossdk.io/math"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/stretchr/testify/require"
 )
 
 // TestOracleUpdateCost measures what updateOracle pays on every reserve change:
@@ -56,4 +58,45 @@ func TestOracleUpdateCost(t *testing.T) {
 		app.AmmKeeper.SetObservations(c, 2, got)
 		return nil
 	})
+}
+
+// TestSwapCostWithRealisticOracle measures a full swap with a full observation
+// ring and non-zero cumulative prices, which is what production looks like:
+// block time advances and the cumulative fields are large instead of zero.
+func TestSwapCostWithRealisticOracle(t *testing.T) {
+	f := newOracleFixture(t)
+
+	ring := ammtypes.Observations{}
+	for i := 0; i < 32; i++ {
+		ring.Items = append(ring.Items, ammtypes.Observation{
+			Timestamp:   int64(1_000 + i),
+			CumulativeA: sdkmath.NewIntWithDecimal(int64(1_000_000+i), 18),
+			CumulativeB: sdkmath.NewIntWithDecimal(int64(2_000_000+i), 18),
+		})
+	}
+	f.app.AmmKeeper.SetObservations(f.ctx, f.poolID, ring)
+
+	const ops = 50
+	amount := sdkmath.NewInt(100)
+
+	measure := func(name string, blockTime func(int) int64) {
+		c := withGasMeter(f.ctx)
+		before := c.GasMeter().GasConsumed()
+
+		for i := 0; i < ops; i++ {
+			cc := c.WithBlockTime(time.Unix(blockTime(i), 0))
+			_, _, err := f.app.AmmKeeper.Swap(
+				cc, f.sender, f.sender, f.path, amount, sdkmath.NewInt(1), nil, 0,
+			)
+			require.NoError(t, err)
+		}
+
+		t.Logf("%-34s %8d gas/op", name, (c.GasMeter().GasConsumed()-before)/ops)
+	}
+
+	// Every swap lands in its own block, so each one writes a checkpoint.
+	measure("swap, new block each swap", func(i int) int64 { return int64(3_000 + i) })
+
+	// All swaps share one block: only the first one writes a checkpoint.
+	measure("swap, same block", func(int) int64 { return 9_000 })
 }

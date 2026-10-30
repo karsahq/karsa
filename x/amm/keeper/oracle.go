@@ -69,6 +69,13 @@ func (k Keeper) updateOracle(ctx sdk.Context, pool types.Pool) {
 	now := ctx.BlockTime().Unix()
 	obs := k.GetObservations(ctx, pool.Id)
 
+	// One checkpoint per pool per timestamp. Within a block the elapsed time is
+	// zero, so an extra observation carries no information: it only rewrites the
+	// whole ring and evicts real history from it.
+	if n := len(obs.Items); n > 0 && obs.Items[n-1].Timestamp == now {
+		return
+	}
+
 	priceA, priceB := spotPrices(pool)
 
 	cumA, cumB := sdkmath.ZeroInt(), sdkmath.ZeroInt()
