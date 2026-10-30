@@ -57,6 +57,9 @@ import (
 	ammkeeper "github.com/karsahq/karsa/x/amm/keeper"
 	ammprecompile "github.com/karsahq/karsa/x/amm/precompile"
 	ammtypes "github.com/karsahq/karsa/x/amm/types"
+	nativetoken "github.com/karsahq/karsa/x/nativetoken"
+	nativetokenkeeper "github.com/karsahq/karsa/x/nativetoken/keeper"
+	nativetokentypes "github.com/karsahq/karsa/x/nativetoken/types"
 
 	autocliv1 "cosmossdk.io/api/cosmos/autocli/v1"
 	reflectionv1 "cosmossdk.io/api/cosmos/reflection/v1"
@@ -194,7 +197,8 @@ type App struct {
 	EVMMempool      sdkmempool.ExtMempool
 
 	// Karsa keepers
-	AmmKeeper ammkeeper.Keeper
+	AmmKeeper         ammkeeper.Keeper
+	NativeTokenKeeper nativetokenkeeper.Keeper
 
 	// the module manager
 	ModuleManager      *module.Manager
@@ -253,6 +257,7 @@ func NewApp(
 		evmtypes.StoreKey, feemarkettypes.StoreKey, erc20types.StoreKey,
 		// Karsa store keys
 		ammtypes.StoreKey,
+		nativetokentypes.StoreKey,
 	)
 	oKeys := storetypes.NewObjectStoreKeys(banktypes.ObjectStoreKey, evmtypes.ObjectKey)
 
@@ -508,6 +513,16 @@ func NewApp(
 		authtypes.NewModuleAddress(govtypes.ModuleName).String(),
 	)
 
+	app.NativeTokenKeeper = nativetokenkeeper.NewKeeper(
+		keys[nativetokentypes.StoreKey],
+		appCodec,
+		app.BankKeeper,
+		&app.Erc20Keeper,
+		app.EVMKeeper,
+		app.DistrKeeper,
+		authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+	)
+
 	// Register the AMM precompile so EVM contracts can quote and swap.
 	staticPrecompiles := precompiletypes.DefaultStaticPrecompiles(
 		*app.StakingKeeper,
@@ -610,6 +625,7 @@ func NewApp(
 		erc20.NewAppModule(app.Erc20Keeper, app.AccountKeeper),
 		// Karsa modules
 		amm.NewAppModule(app.AmmKeeper),
+		nativetoken.NewAppModule(app.NativeTokenKeeper),
 	)
 
 	// BasicModuleManager defines the module BasicManager which is in charge of setting up basic,
@@ -700,6 +716,7 @@ func NewApp(
 		feemarkettypes.ModuleName,
 		erc20types.ModuleName,
 		ammtypes.ModuleName,
+		nativetokentypes.ModuleName,
 
 		ibctransfertypes.ModuleName,
 		genutiltypes.ModuleName, evidencetypes.ModuleName, authz.ModuleName,
