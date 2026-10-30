@@ -60,6 +60,7 @@ import (
 	nativetoken "github.com/karsahq/karsa/x/nativetoken"
 	nativetokenkeeper "github.com/karsahq/karsa/x/nativetoken/keeper"
 	nativetokenfactory "github.com/karsahq/karsa/x/nativetoken/precompile/factory"
+	nativetokenminter "github.com/karsahq/karsa/x/nativetoken/precompile/minter"
 	nativetokentypes "github.com/karsahq/karsa/x/nativetoken/types"
 
 	autocliv1 "cosmossdk.io/api/cosmos/autocli/v1"
@@ -539,6 +540,7 @@ func NewApp(
 	)
 	staticPrecompiles[ammprecompile.Address] = ammprecompile.NewPrecompile(app.AmmKeeper)
 	staticPrecompiles[nativetokenfactory.Address] = nativetokenfactory.NewPrecompile(app.NativeTokenKeeper)
+	staticPrecompiles[nativetokenminter.Address] = nativetokenminter.NewPrecompile(app.NativeTokenKeeper)
 	app.EVMKeeper = app.EVMKeeper.WithStaticPrecompiles(staticPrecompiles)
 
 	/*

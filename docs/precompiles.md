@@ -29,6 +29,7 @@ menambahkan AMM (`genesis.go:33`).
 | `0x…0807` | ICS02 | module | IBC client |
 | `0x…0900` | AMM | Karsa | swap, quote, getPool, liquidity |
 | **`0x…0901`** | **Token Factory** | **Karsa** | `createToken` — membuat native token dari kontrak |
+| **`0x…0902`** | **Token Minter** | **Karsa** | `mint`/`burn` atas nama controller token |
 
 ## 2. Duplikasi yang harus dijaga
 
@@ -65,12 +66,8 @@ dipanggil dari EVM.
 
 ## 4. Precompile yang direncanakan
 
-| Alamat (usulan) | Nama | Sifat | Untuk |
-|---|---|---|---|
-| `0x…0902` | Token Minter | statis | `mint`/`burn` untuk denom yang punya controller |
-
-Minter bersifat global (bukan per token), jadi masuk daftar statis. Tokennya sendiri
-adalah precompile **dinamis** di alamat masing-masing.
+Belum ada. Kandidat berikutnya adalah `permit` (EIP-2612) pada precompile ERC20
+token, jika ternyata bisa diimplementasikan dengan aman.
 
 Lihat `docs/native-token.md` untuk model kepemilikan dan alur pembuatan token.
 

@@ -49,6 +49,7 @@ func BlockedAddresses() map[string]bool {
 	blockedPrecompilesHex = append(blockedPrecompilesHex, vmtypes.AvailableStaticPrecompiles...)
 	blockedPrecompilesHex = append(blockedPrecompilesHex, ammtypes.PrecompileAddress)
 	blockedPrecompilesHex = append(blockedPrecompilesHex, nativetokentypes.FactoryPrecompileAddress)
+	blockedPrecompilesHex = append(blockedPrecompilesHex, nativetokentypes.MinterPrecompileAddress)
 	for _, addr := range corevm.PrecompiledAddressesPrague {
 		blockedPrecompilesHex = append(blockedPrecompilesHex, addr.Hex())
 	}

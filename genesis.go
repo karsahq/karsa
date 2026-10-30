@@ -35,6 +35,7 @@ func NewEVMGenesisState() *evmtypes.GenesisState {
 		append([]string{}, evmtypes.AvailableStaticPrecompiles...),
 		ammtypes.PrecompileAddress,
 		nativetokentypes.FactoryPrecompileAddress,
+		nativetokentypes.MinterPrecompileAddress,
 	)
 	evmGenState.Preinstalls = evmtypes.DefaultPreinstalls
 
