@@ -39,7 +39,8 @@ func newTestApp(t *testing.T) (*karsa.App, sdk.Context) {
 	return app, ctx
 }
 
-// deployTestERC20 deploys the example ERC20 so it can act as a controller.
+// deployTestERC20 deploys the example ERC20, used both as a token creator and as
+// a controller.
 func deployTestERC20(t *testing.T, app *karsa.App, ctx sdk.Context, deployer common.Address) common.Address {
 	t.Helper()
 
@@ -68,28 +69,39 @@ func fundAccount(t *testing.T, app *karsa.App, ctx sdk.Context, addr sdk.AccAddr
 	require.NoError(t, app.BankKeeper.SendCoinsFromModuleToAccount(ctx, nativetokentypes.ModuleName, addr, coins))
 }
 
+// newContractCreator deploys a contract and returns its address as the creator.
+// Creation is contract-only, so tests must go through a contract too.
+func newContractCreator(t *testing.T, app *karsa.App, ctx sdk.Context) (sdk.AccAddress, common.Address) {
+	t.Helper()
+
+	deployer := common.HexToAddress("0x00000000000000000000000000000000000000CC")
+	fundAccount(t, app, ctx, sdk.AccAddress(deployer.Bytes()), sdkmath.NewIntWithDecimal(1_000, 18))
+
+	contract := deployTestERC20(t, app, ctx, deployer)
+
+	return sdk.AccAddress(contract.Bytes()), contract
+}
+
 func TestCreateNativeToken(t *testing.T) {
 	app, ctx := newTestApp(t)
 
-	creator := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AA").Bytes())
+	creator, creatorContract := newContractCreator(t, app, ctx)
 	supply := sdkmath.NewIntWithDecimal(1_000_000, 18)
 
 	token, err := app.NativeTokenKeeper.CreateNativeToken(ctx, creator, "Momo", "Momo Token", supply, "")
 	require.NoError(t, err)
 
-	// Identity: the denom is derived from the address, and the address from the
-	// creator plus the sequence.
+	// Identity: the denom is derived from the address, the address from the
+	// creator contract plus the sequence.
 	require.Equal(t, nativetokentypes.DenomFor(common.HexToAddress(token.Address)), token.Denom)
 	require.True(t, strings.HasPrefix(token.Denom, "n:0x"))
 	require.Len(t, token.Denom, nativetokentypes.DenomLen)
 	require.Equal(t, token.Denom, strings.ToLower(token.Denom))
 
-	// Creator is immutable and stored as lowercase hex.
-	require.Equal(t, "0x00000000000000000000000000000000000000aa", token.Creator)
+	require.Equal(t, strings.ToLower(creatorContract.Hex()), token.Creator)
 	require.Empty(t, token.Controller, "no controller means immutable supply")
 	require.False(t, token.Verified)
 
-	// The registry is readable by denom and by address.
 	stored, found := app.NativeTokenKeeper.GetToken(ctx, token.Denom)
 	require.True(t, found)
 	require.Equal(t, token, stored)
@@ -98,24 +110,29 @@ func TestCreateNativeToken(t *testing.T) {
 	require.True(t, found)
 	require.Equal(t, token.Denom, byAddress.Denom)
 
-	// The whole supply went to the creator.
 	require.Equal(t, supply, app.BankKeeper.GetBalance(ctx, creator, token.Denom).Amount)
 
-	// Bank metadata and the ERC20 pair are registered so wallets and the EVM can
-	// see the token.
 	metadata, found := app.BankKeeper.GetDenomMetaData(ctx, token.Denom)
 	require.True(t, found)
 	require.Equal(t, "Momo Token", metadata.Name)
 	require.Equal(t, "Momo", metadata.Symbol)
 	require.True(t, app.Erc20Keeper.IsERC20Registered(ctx, common.HexToAddress(token.Address)))
 
-	// The creator's sequence advanced, so the next token gets a new address.
 	require.Equal(t, uint64(1), app.NativeTokenKeeper.GetSequence(ctx, token.Creator))
+}
+
+func TestCreateNativeTokenRejectsEOACreator(t *testing.T) {
+	app, ctx := newTestApp(t)
+
+	eoa := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AA").Bytes())
+
+	_, err := app.NativeTokenKeeper.CreateNativeToken(ctx, eoa, "Momo", "Momo", sdkmath.NewInt(1), "")
+	require.ErrorIs(t, err, nativetokentypes.ErrCreatorNotContract)
 }
 
 func TestCreateNativeTokenSequenceIsUnique(t *testing.T) {
 	app, ctx := newTestApp(t)
-	creator := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AA").Bytes())
+	creator, _ := newContractCreator(t, app, ctx)
 	supply := sdkmath.NewInt(1_000)
 
 	first, err := app.NativeTokenKeeper.CreateNativeToken(ctx, creator, "Momo", "Momo", supply, "")
@@ -132,7 +149,7 @@ func TestCreateNativeTokenSequenceIsUnique(t *testing.T) {
 
 func TestCreateNativeTokenControllerMustBeContract(t *testing.T) {
 	app, ctx := newTestApp(t)
-	creator := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AA").Bytes())
+	creator, _ := newContractCreator(t, app, ctx)
 
 	// An EOA must be rejected: control may only live in code.
 	eoa := "0x00000000000000000000000000000000000000bb"
@@ -140,7 +157,6 @@ func TestCreateNativeTokenControllerMustBeContract(t *testing.T) {
 	require.ErrorIs(t, err, nativetokentypes.ErrControllerNotContract)
 
 	// A deployed contract is accepted.
-	fundAccount(t, app, ctx, sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000CC").Bytes()), sdkmath.NewIntWithDecimal(1_000, 18))
 	controller := deployTestERC20(t, app, ctx, common.HexToAddress("0x00000000000000000000000000000000000000CC"))
 
 	token, err := app.NativeTokenKeeper.CreateNativeToken(
@@ -152,7 +168,7 @@ func TestCreateNativeTokenControllerMustBeContract(t *testing.T) {
 
 func TestCreateNativeTokenValidation(t *testing.T) {
 	app, ctx := newTestApp(t)
-	creator := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AA").Bytes())
+	creator, _ := newContractCreator(t, app, ctx)
 
 	cases := []struct {
 		name    string
@@ -179,7 +195,7 @@ func TestCreateNativeTokenValidation(t *testing.T) {
 
 func TestSetTokenVerifiedRequiresAuthority(t *testing.T) {
 	app, ctx := newTestApp(t)
-	creator := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AA").Bytes())
+	creator, _ := newContractCreator(t, app, ctx)
 
 	token, err := app.NativeTokenKeeper.CreateNativeToken(ctx, creator, "Momo", "Momo", sdkmath.NewInt(1), "")
 	require.NoError(t, err)

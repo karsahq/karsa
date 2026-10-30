@@ -56,6 +56,12 @@ func (k Keeper) CreateNativeToken(
 	creatorAddr := common.BytesToAddress(creator)
 	creatorHex := strings.ToLower(creatorAddr.Hex())
 
+	// Creation is contract-only: every token must trace back to code, so there is
+	// no "created from a wallet" case to explain and no key-based path to audit.
+	if !k.evmKeeper.IsContract(ctx, creatorAddr) {
+		return types.Token{}, types.ErrCreatorNotContract.Wrapf("%s has no code", creatorHex)
+	}
+
 	address, denom, sequence, err := k.deriveAddress(ctx, creatorAddr, k.GetSequence(ctx, creatorHex))
 	if err != nil {
 		return types.Token{}, err

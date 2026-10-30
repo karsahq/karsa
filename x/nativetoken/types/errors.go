@@ -17,4 +17,5 @@ var (
 	ErrControllerNotContract = errorsmod.Register(ModuleName, 11, "controller must be a contract")
 	ErrUnauthorized          = errorsmod.Register(ModuleName, 12, "unauthorized")
 	ErrInsufficientFee       = errorsmod.Register(ModuleName, 13, "insufficient creation fee")
+	ErrCreatorNotContract    = errorsmod.Register(ModuleName, 14, "creator must be a contract")
 )
