@@ -201,17 +201,18 @@ indexer dan explorer melihat perubahan supply seperti token biasa.
 ## 8. Registry
 
 ```go
-// x/nativetoken store
-token/{denom}            → TokenRecord{
-                             Creator    common.Address   // immutable
-                             Authority  common.Address   // mutable; zero = immutable
-                             Name       string
-                             Symbol     string
-                             Verified   bool             // governance
-                             CreatedAt  int64
-                           }
-byCreator/{addr}/{denom} → byte{}            // indeks query
+// x/nativetoken store (prefix → isi)
+0x01 token/{denom}          → Token{ Creator, Controller, Name, Symbol, Verified, CreatedAt }
+0x05 list/{denom}           → byte{}             // enumerasi untuk query & genesis
+0x02 sequence/{creator}     → uint64             // per creator, dasar derivasi alamat
+0x03 address/{0x…}          → denom              // dipakai precompile minter
+0x04 params                 → Params
 ```
+
+- `Creator` dan `Controller` disimpan sebagai string lowercase `0x…`.
+- `sequence/{creator}` **wajib** ikut genesis export: alamat diturunkan darinya.
+- `address/{0x…}` memungkinkan precompile minter menemukan denom hanya dari
+alamat token.
 
 Registry **tidak** menegakkan keunikan simbol dan tidak menyimpan indeks simbol.
 Keunikan denom sudah dijamin `x/bank` dan pemeriksaan saat pembuatan.
@@ -354,3 +355,6 @@ langka. Ia hanya menahan pembuatan massal oleh skrip.
 | 7 | Hanya 18 desimal, tanpa scaling bank↔EVM |
 | 8 | Tanpa pause/freeze/blacklist; perilaku transfer dijamin standar |
 | 9 | `permit` pada fase 2 |
+| 10 | Tidak ada pesan Cosmos untuk create/mint/burn; creation hanya lewat precompile factory `0x…0901`, supply hanya lewat precompile minter `0x…0902` |
+| 11 | Precompile factory dan minter **statis**; token itu sendiri **dinamis** per denom |
+| 12 | Mint dibatasi `2^256-1`; burn hanya dari saldo controller sendiri |
