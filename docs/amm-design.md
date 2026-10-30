@@ -301,6 +301,12 @@ custody(poolID) = hash("amm/custody/" + poolID)[:20]
   exception still matters for native-token payouts.
 - Per-pool custody keeps accounting isolated: one pool's donation cannot move
   another pool's reserve.
+- The invariant `balanceOf(custody) >= reserve` is checked inline on inbound
+  external transfers (the balance is already read there) and on demand through
+  `MsgCheckPool`. A shortfall downgrades the pool to `WITHDRAW_ONLY`. An
+  outbound-only swap against a short pool is **not** detected inline: the transfer
+  succeeds as long as the remaining balance covers it, so monitoring should call
+  `MsgCheckPool` rather than wait for a swap.
 
 ## 5. Messages
 

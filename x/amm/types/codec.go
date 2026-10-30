@@ -22,6 +22,7 @@ func RegisterInterfaces(registry codectypes.InterfaceRegistry) {
 		&MsgSwapExactOut{},
 		&MsgSetPoolStatus{},
 		&MsgDonatePool{},
+		&MsgCheckPool{},
 		&MsgUpdateParams{},
 	)
 

@@ -231,6 +231,27 @@ func (m msgServer) DonatePool(goCtx context.Context, msg *types.MsgDonatePool) (
 	return &types.MsgDonatePoolResponse{Donated: donated}, nil
 }
 
+// CheckPool verifies the custody invariant on demand.
+func (m msgServer) CheckPool(goCtx context.Context, msg *types.MsgCheckPool) (*types.MsgCheckPoolResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	if _, err := sdk.AccAddressFromBech32(msg.Sender); err != nil {
+		return nil, types.ErrUnauthorized.Wrapf("invalid sender: %s", err)
+	}
+
+	if err := m.acquireLock(ctx); err != nil {
+		return nil, err
+	}
+	defer m.releaseLock(ctx)
+
+	under, err := m.Keeper.CheckPool(ctx, msg.PoolId)
+	if err != nil {
+		return nil, err
+	}
+
+	return &types.MsgCheckPoolResponse{Undercollateralised: under}, nil
+}
+
 // UpdateParams updates the module params. Only the authority may call it.
 func (m msgServer) UpdateParams(goCtx context.Context, msg *types.MsgUpdateParams) (*types.MsgUpdateParamsResponse, error) {
 	ctx := sdk.UnwrapSDKContext(goCtx)

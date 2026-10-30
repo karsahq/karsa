@@ -19,6 +19,7 @@ service Msg {
   rpc SwapExactOut(MsgSwapExactOut) returns (MsgSwapExactOutResponse);
   rpc SetPoolStatus(MsgSetPoolStatus) returns (MsgSetPoolStatusResponse);
   rpc DonatePool(MsgDonatePool) returns (MsgDonatePoolResponse);
+  rpc CheckPool(MsgCheckPool) returns (MsgCheckPoolResponse);
   rpc UpdateParams(MsgUpdateParams) returns (MsgUpdateParamsResponse);
 }
 
@@ -161,6 +162,21 @@ message MsgDonatePoolResponse {
     (gogoproto.nullable) = false,
     (gogoproto.castrepeated) = "github.com/cosmos/cosmos-sdk/types.Coins"
   ];
+}
+
+// MsgCheckPool verifies that each direct-custody side still holds at least the
+// recorded reserve. A shortfall (forced burn, clawback, negative rebase) means the
+// pool is undercollateralised; it is downgraded to WITHDRAW_ONLY so holders can
+// exit but nobody trades against a stale price.
+message MsgCheckPool {
+  option (cosmos.msg.v1.signer) = "sender";
+
+  string sender = 1;
+  uint64 pool_id = 2;
+}
+
+message MsgCheckPoolResponse {
+  bool undercollateralised = 1;
 }
 
 message MsgUpdateParams {

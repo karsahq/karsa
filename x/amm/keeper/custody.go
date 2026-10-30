@@ -181,12 +181,7 @@ func (k Keeper) moveInWith(
 	}
 
 	if asset.DirectCustody {
-		custody := types.CustodyAddress(poolID)
-
-		return k.evmTransferWith(
-			ctx, k.evmStateDB(ctx, stateDB), fromPrecompile,
-			common.HexToAddress(asset.Address), from, custody, amount,
-		)
+		return k.moveInDirect(ctx, poolID, stateDB, fromPrecompile, asset, from, amount)
 	}
 
 	coins := sdk.NewCoins(sdk.NewCoin(asset.Denom, amount))
@@ -225,6 +220,57 @@ func (k Keeper) evmSendWith(
 				return types.ErrInsufficientFunds.Wrap("transfer returned false")
 			}
 		}
+	}
+
+	return nil
+}
+
+// moveInDirect pulls an external ERC20 from `from` into the pool's custody
+// account. It reads the balance before and after so the delta can be verified,
+// and reuses the before read to check the custody invariant for free.
+func (k Keeper) moveInDirect(
+	ctx sdk.Context, poolID uint64, stateDB *statedb.StateDB, fromPrecompile bool,
+	asset resolvedAsset, from common.Address, amount sdkmath.Int,
+) error {
+	token := common.HexToAddress(asset.Address)
+	custody := types.CustodyAddress(poolID)
+	sdb := k.evmStateDB(ctx, stateDB)
+
+	before, err := k.evmBalanceWith(ctx, sdb, token, custody)
+	if err != nil {
+		return err
+	}
+	if err := k.ensureCustodyHealthy(ctx, poolID, asset, before); err != nil {
+		return err
+	}
+
+	res, err := k.evmKeeper.CallEVM(
+		ctx, sdb, types.ERC20ABI, from, token, true, fromPrecompile, nil,
+		"transfer", custody, amount.BigInt(),
+	)
+	if err != nil {
+		return types.ErrInsufficientFunds.Wrapf("transfer call failed: %s", err)
+	}
+	if res.Failed() {
+		return types.ErrInsufficientFunds.Wrapf("transfer reverted: %s", res.VmError)
+	}
+	if len(res.Ret) > 0 {
+		out, err := types.ERC20ABI.Unpack("transfer", res.Ret)
+		if err == nil && len(out) == 1 {
+			if ok, isBool := out[0].(bool); isBool && !ok {
+				return types.ErrInsufficientFunds.Wrap("transfer returned false")
+			}
+		}
+	}
+
+	after, err := k.evmBalanceWith(ctx, sdb, token, custody)
+	if err != nil {
+		return err
+	}
+	if !after.Sub(before).Equal(amount) {
+		return types.ErrInvalidAsset.Wrapf(
+			"unexpected transfer balance delta: got %s, want %s", after.Sub(before), amount,
+		)
 	}
 
 	return nil
