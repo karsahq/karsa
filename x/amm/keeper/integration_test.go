@@ -1034,14 +1034,12 @@ func TestExternalERC20Pool(t *testing.T) {
 	require.Equal(t, uint64(1), poolID)
 	require.True(t, shares.IsPositive())
 
-	// The pool must hold the bank denom; x/erc20 escrows the contract tokens.
-	moduleAddr := app.AmmKeeper.ModuleAddress()
-	ammModule := sdk.AccAddress(moduleAddr.Bytes())
-	require.Equal(t, sdkmath.NewInt(100_000), app.BankKeeper.GetBalance(ctx, ammModule, denom).Amount)
-	require.Equal(t, sdkmath.NewInt(100_000), erc20BalanceOf(t, app, ctx, token, erc20types.ModuleAddress))
+	// The pool holds the contract token directly at its custody address.
+	custody := ammtypes.CustodyAddress(poolID)
+	require.Equal(t, sdkmath.NewInt(100_000), erc20BalanceOf(t, app, ctx, token, custody))
 	require.Equal(t, sdkmath.NewInt(900_000), erc20BalanceOf(t, app, ctx, token, deployer))
 
-	// Swap native -> ERC20: bank denom is burned and the ERC20 is released.
+	// Swap native -> ERC20: the token is released from custody.
 	path := []string{akraAsset.Hex(), token.Hex()}
 	before := erc20BalanceOf(t, app, ctx, token, deployer)
 
@@ -1052,8 +1050,7 @@ func TestExternalERC20Pool(t *testing.T) {
 
 	after := erc20BalanceOf(t, app, ctx, token, deployer)
 	require.Equal(t, before.Add(amountOut), after)
-	require.Equal(t, sdkmath.NewInt(100_000).Sub(amountOut), app.BankKeeper.GetBalance(ctx, ammModule, denom).Amount)
-	require.Equal(t, sdkmath.NewInt(100_000).Sub(amountOut), erc20BalanceOf(t, app, ctx, token, erc20types.ModuleAddress))
+	require.Equal(t, sdkmath.NewInt(100_000).Sub(amountOut), erc20BalanceOf(t, app, ctx, token, custody))
 }
 
 // TestExternalIntegratorFee checks that an integrator fee on an external ERC20
@@ -1099,10 +1096,10 @@ func TestExternalIntegratorFee(t *testing.T) {
 	require.Equal(t, expectedFee, integratorFee)
 	require.Equal(t, expectedFee, erc20BalanceOf(t, app, ctx, token, integrator))
 
-	// The net amount is converted, not the gross input.
-	ammModule := sdk.AccAddress(app.AmmKeeper.ModuleAddress().Bytes())
+	// The net amount is moved into the pool's custody, not the gross input.
+	custody := ammtypes.CustodyAddress(1)
 	require.Equal(t, sdkmath.NewInt(100_000).Add(amountIn.Sub(expectedFee)),
-		app.BankKeeper.GetBalance(ctx, ammModule, denom).Amount)
+		erc20BalanceOf(t, app, ctx, token, custody))
 }
 
 // TestExternalExactOutAndRemove covers exact-out with an external input plus

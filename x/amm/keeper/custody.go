@@ -9,7 +9,6 @@ import (
 
 	"github.com/karsahq/karsa/x/amm/types"
 
-	erc20types "github.com/cosmos/evm/x/erc20/types"
 	"github.com/cosmos/evm/x/vm/statedb"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -181,14 +180,13 @@ func (k Keeper) moveInWith(
 		return types.ErrInvalidAmount.Wrap("amount must be positive")
 	}
 
-	if asset.ConvertContract != (common.Address{}) {
-		if err := k.convertInWith(
-			ctx, k.evmStateDB(ctx, stateDB), fromPrecompile, asset, from, amount,
-		); err != nil {
-			return err
-		}
-		emitConversion(ctx, types.EventTypeConvertIn, asset, types.AttributeKeySender, from, amount)
-		return nil
+	if asset.DirectCustody {
+		custody := types.CustodyAddress(poolID)
+
+		return k.evmTransferWith(
+			ctx, k.evmStateDB(ctx, stateDB), fromPrecompile,
+			common.HexToAddress(asset.Address), from, custody, amount,
+		)
 	}
 
 	coins := sdk.NewCoins(sdk.NewCoin(asset.Denom, amount))
@@ -198,37 +196,6 @@ func (k Keeper) moveInWith(
 		return types.ErrInsufficientFunds.Wrap(err.Error())
 	}
 	return nil
-}
-
-// convertInWith escrows an external ERC20 in the x/erc20 module and mints the
-// matching bank denom to the AMM module.
-//
-// It mirrors x/erc20's ConvertERC20IntoCoinsForNativeToken, with one difference:
-// the caller's stateDB is threaded through every EVM call, so the contract code
-// and accounts are loaded from the store once per conversion instead of once
-// per call. That is worth roughly a third of the conversion cost.
-func (k Keeper) convertInWith(
-	ctx sdk.Context, stateDB *statedb.StateDB, fromPrecompile bool,
-	asset resolvedAsset, from common.Address, amount sdkmath.Int,
-) error {
-	if !k.erc20Keeper.IsERC20Enabled(ctx) {
-		return types.ErrInvalidAsset.Wrap("erc20 conversion is disabled")
-	}
-
-	if err := k.evmTransferWith(
-		ctx, stateDB, fromPrecompile, asset.ConvertContract, from, erc20types.ModuleAddress, amount,
-	); err != nil {
-		return err
-	}
-
-	coins := sdk.NewCoins(sdk.NewCoin(asset.Denom, amount))
-	if err := k.bankKeeper.MintCoins(ctx, erc20types.ModuleName, coins); err != nil {
-		return err
-	}
-
-	return k.bankKeeper.SendCoinsFromModuleToAccount(
-		ctx, erc20types.ModuleName, sdk.AccAddress(k.moduleAddress.Bytes()), coins,
-	)
 }
 
 // moveOut moves funds for a pool from custody to an account.
@@ -247,8 +214,13 @@ func (k Keeper) moveOutWith(
 		return types.ErrInvalidAmount.Wrap("amount must be positive")
 	}
 
-	if asset.ConvertContract != (common.Address{}) {
-		return k.convertOutWith(ctx, stateDB, fromPrecompile, asset, to, amount)
+	if asset.DirectCustody {
+		custody := types.CustodyAddress(poolID)
+
+		return k.evmTransferWith(
+			ctx, k.evmStateDB(ctx, stateDB), fromPrecompile,
+			common.HexToAddress(asset.Address), custody, to, amount,
+		)
 	}
 
 	coins := sdk.NewCoins(sdk.NewCoin(asset.Denom, amount))
@@ -258,47 +230,4 @@ func (k Keeper) moveOutWith(
 		return err
 	}
 	return nil
-}
-
-// convertOutWith burns the bank denom held by the AMM module and releases the
-// escrowed ERC20 to the user. It uses the caller's stateDB so the release stays
-// atomic inside the EVM execution context (x/erc20's helper creates its own
-// stateDB, which is not valid from a precompile).
-func (k Keeper) convertOutWith(
-	ctx sdk.Context, stateDB *statedb.StateDB, fromPrecompile bool,
-	asset resolvedAsset, to common.Address, amount sdkmath.Int,
-) error {
-	coins := sdk.NewCoins(sdk.NewCoin(asset.Denom, amount))
-
-	if err := k.bankKeeper.SendCoinsFromAccountToModule(
-		ctx, sdk.AccAddress(k.moduleAddress.Bytes()), erc20types.ModuleName, coins,
-	); err != nil {
-		return types.ErrInsufficientFunds.Wrap(err.Error())
-	}
-	if err := k.bankKeeper.BurnCoins(ctx, erc20types.ModuleName, coins); err != nil {
-		return err
-	}
-
-	if err := k.evmTransferWith(
-		ctx, k.evmStateDB(ctx, stateDB), fromPrecompile,
-		asset.ConvertContract, erc20types.ModuleAddress, to, amount,
-	); err != nil {
-		return err
-	}
-
-	emitConversion(ctx, types.EventTypeConvertOut, asset, types.AttributeKeyReceiver, to, amount)
-	return nil
-}
-
-func emitConversion(
-	ctx sdk.Context, eventType string, asset resolvedAsset, partyKey string, party common.Address, amount sdkmath.Int,
-) {
-	ctx.EventManager().EmitEvent(sdk.NewEvent(
-		eventType,
-		sdk.NewAttribute(types.AttributeKeyAsset, asset.Address),
-		sdk.NewAttribute(types.AttributeKeyDenom, asset.Denom),
-		sdk.NewAttribute(types.AttributeKeyContract, asset.ConvertContract.Hex()),
-		sdk.NewAttribute(types.AttributeKeyAmount, amount.String()),
-		sdk.NewAttribute(partyKey, party.Hex()),
-	))
 }
