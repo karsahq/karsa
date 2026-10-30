@@ -9,6 +9,7 @@
 #   - the EVM JSON-RPC answers
 #   - the Karsa precompiles (AMM, factory, minter) are active on chain
 #   - the nativetoken query service is reachable
+#   - a real zero-fee bank transfer is included in a block
 #
 # Usage: tests/e2e/smoke.sh
 set -euo pipefail
@@ -112,5 +113,38 @@ printf 'precompiles 0900, 0901, 0902 active\n'
 step "check nativetoken query"
 "$BIN" q nativetoken params --home "$HOME_DIR" -o json >/dev/null
 printf 'nativetoken params readable\n'
+
+# A default fee-market base fee rejects ordinary txs at DeliverTx even though
+# the broadcast returns code 0 from CheckTx. Send a real tx and wait for it to
+# be indexed, then verify the balance actually moved.
+step "send a zero-fee bank transaction"
+RECIP="recipient"
+"$BIN" keys add "$RECIP" --keyring-backend "$KEYRING" --home "$HOME_DIR" >/dev/null 2>&1
+RECIP_ADDR="$("$BIN" keys show "$RECIP" -a --keyring-backend "$KEYRING" --home "$HOME_DIR")"
+[[ -n "$RECIP_ADDR" ]] || fail "recipient address is empty"
+
+send_out="$("$BIN" tx bank send "$VAL" "$RECIP_ADDR" 1000akra \
+  --from "$VAL" --keyring-backend "$KEYRING" --home "$HOME_DIR" \
+  --chain-id "$CHAIN_ID" \
+  --gas auto --gas-adjustment 1.3 --gas-prices 0akra \
+  --broadcast-mode sync -y -o json)"
+TXHASH="$(printf '%s' "$send_out" | sed -nE 's/.*"txhash":"([^"]+)".*/\1/p')"
+[[ -n "$TXHASH" ]] || fail "bank send returned no txhash: $send_out"
+
+TX_JSON=""
+for _ in $(seq 1 30); do
+  if TX_JSON="$("$BIN" q tx "$TXHASH" --node tcp://127.0.0.1:26657 --home "$HOME_DIR" -o json 2>/dev/null)"; then
+    break
+  fi
+  TX_JSON=""
+  sleep 1
+done
+[[ -n "$TX_JSON" ]] || fail "bank send was not indexed: $TXHASH"
+printf '%s' "$TX_JSON" | grep -q '"code":0' || fail "bank send failed: $TX_JSON"
+printf 'bank send included at %s\n' "$(printf '%s' "$TX_JSON" | sed -nE 's/.*"height":"([0-9]+)".*/\1/p')"
+
+balance="$("$BIN" q bank balances "$RECIP_ADDR" --node tcp://127.0.0.1:26657 --home "$HOME_DIR" -o json)"
+printf '%s' "$balance" | grep -q '"amount": "1000"' || fail "recipient balance did not change: $balance"
+printf 'recipient received 1000akra\n'
 
 printf '\nSMOKE TEST PASSED\n'
