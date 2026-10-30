@@ -34,9 +34,8 @@ middleware because `erc20/v2` implements `IBCModule` but not
 ## Tests
 
 `tests/ibc` runs Karsa-to-Karsa IBC v2 tests. They cover send, receive,
-acknowledgement, timeout, ERC20 conversion, the ICS20 precompile, and the
-receive-side EVM callback. Source-side callback tests (ack/timeout) are not
-ported yet.
+acknowledgement, timeout, ERC20 conversion, the ICS20 precompile, and both the
+receive-side and source-side EVM callbacks (ack and timeout).
 
 Peers must support IBC v2 to connect. Do not expect channel-based Cosmos chains
 to interoperate with Karsa.

@@ -20,6 +20,7 @@ import (
 	v2 "github.com/cosmos/evm/x/erc20/v2"
 	ibctestutil "github.com/cosmos/evm/x/ibc/callbacks/testutil"
 	callbacktypes "github.com/cosmos/evm/x/ibc/callbacks/types"
+	"github.com/cosmos/evm/x/vm/statedb"
 	"github.com/cosmos/gogoproto/proto"
 	transfertypes "github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
 	channeltypes "github.com/cosmos/ibc-go/v11/modules/core/04-channel/types"
@@ -32,6 +33,7 @@ import (
 	"cosmossdk.io/math"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	minttypes "github.com/cosmos/cosmos-sdk/x/mint/types"
 )
 
 // MiddlewareTestSuite tests the v2 IBC middleware for the ERC20 module.
@@ -715,6 +717,125 @@ func (suite *MiddlewareV2TestSuite) TestOnAcknowledgementPacketNativeErc20() {
 			}
 		})
 	}
+}
+
+// TestSourceCallbackOnAcknowledgementV2 verifies that a sender contract can
+// receive the v2 acknowledgement callback. The contract must be the packet
+// sender, which is enforced by the callbacks keeper.
+func (suite *MiddlewareV2TestSuite) TestSourceCallbackOnAcknowledgementV2() {
+	suite.SetupTest()
+
+	ctx := suite.evmChainA.GetContext()
+	karsaApp := suite.evmChainA.App.(*karsa.App)
+	bondDenom, err := karsaApp.StakingKeeper.BondDenom(ctx)
+	suite.Require().NoError(err)
+
+	contractData, err := ibctestutil.LoadCounterWithCallbacksContract()
+	suite.Require().NoError(err)
+	contractAddr, err := DeployContract(suite.T(), suite.evmChainA, testutiltypes.ContractDeploymentData{
+		Contract:        contractData,
+		ConstructorArgs: nil,
+	})
+	suite.Require().NoError(err)
+
+	sender := sdk.AccAddress(contractAddr.Bytes()).String()
+	receiver := suite.chainB.SenderAccount.GetAddress().String()
+	memo := fmt.Sprintf(`{"src_callback":{"address":"%s","gas_limit":"1000000"}}`, contractAddr)
+	packetData := transfertypes.NewFungibleTokenPacketData(
+		bondDenom, ibctesting.DefaultCoinAmount.String(), sender, receiver, memo,
+	)
+	payload := channeltypesv2.NewPayload(
+		transfertypes.PortID, transfertypes.PortID,
+		transfertypes.V1, transfertypes.EncodingJSON,
+		packetData.GetBytes(),
+	)
+
+	router := karsaApp.GetIBCKeeper().ChannelKeeperV2.Router.Route(ibctesting.TransferPort)
+	ack := channeltypes.NewResultAcknowledgement([]byte{1}).Acknowledgement()
+	err = router.OnAcknowledgementPacket(
+		ctx,
+		suite.pathAToB.EndpointA.ClientID,
+		suite.pathAToB.EndpointB.ClientID,
+		1, ack, payload,
+		suite.evmChainA.SenderAccount.GetAddress(),
+	)
+	suite.Require().NoError(err)
+
+	stateDB := statedb.New(ctx, karsaApp.GetEVMKeeper(), statedb.NewEmptyTxConfig())
+	res, err := karsaApp.GetEVMKeeper().CallEVM(
+		ctx, stateDB, contractData.ABI,
+		common.BytesToAddress(suite.evmChainA.SenderAccount.GetAddress()),
+		contractAddr, false, false, nil, "getCounter",
+	)
+	suite.Require().NoError(err)
+
+	var counter *big.Int
+	suite.Require().NoError(contractData.ABI.UnpackIntoInterface(&counter, "getCounter", res.Ret))
+	suite.Require().Equal("1", counter.String(), "acknowledgement callback must run once")
+}
+
+// TestSourceCallbackOnTimeoutV2 verifies the timeout branch of the v2 source
+// callback. The contract sends the packet itself, so it is also the refund
+// recipient and the only address allowed to receive the callback.
+func (suite *MiddlewareV2TestSuite) TestSourceCallbackOnTimeoutV2() {
+	suite.SetupTest()
+
+	ctx := suite.evmChainA.GetContext()
+	karsaApp := suite.evmChainA.App.(*karsa.App)
+	bondDenom, err := karsaApp.StakingKeeper.BondDenom(ctx)
+	suite.Require().NoError(err)
+
+	contractData, err := ibctestutil.LoadCounterWithCallbacksContract()
+	suite.Require().NoError(err)
+	contractAddr, err := DeployContract(suite.T(), suite.evmChainA, testutiltypes.ContractDeploymentData{
+		Contract:        contractData,
+		ConstructorArgs: nil,
+	})
+	suite.Require().NoError(err)
+
+	contractAcc := sdk.AccAddress(contractAddr.Bytes())
+	amount := ibctesting.DefaultCoinAmount
+	coins := sdk.NewCoins(sdk.NewCoin(bondDenom, amount))
+	suite.Require().NoError(karsaApp.BankKeeper.MintCoins(ctx, minttypes.ModuleName, coins))
+	suite.Require().NoError(karsaApp.BankKeeper.SendCoinsFromModuleToAccount(ctx, minttypes.ModuleName, contractAcc, coins))
+
+	memo := fmt.Sprintf(`{"src_callback":{"address":"%s","gas_limit":"1000000"}}`, contractAddr)
+	packetData := transfertypes.NewFungibleTokenPacketData(
+		bondDenom, amount.String(), contractAcc.String(),
+		suite.chainB.SenderAccount.GetAddress().String(), memo,
+	)
+	payload := channeltypesv2.NewPayload(
+		transfertypes.PortID, transfertypes.PortID,
+		transfertypes.V1, transfertypes.EncodingJSON,
+		packetData.GetBytes(),
+	)
+
+	router := karsaApp.GetIBCKeeper().ChannelKeeperV2.Router.Route(ibctesting.TransferPort)
+	const sequence = uint64(7)
+	suite.Require().NoError(router.OnSendPacket(
+		ctx,
+		suite.pathAToB.EndpointA.ClientID,
+		suite.pathAToB.EndpointB.ClientID,
+		sequence, payload, contractAcc,
+	))
+	suite.Require().NoError(router.OnTimeoutPacket(
+		ctx,
+		suite.pathAToB.EndpointA.ClientID,
+		suite.pathAToB.EndpointB.ClientID,
+		sequence, payload, suite.evmChainA.SenderAccount.GetAddress(),
+	))
+
+	stateDB := statedb.New(ctx, karsaApp.GetEVMKeeper(), statedb.NewEmptyTxConfig())
+	res, err := karsaApp.GetEVMKeeper().CallEVM(
+		ctx, stateDB, contractData.ABI,
+		common.BytesToAddress(suite.evmChainA.SenderAccount.GetAddress()),
+		contractAddr, false, false, nil, "getCounter",
+	)
+	suite.Require().NoError(err)
+
+	var counter *big.Int
+	suite.Require().NoError(contractData.ABI.UnpackIntoInterface(&counter, "getCounter", res.Ret))
+	suite.Require().Equal("-1", counter.String(), "timeout callback must run once")
 }
 
 func (suite *MiddlewareV2TestSuite) TestOnTimeoutPacket() {
