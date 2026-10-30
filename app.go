@@ -40,7 +40,6 @@ import (
 	vmrunner "github.com/cosmos/evm/x/vm/runner"
 	evmtypes "github.com/cosmos/evm/x/vm/types"
 	"github.com/cosmos/gogoproto/proto"
-	ibccallbacks "github.com/cosmos/ibc-go/v11/modules/apps/callbacks"
 	ibccallbacksv2 "github.com/cosmos/ibc-go/v11/modules/apps/callbacks/v2"
 	transfer "github.com/cosmos/ibc-go/v11/modules/apps/transfer"
 	transferkeeper "github.com/cosmos/ibc-go/v11/modules/apps/transfer/keeper"
@@ -546,22 +545,18 @@ func NewApp(
 	app.EVMKeeper = app.EVMKeeper.WithStaticPrecompiles(staticPrecompiles)
 
 	/*
-		Create Transfer Stack
+		Create Transfer Stack (IBC v2 only)
+
+		Karsa deliberately does not expose the channel-based ICS20 v1 transfer
+		route. Only IBC v2 clients/packets are accepted; the v1 router is left
+		empty so an accidental channel handshake fails instead of silently
+		falling back to v1.
 
 		transfer stack contains (from bottom to top):
 			- IBC Callbacks Middleware (with EVM ContractKeeper)
 			- ERC-20 Middleware
-			- IBC Transfer
-
-		SendPacket, since it is originating from the application to core IBC:
-		 	transferKeeper.SendPacket ->  erc20.SendPacket -> callbacks.SendPacket -> channel.SendPacket
-
-		RecvPacket, message that originates from core IBC and goes down to app, the flow is the other way
-			channel.RecvPacket -> callbacks.OnRecvPacket -> erc20.OnRecvPacket -> transfer.OnRecvPacket
+			- IBC Transfer v2
 	*/
-
-	// create IBC module from top to bottom of stack
-	var transferStack porttypes.IBCModule
 
 	maxCallbackGas := uint64(1_000_000)
 	app.CallbackKeeper = ibccallbackskeeper.NewKeeper(
@@ -570,31 +565,26 @@ func NewApp(
 		app.Erc20Keeper,
 	)
 
-	transferStack = transfer.NewIBCModule(app.TransferKeeper)
-	transferStack = erc20.NewIBCMiddleware(app.Erc20Keeper, transferStack)
-	callbacksMiddleware := ibccallbacks.NewIBCMiddleware(app.CallbackKeeper, maxCallbackGas)
-	callbacksMiddleware.SetICS4Wrapper(app.IBCKeeper.ChannelKeeper)
-	callbacksMiddleware.SetUnderlyingApplication(transferStack)
-	transferStack = callbacksMiddleware
+	var transferModuleV2 ibcapi.IBCModule = transferv2.NewIBCModule(app.TransferKeeper)
+	unmarshaler, ok := transferModuleV2.(ibcapi.PacketDataUnmarshaler)
+	if !ok {
+		panic("transfer v2 module does not implement PacketDataUnmarshaler")
+	}
 
 	var transferStackV2 ibcapi.IBCModule
-	transferStackV2 = transferv2.NewIBCModule(app.TransferKeeper)
-	transferStackV2 = erc20v2.NewIBCMiddleware(transferStackV2, app.Erc20Keeper)
+	transferStackV2 = erc20v2.NewIBCMiddleware(transferModuleV2, app.Erc20Keeper)
 	transferStackV2 = ibccallbacksv2.NewIBCMiddleware(
-		transferStackV2,
+		packetUnmarshalerV2{IBCModule: transferStackV2, unmarshaler: unmarshaler},
 		app.IBCKeeper.ChannelKeeperV2,
 		app.CallbackKeeper,
 		app.IBCKeeper.ChannelKeeperV2,
 		maxCallbackGas,
 	)
 
-	// Create static IBC router, add transfer route, then set and seal it
-	ibcRouter := porttypes.NewRouter()
-	ibcRouter.AddRoute(ibctransfertypes.ModuleName, transferStack)
+	// Keep the v1 router empty and seal both routers.
+	app.IBCKeeper.SetRouter(porttypes.NewRouter())
 	ibcRouterV2 := ibcapi.NewRouter()
 	ibcRouterV2.AddRoute(ibctransfertypes.ModuleName, transferStackV2)
-
-	app.IBCKeeper.SetRouter(ibcRouter)
 	app.IBCKeeper.SetRouterV2(ibcRouterV2)
 
 	clientKeeper := app.IBCKeeper.ClientKeeper

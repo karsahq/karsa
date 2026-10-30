@@ -3,6 +3,7 @@ package ibc
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"math/big"
 	"testing"
 	"time"
@@ -10,11 +11,15 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	testifysuite "github.com/stretchr/testify/suite"
 
+	"github.com/cosmos/evm/contracts"
 	"github.com/cosmos/evm/testutil"
 	evmibctesting "github.com/cosmos/evm/testutil/ibc"
+	testutiltypes "github.com/cosmos/evm/testutil/types"
 	erc20Keeper "github.com/cosmos/evm/x/erc20/keeper"
 	"github.com/cosmos/evm/x/erc20/types"
 	v2 "github.com/cosmos/evm/x/erc20/v2"
+	ibctestutil "github.com/cosmos/evm/x/ibc/callbacks/testutil"
+	callbacktypes "github.com/cosmos/evm/x/ibc/callbacks/types"
 	"github.com/cosmos/gogoproto/proto"
 	transfertypes "github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
 	channeltypes "github.com/cosmos/ibc-go/v11/modules/core/04-channel/types"
@@ -46,9 +51,9 @@ type MiddlewareV2TestSuite struct {
 }
 
 func (suite *MiddlewareV2TestSuite) SetupTest() {
-	suite.coordinator = evmibctesting.NewCoordinator(suite.T(), 1, 1, integration.SetupKarsa)
+	suite.coordinator = evmibctesting.NewCoordinator(suite.T(), 2, 0, integration.SetupKarsa)
 	suite.evmChainA = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(1))
-	suite.chainB = suite.coordinator.GetChain(evmibctesting.GetChainID(2))
+	suite.chainB = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(2))
 
 	// setup between evmChainA and chainB
 	// pathAToB.EndpointA = endpoint on evmChainA
@@ -227,7 +232,7 @@ func (suite *MiddlewareV2TestSuite) TestOnRecvPacket() {
 		suite.Run(tc.name, func() {
 			suite.SetupTest()
 			ctx = suite.chainB.GetContext()
-			bondDenom, err := suite.chainB.GetSimApp().StakingKeeper.BondDenom(ctx)
+			bondDenom, err := suite.chainB.App.(*karsa.App).StakingKeeper.BondDenom(ctx)
 			suite.Require().NoError(err)
 			receiver := suite.evmChainA.SenderAccount.GetAddress()
 			sendAmt := ibctesting.DefaultCoinAmount
@@ -1041,4 +1046,116 @@ func (suite *MiddlewareV2TestSuite) TestOnRecvPacketNativeERC20Rollback() {
 
 	bankBalAfterRecv := karsaApp.BankKeeper.GetBalance(evmCtx, receiver, nativeErc20.Denom)
 	suite.Require().Equal("0", bankBalAfterRecv.Amount.String())
+}
+
+// TestOnRecvPacketWithCallbackV2 exercises the EVM callbacks middleware on the
+// v2 transfer stack. The callback memo is parsed from the v2 payload, the
+// voucher is approved to the target contract, and the contract must pull the
+// tokens or the packet is reported as failed.
+func (suite *MiddlewareV2TestSuite) TestOnRecvPacketWithCallbackV2() {
+	contractData, err := ibctestutil.LoadCounterWithCallbacksContract()
+	suite.Require().NoError(err)
+	counterABI := contractData.ABI
+
+	testCases := []struct {
+		name      string
+		memo      func(contractAddr, erc20Addr common.Address, amount *big.Int) string
+		expStatus channeltypesv2.PacketStatus
+		expBal    string
+	}{
+		{
+			name: "success - callback transfers the voucher",
+			memo: func(contractAddr, erc20Addr common.Address, amount *big.Int) string {
+				packed, err := counterABI.Pack("add", erc20Addr, amount)
+				suite.Require().NoError(err)
+				return fmt.Sprintf(`{"dest_callback":{"address":"%s","gas_limit":"1000000","calldata":"%x"}}`, contractAddr, packed)
+			},
+			expStatus: channeltypesv2.PacketStatus_Success,
+		},
+		{
+			name: "failure - callback target has no code",
+			memo: func(_, _ common.Address, _ *big.Int) string {
+				return `{"dest_callback":{"address":"0x1234567890123456789012345678901234567890","gas_limit":"1000000","calldata":""}}`
+			},
+			expStatus: channeltypesv2.PacketStatus_Failure,
+		},
+		{
+			name: "failure - callback does not move the voucher",
+			memo: func(contractAddr, _ common.Address, _ *big.Int) string {
+				packed, err := counterABI.Pack("getCounter")
+				suite.Require().NoError(err)
+				return fmt.Sprintf(`{"dest_callback":{"address":"%s","gas_limit":"1000000","calldata":"%x"}}`, contractAddr, packed)
+			},
+			expStatus: channeltypesv2.PacketStatus_Failure,
+		},
+		{
+			name: "failure - insufficient callback gas",
+			memo: func(contractAddr, erc20Addr common.Address, amount *big.Int) string {
+				packed, err := counterABI.Pack("add", erc20Addr, amount)
+				suite.Require().NoError(err)
+				return fmt.Sprintf(`{"dest_callback":{"address":"%s","gas_limit":"1000","calldata":"%x"}}`, contractAddr, packed)
+			},
+			expStatus: channeltypesv2.PacketStatus_Failure,
+		},
+		{
+			name: "failure - malformed callback memo",
+			memo: func(_, _ common.Address, _ *big.Int) string {
+				return `{"dest_callback":{"address":""}}`
+			},
+			expStatus: channeltypesv2.PacketStatus_Failure,
+		},
+	}
+
+	for _, tc := range testCases {
+		suite.Run(tc.name, func() {
+			suite.SetupTest()
+
+			karsaApp := suite.evmChainA.App.(*karsa.App)
+			ctx := suite.evmChainA.GetContext()
+			sourceSender := suite.chainB.SenderAccount.GetAddress()
+			receiver := suite.evmChainA.SenderAccount.GetAddress()
+
+			// Match the client arguments used by the v2 middleware tests.
+			sourceClient := suite.pathBToA.EndpointB.ClientID
+			destinationClient := suite.pathBToA.EndpointA.ClientID
+			isolatedAddr := callbacktypes.GenerateIsolatedAddress(destinationClient, sourceSender.String())
+
+			amount := ibctesting.DefaultCoinAmount
+			packetData := transfertypes.NewFungibleTokenPacketData(
+				testBondDenom, amount.String(), sourceSender.String(), isolatedAddr.String(), "",
+			)
+			data, err := transfertypes.UnmarshalPacketData(packetData.GetBytes(), transfertypes.V1, "")
+			suite.Require().NoError(err)
+			voucherDenom := testutil.GetVoucherDenomFromPacketData(data, transfertypes.PortID, sourceClient)
+			voucher, err := types.NewTokenPairSTRv2(voucherDenom)
+			suite.Require().NoError(err)
+
+			contractAddr, err := DeployContract(suite.T(), suite.evmChainA, testutiltypes.ContractDeploymentData{
+				Contract:        contractData,
+				ConstructorArgs: nil,
+			})
+			suite.Require().NoError(err)
+
+			packetData.Memo = tc.memo(contractAddr, voucher.GetERC20Contract(), amount.BigInt())
+			payload := channeltypesv2.NewPayload(
+				transfertypes.PortID, transfertypes.PortID,
+				transfertypes.V1, transfertypes.EncodingJSON,
+				packetData.GetBytes(),
+			)
+
+			router := karsaApp.GetIBCKeeper().ChannelKeeperV2.Router.Route(ibctesting.TransferPort)
+			result := router.OnRecvPacket(ctx, sourceClient, destinationClient, 1, payload, receiver)
+			suite.Require().Equal(tc.expStatus, result.Status)
+
+			balance := karsaApp.Erc20Keeper.BalanceOf(
+				ctx, contracts.ERC20MinterBurnerDecimalsContract.ABI,
+				voucher.GetERC20Contract(), contractAddr,
+			)
+			if tc.expStatus == channeltypesv2.PacketStatus_Success {
+				suite.Require().Equal(amount.String(), balance.String())
+			} else {
+				suite.Require().Equal("0", balance.String())
+			}
+		})
+	}
 }

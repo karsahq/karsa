@@ -43,7 +43,7 @@ func (s *ICS02ClientTestSuite) SetupTest() {
 	s.chainB = s.coordinator.GetChain(evmibctesting.GetEvmChainID(2))
 
 	s.pathBToA = evmibctesting.NewTransferPath(s.chainB, s.chainA)
-	s.pathBToA.Setup()
+	s.pathBToA.SetupV2()
 
 	karsaAppA := s.chainA.App.(*karsa.App)
 	s.chainAPrecompile = ics02.NewPrecompile(

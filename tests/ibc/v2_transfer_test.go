@@ -21,7 +21,6 @@ import (
 
 	evmibctesting "github.com/cosmos/evm/testutil/ibc"
 	"github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
-	clienttypes "github.com/cosmos/ibc-go/v11/modules/core/02-client/types"
 	channeltypes "github.com/cosmos/ibc-go/v11/modules/core/04-channel/types"
 	channeltypesv2 "github.com/cosmos/ibc-go/v11/modules/core/04-channel/v2/types"
 	"github.com/karsahq/karsa"
@@ -32,7 +31,11 @@ import (
 	sdk "github.com/cosmos/cosmos-sdk/types"
 )
 
-const testclientid = "testclientid"
+const (
+	testclientid = "testclientid"
+	// testBondDenom is the bond denom used by the Karsa test chains.
+	testBondDenom = "aatom"
+)
 
 type TransferTestSuiteV2 struct {
 	testifysuite.Suite
@@ -54,10 +57,10 @@ type TransferTestSuiteV2 struct {
 const invalidPortID = "invalidportid"
 
 func (suite *TransferTestSuiteV2) SetupTest() {
-	suite.coordinator = evmibctesting.NewCoordinator(suite.T(), 1, 2, integration.SetupKarsa)
+	suite.coordinator = evmibctesting.NewCoordinator(suite.T(), 3, 0, integration.SetupKarsa)
 	suite.evmChainA = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(1))
-	suite.chainB = suite.coordinator.GetChain(evmibctesting.GetChainID(2))
-	suite.chainC = suite.coordinator.GetChain(evmibctesting.GetChainID(3))
+	suite.chainB = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(2))
+	suite.chainC = suite.coordinator.GetChain(evmibctesting.GetEvmChainID(3))
 
 	// setup between evmChainA and chainB
 	// NOTE:
@@ -96,13 +99,13 @@ func (suite *TransferTestSuiteV2) TestOnSendPacket() {
 	}{
 		{
 			"transfer single denom",
-			sdk.DefaultBondDenom,
+			testBondDenom,
 			func() {},
 			nil,
 		},
 		{
 			"transfer with invalid source port",
-			sdk.DefaultBondDenom,
+			testBondDenom,
 			func() {
 				payload.SourcePort = invalidPortID
 			},
@@ -110,7 +113,7 @@ func (suite *TransferTestSuiteV2) TestOnSendPacket() {
 		},
 		{
 			"transfer with invalid destination port",
-			sdk.DefaultBondDenom,
+			testBondDenom,
 			func() {
 				payload.DestinationPort = invalidPortID
 			},
@@ -118,7 +121,7 @@ func (suite *TransferTestSuiteV2) TestOnSendPacket() {
 		},
 		{
 			"transfer with invalid source client",
-			sdk.DefaultBondDenom,
+			testBondDenom,
 			func() {
 				suite.pathAToB.EndpointA.ClientID = testclientid
 			},
@@ -126,7 +129,7 @@ func (suite *TransferTestSuiteV2) TestOnSendPacket() {
 		},
 		{
 			"transfer with invalid destination client",
-			sdk.DefaultBondDenom,
+			testBondDenom,
 			func() {
 				suite.pathAToB.EndpointB.ClientID = testclientid
 			},
@@ -231,13 +234,13 @@ func (suite *TransferTestSuiteV2) TestOnRecvPacket() {
 	}{
 		{
 			"transfer single denom",
-			sdk.DefaultBondDenom,
+			testBondDenom,
 			func() {},
 			false,
 		},
 		{
 			"transfer with invalid source port",
-			sdk.DefaultBondDenom,
+			testBondDenom,
 			func() {
 				payload.SourcePort = invalidPortID
 			},
@@ -245,7 +248,7 @@ func (suite *TransferTestSuiteV2) TestOnRecvPacket() {
 		},
 		{
 			"transfer with invalid dest port",
-			sdk.DefaultBondDenom,
+			testBondDenom,
 			func() {
 				payload.DestinationPort = invalidPortID
 			},
@@ -253,7 +256,7 @@ func (suite *TransferTestSuiteV2) TestOnRecvPacket() {
 		},
 		{
 			"transfer with invalid source client",
-			sdk.DefaultBondDenom,
+			testBondDenom,
 			func() {
 				suite.pathBToA.EndpointB.ClientID = testclientid
 			},
@@ -261,7 +264,7 @@ func (suite *TransferTestSuiteV2) TestOnRecvPacket() {
 		},
 		{
 			"transfer with invalid destination client",
-			sdk.DefaultBondDenom,
+			testBondDenom,
 			func() {
 				suite.pathBToA.EndpointA.ClientID = testclientid
 			},
@@ -273,7 +276,7 @@ func (suite *TransferTestSuiteV2) TestOnRecvPacket() {
 		suite.Run(tc.name, func() {
 			suite.SetupTest() // reset
 
-			simAppB := suite.chainB.GetSimApp()
+			simAppB := suite.chainB.App.(*karsa.App)
 			originalBalance := simAppB.BankKeeper.GetBalance(
 				suite.chainB.GetContext(),
 				suite.chainB.SenderAccount.GetAddress(),
@@ -285,15 +288,6 @@ func (suite *TransferTestSuiteV2) TestOnRecvPacket() {
 			amount, ok := sdkmath.NewIntFromString("9223372036854775808") // 2^63 (one above int64)
 			suite.Require().True(ok)
 			originalCoin := sdk.NewCoin(tc.sourceDenomToTransfer, amount)
-
-			msg := types.NewMsgTransferWithEncoding(
-				types.PortID, suite.pathBToA.EndpointB.ClientID,
-				originalCoin, suite.chainB.SenderAccount.GetAddress().String(),
-				suite.evmChainA.SenderAccount.GetAddress().String(), clienttypes.Height{},
-				timeoutTimestamp, "", types.EncodingProtobuf,
-			)
-			_, err := suite.chainB.SendMsgs(msg)
-			suite.Require().NoError(err) // message committed
 
 			token, err := simAppB.TransferKeeper.TokenFromCoin(suite.chainB.GetContext(), originalCoin)
 			suite.Require().NoError(err)
@@ -310,6 +304,17 @@ func (suite *TransferTestSuiteV2) TestOnRecvPacket() {
 				types.PortID, types.PortID, types.V1,
 				types.EncodingProtobuf, bz,
 			)
+
+			_, err = simAppB.GetIBCKeeper().ChannelKeeperV2.SendPacket(
+				suite.chainB.GetContext(),
+				channeltypesv2.NewMsgSendPacket(
+					suite.pathBToA.EndpointA.ClientID,
+					timeoutTimestamp,
+					suite.chainB.SenderAccount.GetAddress().String(),
+					payload,
+				),
+			)
+			suite.Require().NoError(err)
 
 			ctx := suite.evmChainA.GetContext()
 			karsaApp := suite.evmChainA.App.(*karsa.App)
@@ -328,7 +333,7 @@ func (suite *TransferTestSuiteV2) TestOnRecvPacket() {
 				suite.Require().Equal(channeltypesv2.PacketStatus_Success, recvResult.Status)
 				suite.Require().Equal(channeltypes.NewResultAcknowledgement([]byte{byte(1)}).Acknowledgement(), recvResult.Acknowledgement)
 
-				escrowAddress := types.GetEscrowAddress(types.PortID, suite.pathBToA.EndpointB.ClientID)
+				escrowAddress := types.GetEscrowAddress(types.PortID, suite.pathBToA.EndpointA.ClientID)
 				// check that the balance for evmChainA is updated
 				chainBBalance := simAppB.BankKeeper.GetBalance(
 					suite.chainB.GetContext(),
@@ -371,7 +376,7 @@ func (suite *TransferTestSuiteV2) TestOnAckPacket() {
 	}{
 		{
 			"transfer single denom",
-			sdk.DefaultBondDenom,
+			testBondDenom,
 		},
 	}
 
@@ -387,15 +392,6 @@ func (suite *TransferTestSuiteV2) TestOnAckPacket() {
 			amount, ok := sdkmath.NewIntFromString("9223372036854775808") // 2^63 (one above int64)
 			suite.Require().True(ok)
 			originalCoin := sdk.NewCoin(tc.sourceDenomToTransfer, amount)
-
-			msg := types.NewMsgTransferWithEncoding(
-				types.PortID, suite.pathAToB.EndpointA.ClientID,
-				originalCoin, suite.evmChainA.SenderAccount.GetAddress().String(),
-				suite.chainB.SenderAccount.GetAddress().String(), clienttypes.Height{},
-				timeoutTimestamp, "", types.EncodingProtobuf,
-			)
-			_, err := suite.evmChainA.SendMsgs(msg)
-			suite.Require().NoError(err) // message committed
 
 			token, err := karsaApp.TransferKeeper.TokenFromCoin(suite.evmChainA.GetContext(), originalCoin)
 			suite.Require().NoError(err)
@@ -414,6 +410,17 @@ func (suite *TransferTestSuiteV2) TestOnAckPacket() {
 			)
 
 			ctx := suite.evmChainA.GetContext()
+			_, err = karsaApp.GetIBCKeeper().ChannelKeeperV2.SendPacket(
+				ctx,
+				channeltypesv2.NewMsgSendPacket(
+					suite.pathAToB.EndpointA.ClientID,
+					timeoutTimestamp,
+					suite.evmChainA.SenderAccount.GetAddress().String(),
+					payload,
+				),
+			)
+			suite.Require().NoError(err)
+
 			cbs := karsaApp.GetIBCKeeper().ChannelKeeperV2.Router.Route(evmibctesting.TransferPort)
 
 			ack := channeltypes.NewResultAcknowledgement([]byte{byte(1)})
@@ -478,7 +485,7 @@ func (suite *TransferTestSuiteV2) TestOnTimeoutPacket() {
 	}{
 		{
 			"transfer single denom",
-			sdk.DefaultBondDenom,
+			testBondDenom,
 		},
 	}
 
@@ -495,15 +502,6 @@ func (suite *TransferTestSuiteV2) TestOnTimeoutPacket() {
 			suite.Require().True(ok)
 			originalCoin := sdk.NewCoin(tc.sourceDenomToTransfer, amount)
 
-			msg := types.NewMsgTransferWithEncoding(
-				types.PortID, suite.pathAToB.EndpointA.ClientID,
-				originalCoin, suite.evmChainA.SenderAccount.GetAddress().String(),
-				suite.chainB.SenderAccount.GetAddress().String(), clienttypes.Height{},
-				timeoutTimestamp, "", types.EncodingProtobuf,
-			)
-			_, err := suite.evmChainA.SendMsgs(msg)
-			suite.Require().NoError(err) // message committed
-
 			token, err := karsaApp.TransferKeeper.TokenFromCoin(suite.evmChainA.GetContext(), originalCoin)
 			suite.Require().NoError(err)
 
@@ -519,6 +517,17 @@ func (suite *TransferTestSuiteV2) TestOnTimeoutPacket() {
 				types.PortID, types.PortID, types.V1,
 				types.EncodingProtobuf, bz,
 			)
+
+			_, err = karsaApp.GetIBCKeeper().ChannelKeeperV2.SendPacket(
+				suite.evmChainA.GetContext(),
+				channeltypesv2.NewMsgSendPacket(
+					suite.pathAToB.EndpointA.ClientID,
+					timeoutTimestamp,
+					suite.evmChainA.SenderAccount.GetAddress().String(),
+					payload,
+				),
+			)
+			suite.Require().NoError(err)
 
 			// on successful send, the tokens sent in packets should be in escrow
 			escrowAddress := types.GetEscrowAddress(types.PortID, suite.pathAToB.EndpointA.ClientID)
