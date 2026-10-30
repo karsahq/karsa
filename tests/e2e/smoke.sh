@@ -10,6 +10,7 @@
 #   - the Karsa precompiles (AMM, factory, minter) are active on chain
 #   - the nativetoken query service is reachable
 #   - a real zero-fee bank transfer is included in a block
+#   - an AMM pool can be created and swapped through the CLI
 #
 # Usage: tests/e2e/smoke.sh
 set -euo pipefail
@@ -35,6 +36,20 @@ trap cleanup EXIT
 step() { printf '\n== %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
+# wait_for_tx prints the indexed tx JSON, or fails after 30 seconds. A sync
+# broadcast only proves CheckTx passed; DeliverTx is what actually moves state.
+wait_for_tx() {
+  local hash="$1" out=""
+  for _ in $(seq 1 30); do
+    if out="$("$BIN" q tx "$hash" --node tcp://127.0.0.1:26657 --home "$HOME_DIR" -o json 2>/dev/null)"; then
+      printf '%s' "$out"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 step "build"
 ( cd "$ROOT" && go build -o "$BIN" ./cmd/karsad )
 
@@ -46,11 +61,38 @@ rm -rf "$HOME_DIR"
 VAL_ADDR="$("$BIN" keys show "$VAL" -a --keyring-backend "$KEYRING" --home "$HOME_DIR")"
 [[ -n "$VAL_ADDR" ]] || fail "validator address is empty"
 
-"$BIN" genesis add-genesis-account "$VAL_ADDR" 100000000000000000000000000akra \
+"$BIN" genesis add-genesis-account "$VAL_ADDR" \
+  100000000000000000000000000akra,1000000000000000000000uusdc \
   --keyring-backend "$KEYRING" --home "$HOME_DIR" >/dev/null
 "$BIN" genesis gentx "$VAL" 1000000000000000000000akra \
   --chain-id "$CHAIN_ID" --keyring-backend "$KEYRING" --home "$HOME_DIR" >/dev/null
 "$BIN" genesis collect-gentxs --home "$HOME_DIR" >/dev/null
+
+# Register a second, bank-backed asset for the AMM test. This is e2e-only: a
+# module-owned token pair turns the denom into a dynamic ERC20 precompile, so
+# the CLI can create a real KRA/uusdc pool without deploying a contract.
+python3 - "$HOME_DIR/config/genesis.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path) as f:
+    genesis = json.load(f)
+
+erc20 = genesis["app_state"]["erc20"]
+pair = {
+    "erc20_address": "0x1000000000000000000000000000000000000001",
+    "denom": "uusdc",
+    "enabled": True,
+    "contract_owner": "OWNER_MODULE",
+}
+erc20["token_pairs"].append(pair)
+erc20["dynamic_precompiles"].append(pair["erc20_address"])
+
+with open(path, "w") as f:
+    json.dump(genesis, f, separators=(",", ":"))
+PY
+
 "$BIN" genesis validate --home "$HOME_DIR" >/dev/null
 printf 'genesis valid\n'
 
@@ -131,20 +173,50 @@ send_out="$("$BIN" tx bank send "$VAL" "$RECIP_ADDR" 1000akra \
 TXHASH="$(printf '%s' "$send_out" | sed -nE 's/.*"txhash":"([^"]+)".*/\1/p')"
 [[ -n "$TXHASH" ]] || fail "bank send returned no txhash: $send_out"
 
-TX_JSON=""
-for _ in $(seq 1 30); do
-  if TX_JSON="$("$BIN" q tx "$TXHASH" --node tcp://127.0.0.1:26657 --home "$HOME_DIR" -o json 2>/dev/null)"; then
-    break
-  fi
-  TX_JSON=""
-  sleep 1
-done
-[[ -n "$TX_JSON" ]] || fail "bank send was not indexed: $TXHASH"
+TX_JSON="$(wait_for_tx "$TXHASH")" || fail "bank send was not indexed: $TXHASH"
 printf '%s' "$TX_JSON" | grep -q '"code":0' || fail "bank send failed: $TX_JSON"
 printf 'bank send included at %s\n' "$(printf '%s' "$TX_JSON" | sed -nE 's/.*"height":"([0-9]+)".*/\1/p')"
 
 balance="$("$BIN" q bank balances "$RECIP_ADDR" --node tcp://127.0.0.1:26657 --home "$HOME_DIR" -o json)"
 printf '%s' "$balance" | grep -q '"amount": "1000"' || fail "recipient balance did not change: $balance"
 printf 'recipient received 1000akra\n'
+
+step "create an AMM pool"
+KRA_ASSET="0xD4949664cD82660AaE99bEdc034a0deA8A0bd517"
+USDC_ASSET="0x1000000000000000000000000000000000000001"
+create_out="$("$BIN" tx amm create-pool \
+  --asset-a "$KRA_ASSET" --asset-b "$USDC_ASSET" \
+  --fee-bps 30 \
+  --amount-a 1000000000000000000000 --amount-b 1000000000000000000000 \
+  --from "$VAL" --keyring-backend "$KEYRING" --home "$HOME_DIR" \
+  --chain-id "$CHAIN_ID" --gas auto --gas-adjustment 1.3 --gas-prices 0akra \
+  --broadcast-mode sync -y -o json)"
+TXHASH="$(printf '%s' "$create_out" | sed -nE 's/.*"txhash":"([^"]+)".*/\1/p')"
+[[ -n "$TXHASH" ]] || fail "create-pool returned no txhash: $create_out"
+TX_JSON="$(wait_for_tx "$TXHASH")" || fail "create-pool was not indexed: $TXHASH"
+printf '%s' "$TX_JSON" | grep -q '"code":0' || fail "create-pool failed: $TX_JSON"
+printf 'pool created\n'
+
+POOL_JSON="$("$BIN" q amm pool --pool-id 1 --node tcp://127.0.0.1:26657 --home "$HOME_DIR" -o json)"
+printf '%s' "$POOL_JSON" | grep -q '"id": "1"' || fail "pool 1 not found: $POOL_JSON"
+RESERVES_BEFORE="$(printf '%s' "$POOL_JSON" | python3 -c 'import json,sys; p=json.load(sys.stdin)["pool"]; assert not p.get("status") or p["status"] == "POOL_STATUS_ACTIVE"; print(p["reserve_a"], p["reserve_b"])')"
+printf 'pool 1 active, reserves: %s\n' "$RESERVES_BEFORE"
+
+step "swap in the AMM pool"
+swap_out="$("$BIN" tx amm swap-exact-in \
+  --path "$KRA_ASSET,$USDC_ASSET" \
+  --amount-in 1000000000000000000 --min-out 1 \
+  --from "$VAL" --keyring-backend "$KEYRING" --home "$HOME_DIR" \
+  --chain-id "$CHAIN_ID" --gas auto --gas-adjustment 1.3 --gas-prices 0akra \
+  --broadcast-mode sync -y -o json)"
+TXHASH="$(printf '%s' "$swap_out" | sed -nE 's/.*"txhash":"([^"]+)".*/\1/p')"
+[[ -n "$TXHASH" ]] || fail "swap-exact-in returned no txhash: $swap_out"
+TX_JSON="$(wait_for_tx "$TXHASH")" || fail "swap-exact-in was not indexed: $TXHASH"
+printf '%s' "$TX_JSON" | grep -q '"code":0' || fail "swap-exact-in failed: $TX_JSON"
+
+POOL_JSON="$("$BIN" q amm pool --pool-id 1 --node tcp://127.0.0.1:26657 --home "$HOME_DIR" -o json)"
+RESERVES_AFTER="$(printf '%s' "$POOL_JSON" | python3 -c 'import json,sys; p=json.load(sys.stdin)["pool"]; print(p["reserve_a"], p["reserve_b"])')"
+[[ "$RESERVES_AFTER" != "$RESERVES_BEFORE" ]] || fail "swap did not move the reserves"
+printf 'swap moved reserves: %s -> %s\n' "$RESERVES_BEFORE" "$RESERVES_AFTER"
 
 printf '\nSMOKE TEST PASSED\n'
