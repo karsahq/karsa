@@ -644,6 +644,11 @@ func NewApp(
 			stakingtypes.ModuleName:     staking.AppModuleBasic{},
 			govtypes.ModuleName:         gov.NewAppModuleBasic(nil),
 			ibctransfertypes.ModuleName: transfer.AppModuleBasic{},
+			// Karsa genesis overrides: these three differ from the per-module
+			// defaults, and `karsad init` reads them from here.
+			evmtypes.ModuleName:   evmGenesisBasic{},
+			erc20types.ModuleName: erc20GenesisBasic{},
+			minttypes.ModuleName:  mintGenesisBasic{},
 		},
 	)
 	app.BasicModuleManager.RegisterLegacyAminoCodec(legacyAmino)
@@ -958,21 +963,11 @@ func (app *App) TxConfig() client.TxConfig {
 }
 
 // DefaultGenesis returns a default genesis from the registered AppModuleBasic's.
+//
+// The EVM, erc20 and mint entries come from the overrides installed in
+// BasicModuleManager, so this is the same genesis `karsad init` writes.
 func (app *App) DefaultGenesis() map[string]json.RawMessage {
-	genesis := app.BasicModuleManager.DefaultGenesis(app.appCodec)
-
-	mintGenState := NewMintGenesisState()
-	genesis[minttypes.ModuleName] = app.appCodec.MustMarshalJSON(mintGenState)
-
-	evmGenState := NewEVMGenesisState()
-	genesis[evmtypes.ModuleName] = app.appCodec.MustMarshalJSON(evmGenState)
-
-	// NOTE: for the example chain implementation we are also adding a default token pair,
-	// which is the base denomination of the chain (i.e. the WEVMOS contract)
-	erc20GenState := NewErc20GenesisState()
-	genesis[erc20types.ModuleName] = app.appCodec.MustMarshalJSON(erc20GenState)
-
-	return genesis
+	return app.BasicModuleManager.DefaultGenesis(app.appCodec)
 }
 
 // GetKey returns the KVStoreKey for the provided store key.
