@@ -527,6 +527,16 @@ func (k Keeper) swapExec(
 		k.SetPool(ctx, pool)
 		k.updateOracle(ctx, pool)
 
+		if stateDB != nil {
+			if err := types.EmitSwapLog(
+				stateDB, common.BytesToAddress(sender.Bytes()), pool.Id,
+				common.HexToAddress(path[i]), amount,
+				common.HexToAddress(path[i+1]), out,
+			); err != nil {
+				return sdkmath.Int{}, sdkmath.Int{}, err
+			}
+		}
+
 		amount = out
 	}
 

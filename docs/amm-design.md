@@ -329,48 +329,34 @@ swap shows up in an EVM explorer as a call to `0x…0900` with no visible detail
 no generic indexer can build per-pool history.
 
 ```solidity
-event PoolCreated(
-    uint64 indexed poolId,
-    address indexed assetA,
-    address indexed assetB,
-    uint8  poolType,
-    uint32 feeBps
-);
-
+// Implemented today.
 event Swap(
     address indexed sender,
     uint64  indexed poolId,
     address indexed tokenIn,
     uint256 amountIn,
     address tokenOut,
-    uint256 amountOut,
-    uint256 poolFee,
-    uint256 integratorFee
+    uint256 amountOut
 );
 
-event LiquidityAdded(
-    address indexed provider,
-    uint64  indexed poolId,
-    uint256 amountA,
-    uint256 amountB,
-    uint256 shares
-);
-
-event LiquidityRemoved(
-    address indexed provider,
-    uint64  indexed poolId,
-    uint256 amountA,
-    uint256 amountB,
-    uint256 shares
-);
+// Planned: emitted only once a precompile entry point exists for them. Today
+// pool creation and liquidity are Cosmos messages, which never produce an EVM
+// receipt, so emitting these would be dead code.
+event PoolCreated(uint64 indexed poolId, address indexed assetA, address indexed assetB, uint8 poolType, uint32 feeBps);
+event LiquidityAdded(address indexed provider, uint64 indexed poolId, uint256 amountA, uint256 amountB, uint256 shares);
+event LiquidityRemoved(address indexed provider, uint64 indexed poolId, uint256 amountA, uint256 amountB, uint256 shares);
 ```
 
 Rules:
 
 - Emit one `Swap` per hop, indexed by `poolId`, so history can be filtered per pool.
-- Emit from the precompile address (`0x…0900`); never from the token addresses.
+- Emit from the precompile address (`0x…0900`), never from the token addresses.
+- Fees are **not** in the log: computing them per hop would duplicate the curve
+  math, and the Cosmos `swap` event already reports `pool_fee` and
+  `integrator_fee` for the whole swap.
 - Keep Cosmos events too: CLI and Cosmos tooling read those, EVM tooling reads logs.
-- Cost is ~2.5k–3k gas per swap (topics + data), roughly 3% of a bank-denom swap.
+- A swap sent as a Cosmos message never appears in an EVM explorer; only the
+  precompile path emits a log.
 
 ## 6. Queries
 

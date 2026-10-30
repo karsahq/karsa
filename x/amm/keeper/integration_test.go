@@ -697,6 +697,11 @@ func TestAmmPrecompile(t *testing.T) {
 
 	after := app.BankKeeper.GetBalance(ctx, sdk.AccAddress(caller.Bytes()), testUSDCDenom).Amount
 	require.Equal(t, before.Add(sdkmath.NewIntFromBigInt(amountOut)), after)
+
+	// One EVM log per hop, so an explorer can show the swap without a plugin.
+	require.Len(t, res.Logs, 1)
+	require.Equal(t, ammtypes.SwapEventID().Hex(), res.Logs[0].Topics[0])
+	require.Equal(t, common.BigToHash(new(big.Int).SetUint64(1)).Hex(), res.Logs[0].Topics[2])
 }
 
 // TestAmmPrecompileExternal exercises auto-conversion through the EVM precompile:
