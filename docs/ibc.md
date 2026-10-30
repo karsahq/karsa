@@ -14,7 +14,9 @@ ChannelKeeperV2 router
 
 The v1 `PortKeeper` router is deliberately left empty. A v1 channel handshake
 for the transfer port therefore fails instead of silently falling back to v1.
-IBC core clients remain available because IBC v2 uses them too.
+`MsgTransfer` v1 is also rejected in the ante handler, so a channel-based send
+fails explicitly before fees are processed. IBC core clients remain available
+because IBC v2 uses them too.
 
 ## EVM callbacks
 

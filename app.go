@@ -868,7 +868,14 @@ func (app *App) setAnteHandler(txConfig client.TxConfig, maxGasWanted uint64) {
 		panic(err)
 	}
 
-	app.SetAnteHandler(evmante.NewAnteHandler(options))
+	anteHandler := evmante.NewAnteHandler(options)
+	app.SetAnteHandler(func(ctx sdk.Context, tx sdk.Tx, simulate bool) (sdk.Context, error) {
+		if err := rejectIBCV1Tx(tx); err != nil {
+			return ctx, err
+		}
+
+		return anteHandler(ctx, tx, simulate)
+	})
 }
 
 func (app *App) onPendingTx(hash common.Hash) {
