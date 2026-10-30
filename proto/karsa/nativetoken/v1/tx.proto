@@ -9,35 +9,14 @@ option go_package = "github.com/karsahq/karsa/x/nativetoken/types";
 
 // Msg defines the nativetoken Msg service.
 //
-// There is deliberately no MsgMint or MsgBurn: supply is only controllable by a
-// contract through the minter precompile, never by a key.
+// There is deliberately no message that creates, mints or burns: tokens are
+// created by the factory precompile and supply is only movable by a contract
+// through the minter precompile. A key can do neither.
 service Msg {
   option (cosmos.msg.v1.service) = true;
 
-  rpc CreateNativeToken(MsgCreateNativeToken) returns (MsgCreateNativeTokenResponse);
   rpc SetTokenVerified(MsgSetTokenVerified) returns (MsgSetTokenVerifiedResponse);
   rpc UpdateParams(MsgUpdateParams) returns (MsgUpdateParamsResponse);
-}
-
-message MsgCreateNativeToken {
-  option (cosmos.msg.v1.signer) = "creator";
-
-  string creator = 1;
-  // Display symbol, 3..12 chars. Not unique.
-  string symbol = 2;
-  // Display name, 1..64 chars.
-  string name = 3;
-  // Supply minted to the creator at creation.
-  string initial_supply = 4
-      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
-  // Contract allowed to mint and burn afterwards. Empty means immutable.
-  // The module rejects an address that has no code.
-  string controller = 5;
-}
-
-message MsgCreateNativeTokenResponse {
-  string denom = 1;
-  string address = 2;
 }
 
 message MsgSetTokenVerified {

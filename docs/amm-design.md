@@ -63,7 +63,7 @@ there is no escrow to keep in sync.
 |---|---|---|---|---|
 | Native denom | chain genesis | `akra` | precompile | ~76k |
 | IBC voucher | incoming ICS20 transfer | `ibc/<HASH>` | auto precompile | ~76k |
-| **Native token** | `MsgCreateNativeToken` / factory precompile | `n:0x…` | deterministic precompile | **~76k** |
+| **Native token** | factory precompile | `n:0x…` | deterministic precompile | **~76k** |
 | ERC20 contract | user-deployed Solidity | none (held directly by the pool) | the contract itself | ~340k |
 
 Native tokens are specified in `docs/native-token.md`. They exist so a standard token does not have

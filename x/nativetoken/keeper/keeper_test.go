@@ -177,32 +177,6 @@ func TestCreateNativeTokenValidation(t *testing.T) {
 	}
 }
 
-func TestCreateNativeTokenMessageIsClosedByDefault(t *testing.T) {
-	app, ctx := newTestApp(t)
-	creator := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AA").Bytes())
-	msgServer := nativetokenkeeper.NewMsgServerImpl(app.NativeTokenKeeper)
-
-	msg := &nativetokentypes.MsgCreateNativeToken{
-		Creator:       creator.String(),
-		Symbol:        "Momo",
-		Name:          "Momo",
-		InitialSupply: sdkmath.NewInt(1),
-	}
-
-	// Default: only the factory precompile may create, so every token traces
-	// back to a contract.
-	_, err := msgServer.CreateNativeToken(ctx, msg)
-	require.ErrorIs(t, err, nativetokentypes.ErrUnauthorized)
-
-	// Governance can reopen the message path without an upgrade.
-	params := app.NativeTokenKeeper.GetParams(ctx)
-	params.OpenCreation = true
-	require.NoError(t, app.NativeTokenKeeper.SetParams(ctx, params))
-
-	_, err = msgServer.CreateNativeToken(ctx, msg)
-	require.NoError(t, err)
-}
-
 func TestSetTokenVerifiedRequiresAuthority(t *testing.T) {
 	app, ctx := newTestApp(t)
 	creator := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AA").Bytes())

@@ -15,42 +15,6 @@ type msgServer struct {
 // NewMsgServerImpl returns an implementation of the module Msg service.
 func NewMsgServerImpl(k Keeper) types.MsgServer { return msgServer{Keeper: k} }
 
-// CreateNativeToken issues a new native token.
-func (m msgServer) CreateNativeToken(
-	goCtx context.Context, msg *types.MsgCreateNativeToken,
-) (*types.MsgCreateNativeTokenResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
-
-	if err := msg.ValidateBasic(); err != nil {
-		return nil, err
-	}
-
-	// Creation is contract-only by default: everyone who creates goes through the
-	// factory precompile, so a token always traces back to a contract.
-	if !m.GetParams(ctx).OpenCreation {
-		return nil, types.ErrUnauthorized.Wrap(
-			"creation through messages is disabled; use the factory precompile",
-		)
-	}
-
-	creator, err := sdk.AccAddressFromBech32(msg.Creator)
-	if err != nil {
-		return nil, types.ErrInvalidCreator.Wrap(err.Error())
-	}
-
-	token, err := m.Keeper.CreateNativeToken(
-		ctx, creator, msg.Symbol, msg.Name, msg.InitialSupply, msg.Controller,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	return &types.MsgCreateNativeTokenResponse{
-		Denom:   token.Denom,
-		Address: token.Address,
-	}, nil
-}
-
 // SetTokenVerified updates the governance curation flag.
 func (m msgServer) SetTokenVerified(
 	goCtx context.Context, msg *types.MsgSetTokenVerified,

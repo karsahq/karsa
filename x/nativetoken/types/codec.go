@@ -15,7 +15,6 @@ func RegisterLegacyAminoCodec(_ *codec.LegacyAmino) {}
 func RegisterInterfaces(registry codectypes.InterfaceRegistry) {
 	registry.RegisterImplementations(
 		(*sdk.Msg)(nil),
-		&MsgCreateNativeToken{},
 		&MsgSetTokenVerified{},
 		&MsgUpdateParams{},
 	)

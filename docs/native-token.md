@@ -1,4 +1,4 @@
-# Karsa Native Token (`MsgCreateNativeToken`)
+# Karsa Native Token
 
 Token yang memakai **interface ERC20** tetapi **tidak men-deploy kontrak ERC20**.
 Saldo disimpan di bank ledger, logika ERC20 dijalankan oleh dynamic precompile di
@@ -20,7 +20,7 @@ berbeda adalah tempat saldo disimpan dan tempat logika dijalankan.
 | `transfer` dijalankan oleh | precompile (Go) | Solidity |
 | Alamat `0x` | dibuat modul, deterministik dari creator | `CREATE` (pengirim + nonce) |
 | Logika transfer custom | tidak mungkin | bebas |
-| Logika penerbitan custom | authority / controller (fase 2) | bebas |
+| Logika penerbitan custom | controller, lewat precompile minter | bebas |
 | Gas swap di pool AMM | ~76k | ~550k |
 | Bisa IBC native | ya | tidak (butuh bridge) |
 | Source di explorer | tidak ada (precompile) | terverifikasi |
@@ -87,7 +87,7 @@ adjudikasi.**
 | Reclaim / pengambilalihan | tidak ada, termasuk oleh governance |
 | Probation / jendela sengketa | tidak ada |
 | Panjang simbol | 3–12 karakter, `[A-Za-z0-9]` |
-| Simbol bisa diubah authority | ya — simbol murni metadata |
+| Simbol bisa diubah | tidak (metadata immutable di MVP) |
 
 ### Mengapa simbol tidak eksklusif
 
@@ -114,32 +114,37 @@ explorer memberi badge.
   jalur ini. Untuk aset seperti itu, gunakan model token pair `x/erc20` yang ada.
 - `totalSupply` maksimum: `2^256-1`, divalidasi saat mint.
 
-## 5. Model otorisasi (authority)
+## 5. Kepemilikan: kontrak, bukan kunci
 
-Setiap token punya satu `authority` yang boleh mint dan burn. Semua alamat
-disimpan sebagai **20 byte lowercase hex**; bech32 hanya untuk tampilan CLI.
+Tidak ada `authority` dan tidak ada pesan mint/burn. Supply hanya bisa bergerak
+lewat kontrak.
 
 ```
-CREATE ──► authority = creator (atau "" bila immutable)
-              │
-              ├─ MintBurn ──► MsgMint / MsgBurn oleh authority
-              ├─ Transfer ──► MsgChangeTokenAuthority (tanda tangan authority lama)
-              └─ Renounce ──► authority = "" (permanen, tanpa pemulihan)
+CREATE (factory precompile; pemanggil harus kontrak)
+   │
+   ├─ controller = ""        → supply immutable selamanya
+   └─ controller = 0xCtrl    → hanya 0xCtrl yang bisa mint/burn
 ```
 
 | Keputusan | Nilai |
 |---|---|
-| Creator | alamat 0x, **immutable** — tidak pernah berubah |
-| Authority awal | creator, kecuali `immutable: true` |
-| Jenis authority | alamat biasa **atau multisig account** |
-| Validasi authority | lewat autentikasi Cosmos SDK (signer check), bukan format alamat |
-| Renounce | permanen; tidak ada jalur pemulihan, termasuk governance |
-| Nama & simbol | dapat diubah authority |
+| Creator | alamat kontrak, **immutable** |
+| Controller | ditetapkan saat pembuatan; `""` berarti immutable |
+| Siapa boleh mint/burn | hanya `controller`, lewat precompile minter |
+| Ganti controller | hanya oleh controller itu sendiri |
+| Renounce | controller → `""`, permanen, tanpa pemulihan |
+| Metadata | tidak dapat diubah (MVP) |
 | Pause / freeze / blacklist | **tidak ada** |
 | Burn oleh pemegang | boleh membakar saldo sendiri, siapa pun |
 
-`creator` dan `authority` dipisahkan dengan sengaja: creator tidak berubah,
-authority bisa berpindah. Menggabungkan keduanya akan memalsukan sejarah token
+Alasan: kunci bisa hilang, dicuri, atau dipindahkan tanpa jejak. Kontrak bisa
+diaudit, dipantau, dan dibatasi oleh kodenya sendiri.
+
+Biaya yang harus diterima: bug pada kontrak berarti kebijakan supply mati permanen.
+Itu risiko pemilik token, bukan risiko protokol.
+
+`creator` dan `controller` dipisahkan dengan sengaja: creator tidak pernah berubah,
+controller bisa berganti. Menggabungkan keduanya akan memalsukan sejarah token
 setiap kali kendali dialihkan.
 
 Alasan tidak ada pause/blacklist: perilaku transfer harus dijamin standar. Token
@@ -158,59 +163,40 @@ di registry, dikelola governance, dan ditampilkan sebagai badge oleh explorer.
 Aturan yang tidak boleh dilanggar: **jangan pernah menyimpulkan kepercayaan dari
 nama atau simbol.** Explorer dan UI wajib menampilkan alamat di samping simbol.
 
-## 7. Pesan (MVP)
+## 7. Pesan
+
+Tidak ada pesan Cosmos untuk membuat, mencetak, atau membakar token. Itu
+keputusan, bukan kelalaian:
+
+| Operasi | Jalur |
+|---|---|
+| Membuat token | precompile **factory** (`0x…0901`) — hanya dari kontrak |
+| Mint / burn | precompile **minter** (`0x…0902`) — hanya oleh `controller` |
+
+Kunci tidak bisa melakukan keduanya. Tidak ada saklar governance untuk
+mengaktifkannya kembali; membuka jalur berbasis kunci lagi berarti upgrade chain.
+
+Pesan yang tersisa hanya untuk governance:
 
 ```proto
-MsgCreateNativeToken {
-  creator        : string   // bech32 signer; disimpan sebagai 0x
-  symbol         : string   // 3..12 karakter, TIDAK unik
-  name           : string   // 1..64 karakter
-  initial_supply : string   // math.Int, dicetak ke creator
-  immutable      : bool     // true → authority = "" sejak awal
-}
-// denom dan alamat dihitung modul; tidak dikirim pemanggil.
-
-MsgMintNativeToken {
-  authority : string
-  denom     : string
-  amount    : string
-  recipient : string        // opsional, default = authority
-}
-
-MsgBurnNativeToken {
-  sender : string
-  denom  : string
-  amount : string           // dari saldo `sender`
-}
-
-MsgUpdateTokenMetadata {
-  authority : string
-  denom     : string
-  name      : string
-  symbol    : string        // boleh diubah; tidak memengaruhi identitas
-}
-
-MsgChangeTokenAuthority {
-  authority     : string
-  denom         : string
-  new_authority : string
-}
+MsgSetTokenVerified { authority, denom, verified }
+MsgUpdateParams    { authority, params }
 ```
 
-**Pembuatan hanya lewat kontrak.** `MsgCreateNativeToken` ditolak kecuali param
-`open_creation` diaktifkan governance. Default-nya mati, sehingga setiap token
-dilacak kembali ke sebuah kontrak: `creator` selalu alamat kontrak, bukan kunci.
-
-Konsekuensi yang perlu disadari: bila semua orang memakai satu launcher bersama,
+**Konsekuensi `creator`.** Karena pembuatan hanya lewat kontrak, `creator` selalu
+alamat kontrak, bukan kunci. Bila semua orang memakai satu launcher bersama,
 `creator` menjadi sama untuk semua token dan atribusi manusia hanya terlihat dari
 event launcher. Bila tiap proyek men-deploy kontraknya sendiri, `creator` unik per
 token tetapi biaya deploy ditanggung masing-masing.
 
-Semua pesan memvalidasi bahwa `denom` terdaftar sebagai native token Karsa, agar
-tidak bisa dipakai untuk mencetak denom lain (mis. `ibc/…`, `erc20:…`, `akra`).
+Precompile factory menolak pemanggil yang bukan kontrak, sehingga aturan ini tidak
+bisa dilewati lewat EOA.
 
-`MsgMint` dan `MsgBurn` mengeluarkan event `Transfer` ERC20 (dari/ke alamat nol)
-supaya indexer dan explorer melihat perubahan supply seperti token biasa.
+Precompile minter hanya bekerja untuk denom yang `controller`-nya sama dengan
+pemanggil, sehingga tidak bisa dipakai mencetak denom lain.
+
+Mint dan burn mengeluarkan event `Transfer` ERC20 (dari/ke alamat nol) supaya
+indexer dan explorer melihat perubahan supply seperti token biasa.
 
 ## 8. Registry
 
@@ -314,12 +300,13 @@ Memungkinkan logika penerbitan (vesting, cap, bonding curve, penjualan) ditulis 
 Solidity, sementara token tetap bank denom.
 
 ```
-Controller.sol ──mint/burn──► Precompile minter (0x…0901) ──► bank
+Controller.sol ──mint/burn──► Precompile minter (0x…0902) ──► bank
 ```
 
-- Precompile minter memeriksa `authority[denom] == msg.sender`.
+- Precompile minter memeriksa `controller[denom] == msg.sender`.
 - Controller **tidak menyimpan saldo** dan **tidak menyentuh transfer**.
-- Controller didaftarkan lewat `MsgChangeTokenAuthority` berupa alamat kontrak.
+- Controller ditetapkan saat pembuatan dan hanya bisa menggantikan dirinya sendiri;
+  tidak ada kunci atau governance yang bisa mengambil alih.
 
 Prasyarat keamanan: reentrancy lock, batas supply, satu denom satu minter, dan
 keputusan eksplisit siapa yang boleh mengganti minter.
@@ -333,7 +320,6 @@ untuk daftar, duplikasi `local_node.sh`, dan checklist penambahannya.
 | Param | Nilai awal | Catatan |
 |---|---|---|
 | `creation_fee` | **0** | murni anti-spam; naikkan bila ada penyalahgunaan massal |
-| `open_creation` | **false** | pembuatan hanya lewat precompile factory; governance dapat mengaktifkan pesan |
 | `creation_fee_denom` | aset stabil (IBC USDC) | agar tidak ikut volatilitas KRA |
 | penerima fee | treasury | bukan burn |
 | refund | tidak ada | termasuk setelah renounce |
@@ -364,7 +350,7 @@ langka. Ia hanya menahan pembuatan massal oleh skrip.
 | 3 | Simbol tidak unik, tanpa reservasi/reclaim/adjudikasi |
 | 4 | `verified` satu-satunya sinyal kepercayaan + badge explorer |
 | 5 | `creation_fee` opsional default 0, treasury, denom stabil |
-| 6 | Creator immutable (0x), authority mutable (0x), multisig didukung |
+| 6 | Creator = kontrak, immutable; controller opsional (kontrak), hanya bisa menggantikan dirinya sendiri |
 | 7 | Hanya 18 desimal, tanpa scaling bank↔EVM |
 | 8 | Tanpa pause/freeze/blacklist; perilaku transfer dijamin standar |
-| 9 | `permit` dan controller Solidity pada fase 2 |
+| 9 | `permit` pada fase 2 |

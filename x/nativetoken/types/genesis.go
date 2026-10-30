@@ -2,8 +2,6 @@ package types
 
 import (
 	"fmt"
-
-	sdk "github.com/cosmos/cosmos-sdk/types"
 )
 
 // DefaultGenesisState returns the default genesis state.
@@ -60,23 +58,6 @@ func (gs GenesisState) Validate() error {
 			return fmt.Errorf("duplicate sequence entry for %q", normalized)
 		}
 		creators[normalized] = struct{}{}
-	}
-
-	return nil
-}
-
-// ValidateBasic performs stateless validation of the create message.
-func (m MsgCreateNativeToken) ValidateBasic() error {
-	if _, err := sdk.AccAddressFromBech32(m.Creator); err != nil {
-		return ErrInvalidCreator.Wrapf("invalid creator: %s", err)
-	}
-	if m.Controller != "" {
-		if _, err := NormalizeAddress(m.Controller); err != nil {
-			return ErrInvalidController.Wrap(err.Error())
-		}
-	}
-	if !m.InitialSupply.IsPositive() {
-		return ErrInvalidSupply.Wrap("initial supply must be positive")
 	}
 
 	return nil

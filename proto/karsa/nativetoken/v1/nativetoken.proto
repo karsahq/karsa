@@ -47,10 +47,6 @@ message Params {
   uint32 max_name_len = 4;
   string max_initial_supply = 5
       [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
-  // open_creation allows creating tokens through MsgCreateNativeToken. When
-  // false (the default) only the factory precompile can create, so every token
-  // traces back to a contract.
-  bool open_creation = 6;
 }
 
 message GenesisState {
