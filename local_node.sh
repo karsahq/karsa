@@ -235,21 +235,10 @@ if [[ $overwrite == "y" || $overwrite == "Y" ]]; then
   jq '.app_state["gov"]["deposit_params"]["min_deposit"][0]["denom"]="akra"' "$GENESIS" >"$TMP_GENESIS" && mv "$TMP_GENESIS" "$GENESIS"
   jq '.app_state["gov"]["params"]["min_deposit"][0]["denom"]="akra"' "$GENESIS" >"$TMP_GENESIS" && mv "$TMP_GENESIS" "$GENESIS"
   jq '.app_state["gov"]["params"]["expedited_min_deposit"][0]["denom"]="akra"' "$GENESIS" >"$TMP_GENESIS" && mv "$TMP_GENESIS" "$GENESIS"
-  jq '.app_state["evm"]["params"]["evm_denom"]="akra"' "$GENESIS" >"$TMP_GENESIS" && mv "$TMP_GENESIS" "$GENESIS"
-  jq '.app_state["mint"]["params"]["mint_denom"]="akra"' "$GENESIS" >"$TMP_GENESIS" && mv "$TMP_GENESIS" "$GENESIS"
-  jq '.app_state["mint"]["minter"]["inflation"]="0.050000000000000000"' "$GENESIS" >"$TMP_GENESIS" && mv "$TMP_GENESIS" "$GENESIS"
-  jq '.app_state["mint"]["params"] += {
-    "inflation_rate_change": "0.000000000000000000",
-    "inflation_max": "0.050000000000000000",
-    "inflation_min": "0.050000000000000000",
-    "blocks_per_year": "21038400",
-    "max_supply": "1000000000000000000000000000"
-  }' "$GENESIS" >"$TMP_GENESIS" && mv "$TMP_GENESIS" "$GENESIS"
 
   jq '.app_state["bank"]["denom_metadata"]=[{"description":"The native staking token for Karsa.","denom_units":[{"denom":"akra","exponent":0,"aliases":[]},{"denom":"kra","exponent":18,"aliases":[]}],"base":"akra","display":"kra","name":"Karsa","symbol":"KRA","uri":"","uri_hash":""}]' "$GENESIS" >"$TMP_GENESIS" && mv "$TMP_GENESIS" "$GENESIS"
 
 
-  jq '.app_state["evm"]["params"]["evm_denom"]="akra"' "$GENESIS" >"$TMP_GENESIS" && mv "$TMP_GENESIS" "$GENESIS"
 
   jq '.app_state.erc20.native_precompiles=["0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"]' "$GENESIS" >"$TMP_GENESIS" && mv "$TMP_GENESIS" "$GENESIS"
   jq '.app_state.erc20.token_pairs=[{contract_owner:1,erc20_address:"0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE",denom:"akra",enabled:true}]' "$GENESIS" >"$TMP_GENESIS" && mv "$TMP_GENESIS" "$GENESIS"

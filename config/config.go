@@ -1,6 +1,8 @@
 package config
 
 import (
+	sdkmath "cosmossdk.io/math"
+
 	clienthelpers "cosmossdk.io/client/v2/helpers"
 	serverconfig "github.com/cosmos/cosmos-sdk/server/config"
 	cosmosevmserverconfig "github.com/cosmos/evm/server/config"
@@ -15,6 +17,14 @@ const (
 	// Symbol is the ticker symbol of the native token.
 	Symbol = "KRA"
 )
+
+const (
+	// BlocksPerYear corresponds to ~1.5s blocks, the configured cadence.
+	BlocksPerYear uint64 = 21_038_400
+)
+
+// MaxSupply is the hard cap in base units: 1 billion KRA at 18 decimals.
+var MaxSupply = sdkmath.NewIntFromUint64(1_000_000_000).MulRaw(1_000_000_000_000_000_000)
 
 func MustGetDefaultNodeHome() string {
 	defaultNodeHome, err := clienthelpers.GetNodeHomeDirectory(".karsa")

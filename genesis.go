@@ -3,6 +3,8 @@ package karsa
 import (
 	"encoding/json"
 
+	sdkmath "cosmossdk.io/math"
+
 	testconstants "github.com/cosmos/evm/testutil/constants"
 	erc20types "github.com/cosmos/evm/x/erc20/types"
 	feemarkettypes "github.com/cosmos/evm/x/feemarket/types"
@@ -63,11 +65,23 @@ func NewErc20GenesisState() *erc20types.GenesisState {
 
 // NewMintGenesisState returns the default genesis state for the mint module.
 //
-// NOTE: for the example chain implementation we are also adding a default minter.
+// It carries the Karsa supply schedule rather than the SDK defaults: a flat 5%
+// inflation (rate change zero, min and max equal), 21,038,400 blocks per year
+// (~1.5s blocks), and a 1 billion KRA cap. These used to live only in the
+// local_node.sh jq patches, so a chain initialised without that script ran on
+// SDK defaults - 7% to 20% moving inflation and no supply cap.
 func NewMintGenesisState() *minttypes.GenesisState {
 	mintGenState := minttypes.DefaultGenesisState()
 
 	mintGenState.Params.MintDenom = config.BaseDenom
+	mintGenState.Params.InflationRateChange = sdkmath.LegacyZeroDec()
+	mintGenState.Params.InflationMax = sdkmath.LegacyMustNewDecFromStr("0.05")
+	mintGenState.Params.InflationMin = sdkmath.LegacyMustNewDecFromStr("0.05")
+	mintGenState.Params.BlocksPerYear = config.BlocksPerYear
+	mintGenState.Params.MaxSupply = config.MaxSupply
+
+	mintGenState.Minter.Inflation = sdkmath.LegacyMustNewDecFromStr("0.05")
+
 	return mintGenState
 }
 
