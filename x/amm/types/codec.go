@@ -21,6 +21,7 @@ func RegisterInterfaces(registry codectypes.InterfaceRegistry) {
 		&MsgSwapExactIn{},
 		&MsgSwapExactOut{},
 		&MsgSetPoolStatus{},
+		&MsgDonatePool{},
 		&MsgUpdateParams{},
 	)
 

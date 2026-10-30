@@ -113,8 +113,9 @@ Consequences:
 - **Rebasing is tolerated** in the Uniswap v2 sense: reserves track balances, so
   gains and losses land on LPs instead of creating unbacked supply.
 - **Donations** are not absorbed automatically: reserves are stored state, not
-  derived per swap. The excess stays in custody until an explicit `sync` (adopts
-  the balance) or `skim` (sends the excess out).
+  derived per swap. The excess stays in custody until someone calls
+  `MsgDonatePool`, which adopts it into the reserve **without minting shares**, so
+  it accrues to LPs pro rata and cannot be extracted by the caller.
 - **Integrator fee** is still paid in the input token, before custody.
 - **Pool fee** stays in the pool as part of the reserve.
 - **Multi-hop** only moves the first and last assets; intermediate hops stay put.
@@ -127,7 +128,7 @@ Failure modes at the custody boundary:
 | standard ERC20 | works |
 | fee-on-transfer | works; reserve uses the amount actually received |
 | rebasing | works; LPs bear the change, no unwind risk |
-| donation | stays in custody; `sync` adopts it, `skim` sends the excess out |
+| donation | stays in custody; `MsgDonatePool` adds it to the reserve for the LPs |
 | pausable / blacklist | transfers fail; pool frozen, funds safe |
 | upgradeable | behavior can change; worst case is a frozen pool |
 
@@ -501,7 +502,8 @@ Open design points (ante path):
 - [ ] Reentrancy: precompile entrypoint and custody boundary
 - [ ] Pool status transitions: only governance; `ACTIVE <-> WITHDRAW_ONLY`
 - [ ] Custody guard: `SyncPoolStatuses` downgrades pools whose custody is unusable to `WITHDRAW_ONLY`
-- [ ] Custody invariant: `balanceOf(custody(pool)) == reserve`, with `sync`/`skim` for drift
+- [ ] Custody invariant: `balanceOf(custody(pool)) == reserve`; a shortfall means the pool is
+  undercollateralised and must not stay `ACTIVE`
 - [ ] AMM module excluded from `BlockedAddresses`; precompile address still blocked
 - [ ] Multi-pool uniqueness `(assetA, assetB, poolType, feeBps)` and `max_pools_per_pair`
 - [ ] Fixed fee tiers per pool type; no arbitrary fee values
@@ -521,7 +523,7 @@ Open design points (ante path):
 | Phase | Scope |
 |---|---|
 | 1 | Module skeleton, constant product, create/add/remove, exact-in and exact-out swap, `Quote`, integrator fee, 1–2 hop path, LP as bank denom + ERC20 precompile, precompile for `swap`/`quote`, TWAP |
-| 2 | Direct custody for external ERC20 pools (per-pool custody address, balance-derived reserves, `sync`/`skim`), EVM logs on the precompile, multiple fee-tier pools per pair, pool status and governance guard |
+| 2 | Direct custody for external ERC20 pools (per-pool custody address, verified inbound delta, `MsgDonatePool`), EVM logs on the precompile, multiple fee-tier pools per pair, pool status and governance guard |
 | 3 | Bounded multi-hop route search; custody hardening and failure-mode tests (fee-on-transfer, donation, rebasing, paused token) |
 | 4 | ERC-4337 paymaster for ERC20 contracts (separate project) |
 

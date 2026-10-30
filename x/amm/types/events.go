@@ -7,6 +7,7 @@ const (
 	EventTypeRemoveLiquidity = "remove_liquidity"
 	EventTypeSwap            = "swap"
 	EventTypePoolStatus      = "pool_status"
+	EventTypeDonate          = "donate_pool"
 	EventTypeConvertIn       = "convert_in"
 	EventTypeConvertOut      = "convert_out"
 )

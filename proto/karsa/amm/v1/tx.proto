@@ -3,6 +3,7 @@ package karsa.amm.v1;
 
 import "gogoproto/gogo.proto";
 import "cosmos/msg/v1/msg.proto";
+import "cosmos/base/v1beta1/coin.proto";
 import "karsa/amm/v1/amm.proto";
 
 option go_package = "github.com/karsahq/karsa/x/amm/types";
@@ -17,6 +18,7 @@ service Msg {
   rpc SwapExactIn(MsgSwapExactIn) returns (MsgSwapExactInResponse);
   rpc SwapExactOut(MsgSwapExactOut) returns (MsgSwapExactOutResponse);
   rpc SetPoolStatus(MsgSetPoolStatus) returns (MsgSetPoolStatusResponse);
+  rpc DonatePool(MsgDonatePool) returns (MsgDonatePoolResponse);
   rpc UpdateParams(MsgUpdateParams) returns (MsgUpdateParamsResponse);
 }
 
@@ -141,6 +143,25 @@ message MsgSetPoolStatus {
 }
 
 message MsgSetPoolStatusResponse {}
+
+// MsgDonatePool moves any excess balance held by the pool's custody account into
+// the reserve without minting shares, so it accrues to LPs pro rata.
+//
+// Reserves are stored state, not derived from balances, so a stray transfer to a
+// custody address would otherwise sit there unaccounted forever.
+message MsgDonatePool {
+  option (cosmos.msg.v1.signer) = "sender";
+
+  string sender = 1;
+  uint64 pool_id = 2;
+}
+
+message MsgDonatePoolResponse {
+  repeated cosmos.base.v1beta1.Coin donated = 1 [
+    (gogoproto.nullable) = false,
+    (gogoproto.castrepeated) = "github.com/cosmos/cosmos-sdk/types.Coins"
+  ];
+}
 
 message MsgUpdateParams {
   option (cosmos.msg.v1.signer) = "authority";
