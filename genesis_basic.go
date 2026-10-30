@@ -10,6 +10,7 @@ import (
 	"github.com/cosmos/cosmos-sdk/x/staking"
 
 	"github.com/cosmos/evm/x/erc20"
+	"github.com/cosmos/evm/x/feemarket"
 	"github.com/cosmos/evm/x/vm"
 )
 
@@ -38,6 +39,12 @@ type mintGenesisBasic struct{ mint.AppModuleBasic }
 
 func (mintGenesisBasic) DefaultGenesis(cdc codec.JSONCodec) json.RawMessage {
 	return cdc.MustMarshalJSON(NewMintGenesisState())
+}
+
+type feemarketGenesisBasic struct{ feemarket.AppModuleBasic }
+
+func (feemarketGenesisBasic) DefaultGenesis(cdc codec.JSONCodec) json.RawMessage {
+	return cdc.MustMarshalJSON(NewFeeMarketGenesisState())
 }
 
 type stakingGenesisBasic struct{ staking.AppModuleBasic }

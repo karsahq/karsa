@@ -645,11 +645,12 @@ func NewApp(
 			govtypes.ModuleName:         govGenesisBasic{},
 			banktypes.ModuleName:        bankGenesisBasic{},
 			ibctransfertypes.ModuleName: transfer.AppModuleBasic{},
-			// Karsa genesis overrides: these three differ from the per-module
-			// defaults, and `karsad init` reads them from here.
-			evmtypes.ModuleName:   evmGenesisBasic{},
-			erc20types.ModuleName: erc20GenesisBasic{},
-			minttypes.ModuleName:  mintGenesisBasic{},
+			// Karsa genesis overrides: these differ from the per-module defaults,
+			// and `karsad init` reads them from here.
+			evmtypes.ModuleName:       evmGenesisBasic{},
+			erc20types.ModuleName:     erc20GenesisBasic{},
+			minttypes.ModuleName:      mintGenesisBasic{},
+			feemarkettypes.ModuleName: feemarketGenesisBasic{},
 		},
 	)
 	app.BasicModuleManager.RegisterLegacyAminoCodec(legacyAmino)
