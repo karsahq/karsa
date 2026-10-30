@@ -315,6 +315,10 @@ Controller.sol ──mint/burn──► Precompile minter (0x…0901) ──► 
 Prasyarat keamanan: reentrancy lock, batas supply, satu denom satu minter, dan
 keputusan eksplisit siapa yang boleh mengganti minter.
 
+Factory dan minter bersifat **statis** (satu alamat global, bukan per token), sehingga
+keduanya harus didaftarkan di daftar precompile statis — lihat `docs/precompiles.md`
+untuk daftar, duplikasi `local_node.sh`, dan checklist penambahannya.
+
 ## 14. Parameter modul
 
 | Param | Nilai awal | Catatan |
