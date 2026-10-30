@@ -76,3 +76,14 @@ func LPAssetAddress(lpDenom string) common.Address {
 	hash := sha256.Sum256([]byte("amm/lp/" + lpDenom))
 	return common.BytesToAddress(hash[12:])
 }
+
+// CustodyAddress derives the address that holds a directly custodied ERC20 for a
+// pool.
+//
+// Each pool gets its own address so a donation or a misbehaving token in one
+// pool cannot shift another pool's reserve. The "amm/custody/" prefix keeps it
+// disjoint from "amm/lp/".
+func CustodyAddress(poolID uint64) common.Address {
+	hash := sha256.Sum256([]byte("amm/custody/" + strconv.FormatUint(poolID, 10)))
+	return common.BytesToAddress(hash[12:])
+}
