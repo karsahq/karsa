@@ -11,7 +11,7 @@ Fee abstraction (paying gas in a token) is **descoped**.
 ## 1. Goals
 
 1. A first-class automated market maker on Karsa, built as a **Cosmos SDK module** (`x/amm`).
-2. Pools between **ERC20-represented assets** at the API boundary. Pool reserves are **bank denoms**: `akra`/IBC natively, `erc20:0x…` for external ERC20 contracts after automatic conversion.
+2. Pools between **ERC20-represented assets** at the API boundary. Reserves are held **in kind**: `akra`/IBC/native tokens stay in the bank ledger, external ERC20 contracts are held at a per-pool custody address.
 3. Full AMM product: arbitrary asset pairs, multiple fee-tier pools per pair, LP shares, and multi-hop routing (Uniswap v2 style paths).
 4. Optional (descoped): **fee abstraction** — letting a user pay gas in a supported token. Bank-canonical assets (`akra`, IBC vouchers) could use the ante handler; ERC20 contracts would require an ERC-4337 paymaster (§10).
 
@@ -142,23 +142,22 @@ Resolution at the API boundary:
 
 ```
 AssetID --(x/erc20 GetTokenPairID)--> TokenPair{Denom, Enabled, ContractOwner}
-        --(OWNER_EXTERNAL)--> convert contract <-> denom erc20:0x…
-        --(bank)--> pool reserve balance
+        --(OWNER_MODULE)--> bank denom (akra, ibc/…, n:0x…)
+        --(OWNER_EXTERNAL)--> ERC20 contract held at custody(poolID)
 ```
 
 Rejection rules (return an error, never silently skip):
 
 - pair not found / `Enabled == false`
-- conversion disabled for an `OWNER_EXTERNAL` pair (`x/erc20` `MintingEnabled` fails)
 - asset A == asset B (self-pair)
 - a pool with the same `(assetA, assetB, poolType, feeBps)` already exists
 - `max_pools_per_pair` reached
 - `feeBps` is not in the allowed tier list for the pool type
 - the input is a denom string instead of a 20-byte address (e.g. `ibc/…`, `akra`,
-  `erc20:0x…`) — the API boundary only accepts ERC20 addresses; denoms are an
-  internal detail resolved via `x/erc20`
+  `erc20:0x…`, `n:0x…`) — the API boundary only accepts ERC20 addresses; denoms are an
+  internal detail for `OWNER_MODULE` pairs
 
-Special case: the asset whose resolved denom equals `evmtypes.GetEVMCoinDenom()` is the native asset. Its reserves are plain bank `akra`.
+Special case: the asset whose resolved denom equals `evmtypes.GetEVMCoinDenom()` is the native asset. Its reserves are plain bank `akra`. Native tokens (`n:0x…`) are also bank-canonical, so they use the same path.
 
 ## 4. State
 
@@ -173,9 +172,9 @@ type Pool struct {
     ID             uint64
     AssetA         common.Address // sorted: bytes.Compare(AssetA, AssetB) < 0
     AssetB         common.Address
-    DenomA         string         // bank denom; erc20:0x… for external ERC20
+    DenomA         string         // bank denom for OWNER_MODULE; empty for external ERC20
     DenomB         string
-    ReserveA       sdkmath.Int    // bank balance tracked by the pool
+    ReserveA       sdkmath.Int    // bank balance, or balanceOf(custody(id)) for external ERC20
     ReserveB       sdkmath.Int
     TotalShares    sdkmath.Int
     LockedShares   sdkmath.Int
