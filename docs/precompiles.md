@@ -46,7 +46,35 @@ memperoleh seluruh precompile aktif.
 Yang perlu dijaga sekarang hanya `NewEVMGenesisState`: menambah precompile berarti
 menambahkannya di sana, dan `genesis_test.go` menjaga ketiga alamat Karsa.
 
-## 3. Biaya gas: tidak ada
+## 3. Alamat tetap Karsa
+
+| Apa | Alamat |
+|---|---|
+| Native coin KRA | bukan kontrak — currency jaringan, 18 desimal |
+| ERC20 view dari `akra` | `0xD4949664cD82660AaE99bEdc034a0deA8A0bd517` |
+| AMM | `0x…0900` |
+| Token factory | `0x…0901` |
+| Token minter | `0x…0902` |
+| Token native user | diturunkan dari denom `n:0x…` |
+| Aset IBC | diturunkan dari trace hash |
+
+`0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE` adalah penanda EIP-7528
+("aset native" di token list), **bukan** kontrak: tidak ada kode di sana. Jangan
+didaftarkan sebagai precompile; Karsa tidak membutuhkannya karena precompile
+`akra` dibaca langsung dari bank ledger, tanpa langkah wrap seperti WETH.
+
+### Item pra-mainnet: alamat `akra` masih warisan
+
+`NewErc20GenesisState` menyalin `testconstants.ExampleTokenPairs` dari evmOS dan
+hanya mengganti denom menjadi `akra`, sehingga alamat pasangan `akra` adalah
+`0xD494…` — alamat WEVMOS di **Evmos**, bukan turunan dari `akra`.
+
+Ini berfungsi dan konsisten dengan seluruh tes, tetapi secara semantik arbitrary.
+Sebelum mainnet sebaiknya alamat itu diturunkan khusus Karsa (misalnya
+`sha256("karsa/erc20/akra")[12:]`), dengan konsekuensi: memperbarui konstanta di
+`config`, `testconstants` yang dipakai tes AMM, dan dokumentasi ini.
+
+## 4. Biaya gas: tidak ada
 
 Precompile statis **tidak menambah biaya gas** per panggilan EVM. `stateDB.Prepare`
 memasukkan semuanya ke access list tanpa menagih gas.
@@ -59,14 +87,14 @@ Konsekuensinya: memilih 11 atau 20 precompile tidak mengubah performa. Yang
 berubah hanya permukaan serangan, karena setiap precompile adalah kode yang dapat
 dipanggil dari EVM.
 
-## 4. Precompile yang direncanakan
+## 5. Precompile yang direncanakan
 
 Belum ada. Kandidat berikutnya adalah `permit` (EIP-2612) pada precompile ERC20
 token, jika ternyata bisa diimplementasikan dengan aman.
 
 Lihat `docs/native-token.md` untuk model kepemilikan dan alur pembuatan token.
 
-## 5. Checklist menambah precompile statis
+## 6. Checklist menambah precompile statis
 
 - [ ] Tentukan alamat di rentang `0x…09xx`, di luar yang sudah terpakai
 - [ ] Tambahkan ke `genesis.go` (`NewEVMGenesisState`)
@@ -79,7 +107,7 @@ Lihat `docs/native-token.md` untuk model kepemilikan dan alur pembuatan token.
 - [ ] Tes: pemanggilan dari EOA, dari kontrak, reentrancy, dan alamat terblokir
 - [ ] Verifikasi `karsad q evm params` menampilkan alamat baru
 
-## 6. Precompile dinamis
+## 7. Precompile dinamis
 
 Didaftarkan lewat `x/erc20`:
 
