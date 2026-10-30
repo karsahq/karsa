@@ -27,7 +27,8 @@ menambahkan AMM (`genesis.go:33`).
 | `0x…0805` | Gov | module | governance |
 | `0x…0806` | Slashing | module | slashing |
 | `0x…0807` | ICS02 | module | IBC client |
-| **`0x…0900`** | **AMM** | **Karsa** | swap, quote, getPool, liquidity |
+| `0x…0900` | AMM | Karsa | swap, quote, getPool, liquidity |
+| **`0x…0901`** | **Token Factory** | **Karsa** | `createToken` — membuat native token dari kontrak |
 
 ## 2. Duplikasi yang harus dijaga
 
@@ -66,10 +67,9 @@ dipanggil dari EVM.
 
 | Alamat (usulan) | Nama | Sifat | Untuk |
 |---|---|---|---|
-| `0x…0901` | Token Factory | **statis** | `createToken()` — mendirikan bank denom native |
-| `0x…0902` | Token Minter | **statis** | `mint`/`burn` untuk denom yang punya controller |
+| `0x…0902` | Token Minter | statis | `mint`/`burn` untuk denom yang punya controller |
 
-Keduanya global (bukan per token), jadi masuk daftar statis. Tokennya sendiri
+Minter bersifat global (bukan per token), jadi masuk daftar statis. Tokennya sendiri
 adalah precompile **dinamis** di alamat masing-masing.
 
 Lihat `docs/native-token.md` untuk model kepemilikan dan alur pembuatan token.

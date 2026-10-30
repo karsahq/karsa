@@ -9,6 +9,7 @@ import (
 	evmtypes "github.com/cosmos/evm/x/vm/types"
 	"github.com/karsahq/karsa/config"
 	ammtypes "github.com/karsahq/karsa/x/amm/types"
+	nativetokentypes "github.com/karsahq/karsa/x/nativetoken/types"
 
 	minttypes "github.com/cosmos/cosmos-sdk/x/mint/types"
 )
@@ -33,6 +34,7 @@ func NewEVMGenesisState() *evmtypes.GenesisState {
 	evmGenState.Params.ActiveStaticPrecompiles = append(
 		append([]string{}, evmtypes.AvailableStaticPrecompiles...),
 		ammtypes.PrecompileAddress,
+		nativetokentypes.FactoryPrecompileAddress,
 	)
 	evmGenState.Preinstalls = evmtypes.DefaultPreinstalls
 
