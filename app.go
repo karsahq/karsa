@@ -641,8 +641,9 @@ func NewApp(
 		app.ModuleManager,
 		map[string]module.AppModuleBasic{
 			genutiltypes.ModuleName:     genutil.NewAppModuleBasic(genutiltypes.DefaultMessageValidator),
-			stakingtypes.ModuleName:     staking.AppModuleBasic{},
-			govtypes.ModuleName:         gov.NewAppModuleBasic(nil),
+			stakingtypes.ModuleName:     stakingGenesisBasic{},
+			govtypes.ModuleName:         govGenesisBasic{},
+			banktypes.ModuleName:        bankGenesisBasic{},
 			ibctransfertypes.ModuleName: transfer.AppModuleBasic{},
 			// Karsa genesis overrides: these three differ from the per-module
 			// defaults, and `karsad init` reads them from here.

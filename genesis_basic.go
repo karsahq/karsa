@@ -4,20 +4,23 @@ import (
 	"encoding/json"
 
 	"github.com/cosmos/cosmos-sdk/codec"
-	"github.com/cosmos/cosmos-sdk/types/module"
+	"github.com/cosmos/cosmos-sdk/x/bank"
+	"github.com/cosmos/cosmos-sdk/x/gov"
 	"github.com/cosmos/cosmos-sdk/x/mint"
+	"github.com/cosmos/cosmos-sdk/x/staking"
 
 	"github.com/cosmos/evm/x/erc20"
 	"github.com/cosmos/evm/x/vm"
 )
 
-// The app's default genesis differs from the per-module defaults for three
-// modules: the EVM module gets the Karsa precompile list and denom, the erc20
-// module gets the genesis token pair, and mint gets the Karsa supply schedule.
+// The app's default genesis differs from the per-module defaults for several
+// modules: every denom-bearing module must use akra instead of the SDK's "stake"
+// placeholder, and the EVM module needs the Karsa precompile list.
 //
-// `karsad init` serialises the BasicManager defaults, so without these overrides
-// a freshly initialised chain would start with no active precompile at all - the
-// AMM, token factory and minter would be dead - and nothing would report it.
+// `karsad init` serialises the BasicManager defaults. Without these overrides a
+// freshly initialised chain would have no active precompile at all (the AMM,
+// token factory and minter would be dead) and staking would bond a denom that
+// does not exist, so gentx and validators could not work. Nothing reported it.
 
 type evmGenesisBasic struct{ vm.AppModuleBasic }
 
@@ -37,12 +40,20 @@ func (mintGenesisBasic) DefaultGenesis(cdc codec.JSONCodec) json.RawMessage {
 	return cdc.MustMarshalJSON(NewMintGenesisState())
 }
 
-// genesisBasicOverrides maps module names to basics whose DefaultGenesis returns
-// the app-level genesis.
-func genesisBasicOverrides() map[string]module.AppModuleBasic {
-	return map[string]module.AppModuleBasic{
-		vm.AppModuleBasic{}.Name():    evmGenesisBasic{},
-		erc20.AppModuleBasic{}.Name(): erc20GenesisBasic{},
-		mint.AppModuleBasic{}.Name():  mintGenesisBasic{},
-	}
+type stakingGenesisBasic struct{ staking.AppModuleBasic }
+
+func (stakingGenesisBasic) DefaultGenesis(cdc codec.JSONCodec) json.RawMessage {
+	return cdc.MustMarshalJSON(NewStakingGenesisState())
+}
+
+type govGenesisBasic struct{ gov.AppModuleBasic }
+
+func (govGenesisBasic) DefaultGenesis(cdc codec.JSONCodec) json.RawMessage {
+	return cdc.MustMarshalJSON(NewGovGenesisState())
+}
+
+type bankGenesisBasic struct{ bank.AppModuleBasic }
+
+func (bankGenesisBasic) DefaultGenesis(cdc codec.JSONCodec) json.RawMessage {
+	return cdc.MustMarshalJSON(NewBankGenesisState())
 }

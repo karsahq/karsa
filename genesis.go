@@ -13,7 +13,10 @@ import (
 	ammtypes "github.com/karsahq/karsa/x/amm/types"
 	nativetokentypes "github.com/karsahq/karsa/x/nativetoken/types"
 
+	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+	govtypes "github.com/cosmos/cosmos-sdk/x/gov/types/v1"
 	minttypes "github.com/cosmos/cosmos-sdk/x/mint/types"
+	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 )
 
 // GenesisState of the blockchain is represented here as a map of raw json
@@ -61,6 +64,51 @@ func NewErc20GenesisState() *erc20types.GenesisState {
 	erc20GenState.NativePrecompiles = []string{testconstants.WEVMOSContractMainnet}
 
 	return erc20GenState
+}
+
+// NewStakingGenesisState returns the default genesis state for the staking module.
+//
+// The SDK default bond denom is "stake", which does not exist on Karsa; bonding
+// it would break gentx and validator creation.
+func NewStakingGenesisState() *stakingtypes.GenesisState {
+	genesis := stakingtypes.DefaultGenesisState()
+	genesis.Params.BondDenom = config.BaseDenom
+
+	return genesis
+}
+
+// NewGovGenesisState returns the default genesis state for the gov module with
+// every deposit denominated in akra.
+func NewGovGenesisState() *govtypes.GenesisState {
+	genesis := govtypes.DefaultGenesisState()
+
+	for i := range genesis.Params.MinDeposit {
+		genesis.Params.MinDeposit[i].Denom = config.BaseDenom
+	}
+	for i := range genesis.Params.ExpeditedMinDeposit {
+		genesis.Params.ExpeditedMinDeposit[i].Denom = config.BaseDenom
+	}
+
+	return genesis
+}
+
+// NewBankGenesisState returns the default genesis state for the bank module with
+// the akra/kra display metadata, so wallets and explorers can render KRA.
+func NewBankGenesisState() *banktypes.GenesisState {
+	genesis := banktypes.DefaultGenesisState()
+	genesis.DenomMetadata = append(genesis.DenomMetadata, banktypes.Metadata{
+		Description: "The native staking token for Karsa.",
+		Base:        config.BaseDenom,
+		Display:     config.DisplayDenom,
+		Name:        "Karsa",
+		Symbol:      config.Symbol,
+		DenomUnits: []*banktypes.DenomUnit{
+			{Denom: config.BaseDenom, Exponent: 0},
+			{Denom: config.DisplayDenom, Exponent: 18},
+		},
+	})
+
+	return genesis
 }
 
 // NewMintGenesisState returns the default genesis state for the mint module.
