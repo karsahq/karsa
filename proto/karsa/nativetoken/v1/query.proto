@@ -1,0 +1,42 @@
+syntax = "proto3";
+package karsa.nativetoken.v1;
+
+import "gogoproto/gogo.proto";
+import "cosmos/base/query/v1beta1/pagination.proto";
+import "karsa/nativetoken/v1/nativetoken.proto";
+
+option go_package = "github.com/karsahq/karsa/x/nativetoken/types";
+
+// Query defines the nativetoken Query service.
+service Query {
+  // Token returns a token by denom or by address.
+  rpc Token(QueryTokenRequest) returns (QueryTokenResponse);
+  // Tokens lists every native token.
+  rpc Tokens(QueryTokensRequest) returns (QueryTokensResponse);
+  // Params returns the module parameters.
+  rpc Params(QueryParamsRequest) returns (QueryParamsResponse);
+}
+
+message QueryTokenRequest {
+  // Either a denom ("n:0x…") or a lowercase 0x address.
+  string id = 1;
+}
+
+message QueryTokenResponse {
+  Token token = 1 [(gogoproto.nullable) = false];
+}
+
+message QueryTokensRequest {
+  cosmos.base.query.v1beta1.PageRequest pagination = 1;
+}
+
+message QueryTokensResponse {
+  repeated Token tokens = 1 [(gogoproto.nullable) = false];
+  cosmos.base.query.v1beta1.PageResponse pagination = 2;
+}
+
+message QueryParamsRequest {}
+
+message QueryParamsResponse {
+  Params params = 1 [(gogoproto.nullable) = false];
+}

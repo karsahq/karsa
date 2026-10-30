@@ -1,0 +1,56 @@
+syntax = "proto3";
+package karsa.nativetoken.v1;
+
+import "gogoproto/gogo.proto";
+import "cosmos/base/v1beta1/coin.proto";
+
+option go_package = "github.com/karsahq/karsa/x/nativetoken/types";
+
+// Token is a native ERC20: the bank denom is the source of truth for supply and
+// balances, and the EVM address is derived from the denom.
+message Token {
+  // Bank denom, "n:0x…". Immutable once created.
+  string denom = 1;
+  // Lowercase 0x address of the dynamic precompile. Derived from denom.
+  string address = 2;
+  // Lowercase 0x address of the creator. Never changes.
+  string creator = 3;
+  // Lowercase 0x address of the contract allowed to mint and burn. Empty means
+  // the supply is immutable.
+  string controller = 4;
+  // Display name. Metadata only; may be reused by anyone.
+  string name = 5;
+  // Display symbol. Metadata only; not unique and not an identity.
+  string symbol = 6;
+  // Governance curation flag; the only trust signal for a native token.
+  bool verified = 7;
+  // Block time at creation, unix seconds.
+  int64 created_at = 8;
+}
+
+// CreatorSequence tracks how many tokens a creator has issued. It is part of
+// genesis because addresses are derived from it: losing it would let a re-import
+// reuse a sequence and collide with an existing address.
+message CreatorSequence {
+  string creator = 1;
+  uint64 sequence = 2;
+}
+
+message Params {
+  // Fee paid on creation, sent to the treasury. Defaults to zero.
+  repeated cosmos.base.v1beta1.Coin creation_fee = 1 [
+    (gogoproto.nullable) = false,
+    (gogoproto.castrepeated) = "github.com/cosmos/cosmos-sdk/types.Coins"
+  ];
+  uint32 min_symbol_len = 2;
+  uint32 max_symbol_len = 3;
+  uint32 max_name_len = 4;
+  string max_initial_supply = 5
+      [(gogoproto.customtype) = "cosmossdk.io/math.Int", (gogoproto.nullable) = false];
+}
+
+message GenesisState {
+  Params params = 1 [(gogoproto.nullable) = false];
+  repeated Token tokens = 2 [(gogoproto.nullable) = false];
+  repeated CreatorSequence sequences = 3 [(gogoproto.nullable) = false];
+}
