@@ -31,25 +31,20 @@ menambahkan AMM (`genesis.go:33`).
 | **`0x…0901`** | **Token Factory** | **Karsa** | `createToken` — membuat native token dari kontrak |
 | **`0x…0902`** | **Token Minter** | **Karsa** | `mint`/`burn` atas nama controller token |
 
-## 2. Duplikasi yang harus dijaga
+## 2. Satu sumber kebenaran
 
-`karsad init` **tidak** memakai `DefaultGenesis()`, sehingga daftar precompile di
-chain hasil `init` kosong. Karena itu `local_node.sh:251` menambal daftar yang sama
-secara hardcoded.
+Daftar statis dibangun oleh `NewEVMGenesisState` (`genesis.go`) dan dipakai oleh
+`App.DefaultGenesis` (`app.go`). `karsad init` sekarang memakai `App.DefaultGenesis`
+lewat wrapper `NewInitCmd` (`cmd/karsad/cmd/init.go`), sehingga chain baru langsung
+memperoleh seluruh precompile aktif.
 
-Artinya daftar statis hidup di **dua tempat**:
+> Sebelumnya `karsad init` memakai `BasicModuleManager.DefaultGenesis`, yang hanya
+> berisi default per-modul dan **tidak** menyertakan daftar precompile. Chain hasil
+> `init` karenanya tidak memiliki precompile yang berfungsi, dan `local_node.sh`
+> menutupinya dengan menambal genesis lewat `jq`. Patch itu sudah dihapus.
 
-```
-genesis.go:33        NewEVMGenesisState()  → dipakai app, tes, dan chain baru
-local_node.sh:251    jq patch untuk node lokal
-```
-
-> **Setiap penambahan precompile statis harus mengubah keduanya.** Kalau tidak,
-> chain lokal dan chain baru akan berperilaku berbeda, dan gejalanya sulit dilacak.
-
-Perbaikan jangka panjang yang disarankan: buat `karsad init` memakai
-`DefaultGenesis()`, atau turunkan daftar di `local_node.sh` dari satu konstanta,
-sehingga hanya ada satu sumber kebenaran.
+Yang perlu dijaga sekarang hanya `NewEVMGenesisState`: menambah precompile berarti
+menambahkannya di sana, dan `genesis_test.go` menjaga ketiga alamat Karsa.
 
 ## 3. Biaya gas: tidak ada
 

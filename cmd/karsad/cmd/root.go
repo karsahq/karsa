@@ -167,7 +167,7 @@ func initRootCmd(rootCmd *cobra.Command, karsaApp *karsa.App) {
 		return newApp(l, d, ao)
 	}
 	rootCmd.AddCommand(
-		genutilcli.InitCmd(karsaApp.BasicModuleManager, defaultNodeHome),
+		NewInitCmd(karsaApp, defaultNodeHome),
 		genutilcli.Commands(karsaApp.TxConfig(), karsaApp.BasicModuleManager, defaultNodeHome),
 		cmtcli.NewCompletionCmd(rootCmd, true),
 		evmdebug.Cmd(),
