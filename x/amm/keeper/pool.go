@@ -310,6 +310,14 @@ func (k Keeper) CreatePoolWithType(
 
 	id := k.GetNextPoolID(ctx)
 
+	// A pool that holds an external ERC20 directly needs a base account for its
+	// custody address; without it CallEVM cannot act on the address's behalf.
+	if a.DirectCustody || b.DirectCustody {
+		if err := k.ensureCustodyAccount(ctx, id); err != nil {
+			return 0, sdkmath.Int{}, err
+		}
+	}
+
 	if err := k.moveIn(ctx, id, a, common.BytesToAddress(sender.Bytes()), amountA); err != nil {
 		return 0, sdkmath.Int{}, types.ErrInsufficientFunds.Wrapf("initial liquidity %s: %s", a.Address, err)
 	}

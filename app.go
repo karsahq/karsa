@@ -512,6 +512,7 @@ func NewApp(
 		&app.Erc20Keeper,
 		app.EVMKeeper,
 		app.DistrKeeper,
+		app.AccountKeeper,
 		authtypes.NewModuleAddress(govtypes.ModuleName).String(),
 	)
 

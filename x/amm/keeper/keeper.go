@@ -22,6 +22,7 @@ type Keeper struct {
 	erc20Keeper   types.Erc20Keeper
 	evmKeeper     types.EVMKeeper
 	distrKeeper   types.DistributionKeeper
+	accountKeeper types.AccountKeeper
 	authority     string
 	moduleAddress common.Address
 }
@@ -34,6 +35,7 @@ func NewKeeper(
 	erc20Keeper types.Erc20Keeper,
 	evmKeeper types.EVMKeeper,
 	distrKeeper types.DistributionKeeper,
+	accountKeeper types.AccountKeeper,
 	authority string,
 ) Keeper {
 	if _, err := sdk.AccAddressFromBech32(authority); err != nil {
@@ -47,6 +49,7 @@ func NewKeeper(
 		erc20Keeper:   erc20Keeper,
 		evmKeeper:     evmKeeper,
 		distrKeeper:   distrKeeper,
+		accountKeeper: accountKeeper,
 		authority:     authority,
 		moduleAddress: common.BytesToAddress(authtypes.NewModuleAddress(types.ModuleName).Bytes()),
 	}

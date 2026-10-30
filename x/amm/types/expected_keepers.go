@@ -59,3 +59,16 @@ type EVMKeeper interface {
 type DistributionKeeper interface {
 	FundCommunityPool(ctx context.Context, amount sdk.Coins, sender sdk.AccAddress) error
 }
+
+// AccountKeeper registers the account of a pool's custody address.
+//
+// CallEVM reads the sender's sequence, so a custody address needs a base account
+// before it can act as the `from` of an ERC20 transfer. Holding tokens in
+// contract storage does not create a Cosmos account on its own.
+type AccountKeeper interface {
+	GetAccount(ctx context.Context, addr sdk.AccAddress) sdk.AccountI
+	// NewAccountWithAddress assigns the next account number; constructing a base
+	// account by hand reuses number 0 and collides with an existing account.
+	NewAccountWithAddress(ctx context.Context, addr sdk.AccAddress) sdk.AccountI
+	SetAccount(ctx context.Context, acc sdk.AccountI)
+}

@@ -21,8 +21,11 @@ import (
 // ERC20 contracts, the conversion pair needed at the custody boundary.
 type resolvedAsset struct {
 	Address         string // lowercase hex
-	Denom           string // bank denom ("akra", "ibc/…", "erc20:0x…")
+	Denom           string // bank denom ("akra", "ibc/…")
 	ConvertContract common.Address
+	// DirectCustody is true when the pool holds the contract token itself at
+	// custody(poolID) instead of a bank denom.
+	DirectCustody bool
 }
 
 // resolveAsset validates that the given ERC20 address has an enabled token pair
@@ -57,6 +60,7 @@ func (k Keeper) resolveAsset(ctx sdk.Context, asset string) (resolvedAsset, erro
 			return resolvedAsset{}, types.ErrInvalidAsset.Wrapf("asset %s has no contract address", asset)
 		}
 		resolved.ConvertContract = contract
+		resolved.DirectCustody = true
 	}
 
 	return resolved, nil
@@ -140,6 +144,20 @@ func (k Keeper) evmTransferWith(
 			"unexpected transfer balance delta: got %s, want %s", after.Sub(before), amount,
 		)
 	}
+
+	return nil
+}
+
+// ensureCustodyAccount registers a base account for a pool's custody address.
+// Holding an ERC20 only writes to contract storage, which does not create a
+// Cosmos account; CallEVM needs one to read the sender's sequence.
+func (k Keeper) ensureCustodyAccount(ctx sdk.Context, poolID uint64) error {
+	addr := sdk.AccAddress(types.CustodyAddress(poolID).Bytes())
+	if k.accountKeeper.GetAccount(ctx, addr) != nil {
+		return nil
+	}
+
+	k.accountKeeper.SetAccount(ctx, k.accountKeeper.NewAccountWithAddress(ctx, addr))
 
 	return nil
 }
