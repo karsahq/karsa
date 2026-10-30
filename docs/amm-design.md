@@ -112,7 +112,9 @@ Consequences:
   balance delta, so the pool self-corrects instead of rejecting the token.
 - **Rebasing is tolerated** in the Uniswap v2 sense: reserves track balances, so
   gains and losses land on LPs instead of creating unbacked supply.
-- **Donations** are absorbed on the next sync; provide `sync`/`skim` equivalents.
+- **Donations** are not absorbed automatically: reserves are stored state, not
+  derived per swap. The excess stays in custody until an explicit `sync` (adopts
+  the balance) or `skim` (sends the excess out).
 - **Integrator fee** is still paid in the input token, before custody.
 - **Pool fee** stays in the pool as part of the reserve.
 - **Multi-hop** only moves the first and last assets; intermediate hops stay put.
@@ -125,7 +127,7 @@ Failure modes at the custody boundary:
 | standard ERC20 | works |
 | fee-on-transfer | works; reserve uses the amount actually received |
 | rebasing | works; LPs bear the change, no unwind risk |
-| donation | absorbed on sync; `skim` recovers the excess |
+| donation | stays in custody; `sync` adopts it, `skim` sends the excess out |
 | pausable / blacklist | transfers fail; pool frozen, funds safe |
 | upgradeable | behavior can change; worst case is a frozen pool |
 
@@ -287,7 +289,10 @@ custody(poolID) = hash("amm/custody/" + poolID)[:20]
 
 - Input is pulled with `transferFrom(user → custody(pool))`.
 - Output is pushed with `transfer(custody(pool) → user)`.
-- The reserve is `balanceOf(custody(pool))` and is re-synced on every move.
+- The reserve is stored on the pool. It is **not** re-read per swap: on an
+  inbound transfer the module measures `balanceOf(custody)` before and after and
+  requires the delta to equal the requested amount, which is what keeps a
+  donation from being credited to the sender as swap input.
 - Integrator fee is transferred in the input token **before** custody.
 - The pool fee remains inside the pool; it is never moved out in the same swap.
 - No bank mint/burn and no escrow are involved, so a disabled `x/erc20`
