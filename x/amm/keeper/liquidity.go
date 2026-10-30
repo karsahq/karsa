@@ -64,10 +64,10 @@ func (k Keeper) AddLiquidity(
 	}
 
 	senderAddr := common.BytesToAddress(sender.Bytes())
-	if err := k.moveIn(ctx, depositA, senderAddr, usedA); err != nil {
+	if err := k.moveIn(ctx, pool.Id, depositA, senderAddr, usedA); err != nil {
 		return sdkmath.Int{}, types.ErrInsufficientFunds.Wrapf("deposit %s: %s", pool.AssetA, err)
 	}
-	if err := k.moveIn(ctx, depositB, senderAddr, usedB); err != nil {
+	if err := k.moveIn(ctx, pool.Id, depositB, senderAddr, usedB); err != nil {
 		return sdkmath.Int{}, types.ErrInsufficientFunds.Wrapf("deposit %s: %s", pool.AssetB, err)
 	}
 
@@ -151,10 +151,10 @@ func (k Keeper) RemoveLiquidity(
 	}
 
 	senderAddr := common.BytesToAddress(sender.Bytes())
-	if err := k.moveOut(ctx, assetOutA, senderAddr, outA); err != nil {
+	if err := k.moveOut(ctx, pool.Id, assetOutA, senderAddr, outA); err != nil {
 		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
-	if err := k.moveOut(ctx, assetOutB, senderAddr, outB); err != nil {
+	if err := k.moveOut(ctx, pool.Id, assetOutB, senderAddr, outB); err != nil {
 		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
 

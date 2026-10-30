@@ -308,14 +308,15 @@ func (k Keeper) CreatePoolWithType(
 		}
 	}
 
-	if err := k.moveIn(ctx, a, common.BytesToAddress(sender.Bytes()), amountA); err != nil {
+	id := k.GetNextPoolID(ctx)
+
+	if err := k.moveIn(ctx, id, a, common.BytesToAddress(sender.Bytes()), amountA); err != nil {
 		return 0, sdkmath.Int{}, types.ErrInsufficientFunds.Wrapf("initial liquidity %s: %s", a.Address, err)
 	}
-	if err := k.moveIn(ctx, b, common.BytesToAddress(sender.Bytes()), amountB); err != nil {
+	if err := k.moveIn(ctx, id, b, common.BytesToAddress(sender.Bytes()), amountB); err != nil {
 		return 0, sdkmath.Int{}, types.ErrInsufficientFunds.Wrapf("initial liquidity %s: %s", b.Address, err)
 	}
 
-	id := k.GetNextPoolID(ctx)
 	lpDenom := types.LPDenom(id)
 	if err := k.bankKeeper.MintCoins(ctx, types.ModuleName, sdk.NewCoins(sdk.NewCoin(lpDenom, totalShares))); err != nil {
 		return 0, sdkmath.Int{}, err

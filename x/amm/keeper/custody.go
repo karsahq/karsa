@@ -144,14 +144,19 @@ func (k Keeper) evmTransferWith(
 	return nil
 }
 
-// moveIn moves funds from an account into the module.
-func (k Keeper) moveIn(ctx sdk.Context, asset resolvedAsset, from common.Address, amount sdkmath.Int) error {
-	return k.moveInWith(ctx, nil, false, asset, from, amount)
+// moveIn moves funds for a pool from an account into custody.
+func (k Keeper) moveIn(
+	ctx sdk.Context, poolID uint64, asset resolvedAsset, from common.Address, amount sdkmath.Int,
+) error {
+	return k.moveInWith(ctx, poolID, nil, false, asset, from, amount)
 }
 
 // moveInWith is moveIn with an optional EVM execution context.
+//
+// poolID selects the custody account that will hold the asset once direct
+// custody lands; the swap path still converts, so it is not used yet.
 func (k Keeper) moveInWith(
-	ctx sdk.Context, stateDB *statedb.StateDB, fromPrecompile bool,
+	ctx sdk.Context, poolID uint64, stateDB *statedb.StateDB, fromPrecompile bool,
 	asset resolvedAsset, from common.Address, amount sdkmath.Int,
 ) error {
 	if !amount.IsPositive() {
@@ -208,14 +213,16 @@ func (k Keeper) convertInWith(
 	)
 }
 
-// moveOut moves funds from the module to an account.
-func (k Keeper) moveOut(ctx sdk.Context, asset resolvedAsset, to common.Address, amount sdkmath.Int) error {
-	return k.moveOutWith(ctx, nil, false, asset, to, amount)
+// moveOut moves funds for a pool from custody to an account.
+func (k Keeper) moveOut(
+	ctx sdk.Context, poolID uint64, asset resolvedAsset, to common.Address, amount sdkmath.Int,
+) error {
+	return k.moveOutWith(ctx, poolID, nil, false, asset, to, amount)
 }
 
 // moveOutWith is moveOut with an optional EVM execution context.
 func (k Keeper) moveOutWith(
-	ctx sdk.Context, stateDB *statedb.StateDB, fromPrecompile bool,
+	ctx sdk.Context, poolID uint64, stateDB *statedb.StateDB, fromPrecompile bool,
 	asset resolvedAsset, to common.Address, amount sdkmath.Int,
 ) error {
 	if !amount.IsPositive() {

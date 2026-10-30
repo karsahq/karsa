@@ -468,19 +468,41 @@ func (k Keeper) swapExec(
 		return sdkmath.Int{}, sdkmath.Int{}, types.ErrInvalidAmount.Wrap("integrator fee consumes the full input")
 	}
 
-	// Pull the pool input into the module account.
-	if err := k.moveInWith(ctx, stateDB, fromPrecompile, first, common.BytesToAddress(sender.Bytes()), amount); err != nil {
+	// Resolve the first hop before moving the input in: with direct custody the
+	// input has to land on the first pool's custody account.
+	firstPoolID := uint64(0)
+	if len(poolIDs) > 0 {
+		firstPoolID = poolIDs[0]
+	}
+	firstPool, firstAIsA, err := k.bestPoolForExactIn(ctx, path[0], path[1], amount, firstPoolID)
+	if err != nil {
 		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
+
+	// Pull the pool input into custody.
+	if err := k.moveInWith(ctx, firstPool.Id, stateDB, fromPrecompile, first, common.BytesToAddress(sender.Bytes()), amount); err != nil {
+		return sdkmath.Int{}, sdkmath.Int{}, err
+	}
+
+	lastPoolID := firstPool.Id
 	for i := 0; i < len(path)-1; i++ {
-		poolID := uint64(0)
-		if len(poolIDs) > 0 {
-			poolID = poolIDs[i]
+		var (
+			pool types.Pool
+			aIsA bool
+		)
+		if i == 0 {
+			pool, aIsA = firstPool, firstAIsA
+		} else {
+			poolID := uint64(0)
+			if len(poolIDs) > 0 {
+				poolID = poolIDs[i]
+			}
+			pool, aIsA, err = k.bestPoolForExactIn(ctx, path[i], path[i+1], amount, poolID)
+			if err != nil {
+				return sdkmath.Int{}, sdkmath.Int{}, err
+			}
 		}
-		pool, aIsA, err := k.bestPoolForExactIn(ctx, path[i], path[i+1], amount, poolID)
-		if err != nil {
-			return sdkmath.Int{}, sdkmath.Int{}, err
-		}
+		lastPoolID = pool.Id
 
 		out := k.poolAmountOut(pool, aIsA, amount)
 		if !out.IsPositive() {
@@ -514,7 +536,7 @@ func (k Keeper) swapExec(
 		)
 	}
 
-	if err := k.moveOutWith(ctx, stateDB, fromPrecompile, last, common.BytesToAddress(receiver.Bytes()), amount); err != nil {
+	if err := k.moveOutWith(ctx, lastPoolID, stateDB, fromPrecompile, last, common.BytesToAddress(receiver.Bytes()), amount); err != nil {
 		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
 
@@ -661,7 +683,12 @@ func (k Keeper) SwapExactOutWithPools(
 		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
 
-	if err := k.moveIn(ctx, first, common.BytesToAddress(sender.Bytes()), need); err != nil {
+	if len(hops) == 0 {
+		return sdkmath.Int{}, sdkmath.Int{}, types.ErrInvalidPath.Wrap("no hops")
+	}
+
+	firstHopPoolID := hops[0].pool.Id
+	if err := k.moveIn(ctx, firstHopPoolID, first, common.BytesToAddress(sender.Bytes()), need); err != nil {
 		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
 
@@ -685,7 +712,8 @@ func (k Keeper) SwapExactOutWithPools(
 		k.updateOracle(ctx, pool)
 	}
 
-	if err := k.moveOut(ctx, last, common.BytesToAddress(receiver.Bytes()), amountOut); err != nil {
+	lastHopPoolID := hops[len(hops)-1].pool.Id
+	if err := k.moveOut(ctx, lastHopPoolID, last, common.BytesToAddress(receiver.Bytes()), amountOut); err != nil {
 		return sdkmath.Int{}, sdkmath.Int{}, err
 	}
 
