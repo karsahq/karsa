@@ -239,7 +239,7 @@ func (k Keeper) CreatePoolWithType(
 		a, b = b, a
 		amountA, amountB = amountB, amountA
 	}
-	if a.Denom == b.Denom {
+	if a.Denom != "" && a.Denom == b.Denom {
 		return 0, sdkmath.Int{}, types.ErrInvalidAsset.Wrap("assets resolve to the same denom")
 	}
 	if _, found := k.GetPoolIDByKey(ctx, a.Address, b.Address, poolType, feeBps); found {
@@ -343,12 +343,23 @@ func (k Keeper) CreatePoolWithType(
 		return 0, sdkmath.Int{}, err
 	}
 
+	// Pool denoms are bank metadata only. Direct-custody ERC20 assets have no
+	// bank denom; their identity is the asset address. Keep the resolved denom
+	// for response metadata, but do not persist it on the pool.
+	denomA, denomB := a.Denom, b.Denom
+	if a.DirectCustody {
+		denomA = ""
+	}
+	if b.DirectCustody {
+		denomB = ""
+	}
+
 	pool := types.Pool{
 		Id:             id,
 		AssetA:         a.Address,
 		AssetB:         b.Address,
-		DenomA:         a.Denom,
-		DenomB:         b.Denom,
+		DenomA:         denomA,
+		DenomB:         denomB,
 		ReserveA:       amountA,
 		ReserveB:       amountB,
 		TotalShares:    totalShares,

@@ -48,6 +48,16 @@ func TestCustodyAccountCreatedForExternalPool(t *testing.T) {
 	)
 	require.NoError(t, err)
 
+	pool, found := app.AmmKeeper.GetPool(ctx, poolID)
+	require.True(t, found)
+	if pool.AssetA == strings.ToLower(token.Hex()) {
+		require.Empty(t, pool.DenomA, "external ERC20 has no bank denom")
+		require.Equal(t, "akra", pool.DenomB)
+	} else {
+		require.Equal(t, "akra", pool.DenomA)
+		require.Empty(t, pool.DenomB, "external ERC20 has no bank denom")
+	}
+
 	custody := ammtypes.CustodyAddress(poolID)
 	account := app.AccountKeeper.GetAccount(ctx, sdk.AccAddress(custody.Bytes()))
 	require.NotNil(t, account, "custody account must exist for a direct-custody pool")

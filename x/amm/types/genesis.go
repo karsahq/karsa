@@ -40,7 +40,9 @@ func (gs GenesisState) Validate() error {
 		if pool.AssetA >= pool.AssetB {
 			return fmt.Errorf("pool %d: assets must be sorted ascending", pool.Id)
 		}
-		if pool.DenomA == "" || pool.DenomB == "" || pool.DenomA == pool.DenomB {
+		// Denoms are bank metadata only. External ERC20 assets have no bank
+		// denom, so an empty field is valid; only compare non-empty denoms.
+		if pool.DenomA != "" && pool.DenomB != "" && pool.DenomA == pool.DenomB {
 			return fmt.Errorf("pool %d: invalid denoms", pool.Id)
 		}
 		if !pool.ReserveA.IsPositive() || !pool.ReserveB.IsPositive() {
