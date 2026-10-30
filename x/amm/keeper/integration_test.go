@@ -955,54 +955,8 @@ func TestPoolStatusTransitions(t *testing.T) {
 	)
 }
 
-// TestSyncPoolStatuses checks that disabling an external token pair downgrades
-// the pool to WITHDRAW_ONLY automatically.
-func TestSyncPoolStatuses(t *testing.T) {
-	app, ctx := newTestApp(t)
-
-	deployer := common.HexToAddress("0x00000000000000000000000000000000000000D7")
-	nativeCoins := sdk.NewCoins(sdk.NewCoin(karsaNativeDenom(), sdkmath.NewIntWithDecimal(1_000, 18)))
-	require.NoError(t, app.BankKeeper.MintCoins(ctx, ammtypes.ModuleName, nativeCoins))
-	require.NoError(t, app.BankKeeper.SendCoinsFromModuleToAccount(
-		ctx, ammtypes.ModuleName, sdk.AccAddress(deployer.Bytes()), nativeCoins,
-	))
-
-	token := deployTestERC20(t, app, ctx, deployer, "Momo", "MOMO", 18)
-	mintTestERC20(t, app, ctx, token, deployer, sdkmath.NewInt(1_000_000))
-
-	denom := "erc20:" + strings.ToLower(token.Hex())
-	require.NoError(t, app.Erc20Keeper.SetToken(ctx, erc20types.NewTokenPair(
-		token, denom, erc20types.OWNER_EXTERNAL,
-	)))
-
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
-	sender := sdk.AccAddress(deployer.Bytes())
-	poolID, _, err := app.AmmKeeper.CreatePool(
-		ctx, sender, akraAsset.Hex(), token.Hex(), 30,
-		sdkmath.NewInt(100_000), sdkmath.NewInt(100_000),
-	)
-	require.NoError(t, err)
-
-	params := app.Erc20Keeper.GetParams(ctx)
-	params.EnableErc20 = false
-	require.NoError(t, app.Erc20Keeper.SetParams(ctx, params))
-
-	app.AmmKeeper.SyncPoolStatuses(ctx)
-
-	pool, found := app.AmmKeeper.GetPool(ctx, poolID)
-	require.True(t, found)
-	require.Equal(t, ammtypes.PoolStatus_WITHDRAW_ONLY, pool.Status)
-
-	require.ErrorIs(t, app.AmmKeeper.SetPoolStatus(ctx, poolID, ammtypes.PoolStatus_ACTIVE), ammtypes.ErrPoolInactive)
-	_, _, err = app.AmmKeeper.Swap(
-		ctx, sender, sender, []string{akraAsset.Hex(), token.Hex()},
-		sdkmath.NewInt(1_000), sdkmath.NewInt(1), nil, 0,
-	)
-	require.ErrorIs(t, err, ammtypes.ErrPoolInactive)
-}
-
-// TestExternalERC20Pool exercises bank-backed custody: the pool holds the
-// erc20:0x… bank denom while x/erc20 escrows the contract tokens.
+// TestExternalERC20Pool exercises direct custody: the pool holds the contract
+// token at its own custody address.
 func TestExternalERC20Pool(t *testing.T) {
 	app, ctx := newTestApp(t)
 

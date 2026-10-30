@@ -692,9 +692,6 @@ func NewApp(
 		// Cosmos EVM EndBlockers
 		evmtypes.ModuleName, erc20types.ModuleName, feemarkettypes.ModuleName,
 
-		// Karsa modules
-		ammtypes.ModuleName,
-
 		// no-ops
 		ibcexported.ModuleName, ibctransfertypes.ModuleName,
 		distrtypes.ModuleName,
