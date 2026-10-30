@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	nativetokenfactory "github.com/karsahq/karsa/x/nativetoken/precompile/factory"
+	nativetokentypes "github.com/karsahq/karsa/x/nativetoken/types"
 
 	"github.com/cosmos/evm/x/vm/statedb"
 
@@ -43,6 +44,10 @@ func TestFactoryPrecompileCreatesToken(t *testing.T) {
 
 	tokenAddress, ok := out[0].(common.Address)
 	require.True(t, ok)
+
+	// The creation is visible to an EVM explorer without reading Cosmos events.
+	require.Len(t, res.Logs, 1)
+	require.Equal(t, nativetokentypes.TokenCreatedEventID().Hex(), res.Logs[0].Topics[0])
 
 	token, found := app.NativeTokenKeeper.GetTokenByAddress(ctx, strings.ToLower(tokenAddress.Hex()))
 	require.True(t, found)

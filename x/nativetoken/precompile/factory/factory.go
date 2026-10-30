@@ -97,7 +97,7 @@ func (p Precompile) RequiredGas(input []byte) uint64 {
 // Run executes the precompile.
 func (p Precompile) Run(evm *vm.EVM, contract *vm.Contract, readOnly bool) ([]byte, error) {
 	return p.RunNativeAction(evm, contract, func(ctx sdk.Context) ([]byte, error) {
-		return p.Execute(ctx, contract, readOnly)
+		return p.Execute(ctx, evm.StateDB, contract, readOnly)
 	})
 }
 
@@ -105,7 +105,9 @@ func (p Precompile) Run(evm *vm.EVM, contract *vm.Contract, readOnly bool) ([]by
 func (Precompile) IsTransaction(*abi.Method) bool { return true }
 
 // Execute dispatches the ABI method.
-func (p Precompile) Execute(ctx sdk.Context, contract *vm.Contract, readOnly bool) ([]byte, error) {
+func (p Precompile) Execute(
+	ctx sdk.Context, stateDB vm.StateDB, contract *vm.Contract, readOnly bool,
+) ([]byte, error) {
 	method, args, err := cmn.SetupABI(p.ABI, contract, readOnly, p.IsTransaction)
 	if err != nil {
 		return nil, err
@@ -113,14 +115,14 @@ func (p Precompile) Execute(ctx sdk.Context, contract *vm.Contract, readOnly boo
 
 	switch method.Name {
 	case CreateTokenMethod:
-		return p.createToken(ctx, contract, method, args)
+		return p.createToken(ctx, stateDB, contract, method, args)
 	default:
 		return nil, fmt.Errorf(cmn.ErrUnknownMethod, method.Name)
 	}
 }
 
 func (p Precompile) createToken(
-	ctx sdk.Context, contract *vm.Contract, method *abi.Method, args []interface{},
+	ctx sdk.Context, stateDB vm.StateDB, contract *vm.Contract, method *abi.Method, args []interface{},
 ) ([]byte, error) {
 	if len(args) != 4 {
 		return nil, fmt.Errorf(cmn.ErrInvalidNumberOfArgs, 4, len(args))
@@ -159,5 +161,12 @@ func (p Precompile) createToken(
 		return nil, err
 	}
 
-	return method.Outputs.Pack(common.HexToAddress(token.Address))
+	tokenAddr := common.HexToAddress(token.Address)
+	if err := nativetokentypes.EmitTokenCreated(
+		stateDB, Address, tokenAddr, contract.Caller(), token.Symbol,
+	); err != nil {
+		return nil, err
+	}
+
+	return method.Outputs.Pack(tokenAddr)
 }

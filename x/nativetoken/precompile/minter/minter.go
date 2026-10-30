@@ -110,7 +110,7 @@ func (p Precompile) RequiredGas(input []byte) uint64 {
 // Run executes the precompile.
 func (p Precompile) Run(evm *vm.EVM, contract *vm.Contract, readOnly bool) ([]byte, error) {
 	return p.RunNativeAction(evm, contract, func(ctx sdk.Context) ([]byte, error) {
-		return p.Execute(ctx, contract, readOnly)
+		return p.Execute(ctx, evm.StateDB, contract, readOnly)
 	})
 }
 
@@ -118,7 +118,9 @@ func (p Precompile) Run(evm *vm.EVM, contract *vm.Contract, readOnly bool) ([]by
 func (Precompile) IsTransaction(*abi.Method) bool { return true }
 
 // Execute dispatches the ABI method.
-func (p Precompile) Execute(ctx sdk.Context, contract *vm.Contract, readOnly bool) ([]byte, error) {
+func (p Precompile) Execute(
+	ctx sdk.Context, stateDB vm.StateDB, contract *vm.Contract, readOnly bool,
+) ([]byte, error) {
 	method, args, err := cmn.SetupABI(p.ABI, contract, readOnly, p.IsTransaction)
 	if err != nil {
 		return nil, err
@@ -126,16 +128,16 @@ func (p Precompile) Execute(ctx sdk.Context, contract *vm.Contract, readOnly boo
 
 	switch method.Name {
 	case MintMethod:
-		return p.mint(ctx, contract, method, args)
+		return p.mint(ctx, stateDB, contract, method, args)
 	case BurnMethod:
-		return p.burn(ctx, contract, method, args)
+		return p.burn(ctx, stateDB, contract, method, args)
 	default:
 		return nil, fmt.Errorf(cmn.ErrUnknownMethod, method.Name)
 	}
 }
 
 func (p Precompile) mint(
-	ctx sdk.Context, contract *vm.Contract, method *abi.Method, args []interface{},
+	ctx sdk.Context, stateDB vm.StateDB, contract *vm.Contract, method *abi.Method, args []interface{},
 ) ([]byte, error) {
 	tokenAddr, to, amount, err := parseMintArgs(args)
 	if err != nil {
@@ -155,11 +157,17 @@ func (p Precompile) mint(
 		return nil, err
 	}
 
+	if err := nativetokentypes.EmitMint(
+		stateDB, Address, common.HexToAddress(token.Address), to, sdkmath.NewIntFromBigInt(amount),
+	); err != nil {
+		return nil, err
+	}
+
 	return method.Outputs.Pack()
 }
 
 func (p Precompile) burn(
-	ctx sdk.Context, contract *vm.Contract, method *abi.Method, args []interface{},
+	ctx sdk.Context, stateDB vm.StateDB, contract *vm.Contract, method *abi.Method, args []interface{},
 ) ([]byte, error) {
 	if len(args) != 2 {
 		return nil, fmt.Errorf(cmn.ErrInvalidNumberOfArgs, 2, len(args))
@@ -188,6 +196,12 @@ func (p Precompile) burn(
 		sdk.AccAddress(caller.Bytes()), sdkmath.NewIntFromBigInt(amount),
 	)
 	if err != nil {
+		return nil, err
+	}
+
+	if err := nativetokentypes.EmitBurn(
+		stateDB, Address, common.HexToAddress(token.Address), caller, sdkmath.NewIntFromBigInt(amount),
+	); err != nil {
 		return nil, err
 	}
 

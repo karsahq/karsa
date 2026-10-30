@@ -195,8 +195,10 @@ bisa dilewati lewat EOA.
 Precompile minter hanya bekerja untuk denom yang `controller`-nya sama dengan
 pemanggil, sehingga tidak bisa dipakai mencetak denom lain.
 
-Mint dan burn mengeluarkan event `Transfer` ERC20 (dari/ke alamat nol) supaya
-indexer dan explorer melihat perubahan supply seperti token biasa.
+Mint dan burn mengeluarkan EVM log `Mint` / `Burn` dari precompile minter, supaya
+indexer EVM melihat perubahan supply tanpa membaca event Cosmos. Perubahan
+`totalSupply` pada precompile ERC20 terjadi di bank ledger, jadi precompile ERC20
+tidak memancarkan `Transfer` untuk mint/burn yang dipicu dari luar dirinya.
 
 ## 8. Registry
 

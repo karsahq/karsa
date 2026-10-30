@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	nativetokenminter "github.com/karsahq/karsa/x/nativetoken/precompile/minter"
+	nativetokentypes "github.com/karsahq/karsa/x/nativetoken/types"
 
 	"github.com/cosmos/evm/x/vm/statedb"
 
@@ -42,6 +43,10 @@ func TestMinterControllerCanMint(t *testing.T) {
 
 	require.Equal(t, supply.AddRaw(100), app.BankKeeper.GetSupply(ctx, token.Denom).Amount)
 	require.Equal(t, supply.AddRaw(100), app.BankKeeper.GetBalance(ctx, creator, token.Denom).Amount)
+
+	// Supply changes are visible to an EVM explorer as logs.
+	require.Len(t, res.Logs, 1)
+	require.Equal(t, nativetokentypes.MintEventID().Hex(), res.Logs[0].Topics[0])
 }
 
 func TestMinterRejectsNonController(t *testing.T) {
@@ -114,4 +119,7 @@ func TestMinterBurnFromControllerBalance(t *testing.T) {
 
 	require.Equal(t, supply.SubRaw(200), app.BankKeeper.GetSupply(ctx, token.Denom).Amount)
 	require.Equal(t, supply.SubRaw(200), app.BankKeeper.GetBalance(ctx, creator, token.Denom).Amount)
+
+	require.Len(t, res.Logs, 1)
+	require.Equal(t, nativetokentypes.BurnEventID().Hex(), res.Logs[0].Topics[0])
 }
