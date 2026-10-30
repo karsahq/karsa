@@ -23,6 +23,7 @@ func DefaultParams() Params {
 		MaxSymbolLen:     12,
 		MaxNameLen:       64,
 		MaxInitialSupply: MaxSupply,
+		OpenCreation:     false,
 	}
 }
 

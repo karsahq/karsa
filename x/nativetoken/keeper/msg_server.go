@@ -25,6 +25,14 @@ func (m msgServer) CreateNativeToken(
 		return nil, err
 	}
 
+	// Creation is contract-only by default: everyone who creates goes through the
+	// factory precompile, so a token always traces back to a contract.
+	if !m.GetParams(ctx).OpenCreation {
+		return nil, types.ErrUnauthorized.Wrap(
+			"creation through messages is disabled; use the factory precompile",
+		)
+	}
+
 	creator, err := sdk.AccAddressFromBech32(msg.Creator)
 	if err != nil {
 		return nil, types.ErrInvalidCreator.Wrap(err.Error())

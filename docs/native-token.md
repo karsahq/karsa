@@ -197,6 +197,15 @@ MsgChangeTokenAuthority {
 }
 ```
 
+**Pembuatan hanya lewat kontrak.** `MsgCreateNativeToken` ditolak kecuali param
+`open_creation` diaktifkan governance. Default-nya mati, sehingga setiap token
+dilacak kembali ke sebuah kontrak: `creator` selalu alamat kontrak, bukan kunci.
+
+Konsekuensi yang perlu disadari: bila semua orang memakai satu launcher bersama,
+`creator` menjadi sama untuk semua token dan atribusi manusia hanya terlihat dari
+event launcher. Bila tiap proyek men-deploy kontraknya sendiri, `creator` unik per
+token tetapi biaya deploy ditanggung masing-masing.
+
 Semua pesan memvalidasi bahwa `denom` terdaftar sebagai native token Karsa, agar
 tidak bisa dipakai untuk mencetak denom lain (mis. `ibc/…`, `erc20:…`, `akra`).
 
@@ -324,6 +333,7 @@ untuk daftar, duplikasi `local_node.sh`, dan checklist penambahannya.
 | Param | Nilai awal | Catatan |
 |---|---|---|
 | `creation_fee` | **0** | murni anti-spam; naikkan bila ada penyalahgunaan massal |
+| `open_creation` | **false** | pembuatan hanya lewat precompile factory; governance dapat mengaktifkan pesan |
 | `creation_fee_denom` | aset stabil (IBC USDC) | agar tidak ikut volatilitas KRA |
 | penerima fee | treasury | bukan burn |
 | refund | tidak ada | termasuk setelah renounce |
