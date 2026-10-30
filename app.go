@@ -41,6 +41,7 @@ import (
 	evmtypes "github.com/cosmos/evm/x/vm/types"
 	"github.com/cosmos/gogoproto/proto"
 	ibccallbacks "github.com/cosmos/ibc-go/v11/modules/apps/callbacks"
+	ibccallbacksv2 "github.com/cosmos/ibc-go/v11/modules/apps/callbacks/v2"
 	transfer "github.com/cosmos/ibc-go/v11/modules/apps/transfer"
 	transferkeeper "github.com/cosmos/ibc-go/v11/modules/apps/transfer/keeper"
 	ibctransfertypes "github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
@@ -562,14 +563,15 @@ func NewApp(
 	// create IBC module from top to bottom of stack
 	var transferStack porttypes.IBCModule
 
-	transferStack = transfer.NewIBCModule(app.TransferKeeper)
 	maxCallbackGas := uint64(1_000_000)
-	transferStack = erc20.NewIBCMiddleware(app.Erc20Keeper, transferStack)
 	app.CallbackKeeper = ibccallbackskeeper.NewKeeper(
 		app.AccountKeeper,
 		app.EVMKeeper,
 		app.Erc20Keeper,
 	)
+
+	transferStack = transfer.NewIBCModule(app.TransferKeeper)
+	transferStack = erc20.NewIBCMiddleware(app.Erc20Keeper, transferStack)
 	callbacksMiddleware := ibccallbacks.NewIBCMiddleware(app.CallbackKeeper, maxCallbackGas)
 	callbacksMiddleware.SetICS4Wrapper(app.IBCKeeper.ChannelKeeper)
 	callbacksMiddleware.SetUnderlyingApplication(transferStack)
@@ -578,6 +580,13 @@ func NewApp(
 	var transferStackV2 ibcapi.IBCModule
 	transferStackV2 = transferv2.NewIBCModule(app.TransferKeeper)
 	transferStackV2 = erc20v2.NewIBCMiddleware(transferStackV2, app.Erc20Keeper)
+	transferStackV2 = ibccallbacksv2.NewIBCMiddleware(
+		transferStackV2,
+		app.IBCKeeper.ChannelKeeperV2,
+		app.CallbackKeeper,
+		app.IBCKeeper.ChannelKeeperV2,
+		maxCallbackGas,
+	)
 
 	// Create static IBC router, add transfer route, then set and seal it
 	ibcRouter := porttypes.NewRouter()
