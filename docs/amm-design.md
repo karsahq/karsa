@@ -1,11 +1,11 @@
 # Karsa AMM — Design
 
 Status: **in progress** — `x/amm` implements constant-product and two-asset
-stableswap pools, **bank-backed custody with automatic ERC20 ↔ bank conversion at
-the swap/liquidity boundary**, multiple pools per pair selected by fee tier,
+stableswap pools, **in-kind custody (bank denoms stay in the ledger, external ERC20s
+are held at a per-pool custody address)**, multiple pools per pair selected by fee tier,
 integrator fees, exact-in and exact-out swaps, LP shares with an ERC20 precompile,
 an EVM precompile (`quote`, `getPool`, `getPoolById`, `getPools`, `swapExactIn`), and a cumulative-price TWAP.
-Remaining: bounded multi-hop route search and conversion hardening.
+Remaining: direct-custody migration for external ERC20 pools and bounded multi-hop route search.
 Fee abstraction (paying gas in a token) is **descoped**.
 
 ## 1. Goals
@@ -21,7 +21,7 @@ Fee abstraction (paying gas in a token) is **descoped**.
 |---|---|---|
 | D1 | AMM is a Cosmos module, **no Solidity contracts** | Deterministic accounting, native bank integration, and EVM access through a precompile |
 | D2 | Pool assets are identified by **ERC20 address** at the API boundary; the internal reserve denom is resolved via `x/erc20` | Makes the pool interface identical for native, IBC, and external ERC20 assets |
-| D3 | Pool reserves are **bank denoms**. External ERC20 contracts are auto-converted to `erc20:0x…` on the way in and back to the contract token on the way out (§2.2) | Bank ledger is authoritative; token quirks are isolated at the conversion boundary |
+| D3 | Pool reserves are held **in kind**: bank denoms stay in the ledger, external ERC20s are held at a per-pool custody address (§2.2) | No conversion on the swap path; measured ~40% cheaper for ERC20 pairs |
 | D4 | LP shares are bank denoms (`amm/pool/{id}`) | Lets LP tokens participate in fee abstraction and be exposed as ERC20 precompiles |
 | D5 | Routing: caller supplies the path; on-chain path search is bounded | Uniswap v2 semantics; predictable gas, no unbounded search |
 | D6 | **Multiple pools per pair**, keyed by `(assetA, assetB, poolType, feeBps)`; max 6 per pair | Fee competition and anti-squatting without concentrated liquidity |
@@ -35,94 +35,102 @@ An ERC20 address on Karsa can be one of:
 
 | Kind | `ContractOwner` | Balances live in | Poolable |
 |---|---|---|---|
-| Native denom (`akra`) | `OWNER_MODULE` | bank (precompile at the native address) | ✅ no conversion |
-| IBC voucher auto-pair | `OWNER_MODULE` | bank (address derived from trace hash) | ✅ no conversion |
-| Coin-registered pair | `OWNER_MODULE` | bank | ✅ no conversion |
-| User-deployed ERC20 | `OWNER_EXTERNAL` | bank denom `erc20:0x…` after auto-convert; contract only at the boundary | ✅ auto-convert |
+| Native denom (`akra`) | `OWNER_MODULE` | bank (precompile at the native address) | ✅ bank send |
+| IBC voucher auto-pair | `OWNER_MODULE` | bank (address derived from trace hash) | ✅ bank send |
+| Native token (`n:0x…`) | `OWNER_MODULE` | bank (deterministic precompile) | ✅ bank send |
+| User-deployed ERC20 | `OWNER_EXTERNAL` | the contract, held at a per-pool custody address | ✅ direct custody |
 
-Pool reserves are **bank denoms** in all cases. For `OWNER_MODULE` pairs the bank balance and the
-EVM view are the same number. For `OWNER_EXTERNAL` pairs the reserve is the `erc20:0x…` denom,
-backed 1:1 by tokens escrowed at the x/erc20 module address.
+Bank-canonical assets move with `SendCoins`. An external ERC20 moves with
+`transferFrom`/`transfer` between the user and the pool's custody address, which is derived from
+the pool id. No bank mirror is created for it.
 
-### What "bank-backed" means (and the three token classes)
+### Three ways an asset can be held
 
-The Cosmos bank module is the canonical ledger for coins: `balances[account][denom]`.
-Three distinct things are easy to confuse:
-
-| Term | Meaning | Applies to |
+| Model | Balances live in | Used by the swap path for |
 |---|---|---|
-| **precompile-backed** | the ERC20 address is served by chain code that reads the bank ledger | `OWNER_MODULE` pairs (native, IBC) |
-| **escrow-backed** | the bank denom `erc20:0x…` is a claim on tokens escrowed at the x/erc20 module address | `OWNER_EXTERNAL` pairs after conversion |
-| **contract-only** | balances live only in contract storage | `OWNER_EXTERNAL` pairs before conversion |
+| **precompile-backed** | bank ledger; the ERC20 view is served by chain code | `akra`, IBC vouchers, native tokens (`n:0x…`) |
+| **direct custody** | the ERC20 contract, held at a per-pool custody address | user-deployed ERC20 contracts |
+| **escrow-backed** | bank denom `erc20:0x…`, a claim on tokens escrowed at x/erc20 | available, no longer used by the swap path |
 
-A converted ERC20 does **not** become a precompile. Its contract stays at `0xAAA` and keeps its own
-storage; conversion only creates the bank-side mirror `erc20:0xAAA` and escrows the tokens.
-Therefore the EVM explorer keeps showing only the contract balance, while the bank side is visible
-only from Cosmos tooling (see `docs/token-representations.md`).
+A converted ERC20 does **not** become a precompile: its contract stays at its own address and keeps
+its storage, and conversion only creates a bank-side mirror. The AMM no longer relies on that
+mirror — it holds the contract token directly, so pooled assets have no dual representation and
+there is no escrow to keep in sync.
 
-A user-deployed ERC20 contract is **not** bank-canonical: `x/erc20` can bridge it by creating a
-denom `erc20:0x…`, but only for the amount that has been explicitly converted.
+**Four token classes.** User-issued tokens have two paths:
 
-Consequence: a Cosmos module can only move bank balances. The AMM converts an external ERC20 at the
-boundary, so the pool itself only ever moves the bank denom `erc20:0x…`.
+| Class | Issued by | Bank denom | EVM address | Swap cost |
+|---|---|---|---|---|
+| Native denom | chain genesis | `akra` | precompile | ~76k |
+| IBC voucher | incoming ICS20 transfer | `ibc/<HASH>` | auto precompile | ~76k |
+| **Native token** | `MsgCreateNativeToken` / factory precompile | `n:0x…` | deterministic precompile | **~76k** |
+| ERC20 contract | user-deployed Solidity | none (held directly by the pool) | the contract itself | ~340k |
 
-**Decision: no token factory.** Karsa has exactly three token classes:
-
-| Class | Issued by | Bank denom | EVM address |
-|---|---|---|---|
-| Native | chain genesis | `akra` | precompile (native address) |
-| IBC | incoming ICS20 transfer | `ibc/<HASH>` | auto precompile |
-| ERC20 | user-deployed contract | `erc20:0x…` only after conversion | the contract itself |
-
-So user-issued tokens are always ERC20 contracts. Their bank form exists only through `x/erc20`
-conversion (escrow), which makes dual representation inherent for them: the contract balance and
-the `erc20:0x…` bank balance are two halves of the same holding (see `docs/token-representations.md`).
+Native tokens are specified in `docs/native-token.md`. They exist so a standard token does not have
+to pay the EVM-interop cost of a contract.
 
 Consequences:
 
-- There is no "bank-backed from birth" path for new tokens; conversion is the only one.
-- ERC20 contracts become poolable through **auto-converted bank-backed pools** (§2.2).
-- Fee abstraction in the ante handler only works for bank-canonical assets (`akra`, IBC).
-  ERC20 contracts require an ERC-4337 paymaster (§10.2).
+- A pool never needs `erc20:0x…`; the conversion path is optional compatibility, not the default.
+- Fee abstraction in the ante handler only works for bank-canonical assets (`akra`, IBC, native
+  tokens). ERC20 contracts require an ERC-4337 paymaster (§10.2).
 
-### 2.2 Bank-backed pools (external ERC20 auto-convert)
+### 2.2 Pool custody: pools hold the asset itself
 
-Pools always hold **bank denoms**. For an `OWNER_EXTERNAL` ERC20, the pool denom is
-`erc20:0x…`; the AMM converts at the user boundary:
+**Revised.** Pools no longer hold a bank representation of external ERC20s. A pool
+holds whichever asset it trades, in that asset's own form:
+
+| Asset class | Held as | Movement |
+|---|---|---|
+| `akra` | bank denom | `SendCoins` |
+| IBC voucher | bank denom | `SendCoins` |
+| Native token (`n:0x…`) | bank denom (ERC20 precompile on the EVM side) | `SendCoins` |
+| ERC20 contract | the contract token itself | `transferFrom` / `transfer` |
+
+For an external ERC20 the pool keeps the tokens at a **per-pool custody address**:
 
 ```
-user ERC20 --convert--> erc20:0x… (escrow at x/erc20) --> pool
-pool --> erc20:0x… --convert--> user ERC20
+custody(poolID) = hash("amm/custody/" + poolID)[:20]
+
+input  : user --transferFrom--> custody(pool)
+output : custody(pool) --transfer--> user
+reserve: balanceOf(custody(pool))
 ```
 
-- **Input:** convert the user's ERC20 to `erc20:0x…` and move it to the AMM module.
-- **Output:** convert the module's `erc20:0x…` back to the contract token and send it to the user.
-- **Multi-hop:** only the first and last assets are converted; intermediate reserves are bank denoms.
-- **Add/remove liquidity:** convert each external side.
-- **Integrator fee:** paid in the input token **before** conversion.
-- **Pool fee:** stays in the pool as bank denom; it is not converted again.
+No `erc20:0x…` denom is involved, no mint/burn, no escrow at `x/erc20`.
+
+Why this replaced bank-backed conversion: the conversion path issued three EVM
+calls per side (`balanceOf`, `transfer`, `balanceOf`) plus bank mint/burn.
+Measured on the reference machine, an ERC20↔ERC20 swap costs ~565k gas through
+conversion against ~340k with direct custody, about 40% less.
 
 Consequences:
 
-- Users never need to know about `erc20:0x…`; the UI shows the ERC20 contract/precompile.
-- The AMM does not depend on arbitrary token behavior after conversion. `x/erc20` checks balance
-  invariance and rejects fee-on-transfer.
-- The AMM depends on `x/erc20` conversion staying enabled for the pair. If conversion is disabled,
-  external pools must enter `WITHDRAW_ONLY` (or freeze if the guard is bypassed).
-- The AMM module is excluded from `BlockedAddresses` so it can receive minted bank denom; EVM native
-  transfers to the module are still rejected by the `isModule` check.
-- Reentrancy guard still covers conversion + pool update; `x/erc20` performs an ERC20 transfer.
-- No `assertCustody` EVM balance checks are needed; the bank ledger is authoritative.
+- **Reserves are per pool** and isolated: a donation or manipulation in one pool
+  cannot shift another pool's accounting.
+- **Fee-on-transfer is tolerated**: the reserve is updated from the measured
+  balance delta, so the pool self-corrects instead of rejecting the token.
+- **Rebasing is tolerated** in the Uniswap v2 sense: reserves track balances, so
+  gains and losses land on LPs instead of creating unbacked supply.
+- **Donations** are absorbed on the next sync; provide `sync`/`skim` equivalents.
+- **Integrator fee** is still paid in the input token, before custody.
+- **Pool fee** stays in the pool as part of the reserve.
+- **Multi-hop** only moves the first and last assets; intermediate hops stay put.
+- `assertCustody` returns: the invariant is `balanceOf(custody) == reserve`.
 
-Failure modes at the conversion boundary:
+Failure modes at the custody boundary:
 
 | Token behavior | Result |
 |---|---|
 | standard ERC20 | works |
-| fee-on-transfer / reflection | rejected by x/erc20 balance invariance |
-| rebasing | conversion may succeed, but escrow backing can drift; pool bank denom is unaffected |
-| pausable / blacklist | conversion fails; pool is frozen until resolved |
-| upgradeable | behavior can change; conversion failure/freeze is possible |
+| fee-on-transfer | works; reserve uses the amount actually received |
+| rebasing | works; LPs bear the change, no unwind risk |
+| donation | absorbed on sync; `skim` recovers the excess |
+| pausable / blacklist | transfers fail; pool frozen, funds safe |
+| upgradeable | behavior can change; worst case is a frozen pool |
+
+The `erc20:0x…` denom and `x/erc20` conversion remain available for anyone who
+wants a bank representation, but the swap path no longer uses them.
 
 ## 3. Asset model
 
@@ -270,23 +278,24 @@ both scaling factors and `status`; `getPools` returns every pool id for a pair.
 - `x/erc20` governance cannot be intercepted directly (it is an upstream module). The on-chain guard
   is the automatic downgrade plus the `ACTIVE` transition check in `MsgSetPoolStatus`.
 
-### Conversion boundary
+### Custody boundary
 
-With the AMM module excluded from `BlockedAddresses`, conversion can target the module directly:
+Each pool has its own custody address, derived from the pool id:
 
 ```
-input:  user ERC20 --x/erc20 convert--> erc20:0x… at AMM module
-output: erc20:0x… at AMM module --x/erc20 convert--> user ERC20
+custody(poolID) = hash("amm/custody/" + poolID)[:20]
 ```
 
-- Integrator fee is transferred in the input ERC20 **before** the conversion of the net amount.
-- The pool fee remains in the pool as bank denom; it is never converted in the same swap.
-- Output conversion is implemented in the AMM: send the bank denom from the AMM module to the
-  x/erc20 module, burn it, then transfer the escrowed ERC20 with the caller's stateDB. This keeps
-  precompile execution atomic; `x/erc20.ConvertCoinNativeERC20` creates its own stateDB and cannot
-  be used from the precompile path.
-- Without the `BlockedAddresses` exception, input conversion would mint to the user and then require
-  an extra bank send; the exception saves ~17k gas per external input.
+- Input is pulled with `transferFrom(user → custody(pool))`.
+- Output is pushed with `transfer(custody(pool) → user)`.
+- The reserve is `balanceOf(custody(pool))` and is re-synced on every move.
+- Integrator fee is transferred in the input token **before** custody.
+- The pool fee remains inside the pool; it is never moved out in the same swap.
+- No bank mint/burn and no escrow are involved, so a disabled `x/erc20`
+  conversion can no longer freeze an external pool. The `BlockedAddresses`
+  exception still matters for native-token payouts.
+- Per-pool custody keeps accounting isolated: one pool's donation cannot move
+  another pool's reserve.
 
 ## 5. Messages
 
@@ -413,7 +422,7 @@ message authorizes it. Do **not** add a blanket "module may debit any balance" p
 3. EntryPoint calls the paymaster
 4. paymaster charges the user in the ERC20 (transferFrom / permit)
 5. paymaster swaps the ERC20 for akra through a liquidity source
-   (contract DEX, or a bank-backed AMM pool)
+   (contract DEX, or a Karsa AMM pool)
 ```
 
 This is a separate project and is out of scope for phases 1–4. It is the only correct way to let
@@ -435,16 +444,17 @@ Open design points (ante path):
 - [ ] Rounding always favours the pool
 - [ ] TWAP manipulation (window length, minimum liquidity, deviation cap)
 - [ ] Sandwich/JIT liquidity: `min_out` mandatory, consider private orderflow for fee swaps
-- [ ] Reentrancy: precompile entrypoint and conversion boundary
+- [ ] Reentrancy: precompile entrypoint and custody boundary
 - [ ] Pool status transitions: only governance; `ACTIVE <-> WITHDRAW_ONLY`
-- [ ] Governance guard: `SyncPoolStatuses` downgrades external pools to `WITHDRAW_ONLY`; `ACTIVE` transition requires conversion
-- [ ] Conversion dependency: `x/erc20` pair enabled, `MintingEnabled`, `IsSendEnabledCoin`
+- [ ] Custody guard: `SyncPoolStatuses` downgrades pools whose custody is unusable to `WITHDRAW_ONLY`
+- [ ] Custody invariant: `balanceOf(custody(pool)) == reserve`, with `sync`/`skim` for drift
 - [ ] AMM module excluded from `BlockedAddresses`; precompile address still blocked
 - [ ] Multi-pool uniqueness `(assetA, assetB, poolType, feeBps)` and `max_pools_per_pair`
 - [ ] Fixed fee tiers per pool type; no arbitrary fee values
 - [ ] Total fee cap (`pool + integrator`) and quote breakdown
 - [ ] Pool creation spam: `min_initial_liquidity`, creation fee, tier whitelist
-- [ ] Asset pair mutations: pair/ conversion can be disabled later — pools must re-validate on use
+- [ ] Token viability: a paused or blacklisted token must not brick unrelated pools; that pool degrades
+  to `WITHDRAW_ONLY` while custody remains withdrawable
 - [ ] Deterministic addresses: assert no collision between LP asset addresses and existing pairs
 - [ ] Integrator fee cap enforced, emitted in events, and returned by `Quote`
 - [ ] Decimal normalisation in every price/quote surface (18 vs 6 decimals)
@@ -455,8 +465,8 @@ Open design points (ante path):
 | Phase | Scope |
 |---|---|
 | 1 | Module skeleton, constant product, create/add/remove, exact-in and exact-out swap, `Quote`, integrator fee, 1–2 hop path, LP as bank denom + ERC20 precompile, precompile for `swap`/`quote`, TWAP |
-| 2 | Bank-backed custody for external ERC20 with automatic conversion, multiple fee-tier pools per pair, pool status and governance guard |
-| 3 | Bounded multi-hop route search; conversion hardening and failure-mode tests |
+| 2 | Direct custody for external ERC20 pools (per-pool custody address, balance-derived reserves, `sync`/`skim`), multiple fee-tier pools per pair, pool status and governance guard |
+| 3 | Bounded multi-hop route search; custody hardening and failure-mode tests (fee-on-transfer, donation, rebasing, paused token) |
 | 4 | ERC-4337 paymaster for ERC20 contracts (separate project) |
 
 Fee abstraction remains descoped (see §10).
@@ -526,14 +536,50 @@ Rules:
 - **Multi-pool**: display pool type and fee tier; use a canonical pool for price display/routing
   defaults, and let the router compare candidates for execution.
 
+### Curation and pool visibility
+
+Pools stay permissionless on-chain; curation is a display decision. Three levels:
+
+| Level | Source | Default UI |
+|---|---|---|
+| **Verified** | governance flag on the pool (or both tokens verified) | shown |
+| **Unverified** | permissionless pool | hidden from lists, findable by search |
+| **Imported** | client-side, per user | shown only for that user |
+
+Rules:
+
+- A pool is verified only by governance, and verification is revoked when a
+  token's metadata or controller changes.
+- Unverified pools are never deleted or blocked on-chain; the UI simply does not
+  list them by default.
+- A user can always import a pool. This is client state (local storage): no
+  on-chain cost, not portable across devices.
+- **Always show pools where the user has an LP position**, verified or not.
+  Hiding a user's own funds is worse than showing an unverified pool.
+- Show the verification status of both tokens and of the pool. Never let a name
+  or symbol imply trust.
+
+Pools have **no contract address** — they are identified by `poolID`. So the
+"paste the 0x address" flow from Uniswap maps to:
+
+| User has | Import flow |
+|---|---|
+| a token address | paste it; list every pool containing that token |
+| a pool id | paste the id; open that pool directly |
+
+A deterministic pseudo-address for display (`hash("amm/pool/" + id)`) is possible
+but must never be presented as a contract, since nothing exists at that address.
+
 ## 15. Out of scope (for now)
 
-- A token factory module (tokens on Karsa are `akra`, IBC vouchers, or ERC20 contracts)
+- A token factory module (tokens are `akra`, IBC vouchers, ERC20 contracts, or native tokens — see
+  `docs/native-token.md`)
 - Referral / revenue-share of the pool fee (only integrator fees are supported)
 - On-chain order book / CLOB (limit orders are implemented as `min_out` swaps)
 - Solidity AMM/router contracts
 - Flash swaps (module → EVM callback)
 - Cross-chain swaps (IBC packet-forward based)
 - Concentrated liquidity (v3-style ranges); the current model is full-range v2-style with fee tiers
-- Token whitelisting (pools are permissionless; conversion compatibility is enforced by `x/erc20`)
+- Token whitelisting at the protocol level (pools are permissionless; curation is a UI concern, see
+  §14)
 - Paying gas with a non-native token (descoped, see §10)
