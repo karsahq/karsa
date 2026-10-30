@@ -8,8 +8,6 @@ import (
 
 	ammtypes "github.com/karsahq/karsa/x/amm/types"
 
-	testconstants "github.com/cosmos/evm/testutil/constants"
-
 	sdkmath "cosmossdk.io/math"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -27,7 +25,7 @@ func TestPoolRecordCost(t *testing.T) {
 	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AA").Bytes())
 	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(20_000_000, 18))
 
-	akra := common.HexToAddress(testconstants.WEVMOSContractMainnet).Hex()
+	akra := akraERC20().Hex()
 
 	poolID, _, err := app.AmmKeeper.CreatePool(
 		ctx, sender, akra, testUSDCPair.Hex(), 30,

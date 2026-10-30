@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/cosmos/evm/contracts"
-	testconstants "github.com/cosmos/evm/testutil/constants"
 	erc20types "github.com/cosmos/evm/x/erc20/types"
 	"github.com/cosmos/evm/x/vm/statedb"
 
@@ -64,7 +63,7 @@ func TestConversionEscrowInvariant(t *testing.T) {
 		token, denom, erc20types.OWNER_EXTERNAL,
 	)))
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 	_, _, err := app.AmmKeeper.CreatePool(
 		ctx, sender, akraAsset.Hex(), token.Hex(), 30,
 		sdkmath.NewInt(100_000), sdkmath.NewInt(100_000),

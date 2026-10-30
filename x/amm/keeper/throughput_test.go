@@ -10,7 +10,6 @@ import (
 	karsa "github.com/karsahq/karsa"
 	ammtypes "github.com/karsahq/karsa/x/amm/types"
 
-	testconstants "github.com/cosmos/evm/testutil/constants"
 	erc20types "github.com/cosmos/evm/x/erc20/types"
 
 	sdkmath "cosmossdk.io/math"
@@ -123,7 +122,7 @@ func TestThroughput(t *testing.T) {
 		t.Skip("throughput measurement skipped in -short mode")
 	}
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet).Hex()
+	akraAsset := akraERC20().Hex()
 
 	t.Run("bank_swap", func(t *testing.T) {
 		app, ctx := newTestApp(t)

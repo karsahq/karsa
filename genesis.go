@@ -5,7 +5,6 @@ import (
 
 	sdkmath "cosmossdk.io/math"
 
-	testconstants "github.com/cosmos/evm/testutil/constants"
 	erc20types "github.com/cosmos/evm/x/erc20/types"
 	feemarkettypes "github.com/cosmos/evm/x/feemarket/types"
 	evmtypes "github.com/cosmos/evm/x/vm/types"
@@ -49,19 +48,19 @@ func NewEVMGenesisState() *evmtypes.GenesisState {
 
 // NewErc20GenesisState returns the default genesis state for the ERC20 module.
 //
-// NOTE: for the example chain implementation we are also adding a default token pair,
-// which is the base denomination of the chain (i.e. the WEVMOS contract).
+// It registers the native denom as a module-owned token pair at Karsa's own
+// deterministic address. The address must not be inherited from another chain:
+// it is part of genesis and is visible to every wallet and explorer.
 func NewErc20GenesisState() *erc20types.GenesisState {
 	erc20GenState := erc20types.DefaultGenesisState()
 
-	// Use the example token pairs, but point the native pair at the Karsa base denom.
-	tokenPairs := make([]erc20types.TokenPair, len(testconstants.ExampleTokenPairs))
-	copy(tokenPairs, testconstants.ExampleTokenPairs)
-	for i := range tokenPairs {
-		tokenPairs[i].Denom = config.BaseDenom
-	}
-	erc20GenState.TokenPairs = tokenPairs
-	erc20GenState.NativePrecompiles = []string{testconstants.WEVMOSContractMainnet}
+	erc20GenState.TokenPairs = []erc20types.TokenPair{{
+		Erc20Address:  config.NativeERC20Address,
+		Denom:         config.BaseDenom,
+		Enabled:       true,
+		ContractOwner: erc20types.OWNER_MODULE,
+	}}
+	erc20GenState.NativePrecompiles = []string{config.NativeERC20Address}
 
 	return erc20GenState
 }

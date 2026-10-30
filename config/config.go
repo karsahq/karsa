@@ -16,6 +16,12 @@ const (
 	DisplayDenom = "kra"
 	// Symbol is the ticker symbol of the native token.
 	Symbol = "KRA"
+
+	// NativeERC20Address is the ERC20 view of akra. It is derived as
+	// sha256("karsa/erc20/akra")[12:], the same scheme used for custody and
+	// native-token addresses, and is registered as a native precompile at
+	// genesis. Changing it is a consensus-breaking genesis change.
+	NativeERC20Address = "0xd9171c1192d82ecd4f71dec2ee0264769af9531e"
 )
 
 const (

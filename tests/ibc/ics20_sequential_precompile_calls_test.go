@@ -16,6 +16,7 @@ import (
 	"github.com/cosmos/evm/precompiles/ics20"
 	evmibctesting "github.com/cosmos/evm/testutil/ibc"
 	"github.com/karsahq/karsa"
+	"github.com/karsahq/karsa/config"
 	"github.com/karsahq/karsa/tests/integration"
 )
 
@@ -56,7 +57,7 @@ func (suite *ICS20SequentialPrecompileCallsTestSuite) SetupTest() {
 
 	karsaAppA.Erc20Keeper.GetTokenPair(suite.chainA.GetContext(), karsaAppA.Erc20Keeper.GetTokenPairID(suite.chainA.GetContext(), bondDenom))
 
-	avail := karsaAppA.Erc20Keeper.IsNativePrecompileAvailable(suite.chainA.GetContext(), common.HexToAddress("0xD4949664cD82660AaE99bEdc034a0deA8A0bd517"))
+	avail := karsaAppA.Erc20Keeper.IsNativePrecompileAvailable(suite.chainA.GetContext(), common.HexToAddress(config.NativeERC20Address))
 	suite.Require().True(avail)
 
 	karsaAppB := suite.chainB.App.(*karsa.App)

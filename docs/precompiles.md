@@ -51,7 +51,7 @@ menambahkannya di sana, dan `genesis_test.go` menjaga ketiga alamat Karsa.
 | Apa | Alamat |
 |---|---|
 | Native coin KRA | bukan kontrak — currency jaringan, 18 desimal |
-| ERC20 view dari `akra` | `0xD4949664cD82660AaE99bEdc034a0deA8A0bd517` |
+| ERC20 view dari `akra` | `0xd9171c1192d82ecd4f71dec2ee0264769af9531e` |
 | AMM | `0x…0900` |
 | Token factory | `0x…0901` |
 | Token minter | `0x…0902` |
@@ -63,16 +63,20 @@ menambahkannya di sana, dan `genesis_test.go` menjaga ketiga alamat Karsa.
 didaftarkan sebagai precompile; Karsa tidak membutuhkannya karena precompile
 `akra` dibaca langsung dari bank ledger, tanpa langkah wrap seperti WETH.
 
-### Item pra-mainnet: alamat `akra` masih warisan
+### Alamat `akra`
 
-`NewErc20GenesisState` menyalin `testconstants.ExampleTokenPairs` dari evmOS dan
-hanya mengganti denom menjadi `akra`, sehingga alamat pasangan `akra` adalah
-`0xD494…` — alamat WEVMOS di **Evmos**, bukan turunan dari `akra`.
+`NewErc20GenesisState` mendaftarkan pasangan native pada alamat deterministik:
 
-Ini berfungsi dan konsisten dengan seluruh tes, tetapi secara semantik arbitrary.
-Sebelum mainnet sebaiknya alamat itu diturunkan khusus Karsa (misalnya
-`sha256("karsa/erc20/akra")[12:]`), dengan konsekuensi: memperbarui konstanta di
-`config`, `testconstants` yang dipakai tes AMM, dan dokumentasi ini.
+```
+address = sha256("karsa/erc20/akra")[12:]
+        = 0xd9171c1192d82ecd4f71dec2ee0264769af9531e
+```
+
+Konstanta hidup di `config.NativeERC20Address`; `config/config_test.go` mengunci
+nilainya ke derivasi di atas. Alamat ini bagian dari genesis: mengubahnya berarti
+mengubah identitas ERC20 dari aset native dan memutus wallet, pool, serta explorer
+yang sudah menyimpannya. Jangan menyalin alamat dari chain lain (sebelumnya Karsa
+memakai alamat WEVMOS milik Evmos).
 
 ## 4. Biaya gas: tidak ada
 

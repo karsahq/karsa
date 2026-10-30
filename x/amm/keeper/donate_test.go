@@ -9,7 +9,6 @@ import (
 
 	ammtypes "github.com/karsahq/karsa/x/amm/types"
 
-	testconstants "github.com/cosmos/evm/testutil/constants"
 	erc20types "github.com/cosmos/evm/x/erc20/types"
 	"github.com/cosmos/evm/x/vm/statedb"
 
@@ -41,7 +40,7 @@ func TestDonatePoolAdoptsExcess(t *testing.T) {
 		token, "erc20:"+strings.ToLower(token.Hex()), erc20types.OWNER_EXTERNAL,
 	)))
 
-	akra := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akra := akraERC20()
 
 	poolID, _, err := app.AmmKeeper.CreatePool(
 		ctx, sender, akra.Hex(), token.Hex(), 30,

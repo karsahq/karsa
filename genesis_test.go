@@ -3,6 +3,7 @@ package karsa
 import (
 	"testing"
 
+	"github.com/karsahq/karsa/config"
 	ammtypes "github.com/karsahq/karsa/x/amm/types"
 	nativetokentypes "github.com/karsahq/karsa/x/nativetoken/types"
 
@@ -20,6 +21,17 @@ func TestNewEVMGenesisStateActivatesKarsaPrecompiles(t *testing.T) {
 	require.Contains(t, genesis.Params.ActiveStaticPrecompiles, ammtypes.PrecompileAddress)
 	require.Contains(t, genesis.Params.ActiveStaticPrecompiles, nativetokentypes.FactoryPrecompileAddress)
 	require.Contains(t, genesis.Params.ActiveStaticPrecompiles, nativetokentypes.MinterPrecompileAddress)
+}
+
+// The ERC20 view of akra is registered at genesis. Its address must be the
+// Karsa derivation, not an inherited WEVMOS address from another chain.
+func TestNewErc20GenesisStateUsesKarsaAddress(t *testing.T) {
+	genesis := NewErc20GenesisState()
+
+	require.Len(t, genesis.TokenPairs, 1)
+	require.Equal(t, config.NativeERC20Address, genesis.TokenPairs[0].Erc20Address)
+	require.Equal(t, config.BaseDenom, genesis.TokenPairs[0].Denom)
+	require.Equal(t, []string{config.NativeERC20Address}, genesis.NativePrecompiles)
 }
 
 // A default base fee of 1e9 akra per gas makes every ordinary transaction

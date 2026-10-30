@@ -8,7 +8,6 @@ import (
 
 	ammtypes "github.com/karsahq/karsa/x/amm/types"
 
-	testconstants "github.com/cosmos/evm/testutil/constants"
 	erc20types "github.com/cosmos/evm/x/erc20/types"
 
 	sdkmath "cosmossdk.io/math"
@@ -41,7 +40,7 @@ func TestCustodyAccountCreatedForExternalPool(t *testing.T) {
 		token, "erc20:"+strings.ToLower(token.Hex()), erc20types.OWNER_EXTERNAL,
 	)))
 
-	akra := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akra := akraERC20()
 
 	poolID, _, err := app.AmmKeeper.CreatePool(
 		ctx, sender, akra.Hex(), token.Hex(), 30,
@@ -63,7 +62,7 @@ func TestCustodyAccountSkippedForBankPool(t *testing.T) {
 	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AA").Bytes())
 	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(10_000, 18))
 
-	akra := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akra := akraERC20()
 
 	poolID, _, err := app.AmmKeeper.CreatePool(
 		ctx, sender, akra.Hex(), testUSDCPair.Hex(), 30,

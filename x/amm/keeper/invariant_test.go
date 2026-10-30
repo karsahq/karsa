@@ -13,7 +13,6 @@ import (
 
 	contracts "github.com/cosmos/evm/contracts"
 
-	testconstants "github.com/cosmos/evm/testutil/constants"
 	erc20types "github.com/cosmos/evm/x/erc20/types"
 	"github.com/cosmos/evm/x/vm/statedb"
 
@@ -47,7 +46,7 @@ func newExternalPool(t *testing.T) (*karsa.App, sdk.Context, uint64, common.Addr
 		token, "erc20:"+strings.ToLower(token.Hex()), erc20types.OWNER_EXTERNAL,
 	)))
 
-	akra := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akra := akraERC20()
 
 	poolID, _, err := app.AmmKeeper.CreatePool(
 		ctx, sender, akra.Hex(), token.Hex(), 30,
@@ -100,7 +99,7 @@ func TestSwapDetectsShortfallInline(t *testing.T) {
 
 	// The external token is the input here, so the balance the AMM already reads
 	// for the delta check is the custody balance that fell short.
-	akra := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akra := akraERC20()
 	_, _, err := app.AmmKeeper.Swap(
 		ctx, sender, sender, []string{token.Hex(), akra.Hex()},
 		sdkmath.NewInt(1_000), sdkmath.NewInt(1), nil, 0,

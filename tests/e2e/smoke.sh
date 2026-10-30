@@ -207,7 +207,7 @@ printf '%s' "$balance" | grep -q '"amount": "1000"' || fail "recipient balance d
 printf 'recipient received 1000akra\n'
 
 step "create an AMM pool"
-KRA_ASSET="0xD4949664cD82660AaE99bEdc034a0deA8A0bd517"
+KRA_ASSET="0xd9171c1192d82ecd4f71dec2ee0264769af9531e"
 USDC_ASSET="0x1000000000000000000000000000000000000001"
 create_out="$("$BIN" tx amm create-pool \
   --asset-a "$KRA_ASSET" --asset-b "$USDC_ASSET" \

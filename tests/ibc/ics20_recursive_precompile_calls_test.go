@@ -23,6 +23,7 @@ import (
 	transfertypes "github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
 	clienttypes "github.com/cosmos/ibc-go/v11/modules/core/02-client/types"
 	"github.com/karsahq/karsa"
+	"github.com/karsahq/karsa/config"
 	"github.com/karsahq/karsa/tests/integration"
 
 	sdkmath "cosmossdk.io/math"
@@ -246,7 +247,7 @@ func (suite *ICS20RecursivePrecompileCallsTestSuite) SetupTest() {
 	karsaAppA.Erc20Keeper.GetTokenPair(suite.chainA.GetContext(), karsaAppA.Erc20Keeper.GetTokenPairID(suite.chainA.GetContext(), bondDenom))
 	// karsaAppA.Erc20Keeper.SetNativePrecompile(suite.chainA.GetContext(), werc20.Address())
 
-	avail := karsaAppA.Erc20Keeper.IsNativePrecompileAvailable(suite.chainA.GetContext(), common.HexToAddress("0xD4949664cD82660AaE99bEdc034a0deA8A0bd517"))
+	avail := karsaAppA.Erc20Keeper.IsNativePrecompileAvailable(suite.chainA.GetContext(), common.HexToAddress(config.NativeERC20Address))
 	suite.Require().True(avail)
 
 	karsaAppB := suite.chainB.App.(*karsa.App)

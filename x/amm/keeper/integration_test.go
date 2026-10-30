@@ -9,6 +9,7 @@ import (
 	"time"
 
 	karsa "github.com/karsahq/karsa"
+	"github.com/karsahq/karsa/config"
 	ammkeeper "github.com/karsahq/karsa/x/amm/keeper"
 	ammprecompile "github.com/karsahq/karsa/x/amm/precompile"
 	ammtypes "github.com/karsahq/karsa/x/amm/types"
@@ -16,7 +17,6 @@ import (
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 
 	contracts "github.com/cosmos/evm/contracts"
-	testconstants "github.com/cosmos/evm/testutil/constants"
 	erc20types "github.com/cosmos/evm/x/erc20/types"
 	"github.com/cosmos/evm/x/vm/statedb"
 	evmtypes "github.com/cosmos/evm/x/vm/types"
@@ -40,6 +40,11 @@ const (
 	// A second bank-backed test denom (stands in for USDT in tests).
 	testUSDTDenom = "uusdt"
 )
+
+// akraERC20 returns the genesis ERC20 view of the native denom.
+func akraERC20() common.Address {
+	return common.HexToAddress(config.NativeERC20Address)
+}
 
 // testUSDCPair is the module-owned ERC20 address we assign to the test denom.
 var testUSDCPair = common.HexToAddress("0x1000000000000000000000000000000000000001")
@@ -105,7 +110,7 @@ func TestCreatePoolAddRemoveAndSwap(t *testing.T) {
 	initial := sdkmath.NewIntWithDecimal(1_000, 18)
 	fundTestDenoms(t, app, ctx, sender, initial)
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 
 	// --- create pool -------------------------------------------------------
 	poolID, shares, err := app.AmmKeeper.CreatePool(
@@ -189,7 +194,7 @@ func TestSwapWithIntegratorFee(t *testing.T) {
 	integrator := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000CC").Bytes())
 	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 	_, _, err := app.AmmKeeper.CreatePool(
 		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 30,
 		sdkmath.NewInt(1_000_000), sdkmath.NewInt(1_000_000),
@@ -224,7 +229,7 @@ func TestSwapExactOut(t *testing.T) {
 	receiver := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AE").Bytes())
 	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 	_, _, err := app.AmmKeeper.CreatePool(
 		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 30,
 		sdkmath.NewInt(1_000_000), sdkmath.NewInt(1_000_000),
@@ -268,7 +273,7 @@ func TestSwapExactOutIntegratorFee(t *testing.T) {
 	integrator := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000CA").Bytes())
 	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 	_, _, err := app.AmmKeeper.CreatePool(
 		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 30,
 		sdkmath.NewInt(1_000_000), sdkmath.NewInt(1_000_000),
@@ -316,7 +321,7 @@ func TestSwapExactOutMultiHop(t *testing.T) {
 	require.NoError(t, app.BankKeeper.MintCoins(ctx, ammtypes.ModuleName, momoCoins))
 	require.NoError(t, app.BankKeeper.SendCoinsFromModuleToAccount(ctx, ammtypes.ModuleName, sender, momoCoins))
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 	deposit := sdkmath.NewInt(1_000_000)
 	_, _, err := app.AmmKeeper.CreatePool(
 		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 30, deposit, deposit,
@@ -454,7 +459,7 @@ func TestStableSwapMixedDecimals(t *testing.T) {
 	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000D3").Bytes())
 	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 
 	// 1e18 raw akra and 1e6 raw USDC are both one whole token after scaling.
 	poolID, _, err := app.AmmKeeper.CreatePoolWithType(
@@ -500,7 +505,7 @@ func TestCreatePoolFeeTiers(t *testing.T) {
 	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000D4").Bytes())
 	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 	deposit := sdkmath.NewInt(1_000_000)
 
 	// Constant product does not allow 7 bps.
@@ -594,7 +599,7 @@ func TestCreationFee(t *testing.T) {
 	fee := params.CreationFee.AmountOf(karsaNativeDenom())
 	require.True(t, fee.IsPositive())
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 	deposit := sdkmath.NewInt(1_000_000)
 
 	before := app.BankKeeper.GetBalance(ctx, sender, karsaNativeDenom()).Amount
@@ -618,7 +623,7 @@ func TestTwap(t *testing.T) {
 	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000AB").Bytes())
 	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 	poolID, _, err := app.AmmKeeper.CreatePool(
 		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 30,
 		sdkmath.NewInt(1_000_000), sdkmath.NewInt(1_000_000),
@@ -648,7 +653,7 @@ func TestAmmPrecompile(t *testing.T) {
 	initial := sdkmath.NewIntWithDecimal(1_000, 18)
 	fundTestDenoms(t, app, ctx, sdk.AccAddress(caller.Bytes()), initial)
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 	_, _, err := app.AmmKeeper.CreatePool(
 		ctx, sdk.AccAddress(caller.Bytes()), akraAsset.Hex(), testUSDCPair.Hex(), 30,
 		sdkmath.NewInt(1_000_000), sdkmath.NewInt(1_000_000),
@@ -724,7 +729,7 @@ func TestAmmPrecompileExternal(t *testing.T) {
 		token, denom, erc20types.OWNER_EXTERNAL,
 	)))
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 	sender := sdk.AccAddress(caller.Bytes())
 	_, _, err := app.AmmKeeper.CreatePool(
 		ctx, sender, akraAsset.Hex(), token.Hex(), 30,
@@ -782,7 +787,7 @@ func TestMultiPoolRouting(t *testing.T) {
 	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000D5").Bytes())
 	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 	deposit := sdkmath.NewInt(1_000_000)
 
 	pool5, _, err := app.AmmKeeper.CreatePool(
@@ -920,7 +925,7 @@ func TestPoolStatusTransitions(t *testing.T) {
 	sender := sdk.AccAddress(common.HexToAddress("0x00000000000000000000000000000000000000D6").Bytes())
 	fundTestDenoms(t, app, ctx, sender, sdkmath.NewIntWithDecimal(1_000, 18))
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 	deposit := sdkmath.NewInt(1_000_000)
 	poolID, shares, err := app.AmmKeeper.CreatePool(
 		ctx, sender, akraAsset.Hex(), testUSDCPair.Hex(), 30, deposit, deposit,
@@ -982,7 +987,7 @@ func TestExternalERC20Pool(t *testing.T) {
 		token, denom, erc20types.OWNER_EXTERNAL,
 	)))
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 	sender := sdk.AccAddress(deployer.Bytes())
 
 	poolID, shares, err := app.AmmKeeper.CreatePool(
@@ -1034,7 +1039,7 @@ func TestExternalIntegratorFee(t *testing.T) {
 		token, denom, erc20types.OWNER_EXTERNAL,
 	)))
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 	sender := sdk.AccAddress(deployer.Bytes())
 	_, _, err := app.AmmKeeper.CreatePool(
 		ctx, sender, akraAsset.Hex(), token.Hex(), 30,
@@ -1083,7 +1088,7 @@ func TestExternalExactOutAndRemove(t *testing.T) {
 		token, denom, erc20types.OWNER_EXTERNAL,
 	)))
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 	sender := sdk.AccAddress(deployer.Bytes())
 	poolID, shares, err := app.AmmKeeper.CreatePool(
 		ctx, sender, akraAsset.Hex(), token.Hex(), 30,
@@ -1138,7 +1143,7 @@ func TestStableSwapExternalERC20(t *testing.T) {
 		token, denom, erc20types.OWNER_EXTERNAL,
 	)))
 
-	akraAsset := common.HexToAddress(testconstants.WEVMOSContractMainnet)
+	akraAsset := akraERC20()
 	sender := sdk.AccAddress(deployer.Bytes())
 
 	poolID, _, err := app.AmmKeeper.CreatePoolWithType(
