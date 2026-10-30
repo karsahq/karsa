@@ -159,17 +159,9 @@ func (k Keeper) moveInWith(
 	}
 
 	if asset.ConvertContract != (common.Address{}) {
-		_, err := k.erc20Keeper.ConvertERC20IntoCoinsForNativeToken(
-			ctx,
-			k.evmStateDB(ctx, stateDB),
-			asset.ConvertContract,
-			amount,
-			sdk.AccAddress(k.moduleAddress.Bytes()),
-			from,
-			true,
-			fromPrecompile,
-		)
-		if err != nil {
+		if err := k.convertInWith(
+			ctx, k.evmStateDB(ctx, stateDB), fromPrecompile, asset, from, amount,
+		); err != nil {
 			return err
 		}
 		emitConversion(ctx, types.EventTypeConvertIn, asset, types.AttributeKeySender, from, amount)
@@ -183,6 +175,37 @@ func (k Keeper) moveInWith(
 		return types.ErrInsufficientFunds.Wrap(err.Error())
 	}
 	return nil
+}
+
+// convertInWith escrows an external ERC20 in the x/erc20 module and mints the
+// matching bank denom to the AMM module.
+//
+// It mirrors x/erc20's ConvertERC20IntoCoinsForNativeToken, with one difference:
+// the caller's stateDB is threaded through every EVM call, so the contract code
+// and accounts are loaded from the store once per conversion instead of once
+// per call. That is worth roughly a third of the conversion cost.
+func (k Keeper) convertInWith(
+	ctx sdk.Context, stateDB *statedb.StateDB, fromPrecompile bool,
+	asset resolvedAsset, from common.Address, amount sdkmath.Int,
+) error {
+	if !k.erc20Keeper.IsERC20Enabled(ctx) {
+		return types.ErrInvalidAsset.Wrap("erc20 conversion is disabled")
+	}
+
+	if err := k.evmTransferWith(
+		ctx, stateDB, fromPrecompile, asset.ConvertContract, from, erc20types.ModuleAddress, amount,
+	); err != nil {
+		return err
+	}
+
+	coins := sdk.NewCoins(sdk.NewCoin(asset.Denom, amount))
+	if err := k.bankKeeper.MintCoins(ctx, erc20types.ModuleName, coins); err != nil {
+		return err
+	}
+
+	return k.bankKeeper.SendCoinsFromModuleToAccount(
+		ctx, erc20types.ModuleName, sdk.AccAddress(k.moduleAddress.Bytes()), coins,
+	)
 }
 
 // moveOut moves funds from the module to an account.
@@ -232,7 +255,8 @@ func (k Keeper) convertOutWith(
 	}
 
 	if err := k.evmTransferWith(
-		ctx, stateDB, fromPrecompile, asset.ConvertContract, erc20types.ModuleAddress, to, amount,
+		ctx, k.evmStateDB(ctx, stateDB), fromPrecompile,
+		asset.ConvertContract, erc20types.ModuleAddress, to, amount,
 	); err != nil {
 		return err
 	}
