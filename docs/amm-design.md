@@ -310,6 +310,56 @@ custody(poolID) = hash("amm/custody/" + poolID)[:20]
 
 All messages reject `deadline` in the past and `min_out == 0`.
 
+### EVM precompile events
+
+The AMM precompile must emit **EVM logs**, not only Cosmos events. Without them a
+swap shows up in an EVM explorer as a call to `0x…0900` with no visible detail, and
+no generic indexer can build per-pool history.
+
+```solidity
+event PoolCreated(
+    uint64 indexed poolId,
+    address indexed assetA,
+    address indexed assetB,
+    uint8  poolType,
+    uint32 feeBps
+);
+
+event Swap(
+    address indexed sender,
+    uint64  indexed poolId,
+    address indexed tokenIn,
+    uint256 amountIn,
+    address tokenOut,
+    uint256 amountOut,
+    uint256 poolFee,
+    uint256 integratorFee
+);
+
+event LiquidityAdded(
+    address indexed provider,
+    uint64  indexed poolId,
+    uint256 amountA,
+    uint256 amountB,
+    uint256 shares
+);
+
+event LiquidityRemoved(
+    address indexed provider,
+    uint64  indexed poolId,
+    uint256 amountA,
+    uint256 amountB,
+    uint256 shares
+);
+```
+
+Rules:
+
+- Emit one `Swap` per hop, indexed by `poolId`, so history can be filtered per pool.
+- Emit from the precompile address (`0x…0900`); never from the token addresses.
+- Keep Cosmos events too: CLI and Cosmos tooling read those, EVM tooling reads logs.
+- Cost is ~2.5k–3k gas per swap (topics + data), roughly 3% of a bank-denom swap.
+
 ## 6. Queries
 
 | Query | Returns |
@@ -458,13 +508,15 @@ Open design points (ante path):
 - [ ] Integrator fee cap enforced, emitted in events, and returned by `Quote`
 - [ ] Decimal normalisation in every price/quote surface (18 vs 6 decimals)
 - [ ] Price display gated by a minimum-liquidity threshold and canonical pool
+- [ ] Precompile emits EVM logs (`PoolCreated`, `Swap`, `LiquidityAdded`, `LiquidityRemoved`) in
+  addition to Cosmos events, so explorers and indexers can build per-pool history
 
 ## 12. Phasing
 
 | Phase | Scope |
 |---|---|
 | 1 | Module skeleton, constant product, create/add/remove, exact-in and exact-out swap, `Quote`, integrator fee, 1–2 hop path, LP as bank denom + ERC20 precompile, precompile for `swap`/`quote`, TWAP |
-| 2 | Direct custody for external ERC20 pools (per-pool custody address, balance-derived reserves, `sync`/`skim`), multiple fee-tier pools per pair, pool status and governance guard |
+| 2 | Direct custody for external ERC20 pools (per-pool custody address, balance-derived reserves, `sync`/`skim`), EVM logs on the precompile, multiple fee-tier pools per pair, pool status and governance guard |
 | 3 | Bounded multi-hop route search; custody hardening and failure-mode tests (fee-on-transfer, donation, rebasing, paused token) |
 | 4 | ERC-4337 paymaster for ERC20 contracts (separate project) |
 
@@ -568,6 +620,35 @@ Pools have **no contract address** — they are identified by `poolID`. So the
 
 A deterministic pseudo-address for display (`hash("amm/pool/" + id)`) is possible
 but must never be presented as a contract, since nothing exists at that address.
+
+### Where a pool appears in an explorer
+
+Pools have **no address**; they are module state keyed by `poolID`. Three anchors do
+exist in the EVM:
+
+| Anchor | Address | What it shows |
+|---|---|---|
+| AMM precompile | `0x…0900` | every EVM-originated swap, add and remove |
+| LP token | deterministic (`LPAssetAddress`) | LP balances and transfers — the closest thing to a pool address |
+| `poolID` | not an address | queries and UI routes |
+
+| User wants to see | Where |
+|---|---|
+| my LP balance and transfers | EVM explorer, as the LP token |
+| my swap history | EVM explorer, transactions to the precompile address |
+| swap detail (pool, amounts, fee) | the `Swap` log (§5), plus Cosmos events |
+| reserves, fee tier, TWAP | `x/amm` query or the Karsa UI |
+| a specific pool | `/pool/{id}` in the Karsa UI |
+
+Notes:
+
+- A swap sent as a **Cosmos message** never appears in the EVM explorer; only
+  EVM-originated calls to the precompile do. Either route EVM-connected users
+  through the precompile or provide a Cosmos-side explorer.
+- The LP token is the only shareable, verifiable address associated with a pool.
+  Do not invent a pool pseudo-address.
+- Per-pool history is only possible once the precompile emits `Swap` logs; state
+  alone cannot be queried historically.
 
 ## 15. Out of scope (for now)
 
