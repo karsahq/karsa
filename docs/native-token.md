@@ -259,21 +259,32 @@ Transfer yang ditolak oleh kebijakan `config/permissions.go` **harus**:
 
 ## 11. Integrasi explorer
 
-Blockscout mendeteksi token lewat panggilan ERC20 ke alamat. Precompile merespons,
-tetapi **belum pernah diuji di Karsa** — ini item verifikasi, bukan asumsi.
+Blockscout mendeteksi token lewat `eth_getCode` dan panggilan ERC20 (`eth_call`),
+lalu mengikuti perpindahan saldo lewat `eth_getLogs` dan
+`eth_getTransactionReceipt`. Permukaan RPC itu **sudah diuji di Karsa** lewat
+`tests/e2e/smoke.sh`; instance Blockscout penuh belum dijalankan di CI karena
+butuh Postgres/Redis/Docker.
 
-| Uji | Kriteria lulus |
-|---|---|
-| Deteksi token | alamat muncul sebagai token, bukan akun biasa |
-| Metadata | nama, simbol, desimal sesuai |
-| Event transfer | muncul di tab transfer dan menghitung saldo |
-| Perubahan saldo | saldo holder ter-update setelah transfer |
-| Mint/burn | supply ter-update |
-| Token holder list | daftar holder terisi |
-| Badge `verified` | ditampilkan dan membedakan unverified |
+| Uji | Status | Bukti |
+|---|---|---|
+| Deteksi token (`eth_getCode`) | **lulus** | precompile mengembalikan bytecode ERC20 |
+| Metadata (`name`, `symbol`, `decimals`) | **lulus** | nilai sesuai metadata bank (`USDC`, 6) |
+| Event transfer (`eth_getLogs`) | **lulus** | topik `Transfer` ditemukan |
+| Perubahan saldo (`balanceOf`) | **lulus** | saldo penerima berubah setelah transfer |
+| Receipt transaksi | **lulus** | `status=0x1`, log transfer ada di receipt |
+| Mint/burn di explorer | belum diuji | log EVM sudah ada; indexing explorer belum |
+| Token holder list | belum diuji | butuh indexer Blockscout |
+| Badge `verified` | belum diimplementasikan | butuh integrasi registry → explorer |
 
-Jika Blockscout tidak mengindeks precompile dinamis, perlu penanganan khusus —
-dan janji "muncul otomatis" tidak boleh dibuat sebelum terbukti.
+**Syarat metadata.** Precompile ERC20 mengambil `name`/`symbol`/`decimals`
+dari metadata bank. Denom bank tanpa metadata akan **revert** pada ketiga
+panggilan itu, sehingga Blockscout tidak bisa menampilkan token. Native token
+Karsa selalu menulis metadata saat pembuatan; aset yang didaftarkan manual
+harus melakukan hal yang sama.
+
+Langkah berikutnya adalah menjalankan instance Blockscout sungguhan terhadap
+node Karsa dan memverifikasi holder list serta badge. Sampai itu dilakukan,
+janji "token otomatis muncul di explorer" tetap belum boleh dibuat.
 
 Sediakan `IERC20.sol` referensi di dokumentasi untuk integrasi, meskipun tidak ada
 source yang bisa diverifikasi.

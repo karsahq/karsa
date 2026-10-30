@@ -89,6 +89,30 @@ pair = {
 erc20["token_pairs"].append(pair)
 erc20["dynamic_precompiles"].append(pair["erc20_address"])
 
+# The ERC20 precompile reads name/symbol/decimals from bank metadata. Without
+# it those calls revert, so Blockscout cannot display the token even though the
+# precompile exists.
+genesis["app_state"]["bank"]["denom_metadata"].append({
+    "description": "USD Coin test asset",
+    "denom_units": [
+        {"denom": "uusdc", "exponent": 0, "aliases": []},
+        {"denom": "usdc", "exponent": 6, "aliases": []},
+    ],
+    "base": "uusdc",
+    "display": "usdc",
+    "name": "USD Coin",
+    "symbol": "USDC",
+    "uri": "",
+    "uri_hash": "",
+})
+
+# EVM transactions are checked against the block gas limit at admission. The
+# Cosmos default of -1 (unlimited) is read as zero by the EVM mempool, so an
+# ordinary EVM transfer is rejected as exceeding the block gas limit. Mirror
+# the production consensus values from local_node.sh / docs/tokenomics.md.
+genesis["consensus"]["params"]["block"]["max_bytes"] = "3000000"
+genesis["consensus"]["params"]["block"]["max_gas"] = "100000000"
+
 with open(path, "w") as f:
     json.dump(genesis, f, separators=(",", ":"))
 PY
@@ -104,6 +128,7 @@ grep -q '^type = "app"' "$CONFIG_TOML" || fail "could not enable the app-side me
 step "start node"
 "$BIN" start --home "$HOME_DIR" \
   --chain-id "$CHAIN_ID" \
+  --keyring-backend "$KEYRING" \
   --minimum-gas-prices=0akra \
   --evm.min-tip=0 \
   --json-rpc.enable=true \
@@ -218,5 +243,61 @@ POOL_JSON="$("$BIN" q amm pool --pool-id 1 --node tcp://127.0.0.1:26657 --home "
 RESERVES_AFTER="$(printf '%s' "$POOL_JSON" | python3 -c 'import json,sys; p=json.load(sys.stdin)["pool"]; print(p["reserve_a"], p["reserve_b"])')"
 [[ "$RESERVES_AFTER" != "$RESERVES_BEFORE" ]] || fail "swap did not move the reserves"
 printf 'swap moved reserves: %s -> %s\n' "$RESERVES_BEFORE" "$RESERVES_AFTER"
+
+# Blockscout discovers ERC20 tokens through eth_getCode and eth_call, and
+# follows balances through Transfer logs. Exercise that exact surface against
+# the dynamic precompile so an explorer regression is caught here.
+step "check the explorer RPC surface"
+rpc() {
+  local timeout="${2:-5}"
+  curl -s -m "$timeout" -X POST -H 'Content-Type: application/json' -d "$1" "$RPC_URL"
+}
+VAL_EVM="$("$BIN" debug addr "$VAL_ADDR" --home "$HOME_DIR" | sed -nE 's/.*Address hex: (0x[0-9a-fA-F]+).*/\1/p')"
+RECIP_EVM="$("$BIN" debug addr "$RECIP_ADDR" --home "$HOME_DIR" | sed -nE 's/.*Address hex: (0x[0-9a-fA-F]+).*/\1/p')"
+[[ -n "$VAL_EVM" && -n "$RECIP_EVM" ]] || fail "could not derive EVM addresses"
+
+code_json="$(rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getCode\",\"params\":[\"$USDC_ASSET\",\"latest\"]}")"
+printf '%s' "$code_json" | grep -q '"result":"0x[0-9a-fA-F]' || fail "precompile has no code: $code_json"
+
+call_json() {
+  rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_call\",\"params\":[{\"to\":\"$USDC_ASSET\",\"data\":\"$1\"},\"latest\"]}"
+}
+for selector in 0x06fdde03 0x95d89b41 0x313ce567 0x18160ddd; do
+  out="$(call_json "$selector")"
+  printf '%s' "$out" | grep -q '"result":"0x' || fail "ERC20 metadata call $selector failed: $out"
+done
+decimals_hex="$(call_json 0x313ce567 | sed -nE 's/.*"result":"0x0*([0-9a-fA-F]+)".*/\1/p')"
+[[ "$decimals_hex" == "6" ]] || fail "decimals is not 6: $decimals_hex"
+printf 'precompile exposes ERC20 metadata (decimals=%s)\n' "$decimals_hex"
+
+balance_before="$(call_json "0x70a08231000000000000000000000000${RECIP_EVM:2}")"
+printf '%s' "$balance_before" | grep -q '"result":"0x' || fail "balanceOf failed: $balance_before"
+
+block_before="$(rpc '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' | sed -nE 's/.*"result":"(0x[0-9a-fA-F]+)".*/\1/p')"
+transfer_data="0xa9059cbb000000000000000000000000${RECIP_EVM:2}00000000000000000000000000000000000000000000000000000000000003e8"
+send_json="$(rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_sendTransaction\",\"params\":[{\"from\":\"$VAL_EVM\",\"to\":\"$USDC_ASSET\",\"gas\":\"0x100000\",\"gasPrice\":\"0x0\",\"data\":\"$transfer_data\"}]}")"
+EVM_HASH="$(printf '%s' "$send_json" | sed -nE 's/.*"result":"(0x[0-9a-fA-F]+)".*/\1/p')"
+[[ -n "$EVM_HASH" ]] || fail "eth_sendTransaction failed: $send_json"
+printf 'EVM tx submitted: %s\n' "$EVM_HASH"
+
+# eth_getTransactionReceipt retries internally for ~50s when the tx is not yet
+# indexed. Wait for the tx to be included first; otherwise every short client
+# timeout leaves a retry loop running server-side and the test appears stuck.
+for _ in $(seq 1 20); do
+  block_now="$(rpc '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' | sed -nE 's/.*"result":"(0x[0-9a-fA-F]+)".*/\1/p')"
+  if [[ -n "$block_now" && -n "$block_before" ]] && (( block_now >= block_before + 2 )); then break; fi
+  sleep 1
+done
+receipt_json="$(rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getTransactionReceipt\",\"params\":[\"$EVM_HASH\"]}" 60)"
+printf '%s' "$receipt_json" | grep -q '"status":"0x1"' || fail "EVM transfer receipt missing or failed: $receipt_json"
+printf 'EVM receipt confirmed\n'
+
+logs_json="$(rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getLogs\",\"params\":[{\"address\":\"$USDC_ASSET\",\"fromBlock\":\"0x0\",\"toBlock\":\"latest\",\"topics\":[\"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\"]}]}")"
+printf '%s' "$logs_json" | grep -q '"result":\[{.*ddf252ad' || fail "Transfer log missing: $logs_json"
+printf 'Transfer log indexed\n'
+
+balance_after="$(call_json "0x70a08231000000000000000000000000${RECIP_EVM:2}")"
+[[ "$balance_after" != "$balance_before" ]] || fail "ERC20 balance did not change"
+printf 'explorer RPC surface: code, metadata, receipt, Transfer log, balance OK\n'
 
 printf '\nSMOKE TEST PASSED\n'
