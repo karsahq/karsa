@@ -37,5 +37,11 @@ middleware because `erc20/v2` implements `IBCModule` but not
 acknowledgement, timeout, ERC20 conversion, the ICS20 precompile, and both the
 receive-side and source-side EVM callbacks (ack and timeout).
 
+## Minimal live relayer
+
+The experimental one-way relayer and its Karsa/Gaia harnesses now live in
+[`karsahq/ibc-ferry`](https://github.com/karsahq/ibc-ferry), on the
+`prototype/python` branch. The `main` branch is reserved for the Go port.
+
 Peers must support IBC v2 to connect. Do not expect channel-based Cosmos chains
 to interoperate with Karsa.
