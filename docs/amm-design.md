@@ -1,12 +1,13 @@
 # Karsa AMM — Design
 
-Status: **in progress** — `x/amm` implements constant-product and two-asset
+Status: **in progress** (phases 1–2 done; phase 3 in progress) — `x/amm` implements constant-product and two-asset
 stableswap pools, **in-kind custody (bank denoms stay in the ledger, external ERC20s
 are held at a per-pool custody address)**, multiple pools per pair selected by fee tier,
 integrator fees, exact-in and exact-out swaps, LP shares with an ERC20 precompile,
 an EVM precompile (`quote`, `getPool`, `getPoolById`, `getPools`, `swapExactIn`), and a cumulative-price TWAP.
-Remaining: direct-custody migration for external ERC20 pools and bounded multi-hop route search.
-Fee abstraction (paying gas in a token) is **descoped**.
+Direct custody for external ERC20 pools is implemented. Remaining: bounded
+multi-hop route search and further custody hardening. Fee abstraction (paying gas
+in a token) is **descoped**.
 
 ## 1. Goals
 
@@ -26,7 +27,7 @@ Fee abstraction (paying gas in a token) is **descoped**.
 | D5 | Routing: caller supplies the path; on-chain path search is bounded | Uniswap v2 semantics; predictable gas, no unbounded search |
 | D6 | **Multiple pools per pair**, keyed by `(assetA, assetB, poolType, feeBps)`; max 6 per pair | Fee competition and anti-squatting without concentrated liquidity |
 | D7 | Fee tiers are fixed per pool type: constant product `5/10/30` bps, stableswap `1/3/5` bps | Predictable UX, bounded routing, no fee spam |
-| D8 | Integrator fee is capped at 100 bps and charged **before** conversion | User protection; integrator revenue stays separate from LP revenue |
+| D8 | Integrator fee is capped at 100 bps and charged **before** custody (and any conversion) | User protection; integrator revenue stays separate from LP revenue |
 | D9 | Pool status: `ACTIVE` or `WITHDRAW_ONLY`; there is no `CLOSED` or automatic `INACTIVE` state | Keeps the emergency brake but avoids a governance kill switch |
 
 ### Why pools are keyed by ERC20 address
@@ -90,7 +91,7 @@ holds whichever asset it trades, in that asset's own form:
 For an external ERC20 the pool keeps the tokens at a **per-pool custody address**:
 
 ```
-custody(poolID) = hash("amm/custody/" + poolID)[:20]
+custody(poolID) = sha256("amm/custody/" + poolID)[12:]
 
 input  : user --transferFrom--> custody(pool)
 output : custody(pool) --transfer--> user
@@ -263,29 +264,31 @@ both scaling factors and `status`; `getPools` returns every pool id for a pair.
 
 ### Pool status and governance guard
 
-`PoolStatus` prevents LPs from being trapped when the conversion layer is disabled:
+`PoolStatus` is the emergency brake for pools:
 
 | Status | Swap | Add liquidity | Remove liquidity |
 |---|---|---|---|
 | `ACTIVE` | ✅ | ✅ | ✅ |
 | `WITHDRAW_ONLY` | ❌ | ❌ | ✅ |
 
-- Governance may move a pool to `WITHDRAW_ONLY` at any time. This is the emergency path.
-- A pool may return to `ACTIVE` only if `x/erc20` conversion is enabled for both external assets.
-- There is no `CLOSED` or automatic `INACTIVE` state. A pool with no redeemable shares remains in
-  state; the residual locked reserve is never redeemable.
-- `EndBlock` runs `SyncPoolStatuses`: an `ACTIVE` pool with an external leg is downgraded to
-  `WITHDRAW_ONLY` when `x/erc20` is disabled globally or its token pair is disabled. It never
-  upgrades a pool automatically; governance must set `ACTIVE` again after conversion is restored.
-- `x/erc20` governance cannot be intercepted directly (it is an upstream module). The on-chain guard
-  is the automatic downgrade plus the `ACTIVE` transition check in `MsgSetPoolStatus`.
+- Governance may move a pool to `WITHDRAW_ONLY` at any time and may return it to `ACTIVE`.
+- There is no `CLOSED` state. The custody guard can downgrade a pool to `WITHDRAW_ONLY`, but no
+  code path upgrades it automatically. A pool with no redeemable shares remains in state; the
+  residual locked reserve is never redeemable.
+- With direct custody there is no `x/erc20` conversion dependency to guard. The pool works as long
+  as the token contracts accept transfers.
+- `MsgCheckPool` verifies the custody invariant. A shortfall downgrades the pool to
+  `WITHDRAW_ONLY`; the inline inbound transfer guard does the same. No code path upgrades a pool
+  automatically.
+- A paused or blacklisted token can make transfers fail. The pool cannot trade until the token
+  works again; custody remains intact, and holders can remove liquidity when transfers resume.
 
 ### Custody boundary
 
 Each pool has its own custody address, derived from the pool id:
 
 ```
-custody(poolID) = hash("amm/custody/" + poolID)[:20]
+custody(poolID) = sha256("amm/custody/" + poolID)[12:]
 ```
 
 - Input is pulled with `transferFrom(user → custody(pool))`.
@@ -318,9 +321,11 @@ custody(poolID) = hash("amm/custody/" + poolID)[:20]
 | `MsgSwapExactIn{sender, path[], pool_ids[], amount_in, min_out, receiver, deadline, integrator, integrator_fee_bps}` | user | `path` is a list of `AssetID`; `pool_ids[i]` selects the pool for hop `i`; empty `pool_ids` auto-selects the best single pool |
 | `MsgSwapExactOut{sender, path[], pool_ids[], amount_out, max_amount_in, receiver, deadline, integrator, integrator_fee_bps}` | user | bounded by `max_amount_in`; integrator fee is grossed up on top of the pool input |
 | `MsgSetPoolStatus{authority, pool_id, status}` | governance | `ACTIVE` / `WITHDRAW_ONLY`; guard rules in §4 |
-| `MsgUpdateParams{authority, params}` | governance | fee tiers, caps, `max_pools_per_pair` |
+| `MsgDonatePool{sender, pool_id}` | anyone | adopts excess custody balances into the reserve without minting shares |
+| `MsgCheckPool{sender, pool_id}` | anyone | verifies the custody invariant and downgrades on a shortfall |
+| `MsgUpdateParams{authority, params}` | governance | fee tiers, caps, `max_pools_per_pair`, `creation_fee` |
 
-All messages reject `deadline` in the past and `min_out == 0`.
+Swap messages treat `deadline = 0` as no deadline and reject nonzero deadlines in the past. `min_out` is enforced by the swap path.
 
 ### EVM precompile events
 
@@ -492,8 +497,8 @@ Open design points (ante path):
 - [ ] TWAP manipulation (window length, minimum liquidity, deviation cap)
 - [ ] Sandwich/JIT liquidity: `min_out` mandatory, consider private orderflow for fee swaps
 - [ ] Reentrancy: precompile entrypoint and custody boundary
-- [ ] Pool status transitions: only governance; `ACTIVE <-> WITHDRAW_ONLY`
-- [ ] Custody guard: `SyncPoolStatuses` downgrades pools whose custody is unusable to `WITHDRAW_ONLY`
+- [x] Pool status transitions: governance sets `ACTIVE`/`WITHDRAW_ONLY`; the custody guard may downgrade to `WITHDRAW_ONLY`
+- [x] Custody guard: `MsgCheckPool` and the inline inbound guard downgrade short pools to `WITHDRAW_ONLY`
 - [ ] Custody invariant: `balanceOf(custody(pool)) == reserve`; a shortfall means the pool is
   undercollateralised and must not stay `ACTIVE`
 - [ ] AMM module excluded from `BlockedAddresses`; precompile address still blocked
@@ -501,8 +506,8 @@ Open design points (ante path):
 - [ ] Fixed fee tiers per pool type; no arbitrary fee values
 - [ ] Total fee cap (`pool + integrator`) and quote breakdown
 - [ ] Pool creation spam: `min_initial_liquidity`, creation fee, tier whitelist
-- [ ] Token viability: a paused or blacklisted token must not brick unrelated pools; that pool degrades
-  to `WITHDRAW_ONLY` while custody remains withdrawable
+- [ ] Token viability: a paused or blacklisted token must not brick unrelated pools; mark that pool
+  `WITHDRAW_ONLY` if its custody becomes unusable, while custody remains withdrawable
 - [ ] Deterministic addresses: assert no collision between LP asset addresses and existing pairs
 - [ ] Integrator fee cap enforced, emitted in events, and returned by `Quote`
 - [ ] Decimal normalisation in every price/quote surface (18 vs 6 decimals)
@@ -512,12 +517,12 @@ Open design points (ante path):
 
 ## 12. Phasing
 
-| Phase | Scope |
+| Phase | Status |
 |---|---|
-| 1 | Module skeleton, constant product, create/add/remove, exact-in and exact-out swap, `Quote`, integrator fee, 1–2 hop path, LP as bank denom + ERC20 precompile, precompile for `swap`/`quote`, TWAP |
-| 2 | Direct custody for external ERC20 pools (per-pool custody address, verified inbound delta, `MsgDonatePool`), EVM logs on the precompile, multiple fee-tier pools per pair, pool status and governance guard |
-| 3 | Bounded multi-hop route search; custody hardening and failure-mode tests (fee-on-transfer, donation, rebasing, paused token) |
-| 4 | ERC-4337 paymaster for ERC20 contracts (separate project) |
+| 1 | Done — module skeleton, constant product, create/add/remove, exact-in and exact-out swap, `Quote`, integrator fee, 1–2 hop path, LP as bank denom + ERC20 precompile, precompile for `swap`/`quote`, TWAP |
+| 2 | Done — direct custody for external ERC20 pools (per-pool custody address, verified inbound delta, `MsgDonatePool`), `Swap` EVM logs, multiple fee-tier pools per pair, pool status and custody guard |
+| 3 | In progress — bounded multi-hop route search; custody hardening and failure-mode tests (fee-on-transfer, donation, rebasing, paused token) |
+| 4 | Descoped — ERC-4337 paymaster for ERC20 contracts |
 
 Fee abstraction remains descoped (see §10).
 
@@ -539,13 +544,13 @@ user pays 0.5%
 | Integrator fee | `integrator_fee_bps`, optional, default 0 |
 | Integrator cap | `params.max_integrator_fee_bps` (default 100 = 1.00%) |
 | Total cap | `params.max_total_fee_bps` (default 130 = 1.30%) |
-| Token | taken from the **input** token before conversion |
+| Token | taken from the **input** token before custody (and any conversion) |
 | Multi-hop | charged once per swap, not per hop |
 | Events | `swap{sender, integrator, integrator_fee, pool_fee, total_fee, amount_in, amount_out}` |
 
 Notes:
 
-- The fee is deducted before the pool math and before conversion: `amountInForPool = amountIn - integratorFee`.
+- The fee is deducted before the pool math and before custody: `amountInForPool = amountIn - integratorFee`.
 - For exact-output swaps the fee is grossed up on top of the pool input so it stays a percentage of
   the total amount paid: `totalIn = poolIn + ceil(poolIn * bps / (10_000 - bps))`.
 - Nominal total is `poolFee + integratorFee`; effective total is
@@ -651,8 +656,8 @@ Notes:
 
 ## 15. Out of scope (for now)
 
-- A token factory module (tokens are `akra`, IBC vouchers, ERC20 contracts, or native tokens — see
-  `docs/native-token.md`)
+- A separate generic token factory beyond `x/nativetoken` (tokens are `akra`, IBC vouchers, ERC20
+  contracts, or native tokens — see `docs/native-token.md`)
 - Referral / revenue-share of the pool fee (only integrator fees are supported)
 - On-chain order book / CLOB (limit orders are implemented as `min_out` swaps)
 - Solidity AMM/router contracts

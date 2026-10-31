@@ -1,133 +1,134 @@
 # Karsa Precompiles
 
-Dua jenis precompile di Karsa, dengan siklus hidup yang berbeda.
+Karsa has two kinds of precompiles with different lifecycles.
 
-| | **Statis** | **Dinamis** |
+| | **Static** | **Dynamic** |
 |---|---|---|
-| Jumlah | tetap, saat ini 11 | satu per aset |
-| Alamat | konstanta protokol (`0x…0100`–`0x…09ff`) | diturunkan dari denom/alamat |
-| Didaftarkan | genesis atau `evm.params.active_static_precompiles` | runtime lewat `x/erc20.EnableDynamicPrecompile` |
-| Diubah oleh | governance (`MsgUpdateParams` ke `x/vm`) | modul pemilik aset |
-| Contoh | Bank, AMM, Staking | LP token, voucher IBC, native token `n:0x…` |
+| Count | fixed, currently 13 | one per asset |
+| Address | protocol constant (`0x…0100`–`0x…09ff`) | derived from denom/address |
+| Registered | genesis or `evm.params.active_static_precompiles` | at runtime via `x/erc20.EnableDynamicPrecompile` |
+| Changed by | governance (`MsgUpdateParams` to `x/vm`) | the module that owns the asset |
+| Examples | Bank, AMM, Staking | LP token, IBC voucher, native token `n:0x…` |
 
-## 1. Precompile statis yang aktif
+## 1. Active static precompiles
 
-Default genesis mengambil `evmtypes.AvailableStaticPrecompiles` (10 entri) dan
-menambahkan AMM (`genesis.go:33`).
+Default genesis takes `evmtypes.AvailableStaticPrecompiles` and adds three Karsa
+precompiles: AMM, token factory, and token minter (`genesis.go`).
 
-| Alamat | Nama | Jenis | Fungsi |
+| Address | Name | Type | Function |
 |---|---|---|---|
-| `0x…0100` | P256 | stateless | verifikasi tanda tangan secp256r1 |
-| `0x…0400` | Bech32 | stateless | konversi alamat hex ↔ bech32 |
-| `0x…0800` | Staking | module | operasi staking |
-| `0x…0801` | Distribution | module | reward dan distribusi |
-| `0x…0802` | ICS20 | module | transfer IBC |
-| `0x…0803` | Vesting | module | akun vesting |
-| `0x…0804` | Bank | module | saldo, supply, send |
+| `0x…0100` | P256 | stateless | secp256r1 signature verification |
+| `0x…0400` | Bech32 | stateless | hex ↔ bech32 address conversion |
+| `0x…0800` | Staking | module | staking operations |
+| `0x…0801` | Distribution | module | rewards and distribution |
+| `0x…0802` | ICS20 | module | IBC transfer |
+| `0x…0803` | Vesting | module | vesting accounts |
+| `0x…0804` | Bank | module | balances, supply, send |
 | `0x…0805` | Gov | module | governance |
 | `0x…0806` | Slashing | module | slashing |
 | `0x…0807` | ICS02 | module | IBC client |
 | `0x…0900` | AMM | Karsa | swap, quote, getPool, liquidity |
-| **`0x…0901`** | **Token Factory** | **Karsa** | `createToken` — membuat native token dari kontrak |
-| **`0x…0902`** | **Token Minter** | **Karsa** | `mint`/`burn` atas nama controller token |
+| **`0x…0901`** | **Token Factory** | **Karsa** | `createToken` — create a native token from a contract |
+| **`0x…0902`** | **Token Minter** | **Karsa** | `mint`/`burn` on behalf of the token controller |
 
-## 2. Satu sumber kebenaran
+## 2. Single source of truth
 
-Daftar statis dibangun oleh `NewEVMGenesisState` (`genesis.go`) dan dipakai oleh
-`App.DefaultGenesis` (`app.go`). `karsad init` sekarang memakai `App.DefaultGenesis`
-lewat wrapper `NewInitCmd` (`cmd/karsad/cmd/init.go`), sehingga chain baru langsung
-memperoleh seluruh precompile aktif.
+The static list is built by `NewEVMGenesisState` (`genesis.go`) and used by
+`App.DefaultGenesis` (`app.go`). `karsad init` uses the same `BasicModuleManager`
+through `genutilcli.InitCmd` (`cmd/karsad/cmd/root.go`), so a new chain starts
+with every active precompile.
 
-> Sebelumnya `karsad init` memakai `BasicModuleManager.DefaultGenesis`, yang hanya
-> berisi default per-modul dan **tidak** menyertakan daftar precompile. Chain hasil
-> `init` karenanya tidak memiliki precompile yang berfungsi, dan `local_node.sh`
-> menutupinya dengan menambal genesis lewat `jq`. Patch itu sudah dihapus.
+> Previously `karsad init` used `BasicModuleManager.DefaultGenesis`, which only
+> contained per-module defaults and **did not** include the precompile list. A
+> newly initialised chain therefore had no working precompiles, and
+> `local_node.sh` hid the problem by patching genesis through `jq`. That patch
+> has been removed.
 
-Yang perlu dijaga sekarang hanya `NewEVMGenesisState`: menambah precompile berarti
-menambahkannya di sana, dan `genesis_test.go` menjaga ketiga alamat Karsa.
+The only place to maintain is `NewEVMGenesisState`: adding a precompile means
+adding it there, and `genesis_test.go` locks the three Karsa addresses.
 
-## 3. Alamat tetap Karsa
+## 3. Fixed Karsa addresses
 
-| Apa | Alamat |
+| Item | Address |
 |---|---|
-| Native coin KRA | bukan kontrak — currency jaringan, 18 desimal |
-| ERC20 view dari `akra` | `0xd9171c1192d82ecd4f71dec2ee0264769af9531e` |
+| Native coin KRA | not a contract — network currency, 18 decimals |
+| ERC20 view of `akra` | `0xd9171c1192d82ecd4f71dec2ee0264769af9531e` |
 | AMM | `0x…0900` |
 | Token factory | `0x…0901` |
 | Token minter | `0x…0902` |
-| Token native user | diturunkan dari denom `n:0x…` |
-| Aset IBC | diturunkan dari trace hash |
+| User native token | derived from `(creator, sequence)`; denom `n:0x…` |
+| IBC asset | derived from the trace hash |
 
-`0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE` adalah penanda EIP-7528
-("aset native" di token list), **bukan** kontrak: tidak ada kode di sana. Jangan
-didaftarkan sebagai precompile; Karsa tidak membutuhkannya karena precompile
-`akra` dibaca langsung dari bank ledger, tanpa langkah wrap seperti WETH.
+`0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE` is the EIP-7528 marker for a
+native asset in token lists, **not** a contract: there is no code there. Do not
+register it as a precompile; Karsa does not need it because the `akra` precompile
+reads directly from the bank ledger, with no WETH-style wrap step.
 
-### Alamat `akra`
+### The `akra` address
 
-`NewErc20GenesisState` mendaftarkan pasangan native pada alamat deterministik:
+`NewErc20GenesisState` registers the native pair at a deterministic address:
 
 ```
 address = sha256("karsa/erc20/akra")[12:]
         = 0xd9171c1192d82ecd4f71dec2ee0264769af9531e
 ```
 
-Konstanta hidup di `config.NativeERC20Address`; `config/config_test.go` mengunci
-nilainya ke derivasi di atas. Alamat ini bagian dari genesis: mengubahnya berarti
-mengubah identitas ERC20 dari aset native dan memutus wallet, pool, serta explorer
-yang sudah menyimpannya. Jangan menyalin alamat dari chain lain (sebelumnya Karsa
-memakai alamat WEVMOS milik Evmos).
+The constant lives in `config.NativeERC20Address`; `config/config_test.go` locks
+it to the derivation above. This address is part of genesis: changing it changes
+the ERC20 identity of the native asset and breaks wallets, pools, and explorers
+that already stored it. Do not copy an address from another chain (Karsa
+previously used Evmos's WEVMOS address).
 
-## 4. Biaya gas: tidak ada
+## 4. Gas cost: none
 
-Precompile statis **tidak menambah biaya gas** per panggilan EVM. `stateDB.Prepare`
-memasukkan semuanya ke access list tanpa menagih gas.
+Static precompiles **do not add gas per EVM call**. `stateDB.Prepare` adds all of
+them to the access list without charging gas.
 
-Ini sudah diukur dan hipotesis sebaliknya sudah dibuktikan salah: pernah
-diperkirakan 11 precompile × 2.400 gas = 26.400 gas per panggilan, ternyata angka
-itu tidak muncul di hasil pengukuran. Jangan mengoptimasi ke arah itu lagi.
+This was measured, and the opposite hypothesis was disproved: an earlier estimate
+of 13 precompiles × 2,400 gas = 31,200 gas per call never appeared in the
+measurements. Do not optimise in that direction again.
 
-Konsekuensinya: memilih 11 atau 20 precompile tidak mengubah performa. Yang
-berubah hanya permukaan serangan, karena setiap precompile adalah kode yang dapat
-dipanggil dari EVM.
+Consequently, choosing 13 or 20 precompiles does not change performance. It only
+changes the attack surface, because every precompile is code callable from the
+EVM.
 
-## 5. Precompile yang direncanakan
+## 5. Planned precompiles
 
-Belum ada. Kandidat berikutnya adalah `permit` (EIP-2612) pada precompile ERC20
-token, jika ternyata bisa diimplementasikan dengan aman.
+None. The next candidate is `permit` (EIP-2612) on the ERC20 token precompile, if
+it can be implemented safely.
 
-Lihat `docs/native-token.md` untuk model kepemilikan dan alur pembuatan token.
+See `docs/native-token.md` for the ownership model and token creation flow.
 
-## 6. Checklist menambah precompile statis
+## 6. Checklist for adding a static precompile
 
-- [ ] Tentukan alamat di rentang `0x…09xx`, di luar yang sudah terpakai
-- [ ] Tambahkan ke `genesis.go` (`NewEVMGenesisState`)
-- [ ] Tambahkan ke `local_node.sh` (patch `jq`)
-- [ ] Daftarkan implementasinya di `app.go` / `precompiles` module
-- [ ] Pastikan alamatnya masuk `config/permissions.go` (blocked addresses) agar
-      tidak bisa menerima transfer dana secara tidak sengaja
-- [ ] Tambahkan ke `IAmm.sol`-style interface Solidity + NatSpec
-- [ ] Emit EVM log untuk operasi yang mengubah state, bukan hanya Cosmos event
-- [ ] Tes: pemanggilan dari EOA, dari kontrak, reentrancy, dan alamat terblokir
-- [ ] Verifikasi `karsad q evm params` menampilkan alamat baru
+- [ ] Choose an address in the `0x…09xx` range, outside the used addresses
+- [ ] Add it to `genesis.go` (`NewEVMGenesisState`)
+- [ ] Register its implementation in `app.go` / the `precompiles` module
+- [ ] Update `genesis_test.go` so the new address is locked
+- [ ] Make sure the address is in `config/permissions.go` (blocked addresses) so
+      it cannot accidentally receive funds
+- [ ] Add a Solidity interface + NatSpec, following `IAmm.sol`
+- [ ] Emit EVM logs for state-changing operations, not only Cosmos events
+- [ ] Test calls from an EOA, from a contract, reentrancy, and blocked addresses
+- [ ] Verify `karsad q evm params` shows the new address
 
-## 7. Precompile dinamis
+## 7. Dynamic precompiles
 
-Didaftarkan lewat `x/erc20`:
+Registered through `x/erc20`:
 
 ```go
 erc20Keeper.SetToken(ctx, erc20types.NewTokenPair(address, denom, erc20types.OWNER_MODULE))
 erc20Keeper.EnableDynamicPrecompile(ctx, address)
 ```
 
-Yang memakai jalur ini:
+Assets that use this path:
 
-| Aset | Alamat |
+| Asset | Address |
 |---|---|
-| Denom native non-EVM yang di-pair | diturunkan dari denom |
-| Voucher IBC | diturunkan dari trace hash |
+| Non-EVM native denom that is paired | derived from the denom |
+| IBC voucher | derived from the trace hash |
 | LP token | `LPAssetAddress("amm/pool/{id}")` |
-| Native token | `hash(creator, sequence)[:20]` |
+| Native token | `sha256("karsa/native/" + creator + "/" + sequence)[12:]` |
 
-Pendaftaran ini juga membuat akun EVM dengan code hash ERC20, sehingga alamatnya
-lolos pemeriksaan `isContract()` pada integrasi pihak ketiga.
+Registration also creates an EVM account with the ERC20 code hash, so the
+address passes `isContract()` checks in third-party integrations.

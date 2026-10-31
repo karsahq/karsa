@@ -1,373 +1,372 @@
 # Karsa Native Token
 
-Token yang memakai **interface ERC20** tetapi **tidak men-deploy kontrak ERC20**.
-Saldo disimpan di bank ledger, logika ERC20 dijalankan oleh dynamic precompile di
-alamat `0x` yang deterministik.
+A token that exposes an **ERC20 interface** but **does not deploy an ERC20
+contract**. Balances live in the bank ledger; the ERC20 logic runs in a dynamic
+precompile at a deterministic `0x` address.
 
-Pesan produk:
+Product message:
 
 > Deploy an ERC20-compatible token without deploying an ERC20 contract.
 > Native performance, standard EVM compatibility.
 
-## 1. Posisi dalam arsitektur
+## 1. Position in the architecture
 
-Karsa punya dua jalur penerbitan token. Keduanya ERC20 dari sisi pemakai; yang
-berbeda adalah tempat saldo disimpan dan tempat logika dijalankan.
+Karsa has two token issuance paths. Both are ERC20 from the user's perspective;
+the difference is where balances live and where the logic runs.
 
-| | **Native ERC20** (dokumen ini) | **Custom ERC20** |
+| | **Native ERC20** (this document) | **Custom ERC20** |
 |---|---|---|
-| Saldo | bank ledger | storage kontrak |
-| `transfer` dijalankan oleh | precompile (Go) | Solidity |
-| Alamat `0x` | dibuat modul, deterministik dari creator | `CREATE` (pengirim + nonce) |
-| Logika transfer custom | tidak mungkin | bebas |
-| Logika penerbitan custom | controller, lewat precompile minter | bebas |
-| Gas swap di pool AMM | ~76k | ~550k |
-| Bisa IBC native | ya | tidak (butuh bridge) |
-| Source di explorer | tidak ada (precompile) | terverifikasi |
-| Biaya protokol saat terbit | opsional, default 0 | tidak ada |
-| Biaya gas saat terbit | ~100k | ~700k–1.2M |
+| Balances | bank ledger | contract storage |
+| `transfer` executed by | precompile (Go) | Solidity |
+| `0x` address | module-created, deterministic from creator | `CREATE` (sender + nonce) |
+| Custom transfer logic | not possible | unrestricted |
+| Custom issuance logic | controller, through the minter precompile | unrestricted |
+| AMM pool swap gas | ~76k | ~550k |
+| Native IBC | yes | no (requires a bridge) |
+| Explorer source | none (precompile) | verified |
+| Protocol fee on creation | optional, default 0 | none |
+| Gas on creation | ~100k | ~700k–1.2M |
 
-**Prinsip identitas aset:** satu alamat, satu denom, satu sumber kebenaran saldo.
-Alamat adalah identitas; denom hanyalah representasi bank dari alamat itu. Native
-token tidak boleh punya wrapper ERC20 yang bisa diperdagangkan terpisah, dan
-custom ERC20 tidak boleh diregistrasi sebagai token native.
+**Asset identity principle:** one address, one denom, one source of truth for
+balances. The address is the identity; the denom is only the bank representation
+of that address. A native token must not have a separately tradable ERC20
+wrapper, and a custom ERC20 must not be registered as a native token.
 
-## 2. Alamat dibuat lebih dulu, denom mengikuti
+## 2. The address comes first; the denom follows
 
-Berbeda dari aset `ibc/…` atau `erc20:0x…`, native token **tidak** menurunkan
-alamat dari denom. Urutannya dibalik agar alamat menjadi identitas utama — persis
-seperti ERC20 di Ethereum.
+Unlike `ibc/…` or `erc20:0x…` assets, a native token does **not** derive its
+address from a denom. The order is reversed so the address is the primary
+identity — exactly like an ERC20 on Ethereum.
 
 ```
-address = hash(creator, sequence)[:20]        // 20 byte, lowercase hex
-denom   = "n:" + "0x" + address               // contoh: n:0x1a2b…ef12 (44 byte)
+address = sha256("karsa/native/" + lowercase(creator) + "/" + sequence)[12:]
+denom   = "n:" + "0x" + lowercase(address)     // example: n:0x1a2b…ef12 (44 bytes)
 ```
 
-`sequence` adalah nomor urut token milik creator tersebut. Algoritma pembuatan:
+`sequence` is the token number for that creator. Address derivation:
 
 ```
 sequence = 0
-selama true:
-    addr = hash(creator, sequence)[:20]
+while true:
+    addr = sha256("karsa/native/" + lowercase(creator) + "/" + sequence)[12:]
     denom = "n:0x" + lowercase(addr)
-    jika denom sudah ada di bank  → sequence++, ulangi
-    jika addr berada di rentang precompile statis (0x1..0x9ff) → sequence++, ulangi
-    jika addr sudah terisi akun atau kontrak → sequence++, ulangi
-    berhenti
+    if denom already exists in the bank  -> sequence++, retry
+    if addr is in the static precompile range (0x1..0x9ff) -> sequence++, retry
+    if addr already has an account or contract -> sequence++, retry
+    stop
 ```
 
-Sifat-sifat yang dihasilkan:
+Properties:
 
-| Sifat | Konsekuensi |
+| Property | Consequence |
 |---|---|
-| Alamat deterministik dari `(creator, sequence)` | creator bisa menghitung ulang tokennya tanpa menyimpan apa pun |
-| Mapping denom ↔ alamat **sintaktis** | denom bisa dihitung dari alamat tanpa membaca state, dan sebaliknya |
-| `sequence` retry | tabrakan tidak pernah menjadi kegagalan nyata |
-| Lowercase wajib | `n:0xAbC` dan `n:0xabc` adalah denom berbeda — selalu normalisasi |
-| Prefiks `n:` **permanen** | konstanta protokol; mengubahnya memutus semua token yang terbit |
+| Address is deterministic from `(creator, sequence)` | The creator can recompute its token without storing anything |
+| Denom ↔ address mapping is **syntactic** | The denom can be computed from the address without reading state, and vice versa |
+| `sequence` retry | Collisions never become a hard failure |
+| Lowercase is required | `n:0xAbC` and `n:0xabc` are different denoms — always normalise |
+| `n:` prefix is **permanent** | A protocol constant; changing it orphans every issued token |
 
-Konstanta protokol:
+Protocol constant:
 
 ```
 NativeTokenDenomPrefix = "n:"
 ```
 
-Denom 44 byte (sama dengan `erc20:0x…`), biaya tulis pool ~780 gas lebih mahal
-daripada denom simbol pendek — sekitar 1% dari biaya swap, dapat diterima.
+The 44-byte denom (same length as `erc20:0x…`) costs about 780 more gas to write
+in a pool than a short symbol denom — roughly 1% of a swap, which is acceptable.
 
-## 3. Simbol bukan identitas
+## 3. The symbol is not an identity
 
-**Keputusan: simbol tidak unik, tidak ada reservasi, tidak ada reclaim, tidak ada
-adjudikasi.**
+**Decision: symbols are not unique. There is no reservation, reclaim, or
+adjudication.**
 
-| Aturan | Nilai |
+| Rule | Value |
 |---|---|
-| Keunikan simbol | tidak ada — "MOMO" boleh dimiliki banyak token |
-| Reservasi simbol kanonik | tidak ada |
-| Reclaim / pengambilalihan | tidak ada, termasuk oleh governance |
-| Probation / jendela sengketa | tidak ada |
-| Panjang simbol | 3–12 karakter, `[A-Za-z0-9]` |
-| Simbol bisa diubah | tidak (metadata immutable di MVP) |
+| Symbol uniqueness | none — many tokens may use "MOMO" |
+| Canonical symbol reservation | none |
+| Reclaim / takeover | none, including by governance |
+| Probation / dispute window | none |
+| Symbol length | 3–12 characters, `[A-Za-z0-9]` |
+| Mutable symbol | no (metadata is immutable in the MVP) |
 
-### Mengapa simbol tidak eksklusif
+### Why symbols are not exclusive
 
-Nama yang eksklusif memaksa protokol menjawab pertanyaan yang tidak bisa
-dijawabnya dengan baik: siapa yang berhak atas `momo`, bagaimana menyelesaikan
-sengketa, dan bagaimana mencabutnya tanpa merusak integrasi. Setiap jawaban
-menambah governance, dispute, dan jendela waktu — padahal tujuannya hanya
-menghemat gas di pool.
+An exclusive name forces the protocol to answer questions it cannot answer well:
+who owns `momo`, how to resolve disputes, and how to revoke a name without
+breaking integrations. Every answer adds governance, disputes, and time windows —
+for the sole purpose of saving gas in a pool.
 
-Karena identitas token adalah **alamat**, simbol tidak perlu unik. Ini model
-Ethereum: siapa pun boleh punya token bernama "USDC", dan kepercayaan datang dari
-token list, bukan dari nama.
+Because the token identity is the **address**, the symbol does not need to be
+unique. This is the Ethereum model: anyone may have a token named "USDC", and
+trust comes from token lists, not from the name.
 
-Konsekuensi yang harus diterima: tampilan bisa memiliki dua "MOMO" dengan alamat
-berbeda. Penyelesaiannya sama seperti Ethereum — alamat adalah kebenaran, dan
-explorer memberi badge.
+The accepted consequence: a UI may show two "MOMO" tokens with different
+addresses. The resolution is the same as Ethereum — the address is the truth, and
+the explorer shows a badge.
 
-## 4. Desimal
+## 4. Decimals
 
-- MVP: **hanya 18 desimal.** Tidak ada scaling antara bank dan EVM; 1 unit base
-  bank = 1 unit base EVM.
-- `decimals()` pada precompile mengembalikan 18.
-- Denom dengan desimal lain (mis. `uusdc` 6 desimal) **tidak** bisa dibuat lewat
-  jalur ini. Untuk aset seperti itu, gunakan model token pair `x/erc20` yang ada.
-- `totalSupply` maksimum: `2^256-1`, divalidasi saat mint.
+- MVP: **18 decimals only.** There is no scaling between bank and EVM; one bank
+  base unit equals one EVM base unit.
+- `decimals()` on the precompile returns 18.
+- Denoms with other decimals (for example, 6-decimal `uusdc`) **cannot** be
+  created through this path. Use the existing `x/erc20` token-pair model for
+  those assets.
+- Maximum `totalSupply`: `2^256-1`, validated at mint time.
 
-## 5. Kepemilikan: kontrak, bukan kunci
+## 5. Ownership: a contract, not a key
 
-Tidak ada `authority` dan tidak ada pesan mint/burn. Supply hanya bisa bergerak
-lewat kontrak.
+There is no authority key and no mint/burn message. Supply can only move through
+a contract.
 
 ```
-CREATE (factory precompile; pemanggil harus kontrak)
+CREATE (factory precompile; caller must be a contract)
    │
-   ├─ controller = ""        → supply immutable selamanya
-   └─ controller = 0xCtrl    → hanya 0xCtrl yang bisa mint/burn
+   ├─ controller = ""        -> supply is immutable forever
+   └─ controller = 0xCtrl    -> only 0xCtrl can mint/burn
 ```
 
-| Keputusan | Nilai |
+| Decision | Value |
 |---|---|
-| Creator | alamat kontrak, **immutable** |
-| Controller | ditetapkan saat pembuatan; `""` berarti immutable |
-| Siapa boleh mint/burn | hanya `controller`, lewat precompile minter |
-| Ganti controller | hanya oleh controller itu sendiri |
-| Renounce | controller → `""`, permanen, tanpa pemulihan |
-| Metadata | tidak dapat diubah (MVP) |
-| Pause / freeze / blacklist | **tidak ada** |
-| Burn oleh pemegang | boleh membakar saldo sendiri, siapa pun |
+| Creator | contract address, **immutable** |
+| Controller | set at creation; `""` means immutable supply |
+| Who may mint/burn | only `controller`, through the minter precompile |
+| Change controller | **not available** in the MVP; immutable after creation |
+| Renounce | **not available** in the MVP; an empty controller can only be chosen at creation |
+| Metadata | immutable (MVP) |
+| Pause / freeze / blacklist | **none** |
+| Holder burn | none; only the controller may burn, and only from the controller's own balance |
 
-Alasan: kunci bisa hilang, dicuri, atau dipindahkan tanpa jejak. Kontrak bisa
-diaudit, dipantau, dan dibatasi oleh kodenya sendiri.
+Rationale: keys can be lost, stolen, or moved without a trace. A contract can be
+audited, monitored, and constrained by its own code.
 
-Biaya yang harus diterima: bug pada kontrak berarti kebijakan supply mati permanen.
-Itu risiko pemilik token, bukan risiko protokol.
+The cost: a bug in the controller permanently ends the supply policy. That is the
+token owner's risk, not the protocol's.
 
-`creator` dan `controller` dipisahkan dengan sengaja: creator tidak pernah berubah,
-controller bisa berganti. Menggabungkan keduanya akan memalsukan sejarah token
-setiap kali kendali dialihkan.
+`creator` and `controller` are separated deliberately: creator records who
+created the token, controller records which contract may change supply. In the
+MVP both are immutable. There is no path to replace or renounce the controller;
+a token that needs controller rotation must wait for a new mechanism or use a
+custom ERC20.
 
-Alasan tidak ada pause/blacklist: perilaku transfer harus dijamin standar. Token
-yang butuh pembekuan harus memakai jalur custom ERC20.
+There is no pause/blacklist because transfer behaviour must remain standard.
+Tokens that need freezing must use the custom ERC20 path.
 
-## 6. Verifikasi sebagai satu-satunya jalur kepercayaan
+## 6. Verification is the only trust signal
 
-Karena simbol tidak unik, satu-satunya sinyal kepercayaan adalah flag `verified`
-di registry, dikelola governance, dan ditampilkan sebagai badge oleh explorer.
+Because symbols are not unique, the only trust signal is the `verified` flag in
+the registry, managed by governance and displayed as a badge by the explorer.
 
-| Keadaan | Tampilan |
+| State | Display |
 |---|---|
-| `verified = true` | badge terverifikasi, token muncul di daftar utama |
-| `verified = false` | ditandai unverified; tetap bisa dipakai dan di-pool |
+| `verified = true` | verified badge; token appears in the main list |
+| `verified = false` | marked unverified; still usable and poolable |
 
-Aturan yang tidak boleh dilanggar: **jangan pernah menyimpulkan kepercayaan dari
-nama atau simbol.** Explorer dan UI wajib menampilkan alamat di samping simbol.
+The rule that must never be broken: **never infer trust from a name or symbol.**
+Explorers and UIs must show the address next to the symbol.
 
-## 7. Pesan
+## 7. Messages
 
-Tidak ada pesan Cosmos untuk membuat, mencetak, atau membakar token. Itu
-keputusan, bukan kelalaian:
+There are no Cosmos messages to create, mint, or burn tokens. That is a decision,
+not an omission:
 
-| Operasi | Jalur |
+| Operation | Path |
 |---|---|
-| Membuat token | precompile **factory** (`0x…0901`) — hanya dari kontrak |
-| Mint / burn | precompile **minter** (`0x…0902`) — hanya oleh `controller` |
+| Create token | **factory** precompile (`0x…0901`) — contracts only |
+| Mint / burn | **minter** precompile (`0x…0902`) — controller only |
 
-Kunci tidak bisa melakukan keduanya. Tidak ada saklar governance untuk
-mengaktifkannya kembali; membuka jalur berbasis kunci lagi berarti upgrade chain.
+A key can do neither. There is no governance switch to re-enable them; opening a
+key-based path again would require a chain upgrade.
 
-Pesan yang tersisa hanya untuk governance:
+The remaining messages are governance-only:
 
 ```proto
 MsgSetTokenVerified { authority, denom, verified }
 MsgUpdateParams    { authority, params }
 ```
 
-**Konsekuensi `creator`.** Karena pembuatan hanya lewat kontrak, `creator` selalu
-alamat kontrak, bukan kunci. Bila semua orang memakai satu launcher bersama,
-`creator` menjadi sama untuk semua token dan atribusi manusia hanya terlihat dari
-event launcher. Bila tiap proyek men-deploy kontraknya sendiri, `creator` unik per
-token tetapi biaya deploy ditanggung masing-masing.
+**Consequence for `creator`.** Because creation only happens through a contract,
+`creator` is always a contract address, never a key. If everyone uses one shared
+launcher, `creator` is the same for every token and human attribution only
+appears in launcher events. If each project deploys its own contract, `creator`
+is unique per token but each project pays the deploy cost.
 
-Precompile factory menolak pemanggil yang bukan kontrak, sehingga aturan ini tidak
-bisa dilewati lewat EOA.
+The factory precompile rejects non-contract callers, so the rule cannot be
+bypassed through an EOA.
 
-Precompile minter hanya bekerja untuk denom yang `controller`-nya sama dengan
-pemanggil, sehingga tidak bisa dipakai mencetak denom lain.
+The minter precompile only works for denoms whose `controller` is the caller, so
+it cannot mint another token's denom.
 
-Mint dan burn mengeluarkan EVM log `Mint` / `Burn` dari precompile minter, supaya
-indexer EVM melihat perubahan supply tanpa membaca event Cosmos. Perubahan
-`totalSupply` pada precompile ERC20 terjadi di bank ledger, jadi precompile ERC20
-tidak memancarkan `Transfer` untuk mint/burn yang dipicu dari luar dirinya.
+Mint and burn emit EVM `Mint` / `Burn` logs from the minter precompile so EVM
+indexers see supply changes without reading Cosmos events. The ERC20 precompile's
+`totalSupply` changes in the bank ledger, so it does not emit `Transfer` for
+mints/burns triggered outside itself.
 
 ## 8. Registry
 
 ```go
-// x/nativetoken store (prefix → isi)
-0x01 token/{denom}          → Token{ Creator, Controller, Name, Symbol, Verified, CreatedAt }
-0x05 list/{denom}           → byte{}             // enumerasi untuk query & genesis
-0x02 sequence/{creator}     → uint64             // per creator, dasar derivasi alamat
-0x03 address/{0x…}          → denom              // dipakai precompile minter
-0x04 params                 → Params
+// x/nativetoken store (prefix -> content)
+0x01 token/{denom}          -> Token{ Creator, Controller, Name, Symbol, Verified, CreatedAt }
+0x05 list/{denom}           -> byte{}             // enumeration for queries and genesis
+0x02 sequence/{creator}     -> uint64             // per creator, basis for address derivation
+0x03 address/{0x…}          -> denom              // used by the minter precompile
+0x04 params                 -> Params
 ```
 
-- `Creator` dan `Controller` disimpan sebagai string lowercase `0x…`.
-- `sequence/{creator}` **wajib** ikut genesis export: alamat diturunkan darinya.
-- `address/{0x…}` memungkinkan precompile minter menemukan denom hanya dari
-alamat token.
+- `Creator` and `Controller` are stored as lowercase `0x…` strings.
+- `sequence/{creator}` **must** be included in genesis export: addresses are
+  derived from it.
+- `address/{0x…}` lets the minter precompile find the denom from the token
+  address alone.
 
-Registry **tidak** menegakkan keunikan simbol dan tidak menyimpan indeks simbol.
-Keunikan denom sudah dijamin `x/bank` dan pemeriksaan saat pembuatan.
+The registry **does not** enforce symbol uniqueness and does not store a symbol
+index. Denom uniqueness is already guaranteed by `x/bank` and checks at creation.
 
-## 9. Integrasi dengan AMM
+## 9. AMM integration
 
-Native token harus bisa menjadi sisi pool tanpa konversi. Saat pembuatan:
+A native token can be a pool side without conversion. At creation:
 
 ```go
 erc20Keeper.SetToken(ctx, erc20types.NewTokenPair(address, denom, erc20types.OWNER_MODULE))
 erc20Keeper.EnableDynamicPrecompile(ctx, address)
 ```
 
-Ini jalur yang sama dengan `registerTestPair` di tes AMM, jadi `resolveAsset`
-mengenali token sebagai bank-backed (`IsNativeCoin() == true`) dan
-`moveIn`/`moveOut` menjadi bank send murni — tanpa konversi, tanpa escrow.
+This is the same path as `registerTestPair` in the AMM tests, so `resolveAsset`
+recognises the token as bank-backed (`IsNativeCoin() == true`) and
+`moveIn`/`moveOut` become pure bank sends — no conversion, no escrow.
 
-Karena `denom` dan alamat bisa saling dihitung, record pool berpotensi berhenti
-menyimpan `denom_a`/`denom_b` untuk aset address-derived. Itu optimasi terpisah
-dan belum diukur.
+Pools only store `denom_a`/`denom_b` for bank-canonical sides. For a
+direct-custody external ERC20, the denom fields are empty because the contract
+address is the identity. This behaviour is already implemented in `x/amm`.
 
-## 10. Persyaratan precompile ERC20
+## 10. ERC20 precompile requirements
 
-| Item | Persyaratan |
+| Item | Requirement |
 |---|---|
-| `name()` `symbol()` `decimals()` | dari metadata registry/bank |
-| `totalSupply()` | supply bank denom |
-| `balanceOf()` | saldo bank |
-| `transfer()` `transferFrom()` | pindah tepat `amount`, kembalikan `true` |
-| `approve()` `allowance()` | standar; `max uint256` = tak terbatas (jangan dikurangi) |
-| Event `Transfer` | setiap perubahan saldo, termasuk mint/burn (alamat nol) |
-| Event `Approval` | setiap perubahan allowance |
-| Hook / fee / pause | **tidak ada** |
-| `permit` (EIP-2612) | **tidak didukung di MVP** |
+| `name()` `symbol()` `decimals()` | from registry/bank metadata |
+| `totalSupply()` | bank denom supply |
+| `balanceOf()` | bank balance |
+| `transfer()` `transferFrom()` | move exactly `amount`, return `true` |
+| `approve()` `allowance()` | standard; `max uint256` means unlimited (do not decrement) |
+| `Transfer` event | every balance change, including mint/burn (zero address) |
+| `Approval` event | every allowance change |
+| Hooks / fees / pause | **none** |
+| `permit` (EIP-2612) | **not supported in the MVP** |
 
-### Alamat terblokir
+### Blocked addresses
 
-Transfer yang ditolak oleh kebijakan `config/permissions.go` **harus**:
+A transfer rejected by `config/permissions.go` **must**:
 
-- mengembalikan error yang jelas, dan
-- **tidak** memancarkan event `Transfer` palsu.
+- return a clear error, and
+- **not** emit a fake `Transfer` event.
 
-## 11. Integrasi explorer
+## 11. Explorer integration
 
-Blockscout mendeteksi token lewat `eth_getCode` dan panggilan ERC20 (`eth_call`),
-lalu mengikuti perpindahan saldo lewat `eth_getLogs` dan
-`eth_getTransactionReceipt`. Permukaan RPC itu **sudah diuji di Karsa** lewat
-`tests/e2e/smoke.sh`; instance Blockscout penuh belum dijalankan di CI karena
-butuh Postgres/Redis/Docker.
+Blockscout detects tokens through `eth_getCode` and ERC20 calls (`eth_call`), then
+follows balance changes through `eth_getLogs` and `eth_getTransactionReceipt`.
+That RPC surface is **already tested in Karsa** through `tests/e2e/smoke.sh`; a
+full Blockscout instance has not been run in CI because it needs
+Postgres/Redis/Docker.
 
-| Uji | Status | Bukti |
+| Test | Status | Evidence |
 |---|---|---|
-| Deteksi token (`eth_getCode`) | **lulus** | precompile mengembalikan bytecode ERC20 |
-| Metadata (`name`, `symbol`, `decimals`) | **lulus** | nilai sesuai metadata bank (`USDC`, 6) |
-| Event transfer (`eth_getLogs`) | **lulus** | topik `Transfer` ditemukan |
-| Perubahan saldo (`balanceOf`) | **lulus** | saldo penerima berubah setelah transfer |
-| Receipt transaksi | **lulus** | `status=0x1`, log transfer ada di receipt |
-| Mint/burn di explorer | belum diuji | log EVM sudah ada; indexing explorer belum |
-| Token holder list | belum diuji | butuh indexer Blockscout |
-| Badge `verified` | belum diimplementasikan | butuh integrasi registry → explorer |
+| Token detection (`eth_getCode`) | **passes** | the precompile returns ERC20 bytecode |
+| Metadata (`name`, `symbol`, `decimals`) | **passes** | values match bank metadata (`USDC`, 6) |
+| Transfer events (`eth_getLogs`) | **passes** | the `Transfer` topic is found |
+| Balance changes (`balanceOf`) | **passes** | the receiver balance changes after a transfer |
+| Transaction receipt | **passes** | `status=0x1`, transfer log present |
+| Mint/burn in the explorer | not tested | EVM logs exist; explorer indexing does not |
+| Token holder list | not tested | needs the Blockscout indexer |
+| `verified` badge | not implemented | needs registry → explorer integration |
 
-**Syarat metadata.** Precompile ERC20 mengambil `name`/`symbol`/`decimals`
-dari metadata bank. Denom bank tanpa metadata akan **revert** pada ketiga
-panggilan itu, sehingga Blockscout tidak bisa menampilkan token. Native token
-Karsa selalu menulis metadata saat pembuatan; aset yang didaftarkan manual
-harus melakukan hal yang sama.
+**Metadata requirement.** The ERC20 precompile reads `name`/`symbol`/`decimals`
+from bank metadata. A bank denom without metadata **reverts** on all three calls,
+so Blockscout cannot display the token. Native Karsa tokens always write metadata
+at creation; manually registered assets must do the same.
 
-Langkah berikutnya adalah menjalankan instance Blockscout sungguhan terhadap
-node Karsa dan memverifikasi holder list serta badge. Sampai itu dilakukan,
-janji "token otomatis muncul di explorer" tetap belum boleh dibuat.
+The next step is running a real Blockscout instance against a Karsa node and
+verifying the holder list and badge. Until then, the promise "tokens
+automatically appear in the explorer" must not be made.
 
-Sediakan `IERC20.sol` referensi di dokumentasi untuk integrasi, meskipun tidak ada
-source yang bisa diverifikasi.
+Provide a reference `IERC20.sol` in the documentation for integrators, even
+though there is no source to verify.
 
-## 12. Item verifikasi lain
+## 12. Other verification items
 
-| Item | Mengapa penting |
+| Item | Why it matters |
 |---|---|
-| Konversi unit `decimals()` | UI/wallet harus menampilkan angka yang sama dengan bank |
-| Infinite approval | Salah implementasi = allowance terkuras atau tidak berkurang |
-| Approval race (`approve` 0 dulu) | Perilaku standar yang diandalkan tooling |
-| Nilai balik `transfer` | Harus `true`; jangan meniru USDT yang mengembalikan kosong |
-| Interaksi `IERC20` dari Solidity | Termasuk `staticcall` untuk `balanceOf` |
-| Determinisme panggilan precompile | Tidak boleh ada state bergantung konteks lokal |
+| `decimals()` unit conversion | Wallets/UI must display the same number as the bank |
+| Infinite approval | A wrong implementation drains allowances or fails to decrement |
+| Approval race (`approve` 0 first) | Standard behaviour that tooling relies on |
+| `transfer` return value | Must return `true`; do not mimic USDT's empty return |
+| `IERC20` interaction from Solidity | Include `staticcall` for `balanceOf` |
+| Precompile call determinism | No state may depend on local context |
 
-## 13. Fase 2
+## 13. Controller and phase 2
 
 ### `permit` (EIP-2612)
 
-Belum didukung di MVP. Menambah nonce, validasi tanda tangan, domain separator,
-dan permukaan serangan baru. Dokumentasikan eksplisit agar dApp tidak
-mengasumsikan semua token ERC20-compatible mendukung EIP-2612.
+Not supported in the MVP. It adds nonces, signature validation, domain
+separators, and a new attack surface. Document this explicitly so dApps do not
+assume every ERC20-compatible token supports EIP-2612.
 
-### Solidity controller
+### Solidity controller (implemented)
 
-Memungkinkan logika penerbitan (vesting, cap, bonding curve, penjualan) ditulis di
-Solidity, sementara token tetap bank denom.
+A token created with a non-empty controller can be minted or burned only by that
+contract. The token remains bank-backed and the controller does not hold balances
+or intercept transfers.
 
 ```
-Controller.sol ──mint/burn──► Precompile minter (0x…0902) ──► bank
+Controller.sol ──mint/burn──► Minter precompile (0x…0902) ──► bank
 ```
 
-- Precompile minter memeriksa `controller[denom] == msg.sender`.
-- Controller **tidak menyimpan saldo** dan **tidak menyentuh transfer**.
-- Controller ditetapkan saat pembuatan dan hanya bisa menggantikan dirinya sendiri;
-  tidak ada kunci atau governance yang bisa mengambil alih.
+- The minter precompile checks `controller[denom] == msg.sender`.
+- The controller does **not** hold balances and does **not** touch transfers.
+- The controller is fixed at token creation. There is no replacement or renounce
+  path, and no key or governance path to take it over.
+- The factory and minter precompiles are static at `0x…0901` and `0x…0902`, not
+  per token. See `docs/precompiles.md` for the static precompile list.
+- There is no SDK-provided Solidity template. Deploy your own controller and use
+  reentrancy protection and a supply cap. The controller address is immutable.
 
-Prasyarat keamanan: reentrancy lock, batas supply, satu denom satu minter, dan
-keputusan eksplisit siapa yang boleh mengganti minter.
+## 14. Module parameters
 
-Factory dan minter bersifat **statis** (satu alamat global, bukan per token), sehingga
-keduanya harus didaftarkan di daftar precompile statis — lihat `docs/precompiles.md`
-untuk daftar, duplikasi `local_node.sh`, dan checklist penambahannya.
-
-## 14. Parameter modul
-
-| Param | Nilai awal | Catatan |
+| Param | Initial value | Notes |
 |---|---|---|
-| `creation_fee` | **0** | murni anti-spam; naikkan bila ada penyalahgunaan massal |
-| `creation_fee_denom` | aset stabil (IBC USDC) | agar tidak ikut volatilitas KRA |
-| penerima fee | treasury | bukan burn |
-| refund | tidak ada | termasuk setelah renounce |
-| `min_symbol_len` | 3 | metadata saja |
-| `max_symbol_len` | 12 | metadata saja |
+| `creation_fee` | empty / **0** | `sdk.Coins`; purely anti-spam |
+| `min_symbol_len` | 3 | metadata only |
+| `max_symbol_len` | 12 | metadata only |
 | `max_name_len` | 64 | |
-| `max_initial_supply` | `2^256-1` | batas representasi EVM |
-| `immutable_default` | `false` | |
+| `max_initial_supply` | `2^256-1` | EVM representation limit |
 
-`creation_fee` tidak lagi berfungsi sebagai harga nama — tidak ada nama yang
-langka. Ia hanya menahan pembuatan massal oleh skrip.
+There is no `creation_fee_denom`, refund, or `immutable_default` parameter in
+the module. The creation fee is whatever `sdk.Coins` governance sets.
 
-## 15. Bukan bagian dari model ini
+`creation_fee` no longer acts as a name price — no name is scarce. It only slows
+down scripted mass creation.
 
-- desimal selain 18,
+## 15. Not part of this model
+
+- decimals other than 18,
 - pause, freeze, blacklist, fee-on-transfer, rebasing,
-- wrapper ERC20 untuk token native,
-- keunikan simbol, reservasi nama, reclaim, probation,
-- `permit` pada MVP,
-- controller pada MVP.
+- ERC20 wrappers for native tokens,
+- symbol uniqueness, name reservation, reclaim, probation,
+- `permit` (phase 2),
+- controller replacement / renounce.
 
-## 16. Ringkasan keputusan
+## 16. Decision summary
 
-| # | Keputusan |
+| # | Decision |
 |---|---|
-| 1 | Alamat adalah identitas; `address = hash(creator, sequence)[:20]` |
-| 2 | `denom = "n:0x" + lowercase(address)`, 44 byte, prefiks permanen |
-| 3 | Simbol tidak unik, tanpa reservasi/reclaim/adjudikasi |
-| 4 | `verified` satu-satunya sinyal kepercayaan + badge explorer |
-| 5 | `creation_fee` opsional default 0, treasury, denom stabil |
-| 6 | Creator = kontrak, immutable; controller opsional (kontrak), hanya bisa menggantikan dirinya sendiri |
-| 7 | Hanya 18 desimal, tanpa scaling bank↔EVM |
-| 8 | Tanpa pause/freeze/blacklist; perilaku transfer dijamin standar |
-| 9 | `permit` pada fase 2 |
-| 10 | Tidak ada pesan Cosmos untuk create/mint/burn; creation hanya lewat precompile factory `0x…0901`, supply hanya lewat precompile minter `0x…0902` |
-| 11 | Precompile factory dan minter **statis**; token itu sendiri **dinamis** per denom |
-| 12 | Mint dibatasi `2^256-1`; burn hanya dari saldo controller sendiri |
+| 1 | The address is the identity; `address = sha256("karsa/native/" + creator + "/" + sequence)[12:]` |
+| 2 | `denom = "n:0x" + lowercase(address)`, 44 bytes, permanent prefix |
+| 3 | Symbols are not unique; no reservation/reclaim/adjudication |
+| 4 | `verified` is the only trust signal + explorer badge |
+| 5 | `creation_fee` is optional (`sdk.Coins`), empty/0 by default |
+| 6 | Creator = contract, immutable; controller optional (contract) and immutable in the MVP |
+| 7 | 18 decimals only, no bank↔EVM scaling |
+| 8 | No pause/freeze/blacklist; transfer behaviour is standard |
+| 9 | `permit` is phase 2 |
+| 10 | No Cosmos messages for create/mint/burn; creation only through the factory precompile `0x…0901`, supply only through the minter precompile `0x…0902` |
+| 11 | Factory and minter precompiles are **static**; the token itself is **dynamic** per denom |
+| 12 | Mint is capped at `2^256-1`; burn only from the controller's own balance |

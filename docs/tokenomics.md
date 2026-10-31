@@ -1,24 +1,28 @@
 # Karsa Tokenomics
 
-Status: **draft / proposed** — the values below are the launch configuration used by
-`local_node.sh`. They are chain-level parameters, not AMM module parameters.
+Status: **draft / proposed**. The values below are chain-level parameters
+enforced by genesis. They are not AMM module parameters.
 
 ## Supply
 
 | Item | Value |
 |---|---:|
 | Max supply | **1,000,000,000 KRA** |
-| Initial supply at genesis | **100,000,000 KRA** |
-| Initial allocation account | validator/genesis account created by `local_node.sh` |
+| Validator allocation in `local_node.sh` | **100,000,000 KRA** |
+| Dev accounts in `local_node.sh` | **1,000 KRA each** |
+| Production initial allocation | policy decision for genesis |
 
-`1 KRA = 10^18 akra`. The initial 100M KRA is minted into the genesis account; the
-remaining 900M KRA is minted over time by the `x/mint` module until the max supply
-cap is reached.
+`1 KRA = 10^18 akra`. The local node funds the validator with 100M KRA and each
+dev account with 1,000 KRA for testing. That dev funding is not a production
+allocation plan. Production genesis should set the intended balances explicitly.
 
-## Proposed initial allocation
+The `x/mint` module mints new KRA until `max_supply` is reached. The cap is
+enforced by the mint module parameters, not by the AMM or by a separate module.
 
-The on-chain genesis only defines total supply. The 100M initial allocation is a
-policy decision for the genesis account(s):
+## Proposed production allocation
+
+The on-chain genesis only defines balances. How the initial 100M KRA is split is
+a policy decision for the genesis account(s):
 
 | Bucket | Share | Amount |
 |---|---:|---:|
@@ -26,9 +30,9 @@ policy decision for the genesis account(s):
 | Core developers | 25% | 25,000,000 KRA |
 | Treasury / ecosystem / partnerships | 25% | 25,000,000 KRA |
 
-These buckets are **not enforced by the chain**; they are an operational allocation
-commitment. Any vesting/lockup should be implemented with vesting accounts in the
-production genesis.
+These buckets are **not enforced by the chain**; they are an operational
+allocation commitment. Any vesting/lockup should be implemented with vesting
+accounts in the production genesis.
 
 ## Inflation
 
@@ -42,7 +46,6 @@ production genesis.
 | `params.max_supply` | 1,000,000,000 KRA |
 
 Inflation is fixed at **5% per year** and does not adjust with the bonded ratio.
-This keeps validator/delegator income predictable while the network bootstraps.
 The `max_supply` cap stops minting at 1B KRA.
 
 Starting from 100M KRA, 5% compounding reaches 1B in roughly 47 years; the cap
@@ -50,12 +53,13 @@ makes the terminal supply deterministic.
 
 `blocks_per_year` assumes **1.5 second blocks**:
 
-```
+```text
 365.25 * 24 * 60 * 60 / 1.5 = 21,038,400
 ```
 
-If the target block time changes, update this value. Otherwise inflation per block
-is wrong even though the annual percentage is correct.
+`local_node.sh` uses a faster 1s commit for development. Production block time
+should match the value configured here; if it changes, update
+`config.BlocksPerYear` and the genesis parameter together.
 
 ## Block limits
 
@@ -65,33 +69,43 @@ is wrong even though the annual percentage is correct.
 | `consensus.params.block.max_gas` | 100,000,000 |
 
 At ~1.5s blocks this is roughly 66.7M gas/second. `max_gas` is the practical
-limiter for AMM traffic; `max_bytes` caps oversized blocks and stays well above the
-1 MiB per-transaction limit.
+limiter for AMM traffic; `max_bytes` caps oversized blocks and stays well above
+the 1 MiB per-transaction limit.
 
 ## Where inflation goes
 
 The `x/mint` module mints to the fee collector account; `x/distribution` then
-streams rewards to validators and delegators. The community tax (`community_tax`,
-2% by default) is routed to the community pool.
+streams rewards to validators and delegators. The default community tax is 2%;
+that share is routed to the community pool.
 
 ## Fees
 
-- **Gas** is paid in `akra` and burned/distributed according to the fee market.
-- **AMM pool fee** goes to LPs of the selected pool.
+- **Gas** is paid in `akra`. Karsa sets `feemarket.params.no_base_fee = true`,
+  so the base fee is disabled. Transaction fees go to the fee collector and are
+  distributed through `x/distribution`; the chain does not burn a protocol base
+  fee by default.
+- **AMM pool fee** goes to the LPs of the selected pool.
 - **Integrator fee** goes to the integrator, not to LPs and not to the protocol.
-- **Pool creation fee** goes to the community pool (or is partially burned based on
-  `fee_burn_bps`).
+- **AMM pool creation fee** defaults to **100 akra**. With the default
+  `fee_burn_bps = 0`, the full fee is sent to the community pool. A nonzero
+  `fee_burn_bps` can burn part of it instead.
+- **Native-token creation fee** defaults to zero. It is a spam control, not a
+  protocol revenue stream.
 
 ## Non-goals
 
-- No token factory: Karsa tokens are `akra`, IBC vouchers, or ERC20 contracts.
 - No rebasing or elastic supply.
 - No protocol revenue share of AMM pool fees.
+- No protocol allocation tied to the native-token factory. Native tokens are a
+  chain feature; tokenomics does not create a protocol token for them.
+- No guarantee that symbols are unique. Native tokens are identified by address
+  and denom, not by symbol.
 
 ## Production checklist
 
-1. Set the genesis account balances to the intended 100M allocation.
+1. Set genesis balances to the intended allocation.
 2. Use vesting accounts for developer/treasury buckets where applicable.
-3. Confirm `blocks_per_year` against the measured block time.
+3. Confirm `blocks_per_year` against the measured production block time.
 4. Confirm `max_supply` and inflation parameters in the production genesis.
-5. Publish the allocation and vesting schedule before launch.
+5. Confirm the community tax and AMM `creation_fee`/`fee_burn_bps` policy.
+6. Publish the allocation and vesting schedule before launch.

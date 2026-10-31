@@ -37,11 +37,24 @@ middleware because `erc20/v2` implements `IBCModule` but not
 acknowledgement, timeout, ERC20 conversion, the ICS20 precompile, and both the
 receive-side and source-side EVM callbacks (ack and timeout).
 
-## Minimal live relayer
+## Live relayer
 
-The experimental one-way relayer and its Karsa/Gaia harnesses now live in
-[`karsahq/ibc-ferry`](https://github.com/karsahq/ibc-ferry), on the
-`prototype/python` branch. The `main` branch is reserved for the Go port.
+The Go relayer and its Karsa/Gaia harnesses live in
+[`karsahq/ibc-ferry`](https://github.com/karsahq/ibc-ferry). The validated Python
+prototype is kept on the `prototype/python` branch for reference.
+
+The `main` branch contains the Go implementation. It supports:
+
+- link inventory and idempotent `connect`/`pair`;
+- `doctor` checks for clients, trust periods, balances, orphans, and packets;
+- a durable watcher for recv, ack, and timeout;
+- one common source proof height per cycle and batched relay transactions;
+- idle client refresh, retry/backoff, and terminal-packet retention;
+- status/metrics endpoints and a chain-agnostic container image.
+
+Timeout relay uses the non-membership proof from `packet-receipt --prove`; the
+destination chain stores only the acknowledgement hash, so the full ack is
+recovered from the transaction index when needed.
 
 Peers must support IBC v2 to connect. Do not expect channel-based Cosmos chains
 to interoperate with Karsa.

@@ -2,13 +2,27 @@
 
 **KARSA** stands for **K**ernel for **A**ssets, **R**untime, **S**ettlement & **A**pps.
 
-Karsa is a Cosmos EVM chain derived from the Cosmos EVM example chain (the
-`evmd` implementation), used to demonstrate the Cosmos EVM integration and to
-provide a chain object for testing.
+Karsa is a Cosmos EVM chain for on-chain assets, an AMM, native
+ERC20-compatible tokens, and IBC v2. It is built on Cosmos SDK and
+[`cosmos/evm`](https://github.com/cosmos/evm). The repository started from the
+Cosmos EVM example chain, but the chain now has its own genesis, modules, and
+production-oriented defaults.
+
+Karsa is **IBC v2 only**. Channel-based ICS20 v1 transfers are deliberately not
+registered.
+
+## Documentation
+
+- [`docs/ibc.md`](docs/ibc.md) — IBC v2 wiring and relayer
+- [`docs/amm-design.md`](docs/amm-design.md) — AMM design
+- [`docs/native-token.md`](docs/native-token.md) — native ERC20 tokens
+- [`docs/precompiles.md`](docs/precompiles.md) — static and dynamic precompiles
+- [`docs/tokenomics.md`](docs/tokenomics.md) — supply, inflation, and fees
+- [`karsahq/ibc-ferry`](https://github.com/karsahq/ibc-ferry) — Go IBC v2 relayer
 
 ## Config
 
-By default, this chain has the following configuration:
+By default, the chain has the following configuration:
 
 | Option              | Value                  |
 |---------------------|------------------------|
@@ -18,7 +32,7 @@ By default, this chain has the following configuration:
 | Default Token Pairs | 1 for the native token |
 | Denomination        | `akra` (display `kra`, symbol `KRA`) |
 | EVM permissioning   | permissionless         |
-| Enabled Precompiles | all                    |
+| Static Precompiles  | SDK defaults + AMM + native token factory/minter |
 
 ## Running The Chain
 
@@ -34,34 +48,41 @@ Available flags are:
 - `-n`: Do **not** overwrite previous database
 - `--no-install`: Skip building the binary
 - `--remote-debugging`: Build a binary suitable for remote debugging
+- `--additional-users N`: Create N extra funded dev accounts
+- `--mnemonic-file PATH`: Write generated mnemonics to a YAML file
+- `--mnemonics-input PATH`: Use dev mnemonics from a YAML file
+
+## Build and Test
+
+```bash
+gofmt -l .
+go build ./...
+go test ./
+go test -tags=test ./config/... ./x/amm/... ./x/nativetoken/... ./tests/ibc
+tests/e2e/smoke.sh
+```
 
 ## Connect to Wallet
 
-For the sake of this example, we'll be using Metamask:
+For a local node, add a custom network in MetaMask:
 
-1. Use the following seed phrase when adding a new wallet:
-`gesture inject test cycle original hollow east ridge hen combine
-junk child bacon zero hope comfort vacuum milk pitch cage oppose
-unhappy lunar seat`
-2. On the top left of the Metamask extension, click the Network button.
-3. Click Add custom network from the bottom of the modal.
-4. Under Default RPC URL, add the RPC URL as http://localhost:8545. Ensure your chain is running.
-5. Once added, copy the rest of the settings shown in the below images.
+1. Import the local dev mnemonic if you need a funded account:
+   `gesture inject test cycle original hollow east ridge hen combine junk child
+   bacon zero hope comfort vacuum milk pitch cage oppose unhappy lunar seat`
+2. Add a network with RPC URL `http://localhost:8545`.
+3. Use chain ID `262144`, symbol `KRA`, and 18 decimals.
 
-![Button to select network](guide/networks.png "Networks Select")
-![Button to add network](guide/add_network.png "Networks Add")
-![RPC URL Settings](guide/rpc_url.png "RPC URL")
-![Overview of required settings](guide/settings.png "Settings Overview")
+The local node script prints the full set of accounts and mnemonics it funds.
 
-## Available Cosmos SDK Modules
+## Modules
 
-As mentioned above, this exemplary chain implementation is a reduced version of `simapp`.
-Specifically, instead of offering access to all Cosmos SDK modules, it just includes the following:
+Karsa runs the following modules:
+
+### Cosmos SDK
 
 - `auth`
 - `authz`
 - `bank`
-- `capability`
 - `consensus`
 - `distribution`
 - `evidence`
@@ -69,7 +90,27 @@ Specifically, instead of offering access to all Cosmos SDK modules, it just incl
 - `genutil`
 - `gov`
 - `mint`
-- `params`
 - `slashing`
 - `staking`
 - `upgrade`
+- `vesting`
+
+### IBC
+
+- `ibc` (core clients)
+- `07-tendermint`
+- `transfer` (IBC v2 only)
+
+### Cosmos EVM
+
+- `vm` (EVM)
+- `feemarket`
+- `erc20`
+
+### Karsa
+
+- `amm` — constant-product and stableswap pools
+- `nativetoken` — ERC20-compatible bank tokens without a deployed contract
+
+The v1 IBC port router is empty. It is kept that way on purpose so a
+channel-based handshake fails instead of silently falling back to v1.
