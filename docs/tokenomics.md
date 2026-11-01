@@ -83,10 +83,15 @@ that share is routed to the community pool.
 
 ## Fees
 
-- **Gas** is paid in `akra`. Karsa sets `feemarket.params.no_base_fee = true`,
-  so the base fee is disabled. Transaction fees go to the fee collector and are
-  distributed through `x/distribution`; the chain does not burn a protocol base
-  fee by default.
+- **Gas** is paid in `akra`. Karsa enables EIP-1559:
+  `feemarket.params.no_base_fee = false`, with an initial
+  `base_fee = 1,000,000,000 akra/gas` and
+  `min_gas_price = 1,000,000,000 akra/gas`.
+- The base fee adjusts with block usage. This implementation sends transaction
+  fees to the fee collector, so the base fee is not burned; `x/distribution`
+  streams the collected fees with the rest of the fee collector balance.
+- The validator/node defaults use `minimum-gas-prices = 1000000000akra` and
+  `evm.min-tip = 1000000000`, so zero-fee transactions are not accepted.
 - **AMM pool fee** goes to the LPs of the selected pool.
 - **Integrator fee** goes to the integrator, not to LPs and not to the protocol.
 - **AMM pool creation fee** defaults to **100 akra**. With the default
@@ -94,6 +99,26 @@ that share is routed to the community pool.
   `fee_burn_bps` can burn part of it instead.
 - **Native-token creation fee** defaults to zero. It is a spam control, not a
   protocol revenue stream.
+
+## Mempool and fee policy
+
+Karsa uses the Cosmos EVM app-side mempool
+(`mempool.type = "app"`), which combines an EVM txpool with the Cosmos
+priority-nonce pool. The proposer selects from both pools.
+
+| Setting | Default |
+|---|---|
+| `minimum-gas-prices` | `1000000000akra` |
+| `evm.min-tip` | `1000000000` |
+| EVM `price-limit` | `1` |
+| `global-slots` | `5,120` |
+| `global-queue` | `1,024` |
+| `account-slots` | `16` |
+
+The base fee and minimum gas price create a nonzero floor; the minimum tip
+prevents free EVM transactions from entering the mempool. All validators should
+use the app-side mempool and a compatible `minimum-gas-prices`/`min-tip` policy,
+otherwise transaction admission and ordering differ across the network.
 
 ## Non-goals
 

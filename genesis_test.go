@@ -34,16 +34,17 @@ func TestNewErc20GenesisStateUsesKarsaAddress(t *testing.T) {
 	require.Equal(t, []string{config.NativeERC20Address}, genesis.NativePrecompiles)
 }
 
-// A default base fee of 1e9 akra per gas makes every ordinary transaction
-// unpayable unless the sender also sets an equally large gas price. Karsa
-// disables the base fee, and `karsad init` must serialise that choice through
-// the BasicModuleManager override; otherwise the fee checker rejects txs that
-// look valid at broadcast time.
-func TestDefaultGenesisDisablesBaseFee(t *testing.T) {
+// The default genesis enables EIP-1559 and sets a nonzero minimum gas price.
+// `karsad init` must serialise both values through the BasicModuleManager
+// override; a zero base fee or zero minimum price would make the production
+// fee policy depend on per-node config alone.
+func TestDefaultGenesisEnablesFeeMarket(t *testing.T) {
 	app, _ := setup(false, 0, "karsa_262144-1", 262144)
 
 	var genesis feemarkettypes.GenesisState
 	app.AppCodec().MustUnmarshalJSON(app.DefaultGenesis()[feemarkettypes.ModuleName], &genesis)
 
-	require.True(t, genesis.Params.NoBaseFee)
+	require.False(t, genesis.Params.NoBaseFee)
+	require.True(t, genesis.Params.BaseFee.IsPositive())
+	require.True(t, genesis.Params.MinGasPrice.IsPositive())
 }

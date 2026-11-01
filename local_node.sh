@@ -12,7 +12,8 @@ LOGLEVEL="info"
 # Set dedicated home directory for the Karsa instance
 CHAINDIR="$HOME/.karsa"
 
-BASEFEE=10000000
+BASEFEE=1000000000
+MINTIP=1000000000
 
 # Path variables
 CONFIG_TOML=$CHAINDIR/config/config.toml
@@ -331,8 +332,8 @@ fi
 karsad start "$TRACE" \
 	--pruning nothing \
 	--log_level $LOGLEVEL \
-	--minimum-gas-prices=0akra \
-	--evm.min-tip=0 \
+	--minimum-gas-prices=${BASEFEE}akra \
+	--evm.min-tip=${MINTIP} \
 	--home "$CHAINDIR" \
 	--json-rpc.api eth,txpool,personal,net,debug,web3 \
 	--chain-id "$CHAINID"

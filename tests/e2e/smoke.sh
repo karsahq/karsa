@@ -9,7 +9,7 @@
 #   - the EVM JSON-RPC answers
 #   - the Karsa precompiles (AMM, factory, minter) are active on chain
 #   - the nativetoken query service is reachable
-#   - a real zero-fee bank transfer is included in a block
+#   - a real fee-paying bank transfer is included in a block
 #   - an AMM pool can be created and swapped through the CLI
 #
 # Usage: tests/e2e/smoke.sh
@@ -23,6 +23,8 @@ KEYRING="test"
 VAL="val"
 LOG="$HOME_DIR/node.log"
 RPC_URL="http://127.0.0.1:8545"
+MIN_GAS_PRICE=1000000000
+MIN_TIP=1000000000
 
 NODE_PID=""
 cleanup() {
@@ -65,6 +67,7 @@ VAL_ADDR="$("$BIN" keys show "$VAL" -a --keyring-backend "$KEYRING" --home "$HOM
   100000000000000000000000000akra,1000000000000000000000uusdc \
   --keyring-backend "$KEYRING" --home "$HOME_DIR" >/dev/null
 "$BIN" genesis gentx "$VAL" 1000000000000000000000akra \
+  --gas-prices ${MIN_GAS_PRICE}akra \
   --chain-id "$CHAIN_ID" --keyring-backend "$KEYRING" --home "$HOME_DIR" >/dev/null
 "$BIN" genesis collect-gentxs --home "$HOME_DIR" >/dev/null
 
@@ -129,8 +132,8 @@ step "start node"
 "$BIN" start --home "$HOME_DIR" \
   --chain-id "$CHAIN_ID" \
   --keyring-backend "$KEYRING" \
-  --minimum-gas-prices=0akra \
-  --evm.min-tip=0 \
+  --minimum-gas-prices=${MIN_GAS_PRICE}akra \
+  --evm.min-tip=${MIN_TIP} \
   --json-rpc.enable=true \
   --json-rpc.api eth,txpool,personal,net,debug,web3 \
   >"$LOG" 2>&1 &
@@ -181,10 +184,10 @@ step "check nativetoken query"
 "$BIN" q nativetoken params --home "$HOME_DIR" -o json >/dev/null
 printf 'nativetoken params readable\n'
 
-# A default fee-market base fee rejects ordinary txs at DeliverTx even though
-# the broadcast returns code 0 from CheckTx. Send a real tx and wait for it to
-# be indexed, then verify the balance actually moved.
-step "send a zero-fee bank transaction"
+# The enabled fee-market base fee rejects under-priced txs at DeliverTx even
+# though the broadcast can return code 0 from CheckTx. Send a real tx and wait
+# for it to be indexed, then verify the balance actually moved.
+step "send a fee-paying bank transaction"
 RECIP="recipient"
 "$BIN" keys add "$RECIP" --keyring-backend "$KEYRING" --home "$HOME_DIR" >/dev/null 2>&1
 RECIP_ADDR="$("$BIN" keys show "$RECIP" -a --keyring-backend "$KEYRING" --home "$HOME_DIR")"
@@ -193,7 +196,7 @@ RECIP_ADDR="$("$BIN" keys show "$RECIP" -a --keyring-backend "$KEYRING" --home "
 send_out="$("$BIN" tx bank send "$VAL" "$RECIP_ADDR" 1000akra \
   --from "$VAL" --keyring-backend "$KEYRING" --home "$HOME_DIR" \
   --chain-id "$CHAIN_ID" \
-  --gas auto --gas-adjustment 1.3 --gas-prices 0akra \
+  --gas auto --gas-adjustment 1.3 --gas-prices ${MIN_GAS_PRICE}akra \
   --broadcast-mode sync -y -o json)"
 TXHASH="$(printf '%s' "$send_out" | sed -nE 's/.*"txhash":"([^"]+)".*/\1/p')"
 [[ -n "$TXHASH" ]] || fail "bank send returned no txhash: $send_out"
@@ -214,7 +217,7 @@ create_out="$("$BIN" tx amm create-pool \
   --fee-bps 30 \
   --amount-a 1000000000000000000000 --amount-b 1000000000000000000000 \
   --from "$VAL" --keyring-backend "$KEYRING" --home "$HOME_DIR" \
-  --chain-id "$CHAIN_ID" --gas auto --gas-adjustment 1.3 --gas-prices 0akra \
+  --chain-id "$CHAIN_ID" --gas auto --gas-adjustment 1.3 --gas-prices ${MIN_GAS_PRICE}akra \
   --broadcast-mode sync -y -o json)"
 TXHASH="$(printf '%s' "$create_out" | sed -nE 's/.*"txhash":"([^"]+)".*/\1/p')"
 [[ -n "$TXHASH" ]] || fail "create-pool returned no txhash: $create_out"
@@ -232,7 +235,7 @@ swap_out="$("$BIN" tx amm swap-exact-in \
   --path "$KRA_ASSET,$USDC_ASSET" \
   --amount-in 1000000000000000000 --min-out 1 \
   --from "$VAL" --keyring-backend "$KEYRING" --home "$HOME_DIR" \
-  --chain-id "$CHAIN_ID" --gas auto --gas-adjustment 1.3 --gas-prices 0akra \
+  --chain-id "$CHAIN_ID" --gas auto --gas-adjustment 1.3 --gas-prices ${MIN_GAS_PRICE}akra \
   --broadcast-mode sync -y -o json)"
 TXHASH="$(printf '%s' "$swap_out" | sed -nE 's/.*"txhash":"([^"]+)".*/\1/p')"
 [[ -n "$TXHASH" ]] || fail "swap-exact-in returned no txhash: $swap_out"
@@ -275,7 +278,7 @@ printf '%s' "$balance_before" | grep -q '"result":"0x' || fail "balanceOf failed
 
 block_before="$(rpc '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' | sed -nE 's/.*"result":"(0x[0-9a-fA-F]+)".*/\1/p')"
 transfer_data="0xa9059cbb000000000000000000000000${RECIP_EVM:2}00000000000000000000000000000000000000000000000000000000000003e8"
-send_json="$(rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_sendTransaction\",\"params\":[{\"from\":\"$VAL_EVM\",\"to\":\"$USDC_ASSET\",\"gas\":\"0x100000\",\"gasPrice\":\"0x0\",\"data\":\"$transfer_data\"}]}")"
+send_json="$(rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_sendTransaction\",\"params\":[{\"from\":\"$VAL_EVM\",\"to\":\"$USDC_ASSET\",\"gas\":\"0x100000\",\"gasPrice\":\"0x77359400\",\"data\":\"$transfer_data\"}]}")"
 EVM_HASH="$(printf '%s' "$send_json" | sed -nE 's/.*"result":"(0x[0-9a-fA-F]+)".*/\1/p')"
 [[ -n "$EVM_HASH" ]] || fail "eth_sendTransaction failed: $send_json"
 printf 'EVM tx submitted: %s\n' "$EVM_HASH"

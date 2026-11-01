@@ -137,7 +137,9 @@ func NewMintGenesisState() *minttypes.GenesisState {
 // NOTE: for the example chain implementation we are disabling the base fee.
 func NewFeeMarketGenesisState() *feemarkettypes.GenesisState {
 	feeMarketGenState := feemarkettypes.DefaultGenesisState()
-	feeMarketGenState.Params.NoBaseFee = true
+	feeMarketGenState.Params.NoBaseFee = false
+	feeMarketGenState.Params.BaseFee = sdkmath.LegacyNewDec(1_000_000_000)
+	feeMarketGenState.Params.MinGasPrice = sdkmath.LegacyNewDec(1_000_000_000)
 
 	return feeMarketGenState
 }
