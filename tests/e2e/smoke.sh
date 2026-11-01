@@ -23,8 +23,8 @@ KEYRING="test"
 VAL="val"
 LOG="$HOME_DIR/node.log"
 RPC_URL="http://127.0.0.1:8545"
-MIN_GAS_PRICE=1000000000
-MIN_TIP=1000000000
+MIN_GAS_PRICE=20000000000
+MIN_TIP=20000000000
 
 NODE_PID=""
 cleanup() {
@@ -278,7 +278,7 @@ printf '%s' "$balance_before" | grep -q '"result":"0x' || fail "balanceOf failed
 
 block_before="$(rpc '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' | sed -nE 's/.*"result":"(0x[0-9a-fA-F]+)".*/\1/p')"
 transfer_data="0xa9059cbb000000000000000000000000${RECIP_EVM:2}00000000000000000000000000000000000000000000000000000000000003e8"
-send_json="$(rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_sendTransaction\",\"params\":[{\"from\":\"$VAL_EVM\",\"to\":\"$USDC_ASSET\",\"gas\":\"0x100000\",\"gasPrice\":\"0x77359400\",\"data\":\"$transfer_data\"}]}")"
+send_json="$(rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_sendTransaction\",\"params\":[{\"from\":\"$VAL_EVM\",\"to\":\"$USDC_ASSET\",\"gas\":\"0x100000\",\"gasPrice\":\"0x9502f9000\",\"data\":\"$transfer_data\"}]}")"
 EVM_HASH="$(printf '%s' "$send_json" | sed -nE 's/.*"result":"(0x[0-9a-fA-F]+)".*/\1/p')"
 [[ -n "$EVM_HASH" ]] || fail "eth_sendTransaction failed: $send_json"
 printf 'EVM tx submitted: %s\n' "$EVM_HASH"

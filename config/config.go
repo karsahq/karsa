@@ -59,7 +59,7 @@ func InitAppConfig(denom string, evmChainID uint64) (string, interface{}) {
 	//
 	// Karsa uses a nonzero minimum gas price so the dev and production
 	// defaults do not accept free transactions.
-	srvCfg.MinGasPrices = "1000000000" + denom
+	srvCfg.MinGasPrices = "20000000000" + denom
 
 	evmCfg := cosmosevmserverconfig.DefaultEVMConfig()
 	evmCfg.EVMChainID = evmChainID

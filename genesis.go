@@ -138,8 +138,8 @@ func NewMintGenesisState() *minttypes.GenesisState {
 func NewFeeMarketGenesisState() *feemarkettypes.GenesisState {
 	feeMarketGenState := feemarkettypes.DefaultGenesisState()
 	feeMarketGenState.Params.NoBaseFee = false
-	feeMarketGenState.Params.BaseFee = sdkmath.LegacyNewDec(1_000_000_000)
-	feeMarketGenState.Params.MinGasPrice = sdkmath.LegacyNewDec(1_000_000_000)
+	feeMarketGenState.Params.BaseFee = sdkmath.LegacyNewDec(20_000_000_000)
+	feeMarketGenState.Params.MinGasPrice = sdkmath.LegacyNewDec(20_000_000_000)
 
 	return feeMarketGenState
 }

@@ -12,8 +12,8 @@ LOGLEVEL="info"
 # Set dedicated home directory for the Karsa instance
 CHAINDIR="$HOME/.karsa"
 
-BASEFEE=1000000000
-MINTIP=1000000000
+BASEFEE=20000000000
+MINTIP=20000000000
 
 # Path variables
 CONFIG_TOML=$CHAINDIR/config/config.toml

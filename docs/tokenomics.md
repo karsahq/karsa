@@ -85,13 +85,13 @@ that share is routed to the community pool.
 
 - **Gas** is paid in `akra`. Karsa enables EIP-1559:
   `feemarket.params.no_base_fee = false`, with an initial
-  `base_fee = 1,000,000,000 akra/gas` and
-  `min_gas_price = 1,000,000,000 akra/gas`.
+  `base_fee = 20,000,000,000 akra/gas` and
+  `min_gas_price = 20,000,000,000 akra/gas`.
 - The base fee adjusts with block usage. This implementation sends transaction
   fees to the fee collector, so the base fee is not burned; `x/distribution`
   streams the collected fees with the rest of the fee collector balance.
-- The validator/node defaults use `minimum-gas-prices = 1000000000akra` and
-  `evm.min-tip = 1000000000`, so zero-fee transactions are not accepted.
+- The validator/node defaults use `minimum-gas-prices = 20000000000akra` and
+  `evm.min-tip = 20000000000`, so zero-fee transactions are not accepted.
 - **AMM pool fee** goes to the LPs of the selected pool.
 - **Integrator fee** goes to the integrator, not to LPs and not to the protocol.
 - **AMM pool creation fee** defaults to **100 akra**. With the default
@@ -99,6 +99,21 @@ that share is routed to the community pool.
   `fee_burn_bps` can burn part of it instead.
 - **Native-token creation fee** defaults to zero. It is a spam control, not a
   protocol revenue stream.
+
+### Fee examples at the default floor
+
+At `base_fee` / `min_gas_price` = `20,000,000,000 akra/gas`:
+
+| Operation | Gas | Fee |
+|---|---:|---:|
+| Cosmos bank transfer | ~105,526 | **~0.00211 KRA** |
+| Cosmos AMM swap | ~146,816 | **~0.00294 KRA** |
+| EVM native transfer | 21,000 | **~0.00084 KRA** |
+| ERC20 ↔ ERC20 swap | ~340,000 | **~0.0136 KRA** |
+| Relayer create/update client | 2,000,000 | **~0.04 KRA** |
+
+The examples use a fixed `0.1 KRA` fee for relayer JSON transactions to leave
+headroom for the base fee and the 2M gas limit.
 
 ## Mempool and fee policy
 
@@ -108,8 +123,8 @@ priority-nonce pool. The proposer selects from both pools.
 
 | Setting | Default |
 |---|---|
-| `minimum-gas-prices` | `1000000000akra` |
-| `evm.min-tip` | `1000000000` |
+| `minimum-gas-prices` | `20000000000akra` |
+| `evm.min-tip` | `20000000000` |
 | EVM `price-limit` | `1` |
 | `global-slots` | `5,120` |
 | `global-queue` | `1,024` |
