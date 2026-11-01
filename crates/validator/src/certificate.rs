@@ -13,13 +13,21 @@
 
 use crypto::domain::{VoteSigningFields, encode_vote_signing_payload};
 use crypto::encoding::{Decoder, Encoder};
-use crypto::scheme::verify_signature;
+use crypto::registry::ALG_ED25519;
+use crypto::scheme::{Ed25519BatchEntry, verify_ed25519_batch, verify_signature};
 use crypto::{CryptoError, CryptoErrorKind};
 
-use crate::schedule::{ValidatorKey, ValidatorSet};
+use crate::schedule::{ValidatorKey, ValidatorRecord, ValidatorSet};
 
 /// Canonical certificate encoding version.
 pub const CERTIFICATE_VERSION_V1: u16 = 1;
+
+/// Signer count at which batch verification pays for its transcript.
+///
+/// Below this the per-signature single verification is faster; the crossover is
+/// measured by `karsa certify`, not guessed. Mixed-algorithm certificates always
+/// use the individual path, because a batch is per algorithm.
+const BATCH_MIN_SIGNERS: usize = 4;
 
 /// A quorum certificate for one DAG vertex.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,13 +205,62 @@ impl Certificate {
     /// partial credit: a certificate with one bad signature is malformed, not
     /// "mostly valid".
     ///
+    /// When every signer uses Ed25519 and there are at least four of them, the
+    /// signatures are checked in one batch,
+    /// which is the same accept/reject decision for less CPU. The batch cannot
+    /// attribute a failure to a validator, so the error kind is
+    /// [`CryptoErrorKind::InvalidSignature`] rather than a per-signer detail.
+    ///
     /// # Errors
     ///
     /// [`CryptoErrorKind::MalformedCertificate`] when the bitmap does not match
     /// the set or has set padding bits, [`CryptoErrorKind::KeyNotActive`] or
     /// [`CryptoErrorKind::KeyAmbiguous`] from the schedule, plus any verification
-    /// error from [`crypto::scheme::verify_signature`].
+    /// error from [`crypto::scheme::verify_signature`] or
+    /// [`crypto::scheme::verify_ed25519_batch`].
     pub fn verify(&self, set: &ValidatorSet) -> Result<Vec<Vec<u8>>, CryptoError> {
+        let payload = self.signing_payload()?;
+        let signers = self.signers(set)?;
+        let all_ed25519 = signers
+            .iter()
+            .all(|(_, key, _)| key.algorithm_id == ALG_ED25519);
+
+        if all_ed25519 && signers.len() >= BATCH_MIN_SIGNERS {
+            let entries: Vec<Ed25519BatchEntry<'_>> = signers
+                .iter()
+                .map(|(_, key, signature)| Ed25519BatchEntry {
+                    public_key: &key.public_key,
+                    message: &payload,
+                    signature,
+                })
+                .collect();
+            verify_ed25519_batch(&entries)?;
+        } else {
+            verify_each(&payload, &signers)?;
+        }
+        Ok(collect_ids(signers))
+    }
+
+    /// Verifies every signature one at a time, with the same rules as
+    /// [`Certificate::verify`].
+    ///
+    /// This exists so the batch path can be checked against a reference path, and
+    /// so a caller that needs to know which signer failed has one.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`Certificate::verify`], reported for the first signer
+    /// that fails, in ascending validator order.
+    pub fn verify_individual(&self, set: &ValidatorSet) -> Result<Vec<Vec<u8>>, CryptoError> {
+        let payload = self.signing_payload()?;
+        let signers = self.signers(set)?;
+        verify_each(&payload, &signers)?;
+        Ok(collect_ids(signers))
+    }
+
+    /// Resolves the signers named by the bitmap, in order, without checking any
+    /// signature.
+    fn signers<'a>(&'a self, set: &'a ValidatorSet) -> Result<Vec<SignedEntry<'a>>, CryptoError> {
         self.check_shape()?;
         let validators = set.validators.len();
         if self.signer_bitmap.len() != bitmap_len(validators) {
@@ -223,22 +280,22 @@ impl Certificate {
             )));
         }
 
-        let payload = self.signing_payload()?;
         let mut signers = Vec::with_capacity(self.signatures.len());
         let mut signature_index = 0;
         for (index, record) in set.validators.iter().enumerate() {
             if !bit_is_set(&self.signer_bitmap, index) {
                 continue;
             }
-            let key: &ValidatorKey = record.active_key(self.epoch)?;
-            verify_signature(
-                key.algorithm_id,
-                &key.public_key,
-                &payload,
-                &self.signatures[signature_index],
-            )?;
+            let key = record.active_key(self.epoch)?;
+            let signature = self.signatures.get(signature_index).ok_or_else(|| {
+                malformed(format!(
+                    "bitmap marks {} signers but only {} signatures are present",
+                    self.signer_count(),
+                    self.signatures.len()
+                ))
+            })?;
             signature_index += 1;
-            signers.push(record.validator_id.clone());
+            signers.push((record, key, signature.as_slice()));
         }
         Ok(signers)
     }
@@ -264,6 +321,24 @@ impl Certificate {
         }
         Ok(signers)
     }
+}
+
+/// One resolved signer: the validator record, the key active at the certificate
+/// epoch, and that signer's signature bytes.
+type SignedEntry<'a> = (&'a ValidatorRecord, &'a ValidatorKey, &'a [u8]);
+
+fn verify_each(payload: &[u8], signers: &[SignedEntry<'_>]) -> Result<(), CryptoError> {
+    for (_, key, signature) in signers {
+        verify_signature(key.algorithm_id, &key.public_key, payload, signature)?;
+    }
+    Ok(())
+}
+
+fn collect_ids(signers: Vec<SignedEntry<'_>>) -> Vec<Vec<u8>> {
+    signers
+        .into_iter()
+        .map(|(record, _, _)| record.validator_id.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -434,6 +509,45 @@ mod tests {
         set.validate().unwrap();
         let error = signed.verify(&set).unwrap_err();
         assert_eq!(error.kind(), CryptoErrorKind::InvalidSignature);
+    }
+
+    #[test]
+    fn batch_and_individual_paths_agree() {
+        let (set, signers) = validator_set(7);
+        let valid = certificate(&set, &signers, 7);
+        assert_eq!(
+            valid.verify(&set).unwrap(),
+            valid.verify_individual(&set).unwrap()
+        );
+
+        let mut tampered = valid.clone();
+        tampered.signatures[3][10] ^= 0x40;
+        assert_eq!(
+            tampered.verify(&set).unwrap_err().kind(),
+            CryptoErrorKind::InvalidSignature
+        );
+        assert_eq!(
+            tampered.verify_individual(&set).unwrap_err().kind(),
+            CryptoErrorKind::InvalidSignature
+        );
+    }
+
+    #[test]
+    fn a_small_order_r_is_rejected_by_both_paths() {
+        let (set, signers) = validator_set(7);
+        let mut candidate = certificate(&set, &signers, 7);
+        // Replace R with the identity point encoding: `verify_strict` rejects it,
+        // and the batch path must agree rather than accept the equation.
+        candidate.signatures[0][..32].fill(0);
+        candidate.signatures[0][0] = 1;
+        assert_eq!(
+            candidate.verify(&set).unwrap_err().kind(),
+            CryptoErrorKind::InvalidSignature
+        );
+        assert_eq!(
+            candidate.verify_individual(&set).unwrap_err().kind(),
+            CryptoErrorKind::InvalidSignature
+        );
     }
 
     #[test]

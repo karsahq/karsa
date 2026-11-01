@@ -126,13 +126,14 @@ Status of the first stage:
   algorithm registry (same frozen IDs and sizes as V), domain-separated
   payloads, and the `SignatureScheme` trait with Ed25519, ML-DSA-65, and
   SLH-DSA-SHA2-128s implementations.
-- 109 tests pass in the workspace default build (110 with `--all-features`), 30
+- 111 tests pass in the workspace default build (112 with `--all-features`), 30
   of them in `crypto` alone without PQ backends: RFC 8032 vectors, ML-DSA and
   SLH-DSA roundtrip and context binding, deterministic signing, key generation,
   envelope and policy behaviour, validator rotation and quorum-safe counting,
   validator key registration and epoch advance over HTTP, certificate encoding
-  and quorum rejection, in-process HTTP tests, plus byte-for-byte parity checks
-  for the signing payloads and a complete signed envelope.
+  and quorum rejection, batch-vs-individual equality, in-process HTTP tests,
+  plus byte-for-byte parity checks for the signing payloads and a complete
+  signed envelope.
 - `karsa acvp` matches 15/15 NIST ML-DSA-65 and 14/14 SLH-DSA-SHA2-128s sigVer
   vectors.
 - `karsa node` produces the same transaction id as the V node for the same demo
@@ -143,7 +144,8 @@ Status of the first stage:
 - `karsa dagbench` reproduces the V certificate sizes exactly (331,403 B at 100
   validators) and the 10.2× / 1.6× dense-vs-sparse header ratios.
 - `karsa certify` encodes and verifies a real certificate against the schedule:
-  per-signature cost matches the Ed25519 baseline, and below-quorum, tampered,
+  batch verification cuts Ed25519 certificate verification by 1.3–2× (2,630 µs
+  instead of 4,108 µs at 100 validators), and below-quorum, tampered,
   retired-key, and shape-mismatch cases are all rejected with protocol codes.
 - `karsa loadtest` measures ~50–57k accepted tx/s on this machine, against
   ~25–33k for the V node.
@@ -158,7 +160,7 @@ the measured V numbers to beat are in the root `README.md`.
 
 | Need | Candidate | Note |
 | ---- | --------- | ---- |
-| Ed25519 | `ed25519-dalek` | audited, constant-time, fast |
+| Ed25519 | `ed25519-dalek` | audited, constant-time, fast; `batch` feature for multi-scalar verification, `curve25519-dalek` used directly to reject a small-order `R`, which the batch equation does not test |
 | ML-DSA-65 | RustCrypto `ml-dsa`, or OpenSSL via `openssl` crate | RustCrypto's is a pre-release and not independently audited; the V prototype used OpenSSL 3.6.5 and passed ACVP sigVer |
 | SLH-DSA-128s | RustCrypto `slh-dsa` (pure Rust) or OpenSSL 3.5+ EVP | chosen `slh-dsa` 0.2.0-rc.5 so the hash-based fallback needs no system library; also a pre-release, so it still needs an audit |
 | Hashing | `sha2` | matches `SHA-256` in the spec |

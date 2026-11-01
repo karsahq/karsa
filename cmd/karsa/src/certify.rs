@@ -81,11 +81,16 @@ pub fn run(validators: usize) -> Result<(), Box<dyn std::error::Error>> {
         return Err("the certificate did not roundtrip".into());
     }
 
-    let mut verify_ns = u128::MAX;
+    let mut batch_ns = u128::MAX;
+    let mut individual_ns = u128::MAX;
     for _ in 0..MEASUREMENT_ROUNDS {
         let start = Instant::now();
         decoded.verify_quorum(&set)?;
-        verify_ns = verify_ns.min(start.elapsed().as_nanos());
+        batch_ns = batch_ns.min(start.elapsed().as_nanos());
+
+        let start = Instant::now();
+        decoded.verify_individual(&set)?;
+        individual_ns = individual_ns.min(start.elapsed().as_nanos());
     }
 
     println!("== DAG-BFT certificate ==");
@@ -98,14 +103,20 @@ pub fn run(validators: usize) -> Result<(), Box<dyn std::error::Error>> {
     println!("  signers:           {}", decoded.signer_count());
     println!("  bitmap:            {} bytes", decoded.signer_bitmap.len());
     println!("  encoded:           {} bytes", encoded.len());
-    println!("  verify + quorum:   {} us", verify_ns / 1000);
+    println!("  verify (batch):    {} us", batch_ns / 1000);
+    println!("  verify (per-sig):  {} us", individual_ns / 1000);
     println!(
-        "  certificates/s:    {} per core",
-        1_000_000_000u128.checked_div(verify_ns).unwrap_or(0)
+        "  batch speed-up:    {}.{}x",
+        individual_ns / batch_ns,
+        (individual_ns % batch_ns) * 10 / batch_ns
     );
     println!(
-        "  per signature:     {} us",
-        verify_ns / 1000 / validators as u128
+        "  certificates/s:    {} per core (batch)",
+        1_000_000_000u128.checked_div(batch_ns).unwrap_or(0)
+    );
+    println!(
+        "  per signature:     {} us (batch)",
+        batch_ns / 1000 / validators as u128
     );
 
     println!();

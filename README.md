@@ -46,18 +46,20 @@ Done:
   verification against the schedule at the certificate epoch. The certificate
   carries a signer bitmap and one signature per signer, never key ids: the
   active key is resolved from the schedule, so a retired key cannot certify.
+  Ed25519 signers are batch-verified when there are four or more.
 - `karsa node`: the same HTTP pipeline as the V node (decode, policy lookup,
   signature verification, per-sender replay protection) on axum, plus the
   validator schedule: `GET /validators`, `POST /validators/{id}/keys`
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 109 tests in the default workspace build (110 with `--all-features`),
+- 111 tests in the default workspace build (112 with `--all-features`),
   including RFC 8032 vectors, ML-DSA-65 and SLH-DSA roundtrip and context
   binding, deterministic signing, envelope and policy behaviour, validator
   rotation, validator key registration over HTTP, certificate encoding and
-  quorum rejection, in-process HTTP tests, and **byte-for-byte parity checks**
-  against V for the signing payloads and for a complete signed envelope.
+  quorum rejection, batch-vs-individual verification equality, in-process HTTP
+  tests, and **byte-for-byte parity checks** against V for the signing payloads
+  and for a complete signed envelope.
 - `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors (the same result as
   the V prototype) and **14/14** NIST SLH-DSA-SHA2-128s sigVer vectors.
 
@@ -84,9 +86,14 @@ one signature, ~626 ms to sign one, and a 100-validator certificate of 786,103 B
 
 Certificates are no longer only a cost model: `karsa certify 10` encodes a real
 certificate and verifies it against the epoch-bound schedule. 771 bytes at 10
-validators, 405 µs to verify plus check the quorum on one core (2,465/s), and the
-four rejection paths (below quorum, tampered signature, retired signer key,
+validators, 296 µs to verify plus check the quorum on one core (3,376/s) when the
+signers are Ed25519, against 589 µs per signature-at-a-time — a 1.3–2× gain that
+stops well short of 5–10× because every signature still needs its own SHA-512.
+The four rejection paths (below quorum, tampered signature, retired signer key,
 bitmap/signature mismatch) each report a frozen protocol code.
+
+Batching changes CPU only: the certificate bytes are identical, so it does not
+move the bandwidth conclusions.
 
 ```bash
 cargo build

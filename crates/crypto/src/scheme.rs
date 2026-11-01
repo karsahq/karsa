@@ -5,7 +5,8 @@
 //! dispatch in [`verify_signature`] rather than trait objects, so the hot path
 //! has no vtable lookup.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use curve25519_dalek::edwards::CompressedEdwardsY;
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, verify_batch};
 use rand_core::OsRng;
 
 use crate::encoding::MAX_FIELD_LEN;
@@ -130,16 +131,7 @@ impl SignatureScheme for Ed25519Scheme {
     }
 
     fn validate_public_key(&self, public_key: &[u8]) -> Result<(), CryptoError> {
-        if public_key.len() != ED25519_PUBLIC_KEY_SIZE {
-            return Err(CryptoError::new(
-                CryptoErrorKind::MalformedPublicKey,
-                format!(
-                    "ed25519: want {ED25519_PUBLIC_KEY_SIZE} bytes, got {}",
-                    public_key.len()
-                ),
-            ));
-        }
-        Ok(())
+        parse_public_key(public_key).map(|_| ())
     }
 
     fn verify(
@@ -148,29 +140,8 @@ impl SignatureScheme for Ed25519Scheme {
         message: &[u8],
         signature: &[u8],
     ) -> Result<(), CryptoError> {
-        self.validate_public_key(public_key)?;
-        if signature.len() != ED25519_SIGNATURE_SIZE {
-            return Err(CryptoError::new(
-                CryptoErrorKind::MalformedSignature,
-                format!(
-                    "ed25519: want {ED25519_SIGNATURE_SIZE} bytes, got {}",
-                    signature.len()
-                ),
-            ));
-        }
-
-        let mut key_bytes = [0u8; ED25519_PUBLIC_KEY_SIZE];
-        key_bytes.copy_from_slice(public_key);
-        let key = VerifyingKey::from_bytes(&key_bytes).map_err(|_| {
-            CryptoError::new(
-                CryptoErrorKind::MalformedPublicKey,
-                "ed25519: public key is not a canonical point",
-            )
-        })?;
-
-        let mut signature_bytes = [0u8; ED25519_SIGNATURE_SIZE];
-        signature_bytes.copy_from_slice(signature);
-        let signature = Signature::from_bytes(&signature_bytes);
+        let key = parse_public_key(public_key)?;
+        let signature = parse_signature(signature)?;
 
         // `verify_strict` rejects small-order components and non-canonical
         // encodings, matching what the V implementation and OpenSSL do.
@@ -181,6 +152,120 @@ impl SignatureScheme for Ed25519Scheme {
             )
         })
     }
+}
+
+/// Parses a canonical Ed25519 public key.
+///
+/// A point of small order is rejected as malformed rather than merely invalid:
+/// such a key can never produce a signature that `verify_strict` accepts, and
+/// accepting one into a set would weaken batch verification, whose equation does
+/// not test small-order public keys the way single-signature verification does.
+fn parse_public_key(public_key: &[u8]) -> Result<VerifyingKey, CryptoError> {
+    if public_key.len() != ED25519_PUBLIC_KEY_SIZE {
+        return Err(CryptoError::new(
+            CryptoErrorKind::MalformedPublicKey,
+            format!(
+                "ed25519: want {ED25519_PUBLIC_KEY_SIZE} bytes, got {}",
+                public_key.len()
+            ),
+        ));
+    }
+    let mut key_bytes = [0u8; ED25519_PUBLIC_KEY_SIZE];
+    key_bytes.copy_from_slice(public_key);
+    let key = VerifyingKey::from_bytes(&key_bytes).map_err(|_| {
+        CryptoError::new(
+            CryptoErrorKind::MalformedPublicKey,
+            "ed25519: public key is not a canonical point",
+        )
+    })?;
+    if key.is_weak() {
+        return Err(CryptoError::new(
+            CryptoErrorKind::MalformedPublicKey,
+            "ed25519: public key is a small-order point",
+        ));
+    }
+    Ok(key)
+}
+
+fn parse_signature(signature: &[u8]) -> Result<Signature, CryptoError> {
+    if signature.len() != ED25519_SIGNATURE_SIZE {
+        return Err(CryptoError::new(
+            CryptoErrorKind::MalformedSignature,
+            format!(
+                "ed25519: want {ED25519_SIGNATURE_SIZE} bytes, got {}",
+                signature.len()
+            ),
+        ));
+    }
+    let mut signature_bytes = [0u8; ED25519_SIGNATURE_SIZE];
+    signature_bytes.copy_from_slice(signature);
+    Ok(Signature::from_bytes(&signature_bytes))
+}
+
+/// Returns whether the signature's `R` is unusable.
+///
+/// `verify_strict` rejects a small-order `R`; the batch equation does not, so a
+/// batch verifier has to check it explicitly or it would accept a signature the
+/// single-signature path rejects. A `R` that does not decompress also fails.
+fn has_unusable_r(signature: &Signature) -> bool {
+    CompressedEdwardsY(*signature.r_bytes())
+        .decompress()
+        .is_none_or(|point| point.is_small_order())
+}
+
+/// One signature in a batch.
+#[derive(Debug, Clone, Copy)]
+pub struct Ed25519BatchEntry<'a> {
+    /// Canonical 32-byte public key.
+    pub public_key: &'a [u8],
+    /// The message this signature covers.
+    pub message: &'a [u8],
+    /// The 64-byte signature.
+    pub signature: &'a [u8],
+}
+
+/// Verifies many Ed25519 signatures with one multi-scalar multiplication.
+///
+/// The accept/reject decision is the same as verifying each entry with
+/// [`Ed25519Scheme`]: canonical and non-small-order public keys, canonical `s`, a
+/// usable `R`, and a valid equation. The batch randomness is derived from a
+/// transcript over the inputs, not from the operating system, so two nodes
+/// checking the same certificate reach the same verdict.
+///
+/// An empty batch verifies vacuously.
+///
+/// # Errors
+///
+/// Returns a malformed-input error for a wrong-length key or signature, and
+/// [`CryptoErrorKind::InvalidSignature`] when any entry does not verify. The
+/// error does not say which entry failed, because the batch equation cannot
+/// attribute a failure.
+pub fn verify_ed25519_batch(entries: &[Ed25519BatchEntry<'_>]) -> Result<(), CryptoError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut keys = Vec::with_capacity(entries.len());
+    let mut signatures = Vec::with_capacity(entries.len());
+    let mut messages = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let key = parse_public_key(entry.public_key)?;
+        let signature = parse_signature(entry.signature)?;
+        if has_unusable_r(&signature) {
+            return Err(CryptoError::new(
+                CryptoErrorKind::InvalidSignature,
+                "ed25519: signature R is a small-order point",
+            ));
+        }
+        keys.push(key);
+        signatures.push(signature);
+        messages.push(entry.message);
+    }
+    verify_batch(&messages, &signatures, &keys).map_err(|_| {
+        CryptoError::new(
+            CryptoErrorKind::InvalidSignature,
+            "ed25519: batch does not verify",
+        )
+    })
 }
 
 fn copy_seed(seed: &[u8]) -> Result<[u8; ED25519_SEED_SIZE], CryptoError> {
