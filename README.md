@@ -53,7 +53,7 @@ Done:
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 111 tests in the default workspace build (112 with `--all-features`),
+- 120 tests in the default workspace build (121 with `--all-features`),
   including RFC 8032 vectors, ML-DSA-65 and SLH-DSA roundtrip and context
   binding, deterministic signing, envelope and policy behaviour, validator
   rotation, validator key registration over HTTP, certificate encoding and
@@ -154,6 +154,12 @@ Rust port reproduces its measurements.
    Batching, certificate size, and sending to fewer peers are the real levers.
 9. **Batch verification is not aggregation.** It cut certificate verification by
    1.3–2× on this CPU, not 5–10×, and left every byte in place.
+10. **Certificates cost `n²` signatures per round; uncertified DAGs cost `n`.**
+    One artifact per validator per round means our certificate model produces
+    10,000 signatures at 100 validators while a block-per-validator DAG produces
+    100. `karsa bandwidth` puts that at 32.8 MB vs 343 kB of per-node egress with
+    ML-DSA-65; the trade is that a certificate is verifiable offline and a DAG
+    claim is not.
 
 ## Port plan
 

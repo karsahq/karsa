@@ -126,7 +126,7 @@ Status of the first stage:
   algorithm registry (same frozen IDs and sizes as V), domain-separated
   payloads, and the `SignatureScheme` trait with Ed25519, ML-DSA-65, and
   SLH-DSA-SHA2-128s implementations.
-- 116 tests pass in the workspace default build (117 with `--all-features`), 30
+- 120 tests pass in the workspace default build (121 with `--all-features`), 30
   of them in `crypto` alone without PQ backends: RFC 8032 vectors, ML-DSA and
   SLH-DSA roundtrip and context binding, deterministic signing, key generation,
   envelope and policy behaviour, validator rotation and quorum-safe counting,
@@ -149,7 +149,10 @@ Status of the first stage:
   retired-key, and shape-mismatch cases are all rejected with protocol codes.
 - `karsa bandwidth` re-derives the dissemination arithmetic: per-node egress is
   `(n-1)/n` of the originator total for any fanout, so batching and certificate
-  size move the number and fanout does not.
+  size move the number and fanout does not. It also prices three consensus
+  metadata styles per round: an `n`-signature certificate (10,000 signatures at
+  n=100), and block-per-validator DAGs with one signature each (100), which is
+  where a 30–95× metadata difference comes from.
 - `karsa loadtest` measures ~50–57k accepted tx/s on this machine, against
   ~25–33k for the V node.
 - The V prototype's rule that activation requires an implementation is

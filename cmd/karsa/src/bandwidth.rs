@@ -22,6 +22,26 @@ const CLASSICAL_TX_BYTES: u64 = 200;
 const HYBRID_TX_BYTES: u64 = 3_500;
 /// Erasure-coding shapes, `(enough, total)`.
 const ERASURE_SHAPES: [(u64, u64); 3] = [(10, 16), (16, 24), (32, 48)];
+/// Bytes of one block reference: a 32-byte digest, a 4-byte author, an 8-byte
+/// round. This is the shape of the `BlockReference` the Starfish testbed uses.
+const REFERENCE_BYTES: usize = 44;
+/// Fixed block-header bytes other than references and the signature: author,
+/// round, and a couple of small flags. An assumption, not a measurement.
+const BLOCK_FIXED_BYTES: usize = 24;
+/// References a non-leader block carries in the sparse styles: its own previous
+/// block, the previous round's leader, and its certificate claim.
+const NON_LEADER_REFERENCES: usize = 3;
+
+/// One consensus style's per-round metadata shape.
+struct Style {
+    name: &'static str,
+    /// Bytes of one artifact emitted by a non-leader validator.
+    artifact_bytes: usize,
+    /// Bytes of the artifact emitted by the round leader.
+    leader_bytes: usize,
+    /// Signatures the whole committee produces per round.
+    signatures_per_round: u128,
+}
 
 /// Certificates per second when `transactions_per_certificate` transactions are
 /// batched into each one.
@@ -85,6 +105,46 @@ fn erasure_bytes(payload_bytes: u64, enough: u64, total: u64) -> u64 {
         return payload_bytes;
     }
     payload_bytes.saturating_mul(total) / enough
+}
+
+/// Per-round metadata for three consensus styles, all with one artifact per
+/// validator per round.
+///
+/// * **certificate (ours)**: every validator emits a certificate carrying the
+///   whole committee's signatures, so the committee produces `n²` signatures per
+///   round.
+/// * **bluestreak**: every validator emits one block signed once; non-leaders
+///   carry three references and the leader carries the round's reference list.
+/// * **sparse-starfish-speed**: the same, plus a constant `ceil(n/8)` strong-vote
+///   bitmask per block; acknowledgments live on the leader's block only.
+fn styles(validators: usize, signature_size: usize) -> Result<Vec<Style>, Box<dyn Error>> {
+    let certificate = projected_certificate_bytes(validators, signature_size)?;
+    let bluestreak_leader = BLOCK_FIXED_BYTES + signature_size + (validators + 1) * REFERENCE_BYTES;
+    let bluestreak_voter =
+        BLOCK_FIXED_BYTES + signature_size + NON_LEADER_REFERENCES * REFERENCE_BYTES;
+    let bitmask = validators.div_ceil(8);
+    let committee = validators as u128;
+
+    Ok(vec![
+        Style {
+            name: "certificate (ours)",
+            artifact_bytes: certificate,
+            leader_bytes: certificate,
+            signatures_per_round: committee * committee,
+        },
+        Style {
+            name: "bluestreak",
+            artifact_bytes: bluestreak_voter,
+            leader_bytes: bluestreak_leader,
+            signatures_per_round: committee,
+        },
+        Style {
+            name: "sparse-starfish-speed",
+            artifact_bytes: bluestreak_voter + bitmask,
+            leader_bytes: bluestreak_leader + bitmask,
+            signatures_per_round: committee,
+        },
+    ])
 }
 
 fn human(bytes_per_second: u128) -> String {
@@ -190,6 +250,43 @@ pub fn run(
     println!("  {mesh_peers} links once.");
     println!("  Fanout does not reduce dissemination bandwidth; batching and smaller");
     println!("  certificates do.");
+    println!();
+
+    println!("== Consensus metadata per round, by style ==");
+    println!(
+        "  {}  {}  {}  {}  {}  {}",
+        left("scheme", 10),
+        left("style", 22),
+        pad("sigs/round", 10),
+        pad("artifact", 10),
+        pad("per node", 11),
+        pad("leader blk", 11),
+    );
+    for (algorithm_id, name) in schemes {
+        let signature_size = lookup(algorithm_id)?.signature_size;
+        for style in styles(validators, signature_size)? {
+            let egress = (validators as u128 - 1) * style.artifact_bytes as u128;
+            println!(
+                "  {}  {}  {}  {}  {}  {}",
+                left(name, 10),
+                left(style.name, 22),
+                pad(&style.signatures_per_round.to_string(), 10),
+                pad(&bytes_human(style.artifact_bytes), 10),
+                pad(
+                    &bytes_human(usize::try_from(egress).unwrap_or(usize::MAX)),
+                    11
+                ),
+                pad(&bytes_human(style.leader_bytes), 11),
+            );
+        }
+    }
+    println!("  A model, not a measurement. One artifact per validator per round.");
+    println!(
+        "  A block reference is {REFERENCE_BYTES} B, the fixed block overhead is {BLOCK_FIXED_BYTES} B,\n  a non-leader carries {NON_LEADER_REFERENCES} references and the leader carries n+1."
+    );
+    println!("  The certificate style pays n signatures per artifact; the block styles pay");
+    println!("  one, which is where the two orders of magnitude come from. The SSFS bitmask");
+    println!("  is ceil(n/8) bytes and is not where the saving is.");
     println!();
 
     println!("== Transaction payload stream ==");
@@ -321,5 +418,38 @@ mod tests {
         assert_eq!(erasure_bytes(1_000, 10, 16), 1_600);
         assert_eq!(erasure_bytes(1_000, 16, 16), 1_000);
         assert_eq!(erasure_bytes(1_000, 0, 16), 1_000);
+    }
+
+    #[test]
+    fn certificate_style_is_quadratic_in_signatures() {
+        let styles = styles(100, 64).unwrap();
+        assert_eq!(styles[0].signatures_per_round, 10_000);
+        assert_eq!(styles[1].signatures_per_round, 100);
+        assert_eq!(styles[2].signatures_per_round, 100);
+    }
+
+    #[test]
+    fn sparse_starfish_speed_adds_only_a_bitmask() {
+        let validators = 100;
+        let styles = styles(validators, 3_309).unwrap();
+        let bitmask = validators.div_ceil(8);
+        assert_eq!(styles[2].artifact_bytes - styles[1].artifact_bytes, bitmask);
+        assert_eq!(styles[2].leader_bytes - styles[1].leader_bytes, bitmask);
+    }
+
+    #[test]
+    fn the_leader_block_carries_the_reference_list() {
+        let styles = styles(100, 64).unwrap();
+        assert!(styles[1].leader_bytes > styles[1].artifact_bytes * 2);
+        assert!(styles[2].leader_bytes > styles[2].artifact_bytes * 2);
+    }
+
+    #[test]
+    fn one_signature_per_block_beats_one_bundle_per_certificate() {
+        // ML-DSA-65 at n=100: the certificate style pays 100 signatures per
+        // artifact, so it should be more than an order of magnitude larger even
+        // after adding the bitmask and the leader list.
+        let styles = styles(100, 3_309).unwrap();
+        assert!(styles[0].artifact_bytes > styles[2].leader_bytes * 10);
     }
 }
