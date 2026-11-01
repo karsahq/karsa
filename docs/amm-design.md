@@ -82,11 +82,12 @@ These numbers exclude the ante handler, signature recovery, and transaction
 overhead, so a signed transaction costs more. They are useful for relative cost
 and block-capacity estimates, not for fee guarantees.
 
-At the 150M gas evaluation target, the keeper-level ceilings are about 2,750
-bank swaps, 760 `akra`↔ERC20 swaps, or 440 ERC20↔ERC20 swaps per block. At the
-current 100M genesis limit they are about 1,835, 508, and 294 respectively.
+At the 300M genesis block gas limit, the keeper-level ceilings are about 5,500
+bank swaps, 1,520 `akra`↔ERC20 swaps, or 880 ERC20↔ERC20 swaps per block. A full
+300M block takes roughly 0.44 to 0.61 seconds of keeper-level execution to fill.
 `max_bytes` is a separate 3,000,000-byte cap; the actual transaction size decides
-whether bytes or gas binds first.
+whether bytes or gas binds first, and for real signed transactions gas binds
+first.
 
 Consequences:
 

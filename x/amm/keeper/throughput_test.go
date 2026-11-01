@@ -24,7 +24,7 @@ import (
 
 const (
 	// throughputBlockGas is the per-block gas limit we are evaluating.
-	throughputBlockGas = 150_000_000
+	throughputBlockGas = 300_000_000
 	// throughputBlockTime is the configured block cadence.
 	throughputBlockTime = 1500 * time.Millisecond
 )
@@ -71,9 +71,9 @@ func (r opResult) report(t *testing.T) {
 	}
 
 	t.Logf(
-		"%-22s ops=%4d  gas/op=%8.0f (%s)  %6.2f ms/op  -> %5.0f ops/block  %6.0f ms for 150M gas  (budget %.0f ms)",
+		"%-22s ops=%4d  gas/op=%8.0f (%s)  %6.2f ms/op  -> %5.0f ops/block  %6.0f ms for %dM gas  (budget %.0f ms)",
 		r.name, r.ops, gasPerOp, source, msPerOp, opsForLimit, msForLimit,
-		float64(throughputBlockTime.Milliseconds()),
+		throughputBlockGas/1_000_000, float64(throughputBlockTime.Milliseconds()),
 	)
 }
 

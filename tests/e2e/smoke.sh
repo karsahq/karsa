@@ -109,7 +109,7 @@ genesis["app_state"]["bank"]["denom_metadata"].append({
     "uri_hash": "",
 })
 
-# Block limits come from `karsad init`, which sets 150M gas and 3MB. They are
+# Block limits come from `karsad init`, which sets 300M gas and 3MB. They are
 # not patched here on purpose: this run proves the init defaults are usable.
 
 with open(path, "w") as f:

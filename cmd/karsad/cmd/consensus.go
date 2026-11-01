@@ -16,7 +16,7 @@ import (
 
 const (
 	// defaultBlockMaxGas is the gas a block may consume.
-	defaultBlockMaxGas = 150_000_000
+	defaultBlockMaxGas = 300_000_000
 	// defaultBlockMaxBytes caps oversized blocks. With ~330-byte transfers the
 	// gas limit is the practical constraint, so this only stops pathological
 	// blocks.
