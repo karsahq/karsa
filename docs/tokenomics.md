@@ -66,14 +66,16 @@ should match the value configured here; if it changes, update
 | Param | Value |
 |---|---:|
 | `consensus.params.block.max_bytes` | 3,000,000 (~2.86 MiB) |
-| `consensus.params.block.max_gas` | 100,000,000 |
+| `consensus.params.block.max_gas` | 150,000,000 |
 
-At ~1.5s blocks this is roughly 66.7M gas/second. `max_gas` is the practical
+At ~1.5s blocks this is roughly 100M gas/second. `max_gas` is the practical
 limiter for AMM traffic; `max_bytes` caps oversized blocks and stays well above
-the 1 MiB per-transaction limit.
+the 1 MiB per-transaction limit. A ~330-byte transfer fits about 9,000 per block
+by size, while the gas limit allows about 1,700 at the measured 87,880 gas.
 
-The AMM throughput test uses a 150M gas target for capacity evaluation. That is
-not the current genesis value; current `local_node.sh` and e2e use 100M.
+The AMM throughput test uses the same 150M gas target, so its capacity numbers
+describe the genesis value. `karsad init` writes these limits, and `local_node.sh`
+and the e2e scripts set them explicitly.
 
 ## Where inflation goes
 

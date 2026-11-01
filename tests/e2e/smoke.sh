@@ -114,7 +114,7 @@ genesis["app_state"]["bank"]["denom_metadata"].append({
 # ordinary EVM transfer is rejected as exceeding the block gas limit. Mirror
 # the production consensus values from local_node.sh / docs/tokenomics.md.
 genesis["consensus"]["params"]["block"]["max_bytes"] = "3000000"
-genesis["consensus"]["params"]["block"]["max_gas"] = "100000000"
+genesis["consensus"]["params"]["block"]["max_gas"] = "150000000"
 
 with open(path, "w") as f:
     json.dump(genesis, f, separators=(",", ":"))
