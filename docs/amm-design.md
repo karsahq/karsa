@@ -62,13 +62,31 @@ there is no escrow to keep in sync.
 
 | Class | Issued by | Bank denom | EVM address | Swap cost |
 |---|---|---|---|---|
-| Native denom | chain genesis | `akra` | precompile | ~76k |
-| IBC voucher | incoming ICS20 transfer | `ibc/<HASH>` | auto precompile | ~76k |
-| **Native token** | factory precompile | `n:0x…` | deterministic precompile | **~76k** |
-| ERC20 contract | user-deployed Solidity | none (held directly by the pool) | the contract itself | ~340k |
+| Native denom | chain genesis | `akra` | precompile | ~55k |
+| IBC voucher | incoming ICS20 transfer | `ibc/<HASH>` | auto precompile | ~55k |
+| **Native token** | factory precompile | `n:0x…` | deterministic precompile | **~55k** |
+| ERC20 contract | user-deployed Solidity | none (held directly by the pool) | the contract itself | ~197k–340k |
 
 Native tokens are specified in `docs/native-token.md`. They exist so a standard token does not have
 to pay the EVM-interop cost of a contract.
+
+Measured keeper-level gas on the reference machine:
+
+| Swap | Gas/op |
+|---|---:|
+| bank-backed (`akra`/IBC/native token) | 54,502 |
+| `akra` ↔ external ERC20 | 197,024 |
+| external ERC20 ↔ external ERC20 | 339,817 |
+
+These numbers exclude the ante handler, signature recovery, and transaction
+overhead, so a signed transaction costs more. They are useful for relative cost
+and block-capacity estimates, not for fee guarantees.
+
+At the 150M gas evaluation target, the keeper-level ceilings are about 2,750
+bank swaps, 760 `akra`↔ERC20 swaps, or 440 ERC20↔ERC20 swaps per block. At the
+current 100M genesis limit they are about 1,835, 508, and 294 respectively.
+`max_bytes` is a separate 3,000,000-byte cap; the actual transaction size decides
+whether bytes or gas binds first.
 
 Consequences:
 

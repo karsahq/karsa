@@ -72,6 +72,9 @@ At ~1.5s blocks this is roughly 66.7M gas/second. `max_gas` is the practical
 limiter for AMM traffic; `max_bytes` caps oversized blocks and stays well above
 the 1 MiB per-transaction limit.
 
+The AMM throughput test uses a 150M gas target for capacity evaluation. That is
+not the current genesis value; current `local_node.sh` and e2e use 100M.
+
 ## Where inflation goes
 
 The `x/mint` module mints to the fee collector account; `x/distribution` then

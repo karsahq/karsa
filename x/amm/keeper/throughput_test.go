@@ -141,7 +141,7 @@ func TestThroughput(t *testing.T) {
 		pathBA := []string{testUSDCPair.Hex(), akraAsset}
 		amountIn := sdkmath.NewInt(1_000)
 
-		res := measure(t, "bank<->bank swap", 500, 58_000, ctx, func(gctx sdk.Context, i int) error {
+		res := measure(t, "bank<->bank swap", 500, 54_500, ctx, func(gctx sdk.Context, i int) error {
 			path := pathAB
 			if i%2 == 1 {
 				path = pathBA
@@ -175,7 +175,7 @@ func TestThroughput(t *testing.T) {
 		pathBA := []string{token.Hex(), akraAsset}
 		amountIn := sdkmath.NewInt(1_000)
 
-		res := measure(t, "akra<->erc20 swap", 200, 380_000, ctx, func(gctx sdk.Context, i int) error {
+		res := measure(t, "akra<->erc20 swap", 200, 197_000, ctx, func(gctx sdk.Context, i int) error {
 			path := pathAB
 			if i%2 == 1 {
 				path = pathBA
@@ -214,7 +214,7 @@ func TestThroughput(t *testing.T) {
 		pathBA := []string{tokenB.Hex(), tokenA.Hex()}
 		amountIn := sdkmath.NewInt(1_000)
 
-		res := measure(t, "erc20<->erc20 swap", 200, 640_000, ctx, func(gctx sdk.Context, i int) error {
+		res := measure(t, "erc20<->erc20 swap", 200, 340_000, ctx, func(gctx sdk.Context, i int) error {
 			path := pathAB
 			if i%2 == 1 {
 				path = pathBA

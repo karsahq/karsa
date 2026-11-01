@@ -21,7 +21,7 @@ the difference is where balances live and where the logic runs.
 | `0x` address | module-created, deterministic from creator | `CREATE` (sender + nonce) |
 | Custom transfer logic | not possible | unrestricted |
 | Custom issuance logic | controller, through the minter precompile | unrestricted |
-| AMM pool swap gas | ~76k | ~550k |
+| AMM pool swap gas | ~55k | ~197k–340k |
 | Native IBC | yes | no (requires a bridge) |
 | Explorer source | none (precompile) | verified |
 | Protocol fee on creation | optional, default 0 | none |
