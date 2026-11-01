@@ -25,8 +25,11 @@ const (
 )
 
 const (
-	// BlocksPerYear corresponds to ~1.5s blocks, the configured cadence.
-	BlocksPerYear uint64 = 21_038_400
+	// BlocksPerYear corresponds to ~3s blocks, the configured production
+	// cadence: 365.25 days x 86400 seconds / 3. Minting divides the annual
+	// provisions by this number, so it has to match the real block time or the
+	// inflation drifts from 5% per year.
+	BlocksPerYear uint64 = 10_519_200
 )
 
 // MaxSupply is the hard cap in base units: 1 billion KRA at 18 decimals.

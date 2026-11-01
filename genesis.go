@@ -114,7 +114,7 @@ func NewBankGenesisState() *banktypes.GenesisState {
 //
 // It carries the Karsa supply schedule rather than the SDK defaults: a flat 5%
 // inflation (rate change zero, min and max equal), 21,038,400 blocks per year
-// (~1.5s blocks), and a 1 billion KRA cap. These used to live only in the
+// (~3s blocks), and a 1 billion KRA cap. These used to live only in the
 // local_node.sh jq patches, so a chain initialised without that script ran on
 // SDK defaults - 7% to 20% moving inflation and no supply cap.
 func NewMintGenesisState() *minttypes.GenesisState {

@@ -42,7 +42,7 @@ accounts in the production genesis.
 | `params.inflation_rate_change` | 0% |
 | `params.inflation_min` | 5.00% |
 | `params.inflation_max` | 5.00% |
-| `params.blocks_per_year` | 21,038,400 |
+| `params.blocks_per_year` | 10,519,200 |
 | `params.max_supply` | 1,000,000,000 KRA |
 
 Inflation is fixed at **5% per year** and does not adjust with the bonded ratio.
@@ -51,15 +51,18 @@ The `max_supply` cap stops minting at 1B KRA.
 Starting from 100M KRA, 5% compounding reaches 1B in roughly 47 years; the cap
 makes the terminal supply deterministic.
 
-`blocks_per_year` assumes **1.5 second blocks**:
+`blocks_per_year` assumes **3 second blocks**:
 
 ```text
-365.25 * 24 * 60 * 60 / 1.5 = 21,038,400
+365.25 * 24 * 60 * 60 / 3 = 10,519,200
 ```
 
-`local_node.sh` uses a faster 1s commit for development. Production block time
-should match the value configured here; if it changes, update
-`config.BlocksPerYear` and the genesis parameter together.
+Minting divides the annual provisions by this number, so the two must agree:
+with 3s blocks but the old 1.5s count the chain would mint half of the 5% target,
+and with 1s blocks it would mint three times as much. `local_node.sh` uses a 1s
+commit for development, so its inflation runs faster than the production figure
+on purpose. If the production cadence changes, update `config.BlocksPerYear` and
+the genesis parameter together.
 
 ## Block limits
 
@@ -68,14 +71,40 @@ should match the value configured here; if it changes, update
 | `consensus.params.block.max_bytes` | 3,000,000 (~2.86 MiB) |
 | `consensus.params.block.max_gas` | 300,000,000 |
 
-At ~1.5s blocks this is roughly 200M gas/second. `max_gas` is the practical
-limiter for AMM traffic; `max_bytes` caps oversized blocks and stays well above
-the 1 MiB per-transaction limit. A ~330-byte transfer fits about 9,000 per block
-by size, while the gas limit allows about 3,400 at the measured 87,880 gas.
+At ~3s blocks this is 100M gas/second. `max_gas` is the practical limiter for
+AMM traffic; `max_bytes` caps oversized blocks and stays well above the 1 MiB
+per-transaction limit. A ~330-byte transfer fits about 9,000 per block by size,
+while the gas limit allows about 3,400 at the measured 87,880 gas, so gas binds
+first for ordinary traffic.
 
 The AMM throughput test uses the same 300M gas target, so its capacity numbers
-describe the genesis value. `karsad init` writes these limits, and `local_node.sh`
-and the e2e scripts set them explicitly.
+describe the genesis value. `karsad init` writes these limits; `local_node.sh` and
+the e2e scripts no longer patch them.
+
+## Measured throughput
+
+`tests/e2e/tps.sh` loads one local node with pre-signed EVM transfers at 3s
+blocks and 300M gas. On the development host:
+
+| Workload | Limit that binds | Per block | TPS at 3s |
+|---|---|---:|---:|
+| EVM transfer, 21,000 gas, ~327 bytes | `max_bytes` | 9,188 | ~3,060 |
+| Bank transfer, 87,880 gas, ~337 bytes | `max_gas` | ~3,400 | ~1,133 |
+| AMM swap, 54,502 gas (keeper) | `max_gas` | ~5,500 | ~1,830 |
+
+A burst of 16,000 transfers reported 912 TPS end to end, because the first block
+takes 9,188 and the rest drain over the following blocks while the proposer
+rechecks the mempool. The per-block column is the capacity; the burst number is
+what a client observes.
+
+Two limits shape bursts rather than steady state:
+
+- The EVM mempool defaults to 16 executable and 1024 queued transactions
+  globally. A larger burst is throttled or dropped, so sustained load should be
+  paced to the block rate, or these queues raised.
+- `evm.mempool.included-nonce-cache-size` defaults to 4096 and should be at
+  least the number of transactions a block can hold; the load test raises it
+  before pushing more than 4,096 transfers into one block.
 
 ## Where inflation goes
 
