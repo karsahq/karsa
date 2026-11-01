@@ -43,14 +43,17 @@ Done:
   counting (one vote per validator even if two keys sign), and the 3×/2×
   supermajority rule.
 - `karsa node`: the same HTTP pipeline as the V node (decode, policy lookup,
-  signature verification, per-sender replay protection) on axum.
+  signature verification, per-sender replay protection) on axum, plus the
+  validator schedule: `GET /validators`, `POST /validators/{id}/keys`
+  (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 89 tests in the default workspace build (90 with `--all-features`),
+- 100 tests in the default workspace build (101 with `--all-features`),
   including RFC 8032 vectors, ML-DSA-65 and SLH-DSA roundtrip and context
   binding, deterministic signing, envelope and policy behaviour, validator
-  rotation, in-process HTTP tests, and **byte-for-byte parity checks** against V
-  for the signing payloads and for a complete signed envelope.
+  rotation, validator key registration over HTTP, in-process HTTP tests, and
+  **byte-for-byte parity checks** against V for the signing payloads and for a
+  complete signed envelope.
 - `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors (the same result as
   the V prototype) and **14/14** NIST SLH-DSA-SHA2-128s sigVer vectors.
 
@@ -81,10 +84,22 @@ cargo test
 cargo run -p karsa -- demo
 cargo run -p karsa -- node          # HTTP node on 127.0.0.1:8099
 cargo run -p karsa -- acvp testdata/acvp/sigver.json
+cargo run -p karsa -- register-demo 1   # signed validator key rotation body
 cargo run -p karsa -- dagbench
 cargo run -p karsa -- loadtest 20000 16
 ./scripts/rust-check.sh
 ./scripts/acvp-rust.sh       # downloads vectors on first use
+```
+
+Rotating a consensus key against a running node:
+
+```bash
+karsa register-demo 1 > /tmp/rot.json
+curl -s -X POST -H 'content-type: application/json' \
+     --data @/tmp/rot.json http://127.0.0.1:8099/validators/val-1/keys
+curl -s -X POST -H 'content-type: application/json' \
+     -d '{"epoch":1}' http://127.0.0.1:8099/epoch
+curl -s http://127.0.0.1:8099/validators   # genesis retired, val-1-next active
 ```
 
 `pq-testnet` requires at least one PQ backend to be compiled; with neither

@@ -592,6 +592,7 @@ dependencies = [
  "tokio",
  "tower",
  "tx",
+ "validator",
 ]
 
 [[package]]

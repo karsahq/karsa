@@ -16,6 +16,7 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 tx = { path = "../../crates/tx" }
+validator = { path = "../../crates/validator" }
 
 [dev-dependencies]
 http-body-util = "0.1"

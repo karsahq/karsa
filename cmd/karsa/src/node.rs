@@ -3,7 +3,10 @@
 //! Exercises the pipeline from `docs/crypto-registry.md` over HTTP:
 //! decode a canonical envelope, resolve the account policy, verify the
 //! signatures, enforce per-sender sequence replay protection, and store the
-//! result. It has no consensus, no persistence, and no peer networking.
+//! result. It also carries the epoch-bound validator key schedule from
+//! `crates/validator`, so a key rotation can be registered, authorized, and
+//! observed at an epoch boundary. It has no consensus, no persistence, and no
+//! peer networking.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -12,19 +15,32 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use crypto::domain::{KeyRegistrationSigningFields, encode_key_registration_payload};
 use crypto::registry::{self, ALG_ED25519, AlgorithmKind, AlgorithmStatus};
 use crypto::scheme::Ed25519Scheme;
-use serde::Serialize;
+use crypto::{CryptoError, CryptoErrorKind};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tx::envelope::{PROTOCOL_VERSION_V1, Transaction};
 use tx::policy::{AuthKey, AuthPolicy, AuthPolicyKind, Authorization, KeyStatus, NO_EXPIRY};
+use validator::{
+    NO_EXPIRY as NO_EPOCH_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet, ValidatorSignature,
+};
 
 const DEMO_CHAIN_ID: &[u8] = b"karsa-demo-1";
 const DEMO_ACCOUNT: &[u8] = b"acct_alice";
 const DEMO_KEY_ID: &[u8] = b"alice-1";
 const DEMO_LISTEN: &str = "127.0.0.1:8099";
+
+/// The single genesis validator and its first consensus key.
+const DEMO_VALIDATOR: &[u8] = b"val-1";
+const GENESIS_VALIDATOR_KEY_ID: &[u8] = b"val-1-genesis";
+const GENESIS_VALIDATOR_SEED: [u8; 32] = [0x11; 32];
+/// Seed of the second key, used by `karsa register-demo` to show a rotation.
+const ROTATION_VALIDATOR_KEY_ID: &[u8] = b"val-1-next";
+const ROTATION_VALIDATOR_SEED: [u8; 32] = [0x22; 32];
 
 /// One demo account per worker, so a load generator can run several connections
 /// in parallel without tripping the per-sender replay check.
@@ -44,6 +60,9 @@ struct HealthView {
     protocol_version: u16,
     ed25519_backend: &'static str,
     ml_dsa_enabled: bool,
+    slh_dsa_enabled: bool,
+    epoch: u64,
+    validators: usize,
 }
 
 #[derive(Serialize)]
@@ -95,11 +114,62 @@ struct StoredTransaction {
     used_keys: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct ValidatorKeyView {
+    key_id: String,
+    algorithm_id: String,
+    public_key: String,
+    activation_epoch: u64,
+    retirement_epoch: u64,
+    status: &'static str,
+}
+
+#[derive(Serialize)]
+struct ValidatorView {
+    validator_id: String,
+    keys: Vec<ValidatorKeyView>,
+}
+
+#[derive(Serialize)]
+struct ValidatorSetView {
+    epoch: u64,
+    supermajority: usize,
+    validators: Vec<ValidatorView>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RegisterKeyRequest {
+    key_id: String,
+    algorithm_id: String,
+    public_key: String,
+    activation_epoch: u64,
+    #[serde(default = "no_epoch_expiry")]
+    retirement_epoch: u64,
+    signed_at_epoch: u64,
+    authorizer_key_id: String,
+    /// Retire the authorizing key at the new key's activation epoch, which is
+    /// what makes a scheduled rotation contiguous instead of overlapping.
+    #[serde(default)]
+    retire_authorizer: bool,
+    signature: String,
+}
+
+#[derive(Deserialize)]
+struct AdvanceEpochRequest {
+    epoch: u64,
+}
+
+fn no_epoch_expiry() -> u64 {
+    NO_EPOCH_EXPIRY
+}
+
 struct NodeState {
     transactions: HashMap<String, StoredTransaction>,
     order: Vec<String>,
     accounts: HashMap<String, AuthPolicy>,
     sequences: HashMap<String, u64>,
+    validators: ValidatorSet,
+    epoch: u64,
 }
 
 impl NodeState {
@@ -122,8 +192,30 @@ impl NodeState {
             order: Vec::new(),
             accounts,
             sequences: HashMap::new(),
+            validators: genesis_validator_set().expect("the genesis validator set is well formed"),
+            epoch: 0,
         }
     }
+}
+
+/// Builds the genesis set: one validator with one Ed25519 key from epoch 0.
+fn genesis_validator_set() -> Result<ValidatorSet, CryptoError> {
+    let public_key = Ed25519Scheme::public_key_from_seed(&GENESIS_VALIDATOR_SEED)?;
+    let set = ValidatorSet {
+        epoch: 0,
+        validators: vec![ValidatorRecord {
+            validator_id: DEMO_VALIDATOR.to_vec(),
+            keys: vec![ValidatorKey {
+                key_id: GENESIS_VALIDATOR_KEY_ID.to_vec(),
+                algorithm_id: ALG_ED25519,
+                public_key: public_key.to_vec(),
+                activation_epoch: 0,
+                retirement_epoch: NO_EPOCH_EXPIRY,
+            }],
+        }],
+    };
+    set.validate()?;
+    Ok(set)
 }
 
 fn demo_policy(public_key: &[u8; 32]) -> AuthPolicy {
@@ -144,13 +236,16 @@ fn demo_policy(public_key: &[u8; 32]) -> AuthPolicy {
 }
 
 fn demo_private_key() -> [u8; 64] {
-    let seed = [0x42u8; 32];
-    let public_key =
-        Ed25519Scheme::public_key_from_seed(&seed).expect("the demo seed derives a valid key");
+    private_key_for(&[0x42u8; 32]).expect("the demo seed derives a valid key")
+}
+
+/// Builds the `seed ‖ public_key` private key encoding for an Ed25519 seed.
+fn private_key_for(seed: &[u8; 32]) -> Result<[u8; 64], crypto::CryptoError> {
+    let public_key = Ed25519Scheme::public_key_from_seed(seed)?;
     let mut private_key = [0u8; 64];
-    private_key[..32].copy_from_slice(&seed);
+    private_key[..32].copy_from_slice(seed);
     private_key[32..].copy_from_slice(&public_key);
-    private_key
+    Ok(private_key)
 }
 
 fn sample_envelope(sequence: u64) -> Result<Vec<u8>, crypto::CryptoError> {
@@ -224,12 +319,16 @@ fn json_error(status: StatusCode, code: i32, message: impl Into<String>) -> Resp
         .into_response()
 }
 
-async fn health() -> Json<HealthView> {
+async fn health(State(state): State<Shared>) -> Json<HealthView> {
+    let guard = state.lock().expect("node state lock poisoned");
     Json(HealthView {
         status: "ok",
         protocol_version: PROTOCOL_VERSION_V1,
         ed25519_backend: "rust",
         ml_dsa_enabled: registry::ml_dsa_enabled(),
+        slh_dsa_enabled: registry::slh_dsa_enabled(),
+        epoch: guard.epoch,
+        validators: guard.validators.validators.len(),
     })
 }
 
@@ -247,6 +346,268 @@ async fn list_algorithms() -> Json<Vec<AlgorithmView>> {
         })
         .collect();
     Json(views)
+}
+
+fn supermajority_threshold(validators: usize) -> usize {
+    validators * 2 / 3 + 1
+}
+
+fn key_epoch_status(key: &ValidatorKey, epoch: u64) -> &'static str {
+    if key.is_active(epoch) {
+        "active"
+    } else if epoch < key.activation_epoch {
+        "not_yet_active"
+    } else {
+        "retired"
+    }
+}
+
+fn validator_set_view(set: &ValidatorSet, epoch: u64) -> ValidatorSetView {
+    ValidatorSetView {
+        epoch,
+        supermajority: supermajority_threshold(set.validators.len()),
+        validators: set
+            .validators
+            .iter()
+            .map(|record| ValidatorView {
+                validator_id: String::from_utf8_lossy(&record.validator_id).into_owned(),
+                keys: record
+                    .keys
+                    .iter()
+                    .map(|key| ValidatorKeyView {
+                        key_id: String::from_utf8_lossy(&key.key_id).into_owned(),
+                        algorithm_id: format!("0x{:04x}", key.algorithm_id),
+                        public_key: hex::encode(&key.public_key),
+                        activation_epoch: key.activation_epoch,
+                        retirement_epoch: key.retirement_epoch,
+                        status: key_epoch_status(key, epoch),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+/// Returns the epoch-bound validator set as the node currently sees it.
+async fn list_validators(State(state): State<Shared>) -> Json<ValidatorSetView> {
+    let guard = state.lock().expect("node state lock poisoned");
+    Json(validator_set_view(&guard.validators, guard.epoch))
+}
+
+/// Answers a protocol rejection with the frozen error code from
+/// `docs/crypto-registry.md` §7, the same way the transaction path does.
+fn crypto_reject(error: &CryptoError) -> Response {
+    json_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        i32::from(error.code()),
+        error.to_string(),
+    )
+}
+
+fn parse_algorithm_id(raw: &str) -> Option<u16> {
+    let trimmed = raw.trim();
+    let digits = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    u16::from_str_radix(digits, 16).ok()
+}
+
+/// Registers a validator consensus key inside an epoch window.
+///
+/// A registration is authorized by a key the validator already holds: the node
+/// rebuilds the canonical registration payload and verifies the submitted
+/// signature with that existing key at the epoch the signature claims. This is
+/// the property a production chain needs — knowing a validator id must never be
+/// enough to enroll a key under it.
+async fn post_validator_key(
+    State(state): State<Shared>,
+    Path(validator_id): Path<String>,
+    Json(request): Json<RegisterKeyRequest>,
+) -> Response {
+    let validator_id = validator_id.into_bytes();
+    if request.key_id.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, -1, "key_id must not be empty");
+    }
+    let Some(algorithm_id) = parse_algorithm_id(&request.algorithm_id) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            -1,
+            format!("invalid algorithm id: {}", request.algorithm_id),
+        );
+    };
+    let public_key = match hex::decode(&request.public_key) {
+        Ok(public_key) => public_key,
+        Err(error) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                -1,
+                format!("invalid public_key hex: {error}"),
+            );
+        }
+    };
+    let signature = match hex::decode(&request.signature) {
+        Ok(signature) => signature,
+        Err(error) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                -1,
+                format!("invalid signature hex: {error}"),
+            );
+        }
+    };
+
+    // Only an algorithm this build can verify may be enrolled. This is the same
+    // gate the transaction path uses, so a gated PQ key is refused here rather
+    // than failing verification later.
+    let spec = match registry::require_signature_algorithm(algorithm_id) {
+        Ok(spec) => spec,
+        Err(error) => return crypto_reject(&error),
+    };
+    if public_key.len() != spec.public_key_size {
+        return crypto_reject(&CryptoError::new(
+            CryptoErrorKind::MalformedPublicKey,
+            format!(
+                "{}: want {} bytes, got {}",
+                spec.name,
+                spec.public_key_size,
+                public_key.len()
+            ),
+        ));
+    }
+
+    let payload = match encode_key_registration_payload(&KeyRegistrationSigningFields {
+        chain_id: DEMO_CHAIN_ID,
+        validator_id: &validator_id,
+        key_id: request.key_id.as_bytes(),
+        algorithm_id,
+        public_key: &public_key,
+        activation_epoch: request.activation_epoch,
+        retirement_epoch: request.retirement_epoch,
+        signed_at_epoch: request.signed_at_epoch,
+    }) {
+        Ok(payload) => payload,
+        Err(error) => return crypto_reject(&error),
+    };
+
+    let mut guard = state.lock().expect("node state lock poisoned");
+    let current = match guard.validators.validator(&validator_id) {
+        Some(record) => record.clone(),
+        None => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                -1,
+                format!(
+                    "unknown validator: {}",
+                    String::from_utf8_lossy(&validator_id)
+                ),
+            );
+        }
+    };
+    if request.signed_at_epoch > guard.epoch {
+        return crypto_reject(&CryptoError::new(
+            CryptoErrorKind::KeyOutOfWindow,
+            format!(
+                "authorization claims epoch {} but the node is at {}",
+                request.signed_at_epoch, guard.epoch
+            ),
+        ));
+    }
+
+    let authorizer = ValidatorSignature {
+        validator_id: validator_id.clone(),
+        key_id: request.authorizer_key_id.as_bytes().to_vec(),
+        signature,
+    };
+    if let Err(error) = guard.validators.verify_signatures(
+        &payload,
+        request.signed_at_epoch,
+        std::slice::from_ref(&authorizer),
+    ) {
+        return crypto_reject(&error);
+    }
+
+    let new_key = ValidatorKey {
+        key_id: request.key_id.as_bytes().to_vec(),
+        algorithm_id,
+        public_key,
+        activation_epoch: request.activation_epoch,
+        retirement_epoch: request.retirement_epoch,
+    };
+
+    // Validate the schedule the node would end up with before committing it: an
+    // overlapping or inverted interval is a registration error now, not an
+    // ambiguity discovered when a vote is verified later.
+    let mut keys = current.keys;
+    if request.retire_authorizer {
+        let authorizer_key_id = request.authorizer_key_id.as_bytes();
+        let Some(existing) = keys.iter_mut().find(|key| key.key_id == authorizer_key_id) else {
+            return crypto_reject(&CryptoError::new(
+                CryptoErrorKind::UnknownKey,
+                "authorizing key is not registered on this validator",
+            ));
+        };
+        existing.retirement_epoch = request.activation_epoch;
+    }
+    keys.push(new_key.clone());
+    let candidate = ValidatorRecord {
+        validator_id: validator_id.clone(),
+        keys,
+    };
+    if let Err(error) = candidate.validate_schedule() {
+        return crypto_reject(&error);
+    }
+
+    if let Some(record) = guard
+        .validators
+        .validators
+        .iter_mut()
+        .find(|record| record.validator_id == validator_id)
+    {
+        record.keys = candidate.keys;
+    }
+    let epoch = guard.epoch;
+
+    let view = ValidatorKeyView {
+        key_id: String::from_utf8_lossy(&new_key.key_id).into_owned(),
+        algorithm_id: format!("0x{:04x}", new_key.algorithm_id),
+        public_key: hex::encode(&new_key.public_key),
+        activation_epoch: new_key.activation_epoch,
+        retirement_epoch: new_key.retirement_epoch,
+        status: key_epoch_status(&new_key, epoch),
+    };
+    (StatusCode::CREATED, Json(view)).into_response()
+}
+
+/// Advances the demo epoch clock.
+///
+/// A production chain derives the epoch from consensus time. The demo node has
+/// no consensus, so the epoch is explicit and monotonic: it can only move
+/// forward, and it refuses a target epoch that would leave a validator without
+/// an active key.
+async fn post_epoch(
+    State(state): State<Shared>,
+    Json(request): Json<AdvanceEpochRequest>,
+) -> Response {
+    let mut guard = state.lock().expect("node state lock poisoned");
+    if request.epoch <= guard.epoch {
+        return json_error(
+            StatusCode::CONFLICT,
+            -1,
+            format!(
+                "epoch must advance: {} is not greater than {}",
+                request.epoch, guard.epoch
+            ),
+        );
+    }
+    for record in &guard.validators.validators {
+        if let Err(error) = record.active_key(request.epoch) {
+            return crypto_reject(&error);
+        }
+    }
+    guard.epoch = request.epoch;
+    guard.validators.epoch = request.epoch;
+    Json(validator_set_view(&guard.validators, guard.epoch)).into_response()
 }
 
 async fn list_accounts(State(state): State<Shared>) -> Json<Vec<AccountView>> {
@@ -397,6 +758,9 @@ fn build_router(state: Shared) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/registry", get(list_algorithms))
+        .route("/validators", get(list_validators))
+        .route("/validators/{id}/keys", post(post_validator_key))
+        .route("/epoch", post(post_epoch))
         .route("/accounts", get(list_accounts))
         .route("/tx", get(list_transactions).post(post_transaction))
         .route("/tx/{id}", get(get_transaction))
@@ -414,8 +778,11 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     println!("karsa demo node (rust)");
     println!("  listen:         http://{DEMO_LISTEN}");
     println!("  ml-dsa enabled: {}", registry::ml_dsa_enabled());
+    println!("  slh-dsa enabled: {}", registry::slh_dsa_enabled());
+    println!("  validators:     1 at epoch 0");
     println!("  accounts:       {} demo accounts", BENCHMARK_ACCOUNTS + 1);
     println!("  sample tx:      karsa sample-tx");
+    println!("  rotate a key:   karsa register-demo 1  # prints the signed body");
 
     let listener = tokio::net::TcpListener::bind(DEMO_LISTEN).await?;
     axum::serve(listener, app).await?;
@@ -431,6 +798,45 @@ pub fn print_sample_transaction() -> Result<(), Box<dyn std::error::Error>> {
     let envelope = sample_envelope(1)?;
     println!("{}", hex::encode(&envelope));
     eprintln!("{} bytes", envelope.len());
+    Ok(())
+}
+
+/// Prints the JSON body that registers a second consensus key for the genesis
+/// validator, signed by the key that is active today.
+///
+/// It is the same payload the node rebuilds and verifies, so the body can be
+/// posted unchanged with `curl -d @- http://127.0.0.1:8099/validators/val-1/keys`.
+///
+/// # Errors
+///
+/// Returns an error if the payload cannot be encoded or signed.
+pub fn print_demo_registration(activation_epoch: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let authorizer = private_key_for(&GENESIS_VALIDATOR_SEED)?;
+    let new_public_key = Ed25519Scheme::public_key_from_seed(&ROTATION_VALIDATOR_SEED)?;
+    let payload = encode_key_registration_payload(&KeyRegistrationSigningFields {
+        chain_id: DEMO_CHAIN_ID,
+        validator_id: DEMO_VALIDATOR,
+        key_id: ROTATION_VALIDATOR_KEY_ID,
+        algorithm_id: ALG_ED25519,
+        public_key: &new_public_key,
+        activation_epoch,
+        retirement_epoch: NO_EPOCH_EXPIRY,
+        signed_at_epoch: 0,
+    })?;
+    let signature = Ed25519Scheme.sign(&authorizer, &payload)?;
+
+    let request = RegisterKeyRequest {
+        key_id: String::from_utf8_lossy(ROTATION_VALIDATOR_KEY_ID).into_owned(),
+        algorithm_id: format!("0x{ALG_ED25519:04x}"),
+        public_key: hex::encode(new_public_key),
+        activation_epoch,
+        retirement_epoch: NO_EPOCH_EXPIRY,
+        signed_at_epoch: 0,
+        authorizer_key_id: String::from_utf8_lossy(GENESIS_VALIDATOR_KEY_ID).into_owned(),
+        retire_authorizer: true,
+        signature: hex::encode(signature),
+    };
+    println!("{}", serde_json::to_string_pretty(&request)?);
     Ok(())
 }
 
@@ -565,5 +971,196 @@ mod tests {
     async fn unknown_transaction_is_404() {
         let (status, _) = get(test_app(), "/tx/deadbeef").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    async fn get_shared(app: &Router, uri: &str) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    async fn post_json(app: &Router, uri: &str, body: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    /// Builds a registration request signed by the genesis validator key.
+    fn registration(
+        activation_epoch: u64,
+        authorizer_key_id: &str,
+        retire_authorizer: bool,
+    ) -> RegisterKeyRequest {
+        let authorizer = private_key_for(&GENESIS_VALIDATOR_SEED).unwrap();
+        let new_public_key = Ed25519Scheme::public_key_from_seed(&ROTATION_VALIDATOR_SEED).unwrap();
+        let key_id = String::from_utf8_lossy(ROTATION_VALIDATOR_KEY_ID).into_owned();
+        let payload = encode_key_registration_payload(&KeyRegistrationSigningFields {
+            chain_id: DEMO_CHAIN_ID,
+            validator_id: DEMO_VALIDATOR,
+            key_id: key_id.as_bytes(),
+            algorithm_id: ALG_ED25519,
+            public_key: &new_public_key,
+            activation_epoch,
+            retirement_epoch: NO_EPOCH_EXPIRY,
+            signed_at_epoch: 0,
+        })
+        .unwrap();
+        let signature = Ed25519Scheme.sign(&authorizer, &payload).unwrap();
+        RegisterKeyRequest {
+            key_id,
+            algorithm_id: format!("0x{ALG_ED25519:04x}"),
+            public_key: hex::encode(new_public_key),
+            activation_epoch,
+            retirement_epoch: NO_EPOCH_EXPIRY,
+            signed_at_epoch: 0,
+            authorizer_key_id: authorizer_key_id.to_string(),
+            retire_authorizer,
+            signature: hex::encode(signature),
+        }
+    }
+
+    fn body_of(request: &RegisterKeyRequest) -> String {
+        serde_json::to_string(request).unwrap()
+    }
+
+    #[tokio::test]
+    async fn validators_show_the_genesis_key() {
+        let (status, body) = get(test_app(), "/validators").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"validator_id\":\"val-1\""), "{body}");
+        assert!(body.contains("\"key_id\":\"val-1-genesis\""), "{body}");
+        assert!(body.contains("\"status\":\"active\""), "{body}");
+        assert!(body.contains("\"supermajority\":1"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn registration_is_rejected_without_a_valid_authorizer() {
+        let mut request = registration(1, "val-1-genesis", true);
+        request.signature = hex::encode([0u8; 64]);
+
+        let (status, body) =
+            post_json(&test_app(), "/validators/val-1/keys", &body_of(&request)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        // invalid_signature
+        assert!(body.contains("\"code\":6"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn registration_by_an_unregistered_key_is_rejected() {
+        let request = registration(1, "val-1-nope", true);
+        let (status, body) =
+            post_json(&test_app(), "/validators/val-1/keys", &body_of(&request)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        // unknown_key
+        assert!(body.contains("\"code\":7"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn registration_for_an_unknown_validator_is_404() {
+        let request = registration(1, "val-1-genesis", true);
+        let (status, body) =
+            post_json(&test_app(), "/validators/val-9/keys", &body_of(&request)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    #[tokio::test]
+    async fn overlapping_registration_is_rejected() {
+        // Without retiring the authorizing key the intervals overlap, which is the
+        // ambiguity the schedule rules exist to prevent.
+        let request = registration(1, "val-1-genesis", false);
+        let (status, body) =
+            post_json(&test_app(), "/validators/val-1/keys", &body_of(&request)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        // invalid_key_schedule
+        assert!(body.contains("\"code\":21"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn rotation_switches_the_active_key_at_the_epoch() {
+        let app = test_app();
+        let request = registration(1, "val-1-genesis", true);
+        let (status, body) = post_json(&app, "/validators/val-1/keys", &body_of(&request)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body.contains("\"status\":\"not_yet_active\""), "{body}");
+
+        let (_, before) = get_shared(&app, "/validators").await;
+        assert!(
+            before.contains("\"key_id\":\"val-1-next\",\"algorithm_id\":\"0x0001\""),
+            "{before}"
+        );
+        assert!(before.contains("\"status\":\"active\""), "{before}");
+
+        let (status, after) = post_json(&app, "/epoch", r#"{"epoch":1}"#).await;
+        assert_eq!(status, StatusCode::OK, "{after}");
+        // The genesis key is retired at its published epoch and the scheduled key
+        // takes over; the record never has two active keys.
+        assert!(after.contains("\"key_id\":\"val-1-genesis\""), "{after}");
+        assert!(after.contains("\"status\":\"retired\""), "{after}");
+        assert!(after.contains("\"status\":\"active\""), "{after}");
+        assert!(after.contains("\"epoch\":1"), "{after}");
+    }
+
+    #[tokio::test]
+    async fn epoch_cannot_move_backwards() {
+        let (status, body) = post_json(&test_app(), "/epoch", r#"{"epoch":0}"#).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    }
+
+    #[tokio::test]
+    async fn epoch_refuses_to_strand_a_validator() {
+        let mut state = NodeState::demo();
+        state.validators.validators[0].keys[0].retirement_epoch = 1;
+        let app = build_router(Arc::new(Mutex::new(state)));
+
+        let (status, body) = post_json(&app, "/epoch", r#"{"epoch":2}"#).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        // key_not_active
+        assert!(body.contains("\"code\":8"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn gated_or_non_signature_algorithms_are_not_registrable() {
+        // ML-KEM-768 is a key-encapsulation algorithm, never a validator key.
+        let mut request = registration(1, "val-1-genesis", true);
+        request.algorithm_id = "0x0201".to_string();
+        let (status, body) =
+            post_json(&test_app(), "/validators/val-1/keys", &body_of(&request)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        // unsupported_algorithm
+        assert!(body.contains("\"code\":1"), "{body}");
+
+        if !registry::ml_dsa_enabled() {
+            // A compiled-but-gated algorithm is refused before any signing happens.
+            let mut request = registration(1, "val-1-genesis", true);
+            request.algorithm_id = "0x0101".to_string();
+            let (status, body) =
+                post_json(&test_app(), "/validators/val-1/keys", &body_of(&request)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            // algorithm_not_enabled
+            assert!(body.contains("\"code\":2"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_in_the_future_epoch_is_rejected() {
+        let mut request = registration(1, "val-1-genesis", true);
+        request.signed_at_epoch = 5;
+        let (status, body) =
+            post_json(&test_app(), "/validators/val-1/keys", &body_of(&request)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        // key_out_of_window
+        assert!(body.contains("\"code\":9"), "{body}");
     }
 }

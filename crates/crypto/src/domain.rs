@@ -15,6 +15,8 @@ pub const DOMAIN_DAG_VOTE_V1: &str = "KARSA/DAG/VOTE/v1";
 pub const DOMAIN_DAG_PROPOSE_V1: &str = "KARSA/DAG/PROPOSE/v1";
 /// IBC client payload domain.
 pub const DOMAIN_IBC_CLIENT_V1: &str = "KARSA/IBC/CLIENT/v1";
+/// Validator key registration payload domain.
+pub const DOMAIN_VALIDATOR_KEY_V1: &str = "KARSA/VALIDATOR/KEY/v1";
 
 /// The values a transaction signature authorizes.
 ///
@@ -64,6 +66,32 @@ pub struct ProposeSigningFields<'a> {
     pub round: u64,
     /// Digest of the proposal.
     pub proposal_hash: &'a [u8],
+}
+
+/// The values a validator key registration authorizes.
+///
+/// Registration is authorized by a key the validator already has, so a new key
+/// cannot be enrolled by anyone who merely knows the validator id. The signed
+/// fields cover every part of the new key, which is what stops a relay from
+/// swapping the public key or the activation epoch in transit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyRegistrationSigningFields<'a> {
+    /// Chain identifier, which prevents cross-chain replay.
+    pub chain_id: &'a [u8],
+    /// Validator the new key belongs to.
+    pub validator_id: &'a [u8],
+    /// Identifier of the new key.
+    pub key_id: &'a [u8],
+    /// Registry algorithm id of the new key.
+    pub algorithm_id: u16,
+    /// Canonical public-key encoding of the new key.
+    pub public_key: &'a [u8],
+    /// First epoch the new key may sign (inclusive).
+    pub activation_epoch: u64,
+    /// First epoch the new key may no longer sign (exclusive).
+    pub retirement_epoch: u64,
+    /// Epoch the authorizing key claims at signing time.
+    pub signed_at_epoch: u64,
 }
 
 /// Prefixes an already-canonical body with a length-prefixed domain tag.
@@ -122,6 +150,26 @@ pub fn encode_propose_signing_payload(
     wrap_domain(DOMAIN_DAG_PROPOSE_V1, body.as_slice())
 }
 
+/// Builds the bytes a validator key registration signature covers.
+///
+/// # Errors
+///
+/// Returns an error only when a field exceeds the encoding limit.
+pub fn encode_key_registration_payload(
+    fields: &KeyRegistrationSigningFields<'_>,
+) -> Result<Vec<u8>, CryptoError> {
+    let mut body = Encoder::with_capacity(128);
+    body.put_bytes(fields.chain_id)?;
+    body.put_bytes(fields.validator_id)?;
+    body.put_bytes(fields.key_id)?;
+    body.put_u16(fields.algorithm_id);
+    body.put_bytes(fields.public_key)?;
+    body.put_u64(fields.activation_epoch);
+    body.put_u64(fields.retirement_epoch);
+    body.put_u64(fields.signed_at_epoch);
+    wrap_domain(DOMAIN_VALIDATOR_KEY_V1, body.as_slice())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,12 +216,44 @@ mod tests {
             DOMAIN_DAG_VOTE_V1,
             DOMAIN_DAG_PROPOSE_V1,
             DOMAIN_IBC_CLIENT_V1,
+            DOMAIN_VALIDATOR_KEY_V1,
         ];
         for (index, tag) in tags.iter().enumerate() {
             for other in &tags[index + 1..] {
                 assert_ne!(tag, other);
             }
         }
+    }
+
+    #[test]
+    fn key_registration_binds_every_field() {
+        let fields = KeyRegistrationSigningFields {
+            chain_id: b"karsa-testnet-1",
+            validator_id: b"val-1",
+            key_id: b"val-1-next",
+            algorithm_id: 0x0001,
+            public_key: &PAYLOAD_HASH,
+            activation_epoch: 4,
+            retirement_epoch: u64::MAX,
+            signed_at_epoch: 3,
+        };
+        let encoded = encode_key_registration_payload(&fields).unwrap();
+        let tag_len = u32::from_le_bytes(encoded[0..4].try_into().unwrap()) as usize;
+        assert_eq!(&encoded[4..4 + tag_len], DOMAIN_VALIDATOR_KEY_V1.as_bytes());
+
+        let renamed = encode_key_registration_payload(&KeyRegistrationSigningFields {
+            key_id: b"val-1-other",
+            ..fields
+        })
+        .unwrap();
+        assert_ne!(encoded, renamed);
+
+        let rescheduled = encode_key_registration_payload(&KeyRegistrationSigningFields {
+            activation_epoch: 5,
+            ..fields
+        })
+        .unwrap();
+        assert_ne!(encoded, rescheduled);
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! karsa sample-tx                  print a signed demo envelope as hex
 //! karsa demo                       print the registry and a sample payload
 //! karsa acvp <vectors.json>        check NIST ML-DSA or SLH-DSA sigVer vectors
+//! karsa register-demo [epoch]      print a signed validator key rotation body
 //! karsa dagbench                   measure DAG certificate and header cost
 //! karsa loadtest [count] [conc]    drive the node and report tx/s
 //! ```
@@ -40,6 +41,12 @@ enum Command {
     Node,
     /// Print a signed demo transaction envelope as hex on stdout.
     SampleTx,
+    /// Print the signed key registration body for the demo validator.
+    RegisterDemo {
+        /// Epoch at which the new key becomes active.
+        #[arg(default_value_t = 1)]
+        activation_epoch: u64,
+    },
     /// Print the algorithm registry and a sample signing payload.
     Demo,
     /// Check NIST ACVP sigVer vectors for ML-DSA-65 or SLH-DSA-SHA2-128s.
@@ -65,6 +72,9 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Node => run_node(),
         Command::SampleTx => node::print_sample_transaction(),
+        Command::RegisterDemo { activation_epoch } => {
+            node::print_demo_registration(activation_epoch)
+        }
         Command::Demo => demo::run(),
         Command::Acvp { file } => acvp::run(&file),
         Command::Dagbench => dagbench::run(),
