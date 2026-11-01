@@ -103,6 +103,7 @@ cargo run -p karsa -- node          # HTTP node on 127.0.0.1:8099
 cargo run -p karsa -- acvp testdata/acvp/sigver.json
 cargo run -p karsa -- register-demo 1   # signed validator key rotation body
 cargo run -p karsa -- certify 10        # encode, verify, and reject certificates
+cargo run -p karsa -- bandwidth         # per-node dissemination model
 cargo run -p karsa -- dagbench
 cargo run -p karsa -- loadtest 20000 16
 ./scripts/rust-check.sh
@@ -147,6 +148,12 @@ Rust port reproduces its measurements.
    smaller per round with Ed25519 and only 1.6× with ML-DSA-65 at 100 validators.
 7. **The demo node does ~25–33k tx/s on the development machine** for the full
    HTTP + verification path, with no execution or persistence.
+8. **Fanout does not reduce dissemination bytes.** When every validator needs
+   every certificate, per-node egress is `(n-1)/n` of the originator total no
+   matter the topology; a tree changes connections (99 → 4) and hops (1 → 4) only.
+   Batching, certificate size, and sending to fewer peers are the real levers.
+9. **Batch verification is not aggregation.** It cut certificate verification by
+   1.3–2× on this CPU, not 5–10×, and left every byte in place.
 
 ## Port plan
 
@@ -158,7 +165,7 @@ Rust port reproduces its measurements.
 | Envelope + authorization policy | `tx` | done |
 | Validator key schedule | `validator` | done |
 | HTTP node | `karsa node` | done |
-| DAG and throughput benchmarks | `karsa dagbench`, `karsa loadtest` | done |
+| DAG and throughput benchmarks | `karsa dagbench`, `karsa certify`, `karsa bandwidth`, `karsa loadtest` | done |
 
 The normative spec is `docs/crypto-registry.md` (local, unpublished); the V
 numbers to beat are above. Where the Rust code and the spec disagree, the spec

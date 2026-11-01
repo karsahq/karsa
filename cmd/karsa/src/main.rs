@@ -9,11 +9,13 @@
 //! karsa acvp <vectors.json>        check NIST ML-DSA or SLH-DSA sigVer vectors
 //! karsa register-demo [epoch]      print a signed validator key rotation body
 //! karsa certify [n]                build, encode, and verify a DAG certificate
+//! karsa bandwidth                  model per-node dissemination bandwidth
 //! karsa dagbench                   measure DAG certificate and header cost
 //! karsa loadtest [count] [conc]    drive the node and report tx/s
 //! ```
 
 mod acvp;
+mod bandwidth;
 mod certify;
 mod dagbench;
 mod demo;
@@ -55,6 +57,21 @@ enum Command {
         #[arg(default_value_t = 10)]
         validators: usize,
     },
+    /// Model per-node bandwidth for certificate and payload dissemination.
+    Bandwidth {
+        /// Validators in the set.
+        #[arg(long, default_value_t = 100)]
+        validators: usize,
+        /// Committed transactions per second.
+        #[arg(long, default_value_t = 100_000)]
+        tps: u64,
+        /// Peers each node forwards to.
+        #[arg(long, default_value_t = 4)]
+        fanout: usize,
+        /// Transactions batched into one certificate.
+        #[arg(long, default_value_t = 1_000)]
+        transactions_per_certificate: u64,
+    },
     /// Print the algorithm registry and a sample signing payload.
     Demo,
     /// Check NIST ACVP sigVer vectors for ML-DSA-65 or SLH-DSA-SHA2-128s.
@@ -84,6 +101,12 @@ fn main() -> ExitCode {
             node::print_demo_registration(activation_epoch)
         }
         Command::Certify { validators } => certify::run(validators),
+        Command::Bandwidth {
+            validators,
+            tps,
+            fanout,
+            transactions_per_certificate,
+        } => bandwidth::run(validators, tps, fanout, transactions_per_certificate),
         Command::Demo => demo::run(),
         Command::Acvp { file } => acvp::run(&file),
         Command::Dagbench => dagbench::run(),

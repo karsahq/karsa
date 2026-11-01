@@ -242,7 +242,10 @@ fn put_certificate_header(
 
 /// Certificate size without producing the signatures, for algorithms where
 /// signing all validators would dominate the measurement.
-fn projected_certificate_bytes(
+///
+/// Shared with `karsa bandwidth`, so the model and the benchmark cannot drift
+/// apart.
+pub(crate) fn projected_certificate_bytes(
     validators: usize,
     signature_size: usize,
 ) -> Result<usize, Box<dyn std::error::Error>> {
