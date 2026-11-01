@@ -14,6 +14,7 @@ LOADGEN="$ROOT/tests/e2e/loadgen.go"
 KEYRING=test
 ACCOUNTS="${TPS_ACCOUNTS:-32}"
 PER_ACCOUNT="${TPS_PER_ACCOUNT:-200}"
+COMMIT="${TPS_COMMIT:-3s}"
 RPC=26691
 P2P=26690
 GRPC=9101
@@ -54,8 +55,8 @@ done < /tmp/tps-addresses.txt
 # The EVM mempool is app-side. Widen its queues so a burst measures block
 # production instead of the default 16 executable and 1024 queued slots.
 sed -i.bak 's/^type = "flood"/type = "app"/' "$HOME_DIR/config/config.toml"
-sed -i.bak 's/^timeout_commit = "5s"/timeout_commit = "3s"/' "$HOME_DIR/config/config.toml"
-grep -q '^timeout_commit = "3s"' "$HOME_DIR/config/config.toml" || { echo "commit timeout not set"; exit 1; }
+sed -i.bak "s/^timeout_commit = .*/timeout_commit = \"$COMMIT\"/" "$HOME_DIR/config/config.toml"
+grep -q "^timeout_commit = \"$COMMIT\"" "$HOME_DIR/config/config.toml" || { echo "commit timeout not set"; exit 1; }
 sed -i 's/^account-slots = 16$/account-slots = 512/; s/^global-slots = 5120$/global-slots = 40960/; s/^account-queue = 64$/account-queue = 512/; s/^global-queue = 1024$/global-queue = 40960/; s/^included-nonce-cache-size = 4096$/included-nonce-cache-size = 40960/' "$HOME_DIR/config/app.toml"
 
 python3 - "$HOME_DIR/config/genesis.json" <<'PY'
@@ -80,7 +81,7 @@ for _ in $(seq 1 90); do
   if [[ "$out" == *'"latest_block_height"'* && "$out" != *'"latest_block_height":"0"'* ]]; then break; fi
   sleep 1
 done
-echo "node ready with 3s blocks"
+echo "node ready with $COMMIT blocks"
 
 cd "$ROOT"
 go run "$LOADGEN" -mode run -accounts "$ACCOUNTS" -per-account "$PER_ACCOUNT" \
