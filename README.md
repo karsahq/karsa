@@ -42,18 +42,22 @@ Done:
 - `validator`: epoch-bound validator key schedule, quorum-safe signature
   counting (one vote per validator even if two keys sign), and the 3×/2×
   supermajority rule.
+- `validator::certificate`: canonical DAG-BFT certificate encode/decode and
+  verification against the schedule at the certificate epoch. The certificate
+  carries a signer bitmap and one signature per signer, never key ids: the
+  active key is resolved from the schedule, so a retired key cannot certify.
 - `karsa node`: the same HTTP pipeline as the V node (decode, policy lookup,
   signature verification, per-sender replay protection) on axum, plus the
   validator schedule: `GET /validators`, `POST /validators/{id}/keys`
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 100 tests in the default workspace build (101 with `--all-features`),
+- 109 tests in the default workspace build (110 with `--all-features`),
   including RFC 8032 vectors, ML-DSA-65 and SLH-DSA roundtrip and context
   binding, deterministic signing, envelope and policy behaviour, validator
-  rotation, validator key registration over HTTP, in-process HTTP tests, and
-  **byte-for-byte parity checks** against V for the signing payloads and for a
-  complete signed envelope.
+  rotation, validator key registration over HTTP, certificate encoding and
+  quorum rejection, in-process HTTP tests, and **byte-for-byte parity checks**
+  against V for the signing payloads and for a complete signed envelope.
 - `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors (the same result as
   the V prototype) and **14/14** NIST SLH-DSA-SHA2-128s sigVer vectors.
 
@@ -78,6 +82,12 @@ SLH-DSA-SHA2-128s has no V counterpart. Measured the same way: ~905 µs to verif
 one signature, ~626 ms to sign one, and a 100-validator certificate of 786,103 B
 (projected). It is registered for agility, not as a default.
 
+Certificates are no longer only a cost model: `karsa certify 10` encodes a real
+certificate and verifies it against the epoch-bound schedule. 771 bytes at 10
+validators, 405 µs to verify plus check the quorum on one core (2,465/s), and the
+four rejection paths (below quorum, tampered signature, retired signer key,
+bitmap/signature mismatch) each report a frozen protocol code.
+
 ```bash
 cargo build
 cargo test
@@ -85,6 +95,7 @@ cargo run -p karsa -- demo
 cargo run -p karsa -- node          # HTTP node on 127.0.0.1:8099
 cargo run -p karsa -- acvp testdata/acvp/sigver.json
 cargo run -p karsa -- register-demo 1   # signed validator key rotation body
+cargo run -p karsa -- certify 10        # encode, verify, and reject certificates
 cargo run -p karsa -- dagbench
 cargo run -p karsa -- loadtest 20000 16
 ./scripts/rust-check.sh

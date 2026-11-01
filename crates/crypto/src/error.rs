@@ -65,6 +65,9 @@ pub enum CryptoErrorKind {
     DuplicateKeyId = 22,
     /// A validator id appears twice in a set.
     DuplicateValidatorId = 23,
+    /// A certificate's shape is inconsistent: bitmap, padding, or signature
+    /// count do not agree with each other or with the validator set.
+    MalformedCertificate = 24,
 }
 
 impl CryptoErrorKind {
@@ -102,6 +105,7 @@ impl CryptoErrorKind {
             Self::InvalidKeySchedule => "invalid_key_schedule",
             Self::DuplicateKeyId => "duplicate_key_id",
             Self::DuplicateValidatorId => "duplicate_validator_id",
+            Self::MalformedCertificate => "malformed_certificate",
         }
     }
 }
@@ -175,6 +179,7 @@ mod tests {
         assert_eq!(CryptoErrorKind::FieldTooLong.code(), 13);
         assert_eq!(CryptoErrorKind::BackendFailure.code(), 18);
         assert_eq!(CryptoErrorKind::DuplicateValidatorId.code(), 23);
+        assert_eq!(CryptoErrorKind::MalformedCertificate.code(), 24);
     }
 
     #[test]

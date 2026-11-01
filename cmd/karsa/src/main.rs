@@ -8,11 +8,13 @@
 //! karsa demo                       print the registry and a sample payload
 //! karsa acvp <vectors.json>        check NIST ML-DSA or SLH-DSA sigVer vectors
 //! karsa register-demo [epoch]      print a signed validator key rotation body
+//! karsa certify [n]                build, encode, and verify a DAG certificate
 //! karsa dagbench                   measure DAG certificate and header cost
 //! karsa loadtest [count] [conc]    drive the node and report tx/s
 //! ```
 
 mod acvp;
+mod certify;
 mod dagbench;
 mod demo;
 mod loadtest;
@@ -47,6 +49,12 @@ enum Command {
         #[arg(default_value_t = 1)]
         activation_epoch: u64,
     },
+    /// Build, encode, and verify a DAG-BFT certificate, then show rejections.
+    Certify {
+        /// Number of validators in the demo set.
+        #[arg(default_value_t = 10)]
+        validators: usize,
+    },
     /// Print the algorithm registry and a sample signing payload.
     Demo,
     /// Check NIST ACVP sigVer vectors for ML-DSA-65 or SLH-DSA-SHA2-128s.
@@ -75,6 +83,7 @@ fn main() -> ExitCode {
         Command::RegisterDemo { activation_epoch } => {
             node::print_demo_registration(activation_epoch)
         }
+        Command::Certify { validators } => certify::run(validators),
         Command::Demo => demo::run(),
         Command::Acvp { file } => acvp::run(&file),
         Command::Dagbench => dagbench::run(),

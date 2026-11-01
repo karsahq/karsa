@@ -126,13 +126,13 @@ Status of the first stage:
   algorithm registry (same frozen IDs and sizes as V), domain-separated
   payloads, and the `SignatureScheme` trait with Ed25519, ML-DSA-65, and
   SLH-DSA-SHA2-128s implementations.
-- 100 tests pass in the workspace default build (101 with `--all-features`), 30
+- 109 tests pass in the workspace default build (110 with `--all-features`), 30
   of them in `crypto` alone without PQ backends: RFC 8032 vectors, ML-DSA and
   SLH-DSA roundtrip and context binding, deterministic signing, key generation,
   envelope and policy behaviour, validator rotation and quorum-safe counting,
-  validator key registration and epoch advance over HTTP, in-process HTTP tests,
-  plus byte-for-byte parity checks for the signing payloads and a complete
-  signed envelope.
+  validator key registration and epoch advance over HTTP, certificate encoding
+  and quorum rejection, in-process HTTP tests, plus byte-for-byte parity checks
+  for the signing payloads and a complete signed envelope.
 - `karsa acvp` matches 15/15 NIST ML-DSA-65 and 14/14 SLH-DSA-SHA2-128s sigVer
   vectors.
 - `karsa node` produces the same transaction id as the V node for the same demo
@@ -142,6 +142,9 @@ Status of the first stage:
   leave a validator without an active key.
 - `karsa dagbench` reproduces the V certificate sizes exactly (331,403 B at 100
   validators) and the 10.2× / 1.6× dense-vs-sparse header ratios.
+- `karsa certify` encodes and verifies a real certificate against the schedule:
+  per-signature cost matches the Ed25519 baseline, and below-quorum, tampered,
+  retired-key, and shape-mismatch cases are all rejected with protocol codes.
 - `karsa loadtest` measures ~50–57k accepted tx/s on this machine, against
   ~25–33k for the V node.
 - The V prototype's rule that activation requires an implementation is
