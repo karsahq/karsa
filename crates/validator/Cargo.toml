@@ -1,0 +1,18 @@
+[package]
+name = "validator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Karsa epoch-bound validator key schedule"
+
+[dependencies]
+crypto = { path = "../crypto" }
+
+[features]
+default = []
+# Enables the ML-DSA validator-key test against the crypto backend.
+pq-openssl = ["crypto/pq-openssl"]
+
+[lints]
+workspace = true

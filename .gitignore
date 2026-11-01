@@ -1,0 +1,16 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Go
+/bin/
+*.test
+
+# Downloaded test vectors
+testdata/
+
+# Design notes: kept local, not published yet
+/docs/
+
+# Editor and OS noise
+.DS_Store

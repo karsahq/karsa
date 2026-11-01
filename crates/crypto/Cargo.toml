@@ -1,0 +1,22 @@
+[package]
+name = "crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Karsa crypto-agile protocol core: registry, canonical encoding, domain separation"
+
+[features]
+default = []
+# Compiles the ML-DSA-65 backend.
+pq-openssl = ["dep:openssl"]
+# Activates the ML-DSA-65 registry entry. Requires pq-openssl.
+pq-testnet = []
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+openssl = { version = "0.10", optional = true }
+
+[lints]
+workspace = true

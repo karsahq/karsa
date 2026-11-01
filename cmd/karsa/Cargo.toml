@@ -1,0 +1,25 @@
+[package]
+name = "karsa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Karsa command-line entry point"
+
+[dependencies]
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+crypto = { path = "../../crates/crypto", features = ["pq-openssl"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tx = { path = "../../crates/tx" }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true
