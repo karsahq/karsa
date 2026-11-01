@@ -17,6 +17,8 @@ pub const DOMAIN_DAG_PROPOSE_V1: &str = "KARSA/DAG/PROPOSE/v1";
 pub const DOMAIN_IBC_CLIENT_V1: &str = "KARSA/IBC/CLIENT/v1";
 /// Validator key registration payload domain.
 pub const DOMAIN_VALIDATOR_KEY_V1: &str = "KARSA/VALIDATOR/KEY/v1";
+/// DAG vertex payload domain: one signature per vertex.
+pub const DOMAIN_VERTEX_V1: &str = "KARSA/DAG/VERTEX/v1";
 
 /// The values a transaction signature authorizes.
 ///
@@ -92,6 +94,39 @@ pub struct KeyRegistrationSigningFields<'a> {
     pub retirement_epoch: u64,
     /// Epoch the authorizing key claims at signing time.
     pub signed_at_epoch: u64,
+}
+
+/// A reference to another vertex, as it appears inside a signed vertex payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VertexRefFields<'a> {
+    /// Round of the referenced vertex.
+    pub round: u64,
+    /// Author of the referenced vertex.
+    pub author: &'a [u8],
+    /// Digest of the referenced vertex's signed payload.
+    pub digest: &'a [u8],
+}
+
+/// The signed content of a DAG vertex.
+///
+/// One vertex carries one signature, from its author. A vote for a leader is the
+/// presence of that leader in `references`, which is why an uncertified DAG needs
+/// `n` signatures per round rather than `n²`: there is no separate certificate
+/// object to sign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VertexSigningFields<'a> {
+    /// Chain identifier.
+    pub chain_id: &'a [u8],
+    /// Epoch the vertex belongs to.
+    pub epoch: u64,
+    /// Round the vertex belongs to.
+    pub round: u64,
+    /// Validator that authored the vertex.
+    pub author: &'a [u8],
+    /// Digest of the transaction batch this vertex orders.
+    pub payload_hash: &'a [u8],
+    /// Vertices this one references.
+    pub references: &'a [VertexRefFields<'a>],
 }
 
 /// Prefixes an already-canonical body with a length-prefixed domain tag.
@@ -170,6 +205,35 @@ pub fn encode_key_registration_payload(
     wrap_domain(DOMAIN_VALIDATOR_KEY_V1, body.as_slice())
 }
 
+/// Builds the bytes a DAG vertex signature covers.
+///
+/// # Errors
+///
+/// Returns an error only when a field exceeds the encoding limit.
+pub fn encode_vertex_signing_payload(
+    fields: &VertexSigningFields<'_>,
+) -> Result<Vec<u8>, CryptoError> {
+    let mut body = Encoder::with_capacity(128 + fields.references.len() * 48);
+    body.put_bytes(fields.chain_id)?;
+    body.put_u64(fields.epoch);
+    body.put_u64(fields.round);
+    body.put_bytes(fields.author)?;
+    body.put_bytes(fields.payload_hash)?;
+    let count = u32::try_from(fields.references.len()).map_err(|_| {
+        crate::error::CryptoError::new(
+            crate::error::CryptoErrorKind::FieldTooLong,
+            "too many vertex references",
+        )
+    })?;
+    body.put_u32(count);
+    for reference in fields.references {
+        body.put_u64(reference.round);
+        body.put_bytes(reference.author)?;
+        body.put_bytes(reference.digest)?;
+    }
+    wrap_domain(DOMAIN_VERTEX_V1, body.as_slice())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +281,7 @@ mod tests {
             DOMAIN_DAG_PROPOSE_V1,
             DOMAIN_IBC_CLIENT_V1,
             DOMAIN_VALIDATOR_KEY_V1,
+            DOMAIN_VERTEX_V1,
         ];
         for (index, tag) in tags.iter().enumerate() {
             for other in &tags[index + 1..] {
@@ -254,6 +319,45 @@ mod tests {
         })
         .unwrap();
         assert_ne!(encoded, rescheduled);
+    }
+
+    #[test]
+    fn a_vertex_payload_binds_its_references() {
+        let parent = VertexRefFields {
+            round: 6,
+            author: b"val-0",
+            digest: &PAYLOAD_HASH,
+        };
+        let fields = VertexSigningFields {
+            chain_id: b"karsa-test-1",
+            epoch: 1,
+            round: 7,
+            author: b"val-1",
+            payload_hash: &PAYLOAD_HASH,
+            references: std::slice::from_ref(&parent),
+        };
+        let encoded = encode_vertex_signing_payload(&fields).unwrap();
+        let tag_len = u32::from_le_bytes(encoded[0..4].try_into().unwrap()) as usize;
+        assert_eq!(&encoded[4..4 + tag_len], DOMAIN_VERTEX_V1.as_bytes());
+
+        let other_parent = VertexRefFields {
+            round: 6,
+            author: b"val-2",
+            ..parent
+        };
+        let repointed = encode_vertex_signing_payload(&VertexSigningFields {
+            references: std::slice::from_ref(&other_parent),
+            ..fields
+        })
+        .unwrap();
+        assert_ne!(encoded, repointed);
+
+        let no_parent = encode_vertex_signing_payload(&VertexSigningFields {
+            references: &[],
+            ..fields
+        })
+        .unwrap();
+        assert_ne!(encoded, no_parent);
     }
 
     #[test]

@@ -8,6 +8,7 @@ description = "Karsa epoch-bound validator key schedule"
 
 [dependencies]
 crypto = { path = "../crypto" }
+sha2 = "0.10"
 
 [features]
 default = []

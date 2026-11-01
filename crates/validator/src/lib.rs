@@ -7,8 +7,10 @@
 
 mod certificate;
 mod schedule;
+mod vertex;
 
 pub use certificate::{
     CERTIFICATE_VERSION_V1, Certificate, bit_is_set, bitmap_len, bitmap_of, set_bit,
 };
 pub use schedule::{NO_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet, ValidatorSignature};
+pub use vertex::{VERTEX_VERSION_V1, Vertex, VertexId, tally_votes};

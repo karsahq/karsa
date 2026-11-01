@@ -3,7 +3,9 @@
 //! `karsa dagbench` models the bytes; this command actually signs, encodes, and
 //! verifies them through the same code the node would use. It also runs the
 //! negative cases, because a certificate scheme is only interesting for what it
-//! rejects.
+//! rejects, and then does the same round with vertex claims, which is the
+//! uncertified alternative that costs one signature per validator instead of one
+//! per validator per certificate.
 
 use std::time::Instant;
 
@@ -11,7 +13,10 @@ use crypto::registry::ALG_ED25519;
 use crypto::scheme::Ed25519Scheme;
 use crypto::{CryptoError, CryptoErrorKind};
 use sha2::{Digest, Sha256};
-use validator::{Certificate, NO_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet, bitmap_of};
+use validator::{
+    Certificate, NO_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet, Vertex, VertexId,
+    bitmap_of, tally_votes,
+};
 
 const CHAIN_ID: &[u8] = b"karsa-certify-1";
 const VERTEX_ID: &[u8] = b"vertex-0f1e2d3c";
@@ -165,12 +170,123 @@ pub fn run(validators: usize) -> Result<(), Box<dyn std::error::Error>> {
     println!("  The certificate carries no key ids: each signer's key is resolved");
     println!("  from the schedule at the certificate epoch.");
 
+    println!();
+    println!("== Vertex claims for the same round (uncertified) ==");
+    let certificate_round_bytes = validators * encoded.len();
+    let round = measure_vertex_round(validators, &set, &private_keys)?;
+    let vertex_bytes = round.vertex_bytes;
+    let verify_ns = round.verify_ns;
+    let round_bytes = vertex_bytes * validators;
+    println!("  vertices:          {validators} (one per validator per round)");
+    println!(
+        "  round:             {CERTIFICATE_ROUND} leader, {next_round} votes",
+        next_round = CERTIFICATE_ROUND + 1
+    );
+    println!("  signatures/round:  {validators}");
+    println!("  vertex bytes:      {vertex_bytes} bytes");
+    println!("  round metadata:    {round_bytes} bytes");
+    println!("  certificate round: {certificate_round_bytes} bytes ({validators} x certificate)");
+    println!(
+        "  reduction:         {}.{}x",
+        certificate_round_bytes / round_bytes,
+        (certificate_round_bytes % round_bytes) * 10 / round_bytes
+    );
+    println!("  verify/round:      {} us", verify_ns / 1000);
+    println!("  votes for leader:  {} distinct", round.voters.len());
+    println!(
+        "  supermajority:     {}",
+        if set.has_supermajority(round.voters.len()) {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!();
+    println!("  This is not consensus: there is no leader election, no commit rule,");
+    println!("  and no networking. It prices the artifact — one signature per vertex");
+    println!("  instead of one per validator per certificate — and the vote is the");
+    println!("  presence of the leader in the reference list. At Ed25519 sizes the");
+    println!("  certificate's own bitmap and length prefixes are a large share of the");
+    println!("  bytes, so the ratio here is small; it approaches n as the signature grows");
+    println!("  (`karsa bandwidth` prices ML-DSA-65 and SLH-DSA-128s at ~94–98x).");
+    println!("  What it gives up is the portable certificate: a claim only means");
+    println!("  something against the DAG.");
+
     Ok(())
 }
 
 /// Smallest signer count that is a supermajority of `validators`.
 fn supermajority_of(validators: usize) -> usize {
     validators * 2 / 3 + 1
+}
+
+/// Builds and signs one vertex.
+fn signed_vertex(
+    author: usize,
+    round: u64,
+    references: Vec<VertexId>,
+    private_keys: &[Vec<u8>],
+) -> Result<Vertex, Box<dyn std::error::Error>> {
+    let mut vertex = Vertex {
+        chain_id: CHAIN_ID.to_vec(),
+        epoch: CERTIFICATE_EPOCH,
+        round,
+        author: format!("val-{author}").into_bytes(),
+        payload_hash: seed_for(author),
+        references,
+        signature: Vec::new(),
+    };
+    let payload = vertex.signing_payload()?;
+    vertex.signature = Ed25519Scheme.sign(&private_keys[author], &payload)?;
+    Ok(vertex)
+}
+
+/// Result of building and measuring one vertex round.
+struct VertexRound {
+    vertex_bytes: usize,
+    verify_ns: u128,
+    voters: Vec<Vec<u8>>,
+}
+
+/// Builds one leader and one full round of votes, then measures verification.
+fn measure_vertex_round(
+    validators: usize,
+    set: &ValidatorSet,
+    private_keys: &[Vec<u8>],
+) -> Result<VertexRound, Box<dyn std::error::Error>> {
+    let leader = signed_vertex(0, CERTIFICATE_ROUND, Vec::new(), private_keys)?;
+    let leader_id = leader.id()?;
+
+    let mut votes = Vec::with_capacity(validators);
+    for author in 0..validators {
+        votes.push(signed_vertex(
+            author,
+            CERTIFICATE_ROUND + 1,
+            vec![leader_id.clone()],
+            private_keys,
+        )?);
+    }
+
+    let encoded = votes[0].encode()?;
+    if Vertex::decode(&encoded)? != votes[0] {
+        return Err("the vertex did not roundtrip".into());
+    }
+
+    let mut verify_ns = u128::MAX;
+    for _ in 0..MEASUREMENT_ROUNDS {
+        let start = Instant::now();
+        for vote in &votes {
+            vote.verify(set)?;
+        }
+        verify_ns = verify_ns.min(start.elapsed().as_nanos());
+    }
+
+    let voters = tally_votes(set, &leader_id, &votes)?;
+    Ok(VertexRound {
+        vertex_bytes: encoded.len(),
+        verify_ns,
+        voters,
+    })
 }
 
 fn report(label: &str, result: Result<(), CryptoError>) {

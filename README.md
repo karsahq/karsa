@@ -47,19 +47,23 @@ Done:
   carries a signer bitmap and one signature per signer, never key ids: the
   active key is resolved from the schedule, so a retired key cannot certify.
   Ed25519 signers are batch-verified when there are four or more.
+- `validator::vertex`: the uncertified alternative — one signature per block with
+  votes expressed as references, a content-addressed id, and `tally_votes` with
+  one count per author. `karsa certify` runs both styles on the same round.
 - `karsa node`: the same HTTP pipeline as the V node (decode, policy lookup,
   signature verification, per-sender replay protection) on axum, plus the
   validator schedule: `GET /validators`, `POST /validators/{id}/keys`
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 120 tests in the default workspace build (121 with `--all-features`),
+- 128 tests in the default workspace build (129 with `--all-features`),
   including RFC 8032 vectors, ML-DSA-65 and SLH-DSA roundtrip and context
   binding, deterministic signing, envelope and policy behaviour, validator
   rotation, validator key registration over HTTP, certificate encoding and
-  quorum rejection, batch-vs-individual verification equality, in-process HTTP
-  tests, and **byte-for-byte parity checks** against V for the signing payloads
-  and for a complete signed envelope.
+  quorum rejection, vertex encoding and vote tallying, batch-vs-individual
+  verification equality, in-process HTTP tests, and **byte-for-byte parity
+  checks** against V for the signing payloads and for a complete signed
+  envelope.
 - `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors (the same result as
   the V prototype) and **14/14** NIST SLH-DSA-SHA2-128s sigVer vectors.
 

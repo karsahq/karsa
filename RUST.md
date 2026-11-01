@@ -126,14 +126,15 @@ Status of the first stage:
   algorithm registry (same frozen IDs and sizes as V), domain-separated
   payloads, and the `SignatureScheme` trait with Ed25519, ML-DSA-65, and
   SLH-DSA-SHA2-128s implementations.
-- 120 tests pass in the workspace default build (121 with `--all-features`), 30
+- 128 tests pass in the workspace default build (129 with `--all-features`), 30
   of them in `crypto` alone without PQ backends: RFC 8032 vectors, ML-DSA and
   SLH-DSA roundtrip and context binding, deterministic signing, key generation,
   envelope and policy behaviour, validator rotation and quorum-safe counting,
   validator key registration and epoch advance over HTTP, certificate encoding
-  and quorum rejection, batch-vs-individual equality, the dissemination model's
-  formulas, in-process HTTP tests, plus byte-for-byte parity checks for the
-  signing payloads and a complete signed envelope.
+  and quorum rejection, vertex encoding and vote tallying, batch-vs-individual
+  equality, the dissemination model's formulas, in-process HTTP tests, plus
+  byte-for-byte parity checks for the signing payloads and a complete signed
+  envelope.
 - `karsa acvp` matches 15/15 NIST ML-DSA-65 and 14/14 SLH-DSA-SHA2-128s sigVer
   vectors.
 - `karsa node` produces the same transaction id as the V node for the same demo
@@ -146,7 +147,9 @@ Status of the first stage:
 - `karsa certify` encodes and verifies a real certificate against the schedule:
   batch verification cuts Ed25519 certificate verification by 1.3–2× (2,630 µs
   instead of 4,108 µs at 100 validators), and below-quorum, tampered,
-  retired-key, and shape-mismatch cases are all rejected with protocol codes.
+  retired-key, and shape-mismatch cases are all rejected with protocol codes. It
+  then runs the same round as vertex claims (one signature per block) and prints
+  the metadata reduction.
 - `karsa bandwidth` re-derives the dissemination arithmetic: per-node egress is
   `(n-1)/n` of the originator total for any fanout, so batching and certificate
   size move the number and fanout does not. It also prices three consensus
