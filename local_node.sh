@@ -234,11 +234,8 @@ if [[ $overwrite == "y" || $overwrite == "Y" ]]; then
   # ---------- Genesis customizations ----------
 
 
-
-
-
-  jq '.consensus.params.block.max_bytes="3000000" | .consensus.params.block.max_gas="150000000"' "$GENESIS" >"$TMP_GENESIS" && mv "$TMP_GENESIS" "$GENESIS"
-
+  # Block limits come from `karsad init`. Only the dev-only gov speedup is
+  # applied here.
   # Change proposal periods
   sed -i.bak 's/"max_deposit_period": "172800s"/"max_deposit_period": "30s"/g' "$GENESIS"
   sed -i.bak 's/"voting_period": "172800s"/"voting_period": "30s"/g' "$GENESIS"

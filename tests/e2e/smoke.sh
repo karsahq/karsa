@@ -109,12 +109,8 @@ genesis["app_state"]["bank"]["denom_metadata"].append({
     "uri_hash": "",
 })
 
-# EVM transactions are checked against the block gas limit at admission. The
-# Cosmos default of -1 (unlimited) is read as zero by the EVM mempool, so an
-# ordinary EVM transfer is rejected as exceeding the block gas limit. Mirror
-# the production consensus values from local_node.sh / docs/tokenomics.md.
-genesis["consensus"]["params"]["block"]["max_bytes"] = "3000000"
-genesis["consensus"]["params"]["block"]["max_gas"] = "150000000"
+# Block limits come from `karsad init`, which sets 150M gas and 3MB. They are
+# not patched here on purpose: this run proves the init defaults are usable.
 
 with open(path, "w") as f:
     json.dump(genesis, f, separators=(",", ":"))
