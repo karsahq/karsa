@@ -10,13 +10,16 @@ description = "Karsa crypto-agile protocol core: registry, canonical encoding, d
 default = []
 # Compiles the ML-DSA-65 backend.
 pq-openssl = ["dep:openssl"]
-# Activates the ML-DSA-65 registry entry. Requires pq-openssl.
+# Compiles the SLH-DSA-SHA2-128s backend (pure Rust, no OpenSSL needed).
+pq-slh = ["dep:slh-dsa"]
+# Activates PQ registry entries. Requires at least one PQ backend.
 pq-testnet = []
 
 [dependencies]
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 openssl = { version = "0.10", optional = true }
+slh-dsa = { version = "0.2.0-rc.5", optional = true }
 
 [lints]
 workspace = true

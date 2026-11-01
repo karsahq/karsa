@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use crypto::domain::{VoteSigningFields, encode_vote_signing_payload};
 use crypto::encoding::Encoder;
-use crypto::registry::{ALG_ED25519, ALG_ML_DSA_65, lookup, ml_dsa_enabled};
+use crypto::registry::{ALG_ED25519, ALG_ML_DSA_65, ALG_SLH_DSA_SHA2_128S, lookup, ml_dsa_enabled};
 use crypto::scheme::{Ed25519Scheme, verify_signature};
 
 const VALIDATOR_COUNTS: [usize; 6] = [4, 7, 10, 20, 50, 100];
@@ -75,6 +75,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     print_note();
     println!();
     print_header_table(&ed_rows, &pq_rows)?;
+
+    println!();
+    print_slh_dsa_cost(&payload)?;
 
     Ok(())
 }
@@ -214,6 +217,18 @@ fn certificate_bytes(
     signatures: &[Vec<u8>],
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut encoder = Encoder::with_capacity(512);
+    put_certificate_header(&mut encoder, validators, signatures.len())?;
+    for signature in signatures {
+        encoder.put_bytes(signature)?;
+    }
+    Ok(encoder.finish().len())
+}
+
+fn put_certificate_header(
+    encoder: &mut Encoder,
+    validators: usize,
+    signers: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     encoder.put_u16(1);
     encoder.put_bytes(CHAIN_ID)?;
     encoder.put_u64(1);
@@ -221,11 +236,19 @@ fn certificate_bytes(
     encoder.put_bytes(VERTEX_ID)?;
     encoder.put_bytes(VALIDATOR_SET_ID)?;
     encoder.put_bytes(&full_bitmap(validators))?;
-    encoder.put_u32(u32::try_from(signatures.len())?);
-    for signature in signatures {
-        encoder.put_bytes(signature)?;
-    }
-    Ok(encoder.finish().len())
+    encoder.put_u32(u32::try_from(signers)?);
+    Ok(())
+}
+
+/// Certificate size without producing the signatures, for algorithms where
+/// signing all validators would dominate the measurement.
+fn projected_certificate_bytes(
+    validators: usize,
+    signature_size: usize,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut encoder = Encoder::with_capacity(512);
+    put_certificate_header(&mut encoder, validators, validators)?;
+    Ok(encoder.finish().len() + validators * (4 + signature_size))
 }
 
 /// Marks every validator as a signer: `ceil(n/8)` bytes with the unused high bits
@@ -359,4 +382,45 @@ fn print_header_row(n: usize, scheme: &str, signature_size: usize, verify_ns: u1
         pad_left(&format!("{}.{}x", gain_x10 / 10, gain_x10 % 10), 6),
         pad_left(&format!("{} us", verify_ns / 1000), 12),
     );
+}
+
+/// Measures SLH-DSA-SHA2-128s on its own instead of through a certificate: with
+/// a 7,856-byte signature, signing 100 validators would dominate the run and
+/// the number would say more about this tool than about the algorithm.
+fn print_slh_dsa_cost(payload: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    const ROUNDS: usize = 3;
+    let (public_key, private_key) = crypto::slh_dsa::generate_keypair()?;
+
+    let warm = crypto::slh_dsa::sign_with_context(&private_key, payload, &[])?;
+    crypto::slh_dsa::verify_with_context(&public_key, payload, &warm, &[])?;
+
+    let mut signature = warm;
+    let mut sign_ns = u128::MAX;
+    for _ in 0..ROUNDS {
+        let start = Instant::now();
+        signature = crypto::slh_dsa::sign_with_context(&private_key, payload, &[])?;
+        sign_ns = sign_ns.min(start.elapsed().as_nanos());
+    }
+
+    let mut verify_ns = u128::MAX;
+    for _ in 0..ROUNDS {
+        let start = Instant::now();
+        crypto::slh_dsa::verify_with_context(&public_key, payload, &signature, &[])?;
+        verify_ns = verify_ns.min(start.elapsed().as_nanos());
+    }
+
+    let signature_size = lookup(ALG_SLH_DSA_SHA2_128S)?.signature_size;
+    println!("== SLH-DSA-SHA2-128s per-signature cost (single core) ==");
+    println!("  backend:        pure Rust (slh-dsa crate)");
+    println!("  signature:      {signature_size} bytes");
+    println!("  sign/signature: {} us", sign_ns / 1000);
+    println!("  verify/sig:     {} us", verify_ns / 1000);
+    println!(
+        "  cert at n=100:  {} bytes (projected)",
+        projected_certificate_bytes(100, signature_size)?
+    );
+    println!("  Only verification sits on the consensus path; each validator signs once");
+    println!("  per block. The cost profile is why this set is registered for agility");
+    println!("  rather than picked as a default.");
+    Ok(())
 }

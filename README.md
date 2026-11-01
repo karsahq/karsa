@@ -34,6 +34,8 @@ Done:
 - `crypto::ml_dsa` (feature `pq-openssl`): ML-DSA-65 via the `openssl`
   crate, including the FIPS 204 context string and seed-based key derivation.
   Requires OpenSSL 3.5 or newer.
+- `crypto::slh_dsa` (feature `pq-slh`): SLH-DSA-SHA2-128s via the pure-Rust
+  `slh-dsa` crate, including the FIPS 205 context string. No system library.
 - `tx`: transaction envelope (canonical encode/decode, payload hash,
   authorization-list limit) and authorization policy (`single`, `all`,
   `threshold`, no OR).
@@ -44,13 +46,13 @@ Done:
   signature verification, per-sender replay protection) on axum.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 80 tests with `--features pq-openssl` (72 without), including RFC 8032
-  vectors, ML-DSA roundtrip and context binding, deterministic signing,
-  envelope and policy behaviour, validator rotation, in-process HTTP tests, and
-  **byte-for-byte parity checks** against V for the signing payloads and for a
-  complete signed envelope.
-- `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors, the same
-  result as the V prototype.
+- 89 tests in the default workspace build (90 with `--all-features`),
+  including RFC 8032 vectors, ML-DSA-65 and SLH-DSA roundtrip and context
+  binding, deterministic signing, envelope and policy behaviour, validator
+  rotation, in-process HTTP tests, and **byte-for-byte parity checks** against V
+  for the signing payloads and for a complete signed envelope.
+- `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors (the same result as
+  the V prototype) and **14/14** NIST SLH-DSA-SHA2-128s sigVer vectors.
 
 Not yet: nothing in the port plan below is missing.
 
@@ -69,6 +71,10 @@ The Rust node is roughly twice as fast: axum/tokio spread work across threads an
 `ed25519-dalek` verifies faster than libsodium's Ed25519 here. ML-DSA-65 is the
 same OpenSSL engine, so those numbers match within run-to-run noise.
 
+SLH-DSA-SHA2-128s has no V counterpart. Measured the same way: ~905 µs to verify
+one signature, ~626 ms to sign one, and a 100-validator certificate of 786,103 B
+(projected). It is registered for agility, not as a default.
+
 ```bash
 cargo build
 cargo test
@@ -81,9 +87,11 @@ cargo run -p karsa -- loadtest 20000 16
 ./scripts/acvp-rust.sh       # downloads vectors on first use
 ```
 
-The `pq-testnet` feature without `pq-openssl` is a compile error, matching the V
-prototype's rule that activation requires an implementation. With both features,
-ML-DSA-65 becomes enabled for verification.
+`pq-testnet` requires at least one PQ backend to be compiled; with neither
+`pq-openssl` nor `pq-slh` it is a compile error. The two backends activate
+independently, so `--features pq-slh,pq-testnet` enables SLH-DSA-SHA2-128s while
+leaving ML-DSA-65 gated. The CLI always compiles both backends so `karsa acvp`
+can check either vector set.
 
 ## Design findings
 
@@ -94,7 +102,7 @@ Rust port reproduces its measurements.
    encodings, domain separation, and a closed error taxonomy are enough to swap
    signature schemes without touching consensus rules.
 2. **Implementation and activation must be separate.** ML-DSA-65 compiles under
-   `-d pq_openssl` but stays gated unless `-d pq_testnet` is also passed.
+   `pq-openssl` but stays gated unless `pq-testnet` is also passed.
 3. **The PQ cost is size, not arithmetic.** ML-DSA-65 signatures are 3,309 B
    against Ed25519's 64 B.
 4. **Certificates, not transactions, bound a node.** At 100 validators an

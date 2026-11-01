@@ -228,6 +228,8 @@ pub fn verify_signature(
         ALG_ED25519 => Ed25519Scheme.verify(public_key, message, signature),
         #[cfg(feature = "pq-openssl")]
         registry::ALG_ML_DSA_65 => crate::ml_dsa::verify(public_key, message, signature),
+        #[cfg(feature = "pq-slh")]
+        registry::ALG_SLH_DSA_SHA2_128S => crate::slh_dsa::verify(public_key, message, signature),
         _ => Err(CryptoError::new(
             CryptoErrorKind::UnsupportedAlgorithm,
             format!("no verifier wired for algorithm id 0x{algorithm_id:04x}"),

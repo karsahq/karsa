@@ -20,5 +20,7 @@ pub mod encoding;
 pub mod ml_dsa;
 pub mod registry;
 pub mod scheme;
+#[cfg(feature = "pq-slh")]
+pub mod slh_dsa;
 
 pub use error::{CryptoError, CryptoErrorKind};

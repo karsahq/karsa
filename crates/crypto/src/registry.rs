@@ -54,16 +54,23 @@ pub struct AlgorithmSpec {
     pub signature_size: usize,
 }
 
-#[cfg(all(feature = "pq-testnet", not(feature = "pq-openssl")))]
-compile_error!(
-    "the `pq-testnet` feature requires `pq-openssl`: activation needs an implementation"
-);
+#[cfg(all(
+    feature = "pq-testnet",
+    not(any(feature = "pq-openssl", feature = "pq-slh"))
+))]
+compile_error!("the `pq-testnet` feature requires a PQ backend: enable `pq-openssl` or `pq-slh`");
 
-// Activation requires both the implementation feature and the testnet switch.
+// Activation requires both an implementation feature and the testnet switch.
+// The two PQ signatures are independent: ML-DSA needs OpenSSL, SLH-DSA does not.
 #[cfg(all(feature = "pq-testnet", feature = "pq-openssl"))]
 const ML_DSA_65_STATUS: AlgorithmStatus = AlgorithmStatus::Enabled;
 #[cfg(not(all(feature = "pq-testnet", feature = "pq-openssl")))]
 const ML_DSA_65_STATUS: AlgorithmStatus = AlgorithmStatus::ActivationGated;
+
+#[cfg(all(feature = "pq-testnet", feature = "pq-slh"))]
+const SLH_DSA_SHA2_128S_STATUS: AlgorithmStatus = AlgorithmStatus::Enabled;
+#[cfg(not(all(feature = "pq-testnet", feature = "pq-slh")))]
+const SLH_DSA_SHA2_128S_STATUS: AlgorithmStatus = AlgorithmStatus::ActivationGated;
 
 /// The frozen registry.
 pub const REGISTRY: [AlgorithmSpec; 4] = [
@@ -90,7 +97,7 @@ pub const REGISTRY: [AlgorithmSpec; 4] = [
         name: "SLH-DSA-SHA2-128s",
         specification: "FIPS 205",
         kind: AlgorithmKind::Signature,
-        status: AlgorithmStatus::ActivationGated,
+        status: SLH_DSA_SHA2_128S_STATUS,
         public_key_size: 32,
         signature_size: 7856,
     },
@@ -109,6 +116,13 @@ pub const REGISTRY: [AlgorithmSpec; 4] = [
 #[must_use]
 pub const fn ml_dsa_enabled() -> bool {
     matches!(ML_DSA_65_STATUS, AlgorithmStatus::Enabled)
+}
+
+/// Returns whether SLH-DSA-SHA2-128s may be used for authorization in this
+/// build.
+#[must_use]
+pub const fn slh_dsa_enabled() -> bool {
+    matches!(SLH_DSA_SHA2_128S_STATUS, AlgorithmStatus::Enabled)
 }
 
 /// Returns the registry entry for `id`.
@@ -188,6 +202,36 @@ mod tests {
         let spec = require_signature_algorithm(ALG_ED25519).unwrap();
         assert_eq!(spec.public_key_size, 32);
         assert_eq!(spec.signature_size, 64);
+    }
+
+    #[test]
+    fn slh_dsa_status_follows_the_features() {
+        let expected = cfg!(all(feature = "pq-testnet", feature = "pq-slh"));
+        assert_eq!(slh_dsa_enabled(), expected);
+
+        let result = require_signature_algorithm(ALG_SLH_DSA_SHA2_128S);
+        if expected {
+            assert!(result.is_ok());
+        } else {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                CryptoErrorKind::AlgorithmNotEnabled
+            );
+        }
+    }
+
+    #[test]
+    fn pq_activation_is_per_algorithm() {
+        // Enabling one PQ signature must not enable the other: each has its own
+        // backend feature, and `pq-testnet` alone gates both.
+        assert_eq!(
+            ml_dsa_enabled(),
+            cfg!(all(feature = "pq-testnet", feature = "pq-openssl"))
+        );
+        assert_eq!(
+            slh_dsa_enabled(),
+            cfg!(all(feature = "pq-testnet", feature = "pq-slh"))
+        );
     }
 
     #[test]

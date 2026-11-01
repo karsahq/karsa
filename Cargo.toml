@@ -19,3 +19,12 @@ missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = "warn"
+
+# SLH-DSA is hashing-bound: an unoptimised hashing dependency makes its tests
+# and ACVP run take minutes. The rest of the workspace keeps the normal dev
+# profile.
+[profile.dev.package.slh-dsa]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3

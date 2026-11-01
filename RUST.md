@@ -124,14 +124,16 @@ Status of the first stage:
 
 - `crypto` implements the closed error taxonomy, the canonical codec, the
   algorithm registry (same frozen IDs and sizes as V), domain-separated
-  payloads, and the `SignatureScheme` trait with Ed25519 and ML-DSA-65
-  implementations.
-- 80 tests pass with `pq-openssl` (72 without): RFC 8032 vectors, ML-DSA
-  roundtrip and context binding, deterministic signing, key generation,
+  payloads, and the `SignatureScheme` trait with Ed25519, ML-DSA-65, and
+  SLH-DSA-SHA2-128s implementations.
+- 89 tests pass in the workspace default build (90 with `--all-features`), 30 of
+  them in `crypto` alone without PQ backends: RFC 8032 vectors, ML-DSA and
+  SLH-DSA roundtrip and context binding, deterministic signing, key generation,
   envelope and policy behaviour, validator rotation and quorum-safe counting,
   in-process HTTP tests, plus byte-for-byte parity checks for the signing
   payloads and a complete signed envelope.
-- `karsa acvp` matches 15/15 NIST ML-DSA-65 sigVer vectors.
+- `karsa acvp` matches 15/15 NIST ML-DSA-65 and 14/14 SLH-DSA-SHA2-128s sigVer
+  vectors.
 - `karsa node` produces the same transaction id as the V node for the same demo
   envelope, which is expected because the encoded bytes are identical.
 - `karsa dagbench` reproduces the V certificate sizes exactly (331,403 B at 100
@@ -139,7 +141,8 @@ Status of the first stage:
 - `karsa loadtest` measures ~50–57k accepted tx/s on this machine, against
   ~25–33k for the V node.
 - The V prototype's rule that activation requires an implementation is
-  preserved: enabling `pq-testnet` without `pq-openssl` is a compile error.
+  preserved: `pq-testnet` without at least one of `pq-openssl` or `pq-slh` is a
+  compile error.
 
 Port order and the normative spec live in `docs/crypto-registry.md`;
 the measured V numbers to beat are in the root `README.md`.
@@ -150,6 +153,7 @@ the measured V numbers to beat are in the root `README.md`.
 | ---- | --------- | ---- |
 | Ed25519 | `ed25519-dalek` | audited, constant-time, fast |
 | ML-DSA-65 | RustCrypto `ml-dsa`, or OpenSSL via `openssl` crate | RustCrypto's is a pre-release and not independently audited; the V prototype used OpenSSL 3.6.5 and passed ACVP sigVer |
+| SLH-DSA-128s | RustCrypto `slh-dsa` (pure Rust) or OpenSSL 3.5+ EVP | chosen `slh-dsa` 0.2.0-rc.5 so the hash-based fallback needs no system library; also a pre-release, so it still needs an audit |
 | Hashing | `sha2` | matches `SHA-256` in the spec |
 | Encoding | hand-written, as in V | the canonical encoding is normative; do not let `serde` choose bytes |
 | Benchmarking | `criterion` | plus `dhat` or a counting allocator if allocation matters |

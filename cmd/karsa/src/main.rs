@@ -6,7 +6,7 @@
 //! karsa node                       run the demo HTTP node
 //! karsa sample-tx                  print a signed demo envelope as hex
 //! karsa demo                       print the registry and a sample payload
-//! karsa acvp <vectors.json>        check NIST ML-DSA-65 sigVer vectors
+//! karsa acvp <vectors.json>        check NIST ML-DSA or SLH-DSA sigVer vectors
 //! karsa dagbench                   measure DAG certificate and header cost
 //! karsa loadtest [count] [conc]    drive the node and report tx/s
 //! ```
@@ -42,7 +42,7 @@ enum Command {
     SampleTx,
     /// Print the algorithm registry and a sample signing payload.
     Demo,
-    /// Check NIST ACVP ML-DSA-65 sigVer vectors.
+    /// Check NIST ACVP sigVer vectors for ML-DSA-65 or SLH-DSA-SHA2-128s.
     Acvp {
         /// Path to the ACVP internalProjection.json file.
         file: PathBuf,
