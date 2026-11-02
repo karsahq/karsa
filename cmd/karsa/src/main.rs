@@ -142,8 +142,8 @@ enum Command {
     },
     /// Model per-node bandwidth for certificate and payload dissemination.
     Bandwidth {
-        /// Validators in the set.
-        #[arg(long, default_value_t = 100)]
+        /// Validators in the set. 30 matches the assumed launch committee.
+        #[arg(long, default_value_t = 30)]
         validators: usize,
         /// Committed transactions per second.
         #[arg(long, default_value_t = 100_000)]

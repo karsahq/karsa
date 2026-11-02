@@ -106,6 +106,9 @@ Done:
   drops everything at or below a state snapshot, so restart replays only the tail.
   `karsa persist` saves, prunes, drops the simulation, reopens, replays, and fails
   unless the state root comes back identical.
+- `karsa loadtest`: the node's admission path. ~55k accepted tx/s at 16
+  connections, which is 64% of the verification ceiling; the rest is HTTP and
+  serialisation, not crypto.
 - `karsa sweep`: the network simulation across committee sizes, with fault
   tolerance and quorum printed next to each row. Below n=4 the quorum is everyone,
   so those rows show the floor rather than recommend it.
