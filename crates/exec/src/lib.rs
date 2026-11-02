@@ -10,17 +10,16 @@
 //! unaffordable still commits; it just produces [`Outcome::Rejected`] for that
 //! transaction, and every other node rejects it identically.
 
+mod merkle;
 mod transfer;
 
+pub use merkle::{MerkleProof, MerkleTree, ProofStep};
 pub use transfer::Transfer;
 
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
-use crypto::CryptoError;
-use crypto::encoding::Encoder;
-use sha2::{Digest, Sha256};
 use tx::batch::Batch;
 use tx::envelope::Transaction;
 
@@ -220,20 +219,67 @@ impl State {
         }
     }
 
-    /// The commitment to the whole state: balances and sequences, ordered.
+    /// The commitment to the whole state, as a Merkle root over account leaves.
     ///
-    /// # Errors
+    /// Two nodes with the same accounts produce the same root regardless of the
+    /// order they credited them in, because leaves are taken from a `BTreeMap`.
+    #[must_use]
+    pub fn state_root(&self) -> [u8; 32] {
+        self.tree().root()
+    }
+
+    /// Builds an inclusion proof for one account.
     ///
-    /// Returns a field error when an account identifier is too long to encode.
-    pub fn state_root(&self) -> Result<[u8; 32], CryptoError> {
-        let mut encoder = Encoder::with_capacity(64 + self.balances.len() * 48);
-        encoder.put_u64(self.balances.len() as u64);
-        for (account, balance) in &self.balances {
-            encoder.put_bytes(account)?;
-            encoder.put_u64(*balance);
-            encoder.put_u64(self.sequence(account));
-        }
-        Ok(Sha256::digest(encoder.finish()).into())
+    /// Returns `None` when the account does not exist: there is no leaf to prove.
+    #[must_use]
+    pub fn proof(&self, account: &[u8]) -> Option<AccountProof> {
+        let index = self
+            .balances
+            .keys()
+            .position(|candidate| candidate == account)?;
+        let proof = self.tree().proof(index)?;
+        Some(AccountProof {
+            account: account.to_vec(),
+            balance: self.balance(account),
+            sequence: self.sequence(account),
+            proof,
+        })
+    }
+
+    fn leaves(&self) -> Vec<[u8; 32]> {
+        self.balances
+            .iter()
+            .map(|(account, balance)| merkle::hash_leaf(account, *balance, self.sequence(account)))
+            .collect()
+    }
+
+    fn tree(&self) -> MerkleTree {
+        MerkleTree::from_leaves(self.leaves())
+    }
+}
+
+/// An account leaf plus the path that binds it to a state root.
+///
+/// A light client holds only the root. Given this proof it can read one balance
+/// without trusting the node that served it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountProof {
+    /// The account the proof is about.
+    pub account: Vec<u8>,
+    /// Claimed balance.
+    pub balance: u64,
+    /// Claimed next sequence.
+    pub sequence: u64,
+    /// Siblings from the account leaf to the root.
+    pub proof: MerkleProof,
+}
+
+impl AccountProof {
+    /// Returns whether the claim is bound to `root`.
+    #[must_use]
+    pub fn verify(&self, root: &[u8; 32]) -> bool {
+        let leaf = merkle::hash_leaf(&self.account, self.balance, self.sequence);
+        MerkleTree::verify(root, &leaf, &self.proof)
     }
 }
 
@@ -281,11 +327,11 @@ mod tests {
         let mut state = genesis();
         let batch = Batch::new(vec![transaction(b"alice", 1, b"bob", 250)]);
         let _ = state.apply(&batch);
-        let root = state.state_root().unwrap();
+        let root = state.state_root();
 
         let outcomes = state.apply(&batch);
         assert_eq!(outcomes[0].reason(), Some(RejectReason::BadSequence));
-        assert_eq!(state.state_root().unwrap(), root);
+        assert_eq!(state.state_root(), root);
     }
 
     #[test]
@@ -341,7 +387,7 @@ mod tests {
             for batch in &batches {
                 let _ = state.apply(batch);
             }
-            state.state_root().unwrap()
+            state.state_root()
         };
         assert_eq!(run(), run());
     }
@@ -359,20 +405,73 @@ mod tests {
         let _ = backward.apply(&first);
 
         assert_ne!(
-            forward.state_root().unwrap(),
-            backward.state_root().unwrap(),
+            forward.state_root(),
+            backward.state_root(),
             "a consensus that orders differently must not produce the same state"
         );
     }
 
     #[test]
+    fn an_account_proof_verifies_against_the_root() {
+        let mut state = genesis();
+        let _ = state.apply(&Batch::new(vec![
+            transaction(b"alice", 1, b"bob", 250),
+            transaction(b"bob", 1, b"alice", 10),
+        ]));
+        let root = state.state_root();
+
+        for account in [b"alice".as_slice(), b"bob".as_slice()] {
+            let proof = state.proof(account).expect("the account exists");
+            assert!(
+                proof.verify(&root),
+                "{} did not verify",
+                String::from_utf8_lossy(account)
+            );
+            assert_eq!(proof.balance, state.balance(account));
+        }
+        assert!(state.proof(b"nobody").is_none());
+    }
+
+    #[test]
+    fn a_proof_with_a_tampered_balance_does_not_verify() {
+        let state = genesis();
+        let root = state.state_root();
+        let mut proof = state.proof(b"alice").unwrap();
+        proof.balance += 1;
+        assert!(!proof.verify(&root));
+    }
+
+    #[test]
+    fn the_root_does_not_depend_on_insertion_order() {
+        let mut forward = State::new();
+        forward.credit(b"alice", 10).unwrap();
+        forward.credit(b"bob", 20).unwrap();
+
+        let mut backward = State::new();
+        backward.credit(b"bob", 20).unwrap();
+        backward.credit(b"alice", 10).unwrap();
+
+        assert_eq!(forward.state_root(), backward.state_root());
+    }
+
+    #[test]
+    fn the_empty_state_root_is_defined() {
+        let state = State::new();
+        assert_eq!(
+            state.state_root(),
+            MerkleTree::from_leaves(Vec::new()).root()
+        );
+        assert!(state.proof(b"alice").is_none());
+    }
+
+    #[test]
     fn the_root_changes_when_only_the_sequence_changes() {
         let mut state = genesis();
-        let before = state.state_root().unwrap();
+        let before = state.state_root();
         let _ = state.apply(&Batch::new(vec![
             transaction(b"alice", 1, b"bob", 1),
             transaction(b"bob", 1, b"alice", 1),
         ]));
-        assert_ne!(state.state_root().unwrap(), before);
+        assert_ne!(state.state_root(), before);
     }
 }

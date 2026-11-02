@@ -159,6 +159,7 @@ struct Report {
     balances: BTreeMap<Vec<u8>, u64>,
     burned: u64,
     root: [u8; 32],
+    proof: exec::AccountProof,
 }
 
 fn simulate(validators: usize, data_rounds: u64) -> Result<Report, Box<dyn Error>> {
@@ -290,6 +291,12 @@ fn simulate(validators: usize, data_rounds: u64) -> Result<Report, Box<dyn Error
     // silently: genesis total equals circulating balance plus burned fees.
     let burned = u64::try_from(applied).unwrap_or(0) * FEE;
 
+    let root = state.state_root();
+    let first_account = state.balances().keys().next().cloned().unwrap_or_default();
+    let proof = state
+        .proof(&first_account)
+        .ok_or("the state has no account to prove")?;
+
     Ok(Report {
         rounds,
         committed_vertices: order.len(),
@@ -297,7 +304,8 @@ fn simulate(validators: usize, data_rounds: u64) -> Result<Report, Box<dyn Error
         rejected,
         balances: state.balances().clone(),
         burned,
-        root: state.state_root()?,
+        root,
+        proof,
     })
 }
 
@@ -375,6 +383,29 @@ pub fn run(validators: usize, data_rounds: u64) -> Result<(), Box<dyn Error>> {
     println!(
         "  deterministic: {} (two runs, same root)",
         first.root == second.root
+    );
+
+    println!();
+    println!("== State proof: what a light client checks without the state ==");
+    let proof = &first.proof;
+    println!(
+        "  account:  {}  balance {}  sequence {}",
+        String::from_utf8_lossy(&proof.account),
+        proof.balance,
+        proof.sequence
+    );
+    println!(
+        "  path:     {} siblings for {} leaves",
+        proof.proof.height(),
+        proof.proof.leaf_count
+    );
+    println!("  verifies: {}", proof.verify(&first.root));
+
+    let mut tampered = proof.clone();
+    tampered.balance += 1;
+    println!(
+        "  same proof with balance + 1: {} (must be false)",
+        tampered.verify(&first.root)
     );
 
     Ok(())

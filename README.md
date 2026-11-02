@@ -67,24 +67,28 @@ Done:
   never carries payload, so consensus messages stay at their measured size.
 - `exec`: a deterministic account state machine over committed batches. Balances
   and per-sender sequences live in `BTreeMap`s, rejections are values rather than
-  errors, and `state_root` is order-independent by construction.
+  errors, and `state_root` is a Merkle root over one leaf per account. Inclusion
+  proofs let a client holding only the root read one balance without trusting the
+  node that served it; odd nodes are promoted rather than duplicated, so two
+  account sets cannot share a root.
 - `karsa chain`: order and execute a small chain end to end — sign, batch, name by
   vertex, commit through the DAG and the pacemaker, then apply — and check the
-  conservation invariant and the determinism of the state root on every run.
+  conservation invariant, the determinism of the state root, and a Merkle inclusion
+  proof against that root on every run.
 - `karsa node`: the same HTTP pipeline as the V node (decode, policy lookup,
   signature verification, per-sender replay protection) on axum, plus the
   validator schedule: `GET /validators`, `POST /validators/{id}/keys`
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 173 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 186 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
   the DAG direct and indirect commit rules, the deterministic pacemaker, batch
-  encoding, the account state machine, in-process HTTP tests, and **byte-for-byte
-  parity checks** against V for the signing payloads and for a complete signed
-  envelope.
+  encoding, the account state machine, Merkle inclusion and malleability
+  properties, in-process HTTP tests, and **byte-for-byte parity checks** against V
+  for the signing payloads and for a complete signed envelope.
 - `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors (the same result as
   the V prototype) and **14/14** NIST SLH-DSA-SHA2-128s sigVer vectors.
 
