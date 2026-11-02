@@ -10,11 +10,21 @@
 //! unaffordable still commits; it just produces [`Outcome::Rejected`] for that
 //! transaction, and every other node rejects it identically.
 
-mod merkle;
 mod transfer;
 
-pub use merkle::{MerkleProof, MerkleTree, ProofStep};
+pub use crypto::merkle::{MerkleProof, MerkleTree, ProofStep};
 pub use transfer::Transfer;
+
+/// The leaf commitment for one account.
+///
+/// The domain tag keeps an account leaf from ever being confused with a commit
+/// leaf, which lives in the same tree implementation but a different namespace.
+fn account_leaf(account: &[u8], balance: u64, sequence: u64) -> [u8; 32] {
+    crypto::merkle::leaf(
+        b"KARSA/ACCOUNT/v1",
+        &[account, &balance.to_le_bytes(), &sequence.to_le_bytes()],
+    )
+}
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -249,7 +259,7 @@ impl State {
     fn leaves(&self) -> Vec<[u8; 32]> {
         self.balances
             .iter()
-            .map(|(account, balance)| merkle::hash_leaf(account, *balance, self.sequence(account)))
+            .map(|(account, balance)| account_leaf(account, *balance, self.sequence(account)))
             .collect()
     }
 
@@ -278,7 +288,7 @@ impl AccountProof {
     /// Returns whether the claim is bound to `root`.
     #[must_use]
     pub fn verify(&self, root: &[u8; 32]) -> bool {
-        let leaf = merkle::hash_leaf(&self.account, self.balance, self.sequence);
+        let leaf = account_leaf(&self.account, self.balance, self.sequence);
         MerkleTree::verify(root, &leaf, &self.proof)
     }
 }

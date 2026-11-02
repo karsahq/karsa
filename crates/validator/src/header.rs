@@ -41,6 +41,11 @@ pub struct Header {
     pub round: u64,
     /// Merkle root of the account state.
     pub state_root: [u8; 32],
+    /// Merkle root over the committed vertices, in commit order.
+    ///
+    /// This is what lets a client check that a vertex was part of the commit the
+    /// header names, instead of having to trust the node that told it.
+    pub dag_root: [u8; 32],
     /// Identifier of the previous header, all zero at genesis.
     pub previous: [u8; 32],
     /// Cumulative transactions applied at this height.
@@ -64,13 +69,19 @@ fn read_digest(decoder: &mut Decoder<'_>) -> Result<[u8; 32], CryptoError> {
 impl Header {
     /// The genesis header: height 0, no predecessor, no transactions applied.
     #[must_use]
-    pub fn genesis(chain_id: Vec<u8>, epoch: u64, state_root: [u8; 32]) -> Self {
+    pub fn genesis(
+        chain_id: Vec<u8>,
+        epoch: u64,
+        state_root: [u8; 32],
+        dag_root: [u8; 32],
+    ) -> Self {
         Self {
             chain_id,
             epoch,
             height: 0,
             round: 0,
             state_root,
+            dag_root,
             previous: [0u8; 32],
             applied: 0,
         }
@@ -83,6 +94,7 @@ impl Header {
             height: self.height,
             round: self.round,
             state_root: &self.state_root,
+            dag_root: &self.dag_root,
             previous: &self.previous,
             applied: self.applied,
         }
@@ -110,6 +122,7 @@ impl Header {
         encoder.put_u64(self.height);
         encoder.put_u64(self.round);
         encoder.put_bytes(&self.state_root)?;
+        encoder.put_bytes(&self.dag_root)?;
         encoder.put_bytes(&self.previous)?;
         encoder.put_u64(self.applied);
         Ok(encoder.finish())
@@ -136,6 +149,7 @@ impl Header {
         let height = decoder.read_u64()?;
         let round = decoder.read_u64()?;
         let state_root = read_digest(&mut decoder)?;
+        let dag_root = read_digest(&mut decoder)?;
         let previous = read_digest(&mut decoder)?;
         let applied = decoder.read_u64()?;
         decoder.finish()?;
@@ -145,6 +159,7 @@ impl Header {
             height,
             round,
             state_root,
+            dag_root,
             previous,
             applied,
         })
@@ -287,7 +302,7 @@ mod tests {
 
     impl Fixture {
         fn genesis(&self) -> Header {
-            Header::genesis(b"karsa-header-1".to_vec(), EPOCH, [1u8; 32])
+            Header::genesis(b"karsa-header-1".to_vec(), EPOCH, [1u8; 32], [2u8; 32])
         }
 
         fn next(&self, head: &Header, applied: u64) -> Header {
@@ -297,6 +312,7 @@ mod tests {
                 height: head.height + 1,
                 round: head.round + 1,
                 state_root: [u8::try_from(applied % 256).unwrap(); 32],
+                dag_root: [u8::try_from((applied + 1) % 256).unwrap(); 32],
                 previous: head.id().unwrap(),
                 applied,
             }

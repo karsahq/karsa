@@ -30,6 +30,10 @@ Done:
 - Workspace with `sccache` and `mold` (see `RUST.md`).
 - `crypto`: closed error taxonomy, deterministic codec, algorithm
   registry with the same frozen IDs and sizes as V, domain-separated payloads.
+- `crypto::merkle`: the Merkle tree and leaf commitment shared by the state root
+  and the DAG commit root. Two layers of domain separation (structural tags, then a
+  caller tag), odd nodes promoted rather than duplicated, and proofs that carry
+  each sibling's side so verification is a fold.
 - `crypto::scheme`: the `SignatureScheme` trait, Ed25519 via
   `ed25519-dalek`, static-dispatch `verify_signature`, and key generation.
 - `crypto::ml_dsa` (feature `pq-openssl`): ML-DSA-65 via the `openssl`
@@ -77,24 +81,30 @@ Done:
   per round, which is what makes it affordable where a per-round certificate was
   not. `HeaderChain` is the verifier a light client runs: it needs no DAG, no
   transactions, and no account state.
+- `validator::dag` commit root: `dag_root` in a header is a Merkle root over the
+  committed vertices in commit order, and `CommitProof` proves one vertex was part
+  of the commit a header names. The proof is taken against the commit prefix at
+  that height, so it does not verify against a later header.
 - `karsa chain`: order and execute a small chain end to end — sign, batch, name by
   vertex, commit through the DAG and the pacemaker, apply, certify one header per
   committed round, verify the header chain the way a light client would, and check
-  a Merkle inclusion proof against the certified root. The conservation invariant
-  and the determinism of the state root are checked on every run.
+  an account proof against the certified `state_root` and a commit proof against
+  the certified `dag_root`. The conservation invariant and the determinism of the
+  state root are checked on every run.
 - `karsa node`: the same HTTP pipeline as the V node (decode, policy lookup,
   signature verification, per-sender replay protection) on axum, plus the
   validator schedule: `GET /validators`, `POST /validators/{id}/keys`
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 193 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 197 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
   the DAG direct and indirect commit rules, the deterministic pacemaker, batch
-  encoding, the account state machine, Merkle inclusion and malleability
-  properties, header finality and replay refusal, in-process HTTP tests, and
+  encoding, the account state machine, Merkle inclusion, promotion and
+  multi-domain leaf properties, commit-proof membership and prefix binding, header
+  finality and replay refusal, in-process HTTP tests, and
   **byte-for-byte parity checks** against V for the signing payloads and for a
   complete signed envelope.
 - `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors (the same result as

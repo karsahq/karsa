@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use crypto::merkle::{MerkleProof, MerkleTree};
 use crypto::{CryptoError, CryptoErrorKind};
 
 use crate::schedule::ValidatorSet;
@@ -255,6 +256,12 @@ impl Dag {
         &self.order
     }
 
+    /// The Merkle root over everything this node has committed, in commit order.
+    #[must_use]
+    pub fn commit_root(&self) -> [u8; 32] {
+        commit_root(&self.order)
+    }
+
     /// Slots this node has decided to skip, in decision order.
     #[must_use]
     pub fn skipped(&self) -> &[SkippedRound] {
@@ -400,6 +407,56 @@ fn missing(id: &VertexId) -> CryptoError {
             id.round
         ),
     )
+}
+
+/// The leaf commitment for one committed vertex.
+///
+/// The domain tag keeps a commit leaf from colliding with any other kind of leaf
+/// built by the same tree implementation.
+#[must_use]
+pub fn commit_leaf(id: &VertexId) -> [u8; 32] {
+    crypto::merkle::leaf(
+        b"KARSA/DAG/COMMIT/v1",
+        &[&id.round.to_le_bytes(), &id.author, &id.digest],
+    )
+}
+
+/// A Merkle root over a commit sequence, in commit order.
+#[must_use]
+pub fn commit_root(order: &[VertexId]) -> [u8; 32] {
+    MerkleTree::from_leaves(order.iter().map(commit_leaf).collect()).root()
+}
+
+/// Proof that one vertex is inside a commit sequence.
+///
+/// This is what a header's `dag_root` is for: a client that is handed a header can
+/// check that a specific vertex was part of the commit it names, without being
+/// handed the commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitProof {
+    /// The vertex being proven.
+    pub vertex: VertexId,
+    /// Its path to the root.
+    pub proof: MerkleProof,
+}
+
+impl CommitProof {
+    /// Builds a proof for the vertex at `index` in `order`.
+    #[must_use]
+    pub fn prove(order: &[VertexId], index: usize) -> Option<Self> {
+        let vertex = order.get(index)?.clone();
+        let tree = MerkleTree::from_leaves(order.iter().map(commit_leaf).collect());
+        Some(Self {
+            vertex,
+            proof: tree.proof(index)?,
+        })
+    }
+
+    /// Returns whether the proven vertex is inside `dag_root`.
+    #[must_use]
+    pub fn verify(&self, dag_root: &[u8; 32]) -> bool {
+        MerkleTree::verify(dag_root, &commit_leaf(&self.vertex), &self.proof)
+    }
 }
 
 #[cfg(test)]
@@ -804,6 +861,60 @@ mod tests {
             (decision, fixture.dag.order().to_vec())
         };
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn a_commit_proof_proves_membership_in_the_dag_root() {
+        let mut fixture = bootstrapped(4);
+        let votes = fixture.ids(LEADER_ROUND);
+        fixture.full_round(LEADER_ROUND + 1, &votes).unwrap();
+        fixture.dag.try_commit(LEADER_ROUND).unwrap();
+
+        let order = fixture.dag.order().to_vec();
+        assert!(!order.is_empty(), "there is something to prove");
+        let root = fixture.dag.commit_root();
+        assert_eq!(root, commit_root(&order));
+
+        for index in 0..order.len() {
+            let proof = CommitProof::prove(&order, index).expect("index is in range");
+            assert!(
+                proof.verify(&root),
+                "commit {index} did not verify against the root"
+            );
+        }
+        assert!(CommitProof::prove(&order, order.len()).is_none());
+    }
+
+    #[test]
+    fn a_commit_proof_for_another_vertex_does_not_verify() {
+        let mut fixture = bootstrapped(4);
+        let votes = fixture.ids(LEADER_ROUND);
+        fixture.full_round(LEADER_ROUND + 1, &votes).unwrap();
+        fixture.dag.try_commit(LEADER_ROUND).unwrap();
+
+        let order = fixture.dag.order().to_vec();
+        let root = fixture.dag.commit_root();
+        let mut proof = CommitProof::prove(&order, 0).unwrap();
+        proof.vertex.digest[0] ^= 0xff;
+        assert!(!proof.verify(&root));
+    }
+
+    #[test]
+    fn the_commit_root_depends_on_commit_order() {
+        let first = VertexId {
+            round: 1,
+            author: b"val-0".to_vec(),
+            digest: [1u8; 32],
+        };
+        let second = VertexId {
+            round: 1,
+            author: b"val-1".to_vec(),
+            digest: [2u8; 32],
+        };
+        assert_ne!(
+            commit_root(&[first.clone(), second.clone()]),
+            commit_root(&[second, first])
+        );
     }
 
     #[test]

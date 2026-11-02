@@ -1,20 +1,22 @@
-//! A deterministic Merkle tree over account leaves.
+//! A deterministic Merkle tree, and the leaf commitment that feeds it.
 //!
-//! A flat hash of the whole state proves nothing to anyone who does not have the
-//! whole state. A Merkle root does: a light client that holds only the root can be
-//! shown one account and a short path, and can check it without trusting the
-//! prover.
+//! A flat hash of a whole set proves nothing to anyone who does not hold the whole
+//! set. A Merkle root does: a holder of only the root can be shown one element and
+//! a short path, and can check it without trusting the prover.
 //!
 //! Three details make the tree safe rather than merely present:
 //!
-//! - **Domain separation.** Leaves, internal nodes, and the empty tree hash under
-//!   different tags, so no leaf can be replayed as an internal node and the empty
-//!   root cannot collide with a real one.
-//! - **Sorted by account.** Leaves come from a `BTreeMap`, so the tree shape is a
-//!   function of the account set, never of insertion order.
+//! - **Domain separation, in two layers.** Leaves, internal nodes, and the empty
+//!   tree hash under different structural tags, so no leaf can be replayed as an
+//!   internal node and the empty root cannot collide with a real one. On top of
+//!   that, [`leaf`] prefixes a caller-supplied domain, so an account leaf can never
+//!   be confused with a commit leaf.
+//! - **Caller-defined order.** Leaves are hashed in the order given. Callers that
+//!   need an order-independent root must sort their elements first; the tree does
+//!   not guess.
 //! - **No duplicated last node.** An odd node is promoted unchanged. Duplicating it
-//!   would make two different account sets share a root, which is the classic
-//!   Merkle malleability bug.
+//!   would let two different sets share a root, which is the classic Merkle
+//!   malleability bug.
 //!
 //! A proof carries each sibling with its side, so verification is a fold and does
 //! not have to reconstruct the level sizes.
@@ -31,15 +33,24 @@ const EMPTY_DOMAIN: u8 = 0x02;
 /// The bound on proof length, so verifying hostile input cannot loop without end.
 const MAX_PROOF_STEPS: usize = 64;
 
-/// The leaf commitment for one account.
-pub(crate) fn hash_leaf(account: &[u8], balance: u64, sequence: u64) -> [u8; 32] {
+/// The leaf commitment for one element.
+///
+/// `domain` names what kind of leaf this is, and every `part` is length-prefixed,
+/// so `["ab", "c"]` and `["a", "bc"]` produce different leaves.
+#[must_use]
+pub fn leaf(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update([LEAF_DOMAIN]);
-    let length = u32::try_from(account.len()).unwrap_or(u32::MAX);
-    hasher.update(length.to_le_bytes());
-    hasher.update(account);
-    hasher.update(balance.to_le_bytes());
-    hasher.update(sequence.to_le_bytes());
+    hasher.update(
+        u32::try_from(domain.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    hasher.update(domain);
+    for part in parts {
+        hasher.update(u32::try_from(part.len()).unwrap_or(u32::MAX).to_le_bytes());
+        hasher.update(part);
+    }
     hasher.finalize().into()
 }
 
@@ -72,7 +83,7 @@ pub struct ProofStep {
 /// they are not needed to verify, because every step states its own side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MerkleProof {
-    /// Position of the leaf among the sorted leaves.
+    /// Position of the leaf in the order the tree was built from.
     pub leaf_index: usize,
     /// Number of leaves in the tree.
     pub leaf_count: usize,
@@ -115,7 +126,7 @@ impl MerkleTree {
         Self { levels }
     }
 
-    /// The root, or the empty-tree constant when there are no leaves.
+    /// The root of this tree, or the empty-tree constant when it has no leaves.
     #[must_use]
     pub fn root(&self) -> [u8; 32] {
         self.levels
@@ -193,8 +204,20 @@ mod tests {
 
     fn leaves(count: usize) -> Vec<[u8; 32]> {
         (0..count)
-            .map(|index| hash_leaf(format!("acct-{index}").as_bytes(), index as u64 + 1, 0))
+            .map(|index| {
+                leaf(
+                    b"KARSA/TEST/v1",
+                    &[format!("acct-{index}").as_bytes(), &[0, 1]],
+                )
+            })
             .collect()
+    }
+
+    #[test]
+    fn a_leaf_is_bound_to_its_domain_and_its_part_boundaries() {
+        assert_ne!(leaf(b"a", &[b"bc"]), leaf(b"a", &[b"b", b"c"]));
+        assert_ne!(leaf(b"a", &[b"bc"]), leaf(b"b", &[b"bc"]));
+        assert_eq!(leaf(b"a", &[b"bc"]), leaf(b"a", &[b"bc"]));
     }
 
     #[test]
@@ -203,16 +226,17 @@ mod tests {
         assert_eq!(tree.root(), empty_root());
         assert!(tree.is_empty());
         assert!(tree.proof(0).is_none());
+        assert_ne!(empty_root(), leaf(b"anything", &[]));
     }
 
     #[test]
     fn a_single_leaf_is_its_own_root() {
-        let leaf = leaves(1);
-        let tree = MerkleTree::from_leaves(leaf.clone());
-        assert_eq!(tree.root(), leaf[0]);
+        let leaf_hashes = leaves(1);
+        let tree = MerkleTree::from_leaves(leaf_hashes.clone());
+        assert_eq!(tree.root(), leaf_hashes[0]);
         let proof = tree.proof(0).unwrap();
         assert!(proof.steps.is_empty());
-        assert!(MerkleTree::verify(&tree.root(), &leaf[0], &proof));
+        assert!(MerkleTree::verify(&tree.root(), &leaf_hashes[0], &proof));
     }
 
     #[test]
@@ -221,10 +245,10 @@ mod tests {
             let leaf_hashes = leaves(count);
             let tree = MerkleTree::from_leaves(leaf_hashes.clone());
             let root = tree.root();
-            for (index, leaf) in leaf_hashes.iter().enumerate() {
+            for (index, hash) in leaf_hashes.iter().enumerate() {
                 let proof = tree.proof(index).expect("index is in range");
                 assert!(
-                    MerkleTree::verify(&root, leaf, &proof),
+                    MerkleTree::verify(&root, hash, &proof),
                     "leaf {index} of {count} did not verify"
                 );
             }
@@ -233,10 +257,11 @@ mod tests {
 
     #[test]
     fn a_tampered_leaf_does_not_verify() {
-        let leaves = leaves(9);
-        let tree = MerkleTree::from_leaves(leaves);
+        let leaf_hashes = leaves(9);
+        let tree = MerkleTree::from_leaves(leaf_hashes.clone());
         let proof = tree.proof(4).unwrap();
-        let tampered = hash_leaf(b"acct-4", 1_000_000, 0);
+        let tampered = leaf(b"KARSA/TEST/v1", &[b"acct-4-tampered", &[0, 1]]);
+        assert_ne!(tampered, leaf_hashes[4]);
         assert!(!MerkleTree::verify(&tree.root(), &tampered, &proof));
     }
 
@@ -251,36 +276,34 @@ mod tests {
 
     #[test]
     fn an_out_of_range_proof_is_refused() {
-        let leaves = leaves(3);
-        let tree = MerkleTree::from_leaves(leaves.clone());
+        let leaf_hashes = leaves(3);
+        let tree = MerkleTree::from_leaves(leaf_hashes.clone());
         let mut proof = tree.proof(0).unwrap();
         proof.leaf_count = 0;
-        assert!(!MerkleTree::verify(&tree.root(), &leaves[0], &proof));
+        assert!(!MerkleTree::verify(&tree.root(), &leaf_hashes[0], &proof));
         assert!(tree.proof(3).is_none());
-    }
-
-    #[test]
-    fn the_same_leaves_produce_the_same_root() {
-        let first = MerkleTree::from_leaves(leaves(11));
-        let second = MerkleTree::from_leaves(leaves(11));
-        assert_eq!(first.root(), second.root());
     }
 
     #[test]
     fn a_promoted_leaf_differs_from_a_duplicated_one() {
         let three = leaves(3);
         let tree = MerkleTree::from_leaves(three.clone());
-        // Duplicating the odd node is the malleability bug: it would make this
-        // equal to a four-leaf tree over the same three leaves.
         let duplicated = MerkleTree::from_leaves(vec![three[0], three[1], three[2], three[2]]);
         assert_ne!(tree.root(), duplicated.root());
     }
 
     #[test]
-    fn proofs_of_different_leaves_are_not_interchangeable() {
-        let leaves = leaves(8);
-        let tree = MerkleTree::from_leaves(leaves.clone());
-        let first = tree.proof(1).unwrap();
-        assert!(!MerkleTree::verify(&tree.root(), &leaves[2], &first));
+    fn a_truncated_proof_fails_rather_than_looping() {
+        let leaf_hashes = leaves(8);
+        let tree = MerkleTree::from_leaves(leaf_hashes.clone());
+        let mut proof = tree.proof(1).unwrap();
+        proof.steps.truncate(1);
+        assert!(!MerkleTree::verify(&tree.root(), &leaf_hashes[1], &proof));
+    }
+
+    #[test]
+    fn the_tree_reports_its_own_length() {
+        assert_eq!(MerkleTree::from_leaves(leaves(7)).len(), 7);
+        assert_eq!(MerkleTree::from_leaves(Vec::new()).len(), 0);
     }
 }

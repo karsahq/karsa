@@ -24,8 +24,8 @@ use tx::batch::Batch;
 use tx::envelope::{PROTOCOL_VERSION_V1, Transaction};
 use tx::policy::{AuthKey, AuthPolicy, AuthPolicyKind, Authorization, KeyStatus};
 use validator::{
-    Certificate, Dag, Header, HeaderChain, NO_EXPIRY, Pacemaker, PacemakerConfig, ValidatorKey,
-    ValidatorRecord, ValidatorSet, Vertex, bitmap_of,
+    Certificate, CommitProof, Dag, Header, HeaderChain, NO_EXPIRY, Pacemaker, PacemakerConfig,
+    ValidatorKey, ValidatorRecord, ValidatorSet, Vertex, bitmap_of, commit_root,
 };
 
 const CHAIN_ID: &[u8] = b"karsa-chain-1";
@@ -185,6 +185,7 @@ struct Report {
     headers: Vec<HeaderView>,
     head: Header,
     signed_headers: usize,
+    commit_proof: Option<(u64, CommitProof)>,
 }
 
 /// One row of the header table.
@@ -194,6 +195,7 @@ struct HeaderView {
     applied: u64,
     signers: usize,
     state_root: [u8; 32],
+    dag_root: [u8; 32],
 }
 
 fn simulate(validators: usize, data_rounds: u64) -> Result<Report, Box<dyn Error>> {
@@ -282,7 +284,12 @@ fn simulate(validators: usize, data_rounds: u64) -> Result<Report, Box<dyn Error
 
     // Execute in commit order, one header per committed round. The DAG decides the
     // order; these loops only follow it.
-    let genesis_header = Header::genesis(CHAIN_ID.to_vec(), EPOCH, state.state_root());
+    let genesis_header = Header::genesis(
+        CHAIN_ID.to_vec(),
+        EPOCH,
+        state.state_root(),
+        commit_root(&[]),
+    );
     let mut chain = HeaderChain::new(set.clone(), genesis_header.clone());
 
     let mut applied = 0usize;
@@ -293,9 +300,11 @@ fn simulate(validators: usize, data_rounds: u64) -> Result<Report, Box<dyn Error
         applied: 0,
         signers: 0,
         state_root: genesis_header.state_root,
+        dag_root: genesis_header.dag_root,
     }];
     let mut head = genesis_header;
     let mut signed_headers = 0usize;
+    let mut commit_proof: Option<(u64, CommitProof)> = None;
 
     let order = dag.order().to_vec();
     let mut cursor = 0usize;
@@ -351,12 +360,16 @@ fn simulate(validators: usize, data_rounds: u64) -> Result<Report, Box<dyn Error
 
         // A quorum signs the state this round produced. From here the root is no
         // longer a local computation: it is what the chain agreed on.
+        // The commit prefix as of this height, so a proof taken here stays
+        // verifiable against this header and not only against the final one.
+        let prefix = &order[..cursor];
         let header = Header {
             chain_id: CHAIN_ID.to_vec(),
             epoch: EPOCH,
             height: head.height + 1,
             round,
             state_root: state.state_root(),
+            dag_root: commit_root(prefix),
             previous: head.id()?,
             applied: u64::try_from(applied).unwrap_or(0),
         };
@@ -368,7 +381,16 @@ fn simulate(validators: usize, data_rounds: u64) -> Result<Report, Box<dyn Error
             applied: header.applied,
             signers: certificate.signer_count(),
             state_root: header.state_root,
+            dag_root: header.dag_root,
         });
+        if commit_proof.is_none()
+            && let Some(proof) = CommitProof::prove(prefix, start)
+        {
+            if !proof.verify(&header.dag_root) {
+                return Err("commit proof did not verify against its own header".into());
+            }
+            commit_proof = Some((header.height, proof));
+        }
         signed_headers += 1;
         head = header;
     }
@@ -395,6 +417,7 @@ fn simulate(validators: usize, data_rounds: u64) -> Result<Report, Box<dyn Error
         headers,
         head,
         signed_headers,
+        commit_proof,
     })
 }
 
@@ -477,11 +500,12 @@ pub fn run(validators: usize, data_rounds: u64) -> Result<(), Box<dyn Error>> {
     println!();
     println!("== Finality: one certified header per committed round ==");
     println!(
-        "  {}  {}  {}  {}  state root",
+        "  {}  {}  {}  {}  {}  dag root",
         pad("height", 7),
         pad("round", 6),
         pad("applied", 8),
-        pad("signers", 8)
+        pad("signers", 8),
+        pad("state root", 13)
     );
     for header in &first.headers {
         let signers = if header.height == 0 {
@@ -490,18 +514,45 @@ pub fn run(validators: usize, data_rounds: u64) -> Result<(), Box<dyn Error>> {
             format!("{} of {}", header.signers, validators)
         };
         println!(
-            "  {}  {}  {}  {}  {}",
+            "  {}  {}  {}  {}  {}  {}",
             pad(&header.height.to_string(), 7),
             pad(&header.round.to_string(), 6),
             pad(&header.applied.to_string(), 8),
             pad(&signers, 8),
-            short(&header.state_root)
+            pad(&short(&header.state_root), 13),
+            short(&header.dag_root)
         );
     }
     println!(
         "  light client: {} headers verified, head at height {}",
         first.signed_headers, first.head.height
     );
+
+    if let Some((height, proof)) = &first.commit_proof {
+        println!();
+        println!("== Commit proof: a vertex inside the certified DAG root ==");
+        println!(
+            "  vertex:   {}@{}",
+            String::from_utf8_lossy(&proof.vertex.author),
+            proof.vertex.round
+        );
+        println!(
+            "  against:  header at height {height} ({} siblings for {} commits)",
+            proof.proof.height(),
+            proof.proof.leaf_count
+        );
+        let header_root = first
+            .headers
+            .iter()
+            .find(|header| header.height == *height)
+            .map(|header| header.dag_root)
+            .unwrap_or_default();
+        println!("  verifies: {}", proof.verify(&header_root));
+        println!(
+            "  same proof against the head's dag root: {} (must be false)",
+            proof.verify(&first.head.dag_root)
+        );
+    }
 
     println!();
     println!("== State proof: what a light client checks without the state ==");

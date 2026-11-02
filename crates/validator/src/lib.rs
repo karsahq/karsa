@@ -15,7 +15,7 @@ mod vertex;
 pub use certificate::{
     CERTIFICATE_VERSION_V1, Certificate, bit_is_set, bitmap_len, bitmap_of, set_bit,
 };
-pub use dag::{Dag, Decision, SkippedRound};
+pub use dag::{CommitProof, Dag, Decision, SkippedRound, commit_leaf, commit_root};
 pub use header::{HEADER_VERSION_V1, Header, HeaderChain};
 pub use pacemaker::{Pacemaker, PacemakerConfig, Step};
 pub use schedule::{NO_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet, ValidatorSignature};

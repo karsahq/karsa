@@ -258,6 +258,7 @@ dependencies = [
  "ed25519-dalek",
  "openssl",
  "rand_core 0.6.4",
+ "sha2 0.10.9",
  "slh-dsa",
 ]
 

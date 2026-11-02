@@ -150,6 +150,8 @@ pub struct HeaderFields<'a> {
     pub round: u64,
     /// Merkle root of the account state.
     pub state_root: &'a [u8],
+    /// Merkle root over the committed vertices, in commit order.
+    pub dag_root: &'a [u8],
     /// Identifier of the previous header, all zero at genesis.
     pub previous: &'a [u8],
     /// Cumulative number of transactions applied at this height.
@@ -273,6 +275,7 @@ pub fn encode_header_payload(fields: &HeaderFields<'_>) -> Result<Vec<u8>, Crypt
     body.put_u64(fields.height);
     body.put_u64(fields.round);
     body.put_bytes(fields.state_root)?;
+    body.put_bytes(fields.dag_root)?;
     body.put_bytes(fields.previous)?;
     body.put_u64(fields.applied);
     wrap_domain(DOMAIN_HEADER_V1, body.as_slice())
