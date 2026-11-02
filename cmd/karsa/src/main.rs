@@ -9,6 +9,7 @@
 //! karsa acvp <vectors.json>        check NIST ML-DSA or SLH-DSA sigVer vectors
 //! karsa register-demo [epoch]      print a signed validator key rotation body
 //! karsa certify [n]                build, encode, and verify a DAG certificate
+//! karsa dagsim                     run the DAG commit rule on fixed scenarios
 //! karsa bandwidth                  model per-node dissemination bandwidth
 //! karsa dagbench                   measure DAG certificate and header cost
 //! karsa loadtest [count] [conc]    drive the node and report tx/s
@@ -18,6 +19,7 @@ mod acvp;
 mod bandwidth;
 mod certify;
 mod dagbench;
+mod dagsim;
 mod demo;
 mod loadtest;
 mod node;
@@ -55,6 +57,12 @@ enum Command {
     Certify {
         /// Number of validators in the demo set.
         #[arg(default_value_t = 10)]
+        validators: usize,
+    },
+    /// Run the DAG commit rule on fixed scenarios.
+    Dagsim {
+        /// Validators in the simulated committee (at least 4).
+        #[arg(default_value_t = 4)]
         validators: usize,
     },
     /// Model per-node bandwidth for certificate and payload dissemination.
@@ -101,6 +109,7 @@ fn main() -> ExitCode {
             node::print_demo_registration(activation_epoch)
         }
         Command::Certify { validators } => certify::run(validators),
+        Command::Dagsim { validators } => dagsim::run(validators),
         Command::Bandwidth {
             validators,
             tps,

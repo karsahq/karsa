@@ -50,20 +50,24 @@ Done:
 - `validator::vertex`: the uncertified alternative — one signature per block with
   votes expressed as references, a content-addressed id, and `tally_votes` with
   one count per author. `karsa certify` runs both styles on the same round.
+- `validator::dag`: vertices keyed by `(round, author)`, deterministic leader
+  election, and the direct commit rule — commit on a vote supermajority, skip on
+  an observed non-vote supermajority, otherwise undecided. History commits once,
+  in `(round, author)` order. `karsa dagsim` runs nine fixed scenarios.
 - `karsa node`: the same HTTP pipeline as the V node (decode, policy lookup,
   signature verification, per-sender replay protection) on axum, plus the
   validator schedule: `GET /validators`, `POST /validators/{id}/keys`
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 128 tests in the default workspace build (129 with `--all-features`),
+- 138 tests in the default workspace build (139 with `--all-features`),
   including RFC 8032 vectors, ML-DSA-65 and SLH-DSA roundtrip and context
   binding, deterministic signing, envelope and policy behaviour, validator
   rotation, validator key registration over HTTP, certificate encoding and
-  quorum rejection, vertex encoding and vote tallying, batch-vs-individual
-  verification equality, in-process HTTP tests, and **byte-for-byte parity
-  checks** against V for the signing payloads and for a complete signed
-  envelope.
+  quorum rejection, vertex encoding and vote tallying, the DAG direct commit
+  rule and its skip/undecided cases, batch-vs-individual verification equality,
+  in-process HTTP tests, and **byte-for-byte parity checks** against V for the
+  signing payloads and for a complete signed envelope.
 - `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors (the same result as
   the V prototype) and **14/14** NIST SLH-DSA-SHA2-128s sigVer vectors.
 
@@ -107,6 +111,7 @@ cargo run -p karsa -- node          # HTTP node on 127.0.0.1:8099
 cargo run -p karsa -- acvp testdata/acvp/sigver.json
 cargo run -p karsa -- register-demo 1   # signed validator key rotation body
 cargo run -p karsa -- certify 10        # encode, verify, and reject certificates
+cargo run -p karsa -- dagsim            # DAG commit rule on fixed scenarios
 cargo run -p karsa -- bandwidth         # per-node dissemination model
 cargo run -p karsa -- dagbench
 cargo run -p karsa -- loadtest 20000 16

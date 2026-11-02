@@ -68,6 +68,8 @@ pub enum CryptoErrorKind {
     /// A certificate's shape is inconsistent: bitmap, padding, or signature
     /// count do not agree with each other or with the validator set.
     MalformedCertificate = 24,
+    /// A vertex references a vertex this node does not have.
+    MissingReference = 25,
 }
 
 impl CryptoErrorKind {
@@ -106,6 +108,7 @@ impl CryptoErrorKind {
             Self::DuplicateKeyId => "duplicate_key_id",
             Self::DuplicateValidatorId => "duplicate_validator_id",
             Self::MalformedCertificate => "malformed_certificate",
+            Self::MissingReference => "missing_reference",
         }
     }
 }
@@ -180,6 +183,7 @@ mod tests {
         assert_eq!(CryptoErrorKind::BackendFailure.code(), 18);
         assert_eq!(CryptoErrorKind::DuplicateValidatorId.code(), 23);
         assert_eq!(CryptoErrorKind::MalformedCertificate.code(), 24);
+        assert_eq!(CryptoErrorKind::MissingReference.code(), 25);
     }
 
     #[test]

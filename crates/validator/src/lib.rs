@@ -6,11 +6,13 @@
 //! the switch happens at a published epoch rather than by ad hoc node behaviour.
 
 mod certificate;
+mod dag;
 mod schedule;
 mod vertex;
 
 pub use certificate::{
     CERTIFICATE_VERSION_V1, Certificate, bit_is_set, bitmap_len, bitmap_of, set_bit,
 };
+pub use dag::{Dag, Decision};
 pub use schedule::{NO_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet, ValidatorSignature};
 pub use vertex::{VERTEX_VERSION_V1, Vertex, VertexId, tally_votes};
