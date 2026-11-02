@@ -21,6 +21,7 @@
 //! karsa bandwidth                  model per-node dissemination bandwidth
 //! karsa dagbench                   measure DAG certificate and header cost
 //! karsa loadtest [count] [conc]    drive the node and report tx/s
+//! karsa live                       run validator nodes over real loopback sockets
 //! ```
 
 mod acvp;
@@ -31,6 +32,7 @@ mod chain;
 mod dagbench;
 mod dagsim;
 mod demo;
+mod live;
 mod loadtest;
 mod migrate;
 mod netrun;
@@ -192,6 +194,27 @@ enum Command {
         #[arg(default_value_t = 16)]
         concurrency: usize,
     },
+    /// Run validator nodes over real loopback sockets and measure what crosses them.
+    Live {
+        /// Validators in the committee.
+        #[arg(long, default_value_t = 5)]
+        validators: usize,
+        /// First loopback port; node `i` binds `port_base + i`.
+        #[arg(long, default_value_t = 7100)]
+        port_base: u16,
+        /// Rounds each node authors before the run stops.
+        #[arg(long, default_value_t = 20)]
+        rounds: u64,
+        /// Artificial per-frame delay on node 1, in milliseconds.
+        #[arg(long, default_value_t = 0)]
+        slow_ms: u64,
+        /// Wall-clock cap on the whole run.
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+        /// How long the mesh stays up after the last node finishes authoring.
+        #[arg(long, default_value_t = 500)]
+        drain_ms: u64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -244,6 +267,21 @@ fn main() -> ExitCode {
         Command::Acvp { file } => acvp::run(&file),
         Command::Dagbench => dagbench::run(),
         Command::Loadtest { count, concurrency } => loadtest::run(count, concurrency),
+        Command::Live {
+            validators,
+            port_base,
+            rounds,
+            slow_ms,
+            timeout_seconds,
+            drain_ms,
+        } => live::run(live::Config {
+            validators,
+            port_base,
+            rounds,
+            slow_ms,
+            timeout: std::time::Duration::from_secs(timeout_seconds),
+            drain: std::time::Duration::from_millis(drain_ms),
+        }),
     };
 
     match result {

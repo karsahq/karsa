@@ -17,13 +17,17 @@
 //!
 //! # What is not modelled
 //!
-//! No sockets, no TCP behaviour, no retransmission beyond the reliable in-order
-//! delivery this queue provides, no per-link capacity, and no headers or
+//! No sockets: [`wire`] turns a vertex into a length-prefixed frame and back, but
+//! the crate itself does no I/O, so `karsa live` owns the transport and this crate
+//! stays testable without a network. No retransmission beyond the reliable
+//! in-order delivery this queue provides, no per-link capacity, and no headers or
 //! certificates on the wire. Payload is absent too: a vertex here carries a zero
 //! payload hash, because this crate is about *ordering* convergence, and batches
 //! are a separate data plane.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+pub mod wire;
 
 use crypto::registry::ALG_ED25519;
 use crypto::scheme::Ed25519Scheme;

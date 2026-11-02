@@ -187,3 +187,29 @@ the measured V numbers to beat are in the root `README.md`.
 Keep the OpenSSL path as the reference implementation: it is what passed the
 NIST vectors, and a second backend lets the Rust version cross-check itself
 against the V results.
+
+## If the build produces an unusable binary
+
+Symptom: `cargo build` finishes, then `./target/release/karsa` reports
+`Exec format error`, `cannot execute binary file`, or `No such file or directory`, and
+`file` calls it `data`. The artifacts are zero bytes even though cargo says the
+build succeeded.
+
+That is a wrapper or filesystem problem, not a code problem. Check the artifacts
+before blaming the build:
+
+```bash
+ls -l target/release/*.rlib     # a 0-byte rlib is the tell
+file target/release/karsa
+```
+
+Recover with a wrapper-free rebuild:
+
+```bash
+rm -rf target
+RUSTC_WRAPPER= cargo build --release
+file target/release/karsa       # must say ELF, not data
+```
+
+If it recurs, the cache or the disk is writing zeroes; clear `~/.cache/sccache`
+and check the filesystem before trusting any later number.

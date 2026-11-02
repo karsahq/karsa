@@ -12,10 +12,10 @@ not part of this repository.
 | `crates/tx/` | Rust: transaction envelope, authorization policy, batches |
 | `crates/exec/` | Rust: deterministic account state machine over committed batches |
 | `crates/validator/` | Rust: epoch-bound validator key schedule, DAG, pacemaker, headers |
-| `crates/net/` | Rust: vertex dissemination between nodes, deterministic scheduling |
+| `crates/net/` | Rust: vertex dissemination between nodes, deterministic scheduling, and the wire framing for real sockets |
 | `crates/store/` | Rust: append-only on-disk vertices, batches, and roots |
 | `crates/erasure/` | Rust: Reed-Solomon over GF(2^8) for sharded storage |
-| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `dagsim`, `chain`, `net`, `persist`, `audit`, `migrate`, `sigbench`, `sweep`, `shards` |
+| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `live`, `dagsim`, `chain`, `net`, `persist`, `audit`, `migrate`, `sigbench`, `sweep`, `shards` |
 | `.cargo/config.toml` | sccache as rustc wrapper, mold as linker |
 | `scripts/rust-check.sh` | Rust gate: fmt, clippy, tests |
 | `scripts/acvp-rust.sh` | Downloads the ACVP vectors and runs the checker |
@@ -142,13 +142,27 @@ Done:
   roots, `dag_root` unchecked), and it prints which of the two it did. A test
   covers a quorum certifying a wrong state root: the certificate is valid, and only
   re-deriving the state catches it.
+- `net::wire`: the framing a byte stream needs. `u32 body length || u64 sent-at
+  nanos || canonical vertex bytes`, parsed from an accumulator so a frame split
+  across two reads is "not yet" rather than an error, with a 16 MB cap so one peer
+  cannot make a node allocate a number it chose. Four tests: round trip, a partial
+  frame left untouched, an oversized length refused before allocating, and a body
+  shorter than its own header refused.
+- `karsa live`: the DAG on real loopback sockets, full mesh, one listener per
+  node. Verified at n = 2, 4, 6, 8, and 10 for 21 rounds: every size converged on
+  the same commit root, with p50 delivery latency 0.20 → 1.70 ms and p99 0.35 →
+  40 ms as the mesh grew from 1 link to 90. Delivery order there is not the
+  simulator's: a vertex can arrive before the round it references, which is why
+  the node defers it and retries after the next successful insert. The per-peer
+  queue is bounded and awaited, so backpressure replaces a drop policy; that makes
+  a slow node everyone's problem, which `--slow-ms` exists to show.
 - `karsa node`: the same HTTP pipeline as the V node (decode, policy lookup,
   signature verification, per-sender replay protection) on axum, plus the
   validator schedule: `GET /validators`, `POST /validators/{id}/keys`
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 242 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 246 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
@@ -213,6 +227,7 @@ cargo run -p karsa -- dagbench
 cargo run -p karsa -- loadtest 20000 16
 cargo run -p karsa -- persist --keep-history 4 --rounds 6
 cargo run -p karsa -- audit 4               # re-derive both committed roots
+cargo run -p karsa -- live --validators 5 --rounds 20
 ./scripts/rust-check.sh
 ./scripts/acvp-rust.sh       # downloads vectors on first use
 ```
@@ -285,6 +300,14 @@ Rust port reproduces its measurements.
     roots, `dag_root` unchecked), so the retention window is also the audit window.
     This is checkable, not small: a light client still cannot verify it, which is
     the case a zk or fraud proof would cover.
+14. **A real transport changes the order, not the rules.** On loopback sockets at
+    n = 2…10 every committee converged on the same commit root, but delivery order
+    is no longer the simulator's: a vertex can arrive before the round it
+    references. The DAG's shape rule absorbs most of that, and the rest is deferred
+    and retried. With a bounded per-peer queue and no drop policy, a slow reader
+    applies backpressure to its sender instead of losing a vertex — which is the
+    head-of-line problem a dissemination design has to answer, and the reason
+    `--slow-ms` exists.
 
 ## Port plan
 
