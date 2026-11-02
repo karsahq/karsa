@@ -19,19 +19,31 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::PathBuf;
 
+use erasure::Code;
 use exec::State;
-use store::{Roots, Store};
+use store::{PruneReport, Roots, Store};
 use validator::{Dag, Pacemaker, PacemakerConfig, Step, VertexId, commit_root};
 
 use crate::chain;
 
+fn human(bytes: u64) -> String {
+    let value = bytes as f64;
+    if value >= 1e6 {
+        format!("{:.1} MB", value / 1e6)
+    } else if value >= 1e3 {
+        format!("{:.1} kB", value / 1e3)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// What a save wrote.
 struct Saved {
     vertices_before: usize,
-    vertices_after: usize,
-    batches_after: usize,
+    batches_before: usize,
     applied_total: usize,
     prune_round: u64,
+    report: PruneReport,
     roots: Roots,
 }
 
@@ -69,12 +81,18 @@ fn apply_until(
     Ok((state, applied))
 }
 
-/// Writes the vertices, the batches, the snapshot, and the roots a node reported.
+/// Writes the vertices, the batches, one shard per batch, the snapshot, and the
+/// roots a node reported.
+///
+/// The shard is what makes pruning safe: the node drops a payload only when a
+/// shard of it is already on disk, so the chain is never the sole holder of data
+/// it then forgets. One store plays one validator here, so it keeps shard 0.
 fn save(
     store: &Store,
     simulation: &chain::Simulation,
     prune_round: u64,
     accounts: &[chain::Account],
+    validators: usize,
 ) -> Result<Saved, Box<dyn Error>> {
     let highest = simulation.dag.highest_round().unwrap_or(0);
     let mut vertices_before = 0usize;
@@ -86,8 +104,15 @@ fn save(
             }
         }
     }
+    let mut batches_before = 0usize;
+    let code = Code::new(validators - validators / 3, validators)?;
     for batch in simulation.batches.values() {
         store.put_batch(batch)?;
+        let encoded = code.encode(&batch.encode()?)?;
+        if let Some(shard) = encoded.shards.first() {
+            store.put_shard(&batch.digest()?, 0, shard)?;
+        }
+        batches_before += 1;
     }
 
     let (snapshot, _) = apply_until(simulation, accounts, prune_round)?;
@@ -100,14 +125,14 @@ fn save(
     store.put_roots(roots)?;
     store.sync()?;
 
-    store.prune_below(prune_round)?;
+    let report = store.prune_below(prune_round, 1)?;
 
     Ok(Saved {
         vertices_before,
-        vertices_after: store.vertices()?.len(),
-        batches_after: store.batches()?.len(),
+        batches_before,
         applied_total: simulation.report.applied,
         prune_round,
+        report,
         roots: Roots {
             commit_root: roots.commit_root,
             state_root: simulation.state.state_root(),
@@ -187,7 +212,7 @@ pub fn run(path: PathBuf, validators: usize, rounds: u64) -> Result<(), Box<dyn 
         let simulation = chain::simulate(validators, rounds)?;
         let accounts = chain::accounts(validators)?;
         let prune_round = (rounds / 2).max(1);
-        save(&store, &simulation, prune_round, &accounts)?
+        save(&store, &simulation, prune_round, &accounts, validators)?
         // The simulation is dropped here: everything below reads from disk only.
     };
     let replayed = replay(&store, validators)?;
@@ -196,11 +221,19 @@ pub fn run(path: PathBuf, validators: usize, rounds: u64) -> Result<(), Box<dyn 
     println!("== Persistence: save, prune, drop, reopen, replay ==");
     println!("  store:          {}", store.path().display());
     println!(
-        "  saved:          {} vertices, pruned to {} at round {} ({} batches kept)",
-        saved.vertices_before, saved.vertices_after, saved.prune_round, saved.batches_after
+        "  saved:          {} vertices, {} batches, one shard each",
+        saved.vertices_before, saved.batches_before
     );
     println!(
-        "  kept:           {} vertices, {} batches (only what the tail names)",
+        "  pruned:         {} vertices and {} payloads below round {} ({} left, {} freed)",
+        saved.report.vertices,
+        saved.report.batches_dropped,
+        saved.prune_round,
+        saved.report.batches_held,
+        human(saved.report.bytes_freed)
+    );
+    println!(
+        "  kept:           {} vertices, {} batches (the tail plus the window)",
         replayed.vertices, replayed.batches
     );
     println!(
@@ -276,7 +309,7 @@ mod tests {
 
         let saved = {
             let simulation = chain::simulate(4, 4).unwrap();
-            save(&store, &simulation, 2, &accounts).unwrap()
+            save(&store, &simulation, 2, &accounts, 4).unwrap()
         };
         let replayed = replay(&store, 4).unwrap();
 
@@ -299,12 +332,45 @@ mod tests {
 
         let saved = {
             let simulation = chain::simulate(4, 2).unwrap();
-            save(&store, &simulation, 0, &accounts).unwrap()
+            save(&store, &simulation, 0, &accounts, 4).unwrap()
         };
         assert_eq!(
-            saved.vertices_after + 4,
-            saved.vertices_before,
+            saved.report.vertices, 4,
             "round 0 holds one vertex per validator"
+        );
+        assert_eq!(
+            saved.report.batches_dropped, 0,
+            "round 0 carries no payload, so nothing can be dropped"
+        );
+        assert!(saved.report.bytes_freed > 0, "the vertex log still shrank");
+    }
+
+    #[test]
+    fn a_pruned_payload_is_dropped_only_when_its_shard_is_on_disk() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let accounts = chain::accounts(4).unwrap();
+
+        let saved = {
+            let simulation = chain::simulate(4, 6).unwrap();
+            save(&store, &simulation, 3, &accounts, 4).unwrap()
+        };
+        assert!(
+            saved.report.batches_dropped > 0,
+            "payloads behind the window are dropped"
+        );
+        assert_eq!(
+            saved.report.batches_held, 0,
+            "every dropped payload has a shard left on disk"
+        );
+        assert_eq!(
+            store.shards().unwrap().len(),
+            saved.batches_before,
+            "the shards are the part that survives"
+        );
+        assert_eq!(
+            store.batches().unwrap().len(),
+            saved.batches_before - saved.report.batches_dropped
         );
     }
 }

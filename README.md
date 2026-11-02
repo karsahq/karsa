@@ -104,14 +104,19 @@ Done:
 - `store`: append-only logs of `u32 len || payload` records for vertices and
   batches, plus atomically replaced snapshot and roots files. A torn tail from a
   crash is ignored; a complete record that does not decode is an error. Pruning
-  drops everything at or below a state snapshot, so restart replays only the tail.
+  drops everything at or below a state snapshot, so restart replays only the tail,
+  and it will only drop a payload this node cannot lose: a batch is deletable when
+  nothing in the retained tail names it **and** a shard of it is already on disk.
+  A node holding no shards keeps every payload, and the report says so.
   `karsa persist` saves, prunes, drops the simulation, reopens, replays, and fails
   unless the state root comes back identical.
 - `erasure`: Reed-Solomon over GF(2^8), non-systematic Vandermonde, any `data` of
   `total` shards reconstruct. `karsa shards` shows the storage it buys (302 GB/day
   down to 9.45 at 1k TPS), the CPU it costs (~36 MB/s scalar, 10% of a core at 1k
   TPS, 98% at 10k), and a round trip through the real store: sixteen directories
-  with one shard each, six discarded, payload rebuilt intact.
+  with one shard each, six discarded, payload rebuilt intact. `karsa persist` writes
+  a shard per batch before pruning, so the demo of the retention rule runs against
+  real files rather than a model.
 - `karsa loadtest`: the node's admission path. ~55k accepted tx/s at 16
   connections, which is 64% of the verification ceiling; the rest is HTTP and
   serialisation, not crypto.
@@ -134,7 +139,7 @@ Done:
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 233 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 236 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
@@ -142,7 +147,9 @@ Done:
   encoding, the account state machine, Merkle inclusion, promotion and
   multi-domain leaf properties, commit-proof membership and prefix binding, header
   finality and replay refusal, cross-node convergence with and without a crashed
-  validator, store round-trips, torn-tail tolerance, pruning, replay-to-the-same-
+  validator, store round-trips, torn-tail tolerance, pruning, the retention rule
+  (a sharded payload is dropped, an unsharded one is held, an in-window one stays),
+  replay-to-the-same-
   roots, in-process HTTP tests, and
   **byte-for-byte parity checks** against V for the signing payloads and for a
   complete signed envelope.
@@ -247,6 +254,17 @@ Rust port reproduces its measurements.
     100. `karsa bandwidth` puts that at 32.8 MB vs 343 kB of per-node egress with
     ML-DSA-65; the trade is that a certificate is verifiable offline and a DAG
     claim is not.
+11. **A committee buys safety, not throughput.** `karsa sweep` over n = 2…100 at
+    32 ticks: deliveries are exactly `held × (n−1)`, quadratic in total and linear
+    per node, while commits per tick flatten from n=40 (437 at n=40, 471 at n=60,
+    both at 32 ticks). Every size agreed on the DAG and the order. Above the quorum
+    floor, more validators only raise `f`.
+12. **The retention window, not the shard, decides storage.** Sharding is a 32× cut
+    that is permanent; the full-payload window is a duration and does not scale with
+    it. At 1k TPS a 1-hour window costs 12.6 GB against a 9.45 GB/day shard (22 GB
+    total), while a 1-day window costs 302 GB and erases the saving (311 GB total).
+    So the window has to be hours, and its purpose is serving a peer that is behind,
+    not serving history.
 
 ## Port plan
 

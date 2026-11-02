@@ -97,6 +97,19 @@ pub struct Snapshot {
     pub state: Vec<u8>,
 }
 
+/// What one pruning pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Vertices removed from the log.
+    pub vertices: usize,
+    /// Batches whose payload was removed.
+    pub batches_dropped: usize,
+    /// Batches whose payload was kept because no shard backs it.
+    pub batches_held: usize,
+    /// Bytes the two logs shrank by.
+    pub bytes_freed: u64,
+}
+
 /// One erasure-coded shard this node holds for a batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredShard {
@@ -379,53 +392,103 @@ impl Store {
         }))
     }
 
-    /// Drops every vertex at or below `round`, and every batch no kept vertex names.
+    /// Drops every vertex at or below `round`, and every payload no kept vertex
+    /// names — but only when a shard still backs that payload.
+    ///
+    /// This is model B's closing edge. A shard is kept forever; a payload is kept
+    /// for a window and then dropped, because `n` nodes each holding one shard can
+    /// rebuild what none of them holds whole. The rule that decides *when* is:
+    ///
+    /// * a batch is deletable once nothing in the retained tail names it, and
+    /// * this node holds at least `min_shards` shards of it.
+    ///
+    /// So a node with no shards keeps every payload: deleting data it alone holds
+    /// would be silent loss, not pruning. `min_shards = 0` deletes
+    /// unconditionally and is only correct for a node outside the erasure set.
+    ///
+    /// The window is the caller's `round`. Payload cannot be kept *longer* than
+    /// metadata in this layout: once the vertices are gone, nothing on disk says
+    /// which round a batch belonged to, so there is no way to age it out later.
+    /// A longer payload window therefore means a longer vertex window too.
     ///
     /// Both logs are rewritten through a temporary file and renamed into place, so a
     /// crash leaves either the old log or the new one.
-    ///
-    /// Returns how many vertices were removed.
     ///
     /// # Errors
     ///
     /// [`StoreError::Io`] on read or write failure, [`StoreError::Decode`] when a
     /// record does not decode.
-    pub fn prune_below(&self, round: u64) -> Result<usize, StoreError> {
+    pub fn prune_below(&self, round: u64, min_shards: usize) -> Result<PruneReport, StoreError> {
         let vertices = self.vertices()?;
-        let before = vertices.len();
         let kept: Vec<&Vertex> = vertices
             .iter()
             .filter(|vertex| vertex.round > round)
             .collect();
-        let removed = before - kept.len();
-        if removed == 0 {
-            return Ok(0);
-        }
+        let removed = vertices.len() - kept.len();
 
         let mut hashes = std::collections::HashSet::new();
         for vertex in &kept {
             hashes.insert(vertex.payload_hash);
         }
 
-        let mut encoded = Vec::new();
-        for vertex in &kept {
-            let bytes = vertex.encode()?;
-            encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            encoded.extend_from_slice(&bytes);
+        let mut shard_count: std::collections::HashMap<[u8; 32], usize> =
+            std::collections::HashMap::new();
+        for shard in self.shards()? {
+            *shard_count.entry(shard.digest).or_default() += 1;
         }
-        rewrite(&self.path_of(VERTICES_FILE), &encoded)?;
 
-        let mut kept_batches = Vec::new();
-        for batch in self.batches()? {
-            if hashes.contains(&batch.digest()?) {
-                let bytes = batch.encode()?;
-                kept_batches.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                kept_batches.extend_from_slice(&bytes);
+        let mut before: u64 = 0;
+        for name in [VERTICES_FILE, BATCHES_FILE] {
+            let path = self.path_of(name);
+            if path.exists() {
+                before += fs::metadata(&path)?.len();
             }
         }
-        rewrite(&self.path_of(BATCHES_FILE), &kept_batches)?;
 
-        Ok(removed)
+        let mut kept_batches = Vec::new();
+        let mut report = PruneReport {
+            vertices: removed,
+            ..PruneReport::default()
+        };
+        for batch in self.batches()? {
+            let digest = batch.digest()?;
+            let named = hashes.contains(&digest);
+            let backed = shard_count.get(&digest).copied().unwrap_or(0) >= min_shards;
+            if !named && backed {
+                report.batches_dropped += 1;
+                continue;
+            }
+            if !named {
+                report.batches_held += 1;
+            }
+            let bytes = batch.encode()?;
+            kept_batches.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            kept_batches.extend_from_slice(&bytes);
+        }
+
+        if removed > 0 {
+            let mut encoded = Vec::new();
+            for vertex in &kept {
+                let bytes = vertex.encode()?;
+                encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                encoded.extend_from_slice(&bytes);
+            }
+            rewrite(&self.path_of(VERTICES_FILE), &encoded)?;
+        }
+        if report.batches_dropped > 0 {
+            rewrite(&self.path_of(BATCHES_FILE), &kept_batches)?;
+        }
+
+        let mut after: u64 = 0;
+        for name in [VERTICES_FILE, BATCHES_FILE] {
+            let path = self.path_of(name);
+            if path.exists() {
+                after += fs::metadata(&path)?.len();
+            }
+        }
+        report.bytes_freed = before.saturating_sub(after);
+
+        Ok(report)
     }
 
     /// Reads the last reported roots, if any were ever written.
@@ -695,8 +758,10 @@ mod tests {
         assert_eq!(store.vertices().unwrap().len(), 4);
         assert_eq!(store.batches().unwrap().len(), 4);
 
-        let removed = store.prune_below(1).unwrap();
-        assert_eq!(removed, 2, "rounds 0 and 1 are dropped");
+        let report = store.prune_below(1, 0).unwrap();
+        assert_eq!(report.vertices, 2, "rounds 0 and 1 are dropped");
+        assert_eq!(report.batches_dropped, 2, "nothing is kept in the tail");
+        assert!(report.bytes_freed > 0);
 
         let kept: Vec<u64> = store
             .vertices()
@@ -737,9 +802,44 @@ mod tests {
         store.put_shard(&digest, 3, b"a shard").unwrap();
         store.append_vertex(&vertex(0, &payload)).unwrap();
 
-        store.prune_below(0).unwrap();
+        let report = store.prune_below(0, 1).unwrap();
+        assert_eq!(report.batches_dropped, 1);
         assert!(store.batches().unwrap().is_empty(), "the batch is gone");
         assert_eq!(store.shards().unwrap().len(), 1, "the shard remains");
+    }
+
+    #[test]
+    fn a_payload_without_a_shard_is_never_dropped() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let payload = batch(1);
+        store.put_batch(&payload).unwrap();
+        store.append_vertex(&vertex(0, &payload)).unwrap();
+
+        // Simulate a node that is not part of the erasure set: it holds no shard,
+        // so deleting this batch would destroy the only copy it knows about.
+        let report = store.prune_below(0, 1).unwrap();
+        assert_eq!(report.vertices, 1, "metadata still goes");
+        assert_eq!(report.batches_dropped, 0);
+        assert_eq!(report.batches_held, 1);
+        assert_eq!(store.batches().unwrap(), vec![payload]);
+    }
+
+    #[test]
+    fn an_unsharded_payload_stays_inside_the_window() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let kept = batch(9);
+        let digest = kept.digest().unwrap();
+        store.put_batch(&kept).unwrap();
+        store.put_shard(&digest, 0, b"a shard").unwrap();
+        store.append_vertex(&vertex(5, &kept)).unwrap();
+
+        // Pruning at round 4 leaves the vertex at round 5, so its payload is
+        // inside the window even though a shard would allow dropping it.
+        let report = store.prune_below(4, 1).unwrap();
+        assert_eq!(report.batches_dropped, 0);
+        assert_eq!(store.batches().unwrap(), vec![kept]);
     }
 
     #[test]
