@@ -1,9 +1,10 @@
 //! Deterministic in-process DAG simulator.
 //!
-//! Runs the direct commit rule from `validator::Dag` against fixed scenarios so
-//! the rules are observable: a supermajority of votes commits, a supermajority of
-//! observed non-votes skips, and anything else stays undecided. No networking and
-//! no timing: the same input always produces the same output.
+//! Runs the rules from `validator::Dag` against fixed scenarios so they are
+//! observable: a supermajority of votes commits, a supermajority of observed
+//! non-votes skips, a partially observed round stays undecided, and a later
+//! committed anchor resolves an earlier slot. No networking and no timing: the
+//! same input always produces the same output.
 
 use std::error::Error;
 
@@ -15,7 +16,8 @@ use validator::{
 
 const CHAIN_ID: &[u8] = b"karsa-dagsim-1";
 const EPOCH: u64 = 1;
-const LEADER_ROUND: u64 = 7;
+/// Round 0 is genesis and needs no references, so the first leader is here.
+const LEADER_ROUND: u64 = 1;
 
 struct Sim {
     keys: Vec<Vec<u8>>,
@@ -23,11 +25,14 @@ struct Sim {
 }
 
 impl Sim {
-    fn new(validators: usize) -> Result<Self, Box<dyn Error>> {
+    fn new(validators: usize) -> Result<Self, crypto::CryptoError> {
         let mut keys = Vec::with_capacity(validators);
         let mut records = Vec::with_capacity(validators);
         for index in 0..validators {
-            let seed = [u8::try_from(index + 1)?; 32];
+            // Two bytes of index: distinct for any realistic committee size.
+            let mut seed = [0u8; 32];
+            seed[0] = u8::try_from(index & 0xff).unwrap_or(0);
+            seed[1] = u8::try_from((index >> 8) & 0xff).unwrap_or(0);
             let public_key = Ed25519Scheme::public_key_from_seed(&seed)?;
             let mut private_key = Vec::with_capacity(64);
             private_key.extend_from_slice(&seed);
@@ -53,18 +58,30 @@ impl Sim {
         Ok(Self { keys, dag })
     }
 
+    fn count(&self) -> usize {
+        self.dag.set().validators.len()
+    }
+
+    fn quorum(&self) -> usize {
+        self.dag.set().quorum_size()
+    }
+
+    fn leader_index(&self, round: u64) -> usize {
+        usize::try_from(round).unwrap_or(0) % self.count()
+    }
+
     fn vertex(
         &self,
         author: usize,
         round: u64,
         references: Vec<VertexId>,
-    ) -> Result<Vertex, Box<dyn Error>> {
+    ) -> Result<Vertex, crypto::CryptoError> {
         let mut vertex = Vertex {
             chain_id: CHAIN_ID.to_vec(),
             epoch: EPOCH,
             round,
             author: format!("val-{author}").into_bytes(),
-            payload_hash: [u8::try_from(author + 1)?; 32],
+            payload_hash: [u8::try_from(author + 1).unwrap_or(u8::MAX); 32],
             references,
             signature: Vec::new(),
         };
@@ -73,20 +90,54 @@ impl Sim {
         Ok(vertex)
     }
 
-    fn insert(&mut self, vertex: Vertex) -> Result<VertexId, Box<dyn Error>> {
-        Ok(self.dag.insert(vertex)?)
+    fn insert(&mut self, vertex: Vertex) -> Result<VertexId, crypto::CryptoError> {
+        self.dag.insert(vertex)
     }
 
-    /// The elected leader of `round`, from the same rule the DAG uses.
-    fn leader(&self, round: u64) -> Option<VertexId> {
-        let index = usize::try_from(round).ok()? % self.dag.set().validators.len();
-        let author = &self.dag.set().validators[index].validator_id;
-        self.dag.get(round, author).and_then(|v| v.id().ok())
+    /// Inserts one vertex per validator, all with the same references.
+    fn fill_round(
+        &mut self,
+        round: u64,
+        references: &[VertexId],
+    ) -> Result<(), crypto::CryptoError> {
+        for author in 0..self.count() {
+            let vertex = self.vertex(author, round, references.to_vec())?;
+            self.insert(vertex)?;
+        }
+        Ok(())
     }
 
-    fn insert_leader(&mut self, references: Vec<VertexId>) -> Result<VertexId, Box<dyn Error>> {
-        let index = usize::try_from(LEADER_ROUND)? % self.dag.set().validators.len();
-        self.insert(self.vertex(index, LEADER_ROUND, references)?)
+    fn ids(&self, round: u64) -> Vec<VertexId> {
+        self.ids_where(round, |_| true)
+    }
+
+    /// Ids of every vertex in `round` except that round's leader.
+    fn ids_without_leader(&self, round: u64) -> Vec<VertexId> {
+        let leader = self.leader_index(round);
+        self.ids_where(round, |author| author != leader)
+    }
+
+    fn ids_where(&self, round: u64, keep: impl Fn(usize) -> bool) -> Vec<VertexId> {
+        let mut ids = Vec::new();
+        for author in 0..self.count() {
+            if !keep(author) {
+                continue;
+            }
+            let key = format!("val-{author}");
+            if let Some(vertex) = self.dag.get(round, key.as_bytes())
+                && let Ok(id) = vertex.id()
+            {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// Genesis round plus the first leader round, both complete.
+    fn bootstrap(&mut self) -> Result<(), crypto::CryptoError> {
+        self.fill_round(0, &[])?;
+        let genesis = self.ids(0);
+        self.fill_round(LEADER_ROUND, &genesis)
     }
 }
 
@@ -112,31 +163,43 @@ fn committed_count(decision: &Decision) -> usize {
     }
 }
 
+fn pad(value: &str, width: usize) -> String {
+    format!("{value:<width$}")
+}
+
+fn outcome(decision: Decision, detail: impl Into<String>) -> Outcome {
+    Outcome {
+        decision: describe(&decision),
+        committed: committed_count(&decision),
+        detail: detail.into(),
+    }
+}
+
 pub fn run(validators: usize) -> Result<(), Box<dyn Error>> {
     if validators < 4 {
         return Err("--validators must be at least 4 so that a quorum is not everyone".into());
     }
 
-    println!("== DAG simulator (direct commit rule only) ==");
-    println!("  validators:   {validators}");
+    println!("== DAG simulator ==");
+    println!("  validators:    {validators}");
     println!(
         "  supermajority: {} of {validators}",
         validators * 2 / 3 + 1
     );
     println!(
-        "  rounds:       leader at {LEADER_ROUND}, votes at {}",
+        "  rounds:        genesis 0, leader {LEADER_ROUND}, votes {}",
         LEADER_ROUND + 1
     );
     println!();
 
-    let scenarios: Vec<(&str, Outcome)> = vec![
+    let scenarios = vec![
         ("all validators vote", all_vote(validators)?),
-        ("one validator silent", three_of_four(validators)?),
+        ("one validator silent", one_silent(validators)?),
         ("half the validators silent", half_silent(validators)?),
         ("supermajority of non-votes", non_vote_quorum(validators)?),
         ("leader never received", missing_leader(validators)?),
         ("one author submits twice", duplicate_author(validators)?),
-        ("leader with two ancestors", with_history(validators)?),
+        ("leader with full history", with_history(validators)?),
     ];
 
     println!(
@@ -145,44 +208,27 @@ pub fn run(validators: usize) -> Result<(), Box<dyn Error>> {
         pad("decision", 10),
         pad("committed", 10)
     );
-    for (name, outcome) in &scenarios {
+    for scenario in &scenarios {
         println!(
             "  {}  {}  {}  {}",
-            pad(name, 28),
-            pad(outcome.decision, 10),
-            pad(&outcome.committed.to_string(), 10),
-            outcome.detail
+            pad(scenario.0, 28),
+            pad(scenario.1.decision, 10),
+            pad(&scenario.1.committed.to_string(), 10),
+            scenario.1.detail
         );
     }
 
-    // A missing ancestor is a failure, not a decision, and it must not commit.
-    let mut sim = Sim::new(validators)?;
-    let phantom = VertexId {
-        round: LEADER_ROUND - 1,
-        author: b"val-0".to_vec(),
-        digest: [7u8; 32],
-    };
-    sim.insert_leader(vec![phantom])?;
-    let leader = sim.leader(LEADER_ROUND).expect("leader was inserted");
-    for author in 0..validators {
-        sim.insert(sim.vertex(author, LEADER_ROUND + 1, vec![leader.clone()])?)?;
-    }
-    let missing = sim.dag.try_commit(LEADER_ROUND);
     println!();
-    print!("  missing ancestor: ");
-    match missing {
-        Ok(decision) => println!("{} (unexpected)", describe(&decision)),
+    print!("  shape rule: ");
+    match violated_shape(validators) {
+        Ok(()) => println!("accepted (unexpected)"),
         Err(error) => println!("rejected, code {} {}", error.code(), error.kind()),
     }
-
-    // Determinism: the same scenario must produce the same commit sequence.
-    let first = with_history(validators)?;
-    let second = with_history(validators)?;
-    println!();
-    println!(
-        "  deterministic: {} (same input, same decision and same committed count)",
-        first.decision == second.decision && first.committed == second.committed
-    );
+    print!("  missing ancestor: ");
+    match missing_ancestor(validators) {
+        Ok(()) => println!("accepted (unexpected)"),
+        Err(error) => println!("rejected, code {} {}", error.code(), error.kind()),
+    }
 
     println!();
     println!("== Indirect rule: deciding an earlier slot through a committed anchor ==");
@@ -206,104 +252,149 @@ pub fn run(validators: usize) -> Result<(), Box<dyn Error>> {
     }
 
     println!();
-    println!("  Indirect skip assumes every vertex references a supermajority of the");
-    println!("  previous round; this simulator does not enforce that rule.");
+    println!(
+        "  deterministic: {} (same input, same decision)",
+        all_vote(validators)?.decision == all_vote(validators)?.decision
+    );
+    println!();
     println!("  Not modelled: waves or pipelining, a pacemaker, asynchrony, networking,");
     println!("  and execution.");
 
     Ok(())
 }
 
-fn pad(value: &str, width: usize) -> String {
-    format!("{value:<width$}")
-}
-
-fn outcome(decision: Decision, detail: impl Into<String>) -> Result<Outcome, Box<dyn Error>> {
-    let outcome = Outcome {
-        decision: describe(&decision),
-        committed: committed_count(&decision),
-        detail: detail.into(),
-    };
-    Ok(outcome)
-}
-
 fn all_vote(validators: usize) -> Result<Outcome, Box<dyn Error>> {
     let mut sim = Sim::new(validators)?;
-    let leader = sim.insert_leader(Vec::new())?;
-    for author in 0..validators {
-        sim.insert(sim.vertex(author, LEADER_ROUND + 1, vec![leader.clone()])?)?;
-    }
+    sim.bootstrap()?;
+    let votes = sim.ids(LEADER_ROUND);
+    sim.fill_round(LEADER_ROUND + 1, &votes)?;
     let decision = sim.dag.try_commit(LEADER_ROUND)?;
-    outcome(decision, "every vote references the leader")
+    Ok(outcome(
+        decision,
+        "every vote references the leader and a quorum of the previous round",
+    ))
 }
 
-fn three_of_four(validators: usize) -> Result<Outcome, Box<dyn Error>> {
+fn one_silent(validators: usize) -> Result<Outcome, Box<dyn Error>> {
     let mut sim = Sim::new(validators)?;
-    let leader = sim.insert_leader(Vec::new())?;
+    sim.bootstrap()?;
+    let votes = sim.ids(LEADER_ROUND);
     for author in 0..validators - 1 {
-        sim.insert(sim.vertex(author, LEADER_ROUND + 1, vec![leader.clone()])?)?;
+        let vertex = sim.vertex(author, LEADER_ROUND + 1, votes.clone())?;
+        sim.insert(vertex)?;
     }
     let decision = sim.dag.try_commit(LEADER_ROUND)?;
-    outcome(
+    Ok(outcome(
         decision,
-        format!("{} votes, one validator absent", validators - 1),
-    )
+        format!("{} votes, one absent", validators - 1),
+    ))
 }
 
 fn half_silent(validators: usize) -> Result<Outcome, Box<dyn Error>> {
     let mut sim = Sim::new(validators)?;
-    let leader = sim.insert_leader(Vec::new())?;
+    sim.bootstrap()?;
+    let votes = sim.ids(LEADER_ROUND);
     let voting = validators / 2;
     for author in 0..voting {
-        sim.insert(sim.vertex(author, LEADER_ROUND + 1, vec![leader.clone()])?)?;
+        let vertex = sim.vertex(author, LEADER_ROUND + 1, votes.clone())?;
+        sim.insert(vertex)?;
     }
     let decision = sim.dag.try_commit(LEADER_ROUND)?;
-    outcome(decision, format!("{voting} votes, absence is not evidence"))
+    Ok(outcome(
+        decision,
+        format!("{voting} votes, absence is not evidence"),
+    ))
 }
 
 fn non_vote_quorum(validators: usize) -> Result<Outcome, Box<dyn Error>> {
     let mut sim = Sim::new(validators)?;
-    sim.insert_leader(Vec::new())?;
-    let quorum = validators * 2 / 3 + 1;
+    sim.bootstrap()?;
+    let without_leader = sim.ids_without_leader(LEADER_ROUND);
+    let quorum = sim.quorum();
     for author in 0..quorum {
-        sim.insert(sim.vertex(author, LEADER_ROUND + 1, Vec::new())?)?;
+        let vertex = sim.vertex(author, LEADER_ROUND + 1, without_leader.clone())?;
+        sim.insert(vertex)?;
     }
     let decision = sim.dag.try_commit(LEADER_ROUND)?;
-    outcome(decision, format!("{quorum} observed non-votes"))
+    Ok(outcome(decision, format!("{quorum} observed non-votes")))
 }
 
 fn missing_leader(validators: usize) -> Result<Outcome, Box<dyn Error>> {
     let mut sim = Sim::new(validators)?;
+    sim.fill_round(0, &[])?;
+    let genesis = sim.ids(0);
+    let leader = sim.leader_index(LEADER_ROUND);
     for author in 0..validators {
-        sim.insert(sim.vertex(author, LEADER_ROUND + 1, Vec::new())?)?;
+        if author == leader {
+            continue;
+        }
+        let vertex = sim.vertex(author, LEADER_ROUND, genesis.clone())?;
+        sim.insert(vertex)?;
     }
+    let present = sim.ids(LEADER_ROUND);
+    sim.fill_round(LEADER_ROUND + 1, &present)?;
     let decision = sim.dag.try_commit(LEADER_ROUND)?;
-    outcome(decision, "no leader vertex to decide")
+    Ok(outcome(decision, "no leader vertex to decide"))
 }
 
 fn duplicate_author(validators: usize) -> Result<Outcome, Box<dyn Error>> {
     let mut sim = Sim::new(validators)?;
-    let leader = sim.insert_leader(Vec::new())?;
+    sim.bootstrap()?;
+    let votes = sim.ids(LEADER_ROUND);
     for _ in 0..2 {
-        sim.insert(sim.vertex(0, LEADER_ROUND + 1, vec![leader.clone()])?)?;
+        let vertex = sim.vertex(0, LEADER_ROUND + 1, votes.clone())?;
+        sim.insert(vertex)?;
     }
     let decision = sim.dag.try_commit(LEADER_ROUND)?;
-    outcome(decision, "one author cannot make a quorum alone")
+    Ok(outcome(decision, "one author cannot make a quorum alone"))
 }
 
 fn with_history(validators: usize) -> Result<Outcome, Box<dyn Error>> {
     let mut sim = Sim::new(validators)?;
-    let ancestor_round = LEADER_ROUND - 1;
-    let mut ancestors = Vec::new();
-    for author in 0..2 {
-        ancestors.push(sim.insert(sim.vertex(author, ancestor_round, Vec::new())?)?);
-    }
-    let leader = sim.insert_leader(ancestors)?;
-    for author in 0..validators {
-        sim.insert(sim.vertex(author, LEADER_ROUND + 1, vec![leader.clone()])?)?;
-    }
+    sim.bootstrap()?;
+    let votes = sim.ids(LEADER_ROUND);
+    sim.fill_round(LEADER_ROUND + 1, &votes)?;
     let decision = sim.dag.try_commit(LEADER_ROUND)?;
-    outcome(decision, "leader plus two ancestors, committed once")
+    Ok(outcome(
+        decision,
+        "the leader plus the genesis round it references",
+    ))
+}
+
+/// A round-1 vertex that references too few previous-round authors.
+fn violated_shape(validators: usize) -> Result<(), crypto::CryptoError> {
+    let mut sim = Sim::new(validators)?;
+    sim.fill_round(0, &[])?;
+    let genesis = sim.ids(0);
+    let short = genesis[..sim.quorum() - 1].to_vec();
+    let vertex = sim.vertex(0, LEADER_ROUND, short)?;
+    sim.insert(vertex)?;
+    Ok(())
+}
+
+/// A leader that references a vertex nobody holds.
+fn missing_ancestor(validators: usize) -> Result<(), crypto::CryptoError> {
+    let mut sim = Sim::new(validators)?;
+    sim.fill_round(0, &[])?;
+    let genesis = sim.ids(0);
+    let leader = sim.leader_index(LEADER_ROUND);
+    for author in 0..validators {
+        let mut references = genesis.clone();
+        if author == leader {
+            references.truncate(sim.quorum());
+            references.push(VertexId {
+                round: 0,
+                author: b"val-unknown".to_vec(),
+                digest: [9u8; 32],
+            });
+        }
+        let vertex = sim.vertex(author, LEADER_ROUND, references)?;
+        sim.insert(vertex)?;
+    }
+    let votes = sim.ids(LEADER_ROUND);
+    sim.fill_round(LEADER_ROUND + 1, &votes)?;
+    sim.dag.try_commit(LEADER_ROUND)?;
+    Ok(())
 }
 
 /// One indirect-decision run: an earlier slot decided through a committed anchor.
@@ -316,52 +407,42 @@ struct IndirectOutcome {
 
 fn indirect(validators: usize, anchored: bool) -> Result<IndirectOutcome, Box<dyn Error>> {
     let mut sim = Sim::new(validators)?;
-    let leader = sim.insert_leader(Vec::new())?;
+    sim.bootstrap()?;
+    let votes = sim.ids(LEADER_ROUND);
+    let without_leader = sim.ids_without_leader(LEADER_ROUND);
 
-    // Round 8 carries the votes for the round-7 leader. Only the anchored case
-    // makes them reachable from later history.
+    // Round 2: the anchored case has two voters, the unanchored case none.
     for author in 0..validators {
         let references = if anchored && author < 2 {
-            vec![leader.clone()]
+            votes.clone()
         } else {
-            Vec::new()
+            without_leader.clone()
         };
-        sim.insert(sim.vertex(author, LEADER_ROUND + 1, references)?)?;
+        let vertex = sim.vertex(author, LEADER_ROUND + 1, references)?;
+        sim.insert(vertex)?;
     }
-    let votes: Vec<VertexId> = (0..validators)
-        .map(|author| {
-            sim.dag
-                .get(LEADER_ROUND + 1, format!("val-{author}").as_bytes())
-                .expect("round 8 was just inserted")
-                .id()
-                .expect("vertex id")
-        })
-        .collect();
 
-    // Round 9 references the whole round 8, and round 10 commits its leader.
-    for author in 0..validators {
-        sim.insert(sim.vertex(author, LEADER_ROUND + 2, votes.clone())?)?;
-    }
-    let anchor_author = usize::try_from(LEADER_ROUND + 2)? % validators;
+    // Rounds 3 and 4 carry the anchor: round 4 commits the round-3 leader.
+    let round_two = sim.ids(LEADER_ROUND + 1);
+    sim.fill_round(LEADER_ROUND + 2, &round_two)?;
     let anchor = sim
         .dag
-        .get(LEADER_ROUND + 2, format!("val-{anchor_author}").as_bytes())
-        .expect("the round-9 leader was inserted")
+        .leader(LEADER_ROUND + 2)
+        .expect("the round-3 leader was inserted")
         .id()?;
-    for author in 0..validators {
-        sim.insert(sim.vertex(author, LEADER_ROUND + 3, vec![anchor.clone()])?)?;
-    }
+    let round_three = sim.ids(LEADER_ROUND + 2);
+    sim.fill_round(LEADER_ROUND + 3, &round_three)?;
     sim.dag.try_commit(LEADER_ROUND + 2)?;
 
-    // An anchor only one round later has not had the chance to carry a quorum path.
-    let too_recent_anchor = sim
+    // An anchor only one round later has not had the round a quorum path needs.
+    let one_round_later = sim
         .dag
-        .get(LEADER_ROUND + 1, b"val-0")
-        .expect("round 8 was inserted")
+        .leader(LEADER_ROUND + 1)
+        .expect("the round-2 leader was inserted")
         .id()?;
     let too_recent = describe(
         &sim.dag
-            .try_indirect_decide(LEADER_ROUND, &too_recent_anchor)?,
+            .try_indirect_decide(LEADER_ROUND, &one_round_later)?,
     );
 
     let decision = sim.dag.try_indirect_decide(LEADER_ROUND, &anchor)?;

@@ -70,6 +70,8 @@ pub enum CryptoErrorKind {
     MalformedCertificate = 24,
     /// A vertex references a vertex this node does not have.
     MissingReference = 25,
+    /// A vertex does not carry the references its round requires.
+    InvalidVertex = 26,
 }
 
 impl CryptoErrorKind {
@@ -109,6 +111,7 @@ impl CryptoErrorKind {
             Self::DuplicateValidatorId => "duplicate_validator_id",
             Self::MalformedCertificate => "malformed_certificate",
             Self::MissingReference => "missing_reference",
+            Self::InvalidVertex => "invalid_vertex",
         }
     }
 }
@@ -184,6 +187,7 @@ mod tests {
         assert_eq!(CryptoErrorKind::DuplicateValidatorId.code(), 23);
         assert_eq!(CryptoErrorKind::MalformedCertificate.code(), 24);
         assert_eq!(CryptoErrorKind::MissingReference.code(), 25);
+        assert_eq!(CryptoErrorKind::InvalidVertex.code(), 26);
     }
 
     #[test]

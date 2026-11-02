@@ -229,6 +229,15 @@ impl ValidatorSet {
     pub fn has_supermajority(&self, signer_count: usize) -> bool {
         signer_count.saturating_mul(3) > self.validators.len().saturating_mul(2)
     }
+
+    /// Smallest signer count that is a supermajority of the set.
+    ///
+    /// This is the number of distinct previous-round authors a vertex must
+    /// reference, and the number of votes a leader needs to commit.
+    #[must_use]
+    pub fn quorum_size(&self) -> usize {
+        self.validators.len() * 2 / 3 + 1
+    }
 }
 
 #[cfg(test)]

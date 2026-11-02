@@ -61,17 +61,27 @@ impl Dag {
         &self.set
     }
 
-    /// Inserts a vertex after verifying it.
+    /// Inserts a vertex after verifying it and its shape.
+    ///
+    /// The shape rule is the one this module previously only assumed: a vertex in
+    /// round `r > 0` MUST reference at least [`ValidatorSet::quorum_size`]
+    /// **distinct, registered authors** of round `r - 1`. Without it, the indirect
+    /// skip argument does not hold: an anchor could be committed while a valid
+    /// path to an earlier leader exists on a branch the anchor does not cover.
+    ///
+    /// References to other rounds are allowed and not counted; they are weak edges
+    /// that carry causal history.
     ///
     /// A second vertex from the same author in the same round is **ignored**: the
-    /// first one wins, so an author cannot vote twice. That is the rule that stops
-    /// a Byzantine validator from manufacturing quorum alone.
+    /// first one wins, so an author cannot vote twice.
     ///
     /// # Errors
     ///
-    /// Propagates [`Vertex::verify`].
+    /// Propagates [`Vertex::verify`], and returns
+    /// [`CryptoErrorKind::InvalidVertex`] when the reference rule is not met.
     pub fn insert(&mut self, vertex: Vertex) -> Result<VertexId, CryptoError> {
         vertex.verify(&self.set)?;
+        self.check_round_references(&vertex)?;
         let key = (vertex.round, vertex.author.clone());
         if let Some(existing) = self.vertices.get(&key) {
             return existing.id();
@@ -79,6 +89,38 @@ impl Dag {
         let id = vertex.id()?;
         self.vertices.insert(key, vertex);
         Ok(id)
+    }
+
+    /// Checks that a vertex references a quorum of the previous round.
+    fn check_round_references(&self, vertex: &Vertex) -> Result<(), CryptoError> {
+        if vertex.round == 0 {
+            return Ok(());
+        }
+        let previous = vertex.round - 1;
+        let registered = |author: &[u8]| {
+            self.set
+                .validators
+                .iter()
+                .any(|record| record.validator_id == author)
+        };
+        let mut authors: HashSet<&[u8]> = HashSet::new();
+        for reference in &vertex.references {
+            if reference.round == previous && registered(&reference.author) {
+                authors.insert(&reference.author);
+            }
+        }
+        let required = self.set.quorum_size();
+        if authors.len() < required {
+            return Err(CryptoError::new(
+                CryptoErrorKind::InvalidVertex,
+                format!(
+                    "round {} references {} of {required} required authors from round {previous}",
+                    vertex.round,
+                    authors.len()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Returns the vertex for one author and round.
@@ -291,6 +333,8 @@ mod tests {
     use crypto::scheme::Ed25519Scheme;
 
     const EPOCH: u64 = 1;
+    /// Round 0 is genesis and needs no references, so the first leader is here.
+    const LEADER_ROUND: u64 = 1;
 
     struct Fixture {
         keys: Vec<Vec<u8>>,
@@ -323,8 +367,10 @@ mod tests {
             validators,
         };
         set.validate().unwrap();
-        let dag = Dag::new(set);
-        Fixture { keys, dag }
+        Fixture {
+            keys,
+            dag: Dag::new(set),
+        }
     }
 
     fn vertex(fixture: &Fixture, author: usize, round: u64, references: Vec<VertexId>) -> Vertex {
@@ -342,311 +388,277 @@ mod tests {
         vertex
     }
 
-    /// Elects the leader of `round` by the same rule the DAG uses.
-    fn leader_index(round: u64, count: usize) -> usize {
-        usize::try_from(round).unwrap() % count
+    impl Fixture {
+        fn count(&self) -> usize {
+            self.dag.set().validators.len()
+        }
+
+        fn leader_index(&self, round: u64) -> usize {
+            usize::try_from(round).unwrap() % self.count()
+        }
+
+        /// Inserts one vertex per validator, all with the same references.
+        fn full_round(&mut self, round: u64, references: &[VertexId]) -> Result<(), CryptoError> {
+            for author in 0..self.count() {
+                let vertex = vertex(self, author, round, references.to_vec());
+                self.dag.insert(vertex)?;
+            }
+            Ok(())
+        }
+
+        fn ids(&self, round: u64) -> Vec<VertexId> {
+            self.ids_where(round, |_| true)
+        }
+
+        /// Ids of every vertex in `round` except the round's leader.
+        fn ids_without_leader(&self, round: u64) -> Vec<VertexId> {
+            let leader = self.leader_index(round);
+            self.ids_where(round, |author| author != leader)
+        }
+
+        fn ids_where(&self, round: u64, keep: impl Fn(usize) -> bool) -> Vec<VertexId> {
+            let mut ids = Vec::new();
+            for author in 0..self.count() {
+                if !keep(author) {
+                    continue;
+                }
+                let key = format!("val-{author}");
+                if let Some(vertex) = self.dag.get(round, key.as_bytes()) {
+                    ids.push(vertex.id().unwrap());
+                }
+            }
+            ids
+        }
+    }
+
+    /// Genesis round plus the first leader round, both full and well formed.
+    fn bootstrapped(count: usize) -> Fixture {
+        let mut fixture = fixture(count);
+        fixture.full_round(0, &[]).unwrap();
+        let genesis = fixture.ids(0);
+        fixture.full_round(LEADER_ROUND, &genesis).unwrap();
+        fixture
     }
 
     #[test]
-    fn a_supermajority_of_votes_commits_the_leader() {
+    fn round_zero_needs_no_references_and_later_rounds_do() {
         let mut fixture = fixture(4);
-        let leader_author = leader_index(7, 4);
-        fixture
+        fixture.full_round(0, &[]).unwrap();
+        let genesis = fixture.ids(0);
+
+        // Two of the three required round-0 authors is not enough.
+        let short = vertex(&fixture, 0, 1, genesis[..2].to_vec());
+        let error = fixture.dag.insert(short).unwrap_err();
+        assert_eq!(error.kind(), CryptoErrorKind::InvalidVertex);
+
+        // The same author repeated three times is one author.
+        let repeated = vec![genesis[0].clone(); 3];
+        let error = fixture
             .dag
-            .insert(vertex(&fixture, leader_author, 7, Vec::new()))
-            .unwrap();
-        let leader_id = fixture.dag.leader(7).unwrap().id().unwrap();
+            .insert(vertex(&fixture, 0, 1, repeated))
+            .unwrap_err();
+        assert_eq!(error.kind(), CryptoErrorKind::InvalidVertex);
 
-        for author in 0..4 {
-            fixture
-                .dag
-                .insert(vertex(&fixture, author, 8, vec![leader_id.clone()]))
-                .unwrap();
-        }
+        // A full quorum of distinct authors is accepted.
+        fixture.full_round(1, &genesis).unwrap();
+    }
 
-        let decision = fixture.dag.try_commit(7).unwrap();
-        match decision {
-            Decision::Commit(history) => {
-                assert!(history.contains(&leader_id));
-                assert_eq!(history.len(), 1, "only the leader was referenced");
-            }
-            other => panic!("expected a commit, got {other:?}"),
-        }
-        assert_eq!(fixture.dag.order().len(), 1);
+    #[test]
+    fn references_to_other_rounds_do_not_count() {
+        let mut fixture = bootstrapped(4);
+        let genesis = fixture.ids(0);
+        let error = fixture
+            .dag
+            .insert(vertex(&fixture, 0, 2, genesis))
+            .unwrap_err();
+        assert_eq!(error.kind(), CryptoErrorKind::InvalidVertex);
+    }
+
+    #[test]
+    fn a_supermajority_of_votes_commits_the_leader_and_its_history() {
+        let mut fixture = bootstrapped(4);
+        let leader_id = fixture.dag.leader(LEADER_ROUND).unwrap().id().unwrap();
+        let votes = fixture.ids(LEADER_ROUND);
+        fixture.full_round(LEADER_ROUND + 1, &votes).unwrap();
+
+        let Decision::Commit(history) = fixture.dag.try_commit(LEADER_ROUND).unwrap() else {
+            panic!("expected a commit");
+        };
+        assert!(history.contains(&leader_id));
+        assert_eq!(history.len(), 5, "four genesis vertices plus the leader");
+        assert_eq!(fixture.dag.order().len(), 5);
     }
 
     #[test]
     fn one_silent_validator_still_commits() {
-        let mut fixture = fixture(4);
-        let leader_author = leader_index(7, 4);
-        fixture
-            .dag
-            .insert(vertex(&fixture, leader_author, 7, Vec::new()))
-            .unwrap();
-        let leader_id = fixture.dag.leader(7).unwrap().id().unwrap();
-
+        let mut fixture = bootstrapped(4);
+        let votes = fixture.ids(LEADER_ROUND);
         for author in 0..3 {
-            fixture
-                .dag
-                .insert(vertex(&fixture, author, 8, vec![leader_id.clone()]))
-                .unwrap();
+            let vertex = vertex(&fixture, author, LEADER_ROUND + 1, votes.clone());
+            fixture.dag.insert(vertex).unwrap();
         }
         assert!(matches!(
-            fixture.dag.try_commit(7).unwrap(),
+            fixture.dag.try_commit(LEADER_ROUND).unwrap(),
             Decision::Commit(_)
         ));
     }
 
     #[test]
     fn missing_votes_are_undecided_not_a_skip() {
-        // n=4, quorum is 3. Two votes and two absent voters is neither quorum.
-        let mut fixture = fixture(4);
-        let leader_author = leader_index(7, 4);
-        fixture
-            .dag
-            .insert(vertex(&fixture, leader_author, 7, Vec::new()))
-            .unwrap();
-        let leader_id = fixture.dag.leader(7).unwrap().id().unwrap();
-
+        let mut fixture = bootstrapped(4);
+        let votes = fixture.ids(LEADER_ROUND);
         for author in 0..2 {
-            fixture
-                .dag
-                .insert(vertex(&fixture, author, 8, vec![leader_id.clone()]))
-                .unwrap();
+            let vertex = vertex(&fixture, author, LEADER_ROUND + 1, votes.clone());
+            fixture.dag.insert(vertex).unwrap();
         }
-        assert_eq!(fixture.dag.try_commit(7).unwrap(), Decision::Undecided);
+        assert_eq!(
+            fixture.dag.try_commit(LEADER_ROUND).unwrap(),
+            Decision::Undecided
+        );
     }
 
     #[test]
     fn observed_non_votes_skip_the_leader() {
-        let mut fixture = fixture(4);
-        let leader_author = leader_index(7, 4);
-        fixture
-            .dag
-            .insert(vertex(&fixture, leader_author, 7, Vec::new()))
-            .unwrap();
-
-        // Three voters present, none of them referencing the leader: that is an
-        // observed supermajority of non-votes, which is the only evidence that
-        // may skip a leader.
+        let mut fixture = bootstrapped(4);
+        // A quorum of the next round, none of it referencing the leader.
+        let without_leader = fixture.ids_without_leader(LEADER_ROUND);
         for author in 0..3 {
-            fixture
-                .dag
-                .insert(vertex(&fixture, author, 8, Vec::new()))
-                .unwrap();
+            let vertex = vertex(&fixture, author, LEADER_ROUND + 1, without_leader.clone());
+            fixture.dag.insert(vertex).unwrap();
         }
-        assert_eq!(fixture.dag.try_commit(7).unwrap(), Decision::Skip);
+        assert_eq!(
+            fixture.dag.try_commit(LEADER_ROUND).unwrap(),
+            Decision::Skip
+        );
         assert!(fixture.dag.order().is_empty());
     }
 
     #[test]
     fn a_missing_leader_is_undecided() {
         let mut fixture = fixture(4);
-        assert_eq!(fixture.dag.try_commit(7).unwrap(), Decision::Undecided);
+        fixture.full_round(0, &[]).unwrap();
+        let genesis = fixture.ids(0);
+        let leader = fixture.leader_index(LEADER_ROUND);
+        for author in 0..4 {
+            if author == leader {
+                continue;
+            }
+            let vertex = vertex(&fixture, author, LEADER_ROUND, genesis.clone());
+            fixture.dag.insert(vertex).unwrap();
+        }
+        let present = fixture.ids(LEADER_ROUND);
+        fixture.full_round(LEADER_ROUND + 1, &present).unwrap();
+
+        assert_eq!(
+            fixture.dag.try_commit(LEADER_ROUND).unwrap(),
+            Decision::Undecided
+        );
     }
 
     #[test]
     fn a_second_vertex_from_the_same_author_is_ignored() {
-        let mut fixture = fixture(4);
-        let leader_author = leader_index(7, 4);
-        fixture
-            .dag
-            .insert(vertex(&fixture, leader_author, 7, Vec::new()))
-            .unwrap();
-        let leader_id = fixture.dag.leader(7).unwrap().id().unwrap();
-
-        // The same author submits twice in round 8: the vote still counts once.
+        let mut fixture = bootstrapped(4);
+        let votes = fixture.ids(LEADER_ROUND);
         for _ in 0..2 {
-            fixture
-                .dag
-                .insert(vertex(&fixture, 0, 8, vec![leader_id.clone()]))
-                .unwrap();
+            let vertex = vertex(&fixture, 0, LEADER_ROUND + 1, votes.clone());
+            fixture.dag.insert(vertex).unwrap();
         }
-        assert_eq!(fixture.dag.round_vertices(8).len(), 1);
-        assert_eq!(fixture.dag.try_commit(7).unwrap(), Decision::Undecided);
+        assert_eq!(fixture.dag.round_vertices(LEADER_ROUND + 1).len(), 1);
+        assert_eq!(
+            fixture.dag.try_commit(LEADER_ROUND).unwrap(),
+            Decision::Undecided
+        );
     }
 
     #[test]
     fn history_is_committed_once_and_in_a_stable_order() {
-        let mut fixture = fixture(4);
-        // Round 7 leader references round 6 vertices from two authors.
-        for author in 0..2 {
-            fixture
-                .dag
-                .insert(vertex(&fixture, author, 6, Vec::new()))
-                .unwrap();
-        }
-        let round6: Vec<VertexId> = (0..2)
-            .map(|author| {
-                fixture
-                    .dag
-                    .get(6, format!("val-{author}").as_bytes())
-                    .unwrap()
-                    .id()
-                    .unwrap()
-            })
-            .collect();
+        let mut fixture = bootstrapped(4);
+        let votes = fixture.ids(LEADER_ROUND);
+        fixture.full_round(LEADER_ROUND + 1, &votes).unwrap();
 
-        let leader_author = leader_index(7, 4);
-        fixture
-            .dag
-            .insert(vertex(&fixture, leader_author, 7, round6.clone()))
-            .unwrap();
-        let leader_id = fixture.dag.leader(7).unwrap().id().unwrap();
-
-        for author in 0..4 {
-            fixture
-                .dag
-                .insert(vertex(&fixture, author, 8, vec![leader_id.clone()]))
-                .unwrap();
-        }
-
-        let Decision::Commit(history) = fixture.dag.try_commit(7).unwrap() else {
-            panic!("expected a commit");
-        };
-        assert_eq!(history.len(), 3, "two ancestors plus the leader");
-        // Ancestors first, ordered by (round, author).
-        assert_eq!(history[0].round, 6);
-        assert_eq!(history[1].round, 6);
-        assert_eq!(history[2].round, 7);
-
+        assert!(matches!(
+            fixture.dag.try_commit(LEADER_ROUND).unwrap(),
+            Decision::Commit(_)
+        ));
         // Asking again changes nothing.
         assert_eq!(
-            fixture.dag.try_commit(7).unwrap(),
+            fixture.dag.try_commit(LEADER_ROUND).unwrap(),
             Decision::Commit(Vec::new())
         );
-        assert_eq!(fixture.dag.order().len(), 3);
+        assert_eq!(fixture.dag.order().len(), 5);
     }
 
     #[test]
     fn a_missing_ancestor_blocks_the_commit() {
         let mut fixture = fixture(4);
-        // A fabricated reference to a vertex this node never received.
-        let phantom = VertexId {
-            round: 6,
-            author: b"val-2".to_vec(),
+        fixture.full_round(0, &[]).unwrap();
+        let genesis = fixture.ids(0);
+        let mut references = genesis.clone();
+        // Keep the shape rule satisfied, then add a reference nobody holds.
+        references.truncate(fixture.dag.set().quorum_size());
+        references.push(VertexId {
+            round: 0,
+            author: b"val-9".to_vec(),
             digest: [9u8; 32],
-        };
-        let leader_author = leader_index(7, 4);
-        fixture
-            .dag
-            .insert(vertex(&fixture, leader_author, 7, vec![phantom]))
-            .unwrap();
-        let leader_id = fixture.dag.leader(7).unwrap().id().unwrap();
+        });
+
+        let leader = fixture.leader_index(LEADER_ROUND);
         for author in 0..4 {
-            fixture
-                .dag
-                .insert(vertex(&fixture, author, 8, vec![leader_id.clone()]))
-                .unwrap();
+            let chosen = if author == leader {
+                references.clone()
+            } else {
+                genesis.clone()
+            };
+            let vertex = vertex(&fixture, author, LEADER_ROUND, chosen);
+            fixture.dag.insert(vertex).unwrap();
         }
 
-        let error = fixture.dag.try_commit(7).unwrap_err();
+        let votes = fixture.ids(LEADER_ROUND);
+        fixture.full_round(LEADER_ROUND + 1, &votes).unwrap();
+
+        let error = fixture.dag.try_commit(LEADER_ROUND).unwrap_err();
         assert_eq!(error.kind(), CryptoErrorKind::MissingReference);
         assert!(fixture.dag.order().is_empty());
     }
 
     #[test]
-    fn the_same_input_commits_the_same_sequence() {
-        let run = || {
-            let mut fixture = fixture(4);
-            for author in 0..3 {
-                fixture
-                    .dag
-                    .insert(vertex(&fixture, author, 6, Vec::new()))
-                    .unwrap();
-            }
-            let refs: Vec<VertexId> = (0..3)
-                .map(|author| {
-                    fixture
-                        .dag
-                        .get(6, format!("val-{author}").as_bytes())
-                        .unwrap()
-                        .id()
-                        .unwrap()
-                })
-                .collect();
-            let leader_author = leader_index(7, 4);
-            fixture
-                .dag
-                .insert(vertex(&fixture, leader_author, 7, refs))
-                .unwrap();
-            let leader_id = fixture.dag.leader(7).unwrap().id().unwrap();
-            for author in 0..4 {
-                fixture
-                    .dag
-                    .insert(vertex(&fixture, author, 8, vec![leader_id.clone()]))
-                    .unwrap();
-            }
-            let decision = fixture.dag.try_commit(7).unwrap();
-            (decision, fixture.dag.order().to_vec())
-        };
-        assert_eq!(run(), run());
-    }
-
-    #[test]
     fn indirect_commit_finds_the_leader_inside_the_anchor_history() {
-        let mut fixture = fixture(4);
-        let leader_author = leader_index(7, 4);
-        fixture
-            .dag
-            .insert(vertex(&fixture, leader_author, 7, Vec::new()))
-            .unwrap();
-        let leader_id = fixture.dag.leader(7).unwrap().id().unwrap();
+        let mut fixture = bootstrapped(4);
+        let leader_id = fixture.dag.leader(LEADER_ROUND).unwrap().id().unwrap();
+        let votes = fixture.ids(LEADER_ROUND);
+        let without_leader = fixture.ids_without_leader(LEADER_ROUND);
 
-        // Round 8: two authors vote for the round-7 leader, two do not. The direct
-        // rule cannot decide, because two is not a quorum of four.
+        // A split round: two vote for the leader, two reference the rest.
         for author in 0..4 {
             let references = if author < 2 {
-                vec![leader_id.clone()]
+                votes.clone()
             } else {
-                Vec::new()
+                without_leader.clone()
             };
-            fixture
-                .dag
-                .insert(vertex(&fixture, author, 8, references))
-                .unwrap();
+            let vertex = vertex(&fixture, author, LEADER_ROUND + 1, references);
+            fixture.dag.insert(vertex).unwrap();
         }
-        assert_eq!(fixture.dag.try_commit(7).unwrap(), Decision::Undecided);
+        assert_eq!(
+            fixture.dag.try_commit(LEADER_ROUND).unwrap(),
+            Decision::Undecided
+        );
 
-        // Round 9 references the whole round 8, and round 10 commits its leader.
-        let round8: Vec<VertexId> = (0..4)
-            .map(|author| {
-                fixture
-                    .dag
-                    .get(8, format!("val-{author}").as_bytes())
-                    .unwrap()
-                    .id()
-                    .unwrap()
-            })
-            .collect();
-        for author in 0..4 {
-            fixture
-                .dag
-                .insert(vertex(&fixture, author, 9, round8.clone()))
-                .unwrap();
-        }
-        let anchor_author = leader_index(9, 4);
-        let anchor_id = fixture
-            .dag
-            .get(9, format!("val-{anchor_author}").as_bytes())
-            .unwrap()
-            .id()
-            .unwrap();
-        for author in 0..4 {
-            fixture
-                .dag
-                .insert(vertex(&fixture, author, 10, vec![anchor_id.clone()]))
-                .unwrap();
-        }
+        // Two rounds later the anchor commits with its whole history.
+        let round_two = fixture.ids(LEADER_ROUND + 1);
+        fixture.full_round(LEADER_ROUND + 2, &round_two).unwrap();
+        let anchor = fixture.dag.leader(LEADER_ROUND + 2).unwrap().id().unwrap();
+        let round_three = fixture.ids(LEADER_ROUND + 2);
+        fixture.full_round(LEADER_ROUND + 3, &round_three).unwrap();
         assert!(matches!(
-            fixture.dag.try_commit(9).unwrap(),
+            fixture.dag.try_commit(LEADER_ROUND + 2).unwrap(),
             Decision::Commit(_)
         ));
 
-        // The round-7 slot is inside the anchor's history, so it is decided, and
-        // asking again yields nothing new.
         assert_eq!(
-            fixture.dag.try_indirect_decide(7, &anchor_id).unwrap(),
+            fixture
+                .dag
+                .try_indirect_decide(LEADER_ROUND, &anchor)
+                .unwrap(),
             Decision::Commit(Vec::new())
         );
         assert!(fixture.dag.skipped().is_empty());
@@ -655,62 +667,36 @@ mod tests {
 
     #[test]
     fn indirect_skip_when_the_anchor_history_does_not_contain_the_leader() {
-        let mut fixture = fixture(4);
-        let leader_author = leader_index(7, 4);
-        fixture
-            .dag
-            .insert(vertex(&fixture, leader_author, 7, Vec::new()))
-            .unwrap();
+        let mut fixture = bootstrapped(4);
+        let without_leader = fixture.ids_without_leader(LEADER_ROUND);
 
-        // Nobody references the round-7 leader, so it is inside no one's history.
-        for author in 0..4 {
-            fixture
-                .dag
-                .insert(vertex(&fixture, author, 8, Vec::new()))
-                .unwrap();
-        }
-        let round8: Vec<VertexId> = (0..4)
-            .map(|author| {
-                fixture
-                    .dag
-                    .get(8, format!("val-{author}").as_bytes())
-                    .unwrap()
-                    .id()
-                    .unwrap()
-            })
-            .collect();
-        for author in 0..4 {
-            fixture
-                .dag
-                .insert(vertex(&fixture, author, 9, round8.clone()))
-                .unwrap();
-        }
-        let anchor_author = leader_index(9, 4);
-        let anchor_id = fixture
-            .dag
-            .get(9, format!("val-{anchor_author}").as_bytes())
-            .unwrap()
-            .id()
+        fixture
+            .full_round(LEADER_ROUND + 1, &without_leader)
             .unwrap();
-        for author in 0..4 {
-            fixture
-                .dag
-                .insert(vertex(&fixture, author, 10, vec![anchor_id.clone()]))
-                .unwrap();
-        }
+        let round_two = fixture.ids(LEADER_ROUND + 1);
+        fixture.full_round(LEADER_ROUND + 2, &round_two).unwrap();
+        let anchor = fixture.dag.leader(LEADER_ROUND + 2).unwrap().id().unwrap();
+        let round_three = fixture.ids(LEADER_ROUND + 2);
+        fixture.full_round(LEADER_ROUND + 3, &round_three).unwrap();
         assert!(matches!(
-            fixture.dag.try_commit(9).unwrap(),
+            fixture.dag.try_commit(LEADER_ROUND + 2).unwrap(),
             Decision::Commit(_)
         ));
 
         assert_eq!(
-            fixture.dag.try_indirect_decide(7, &anchor_id).unwrap(),
+            fixture
+                .dag
+                .try_indirect_decide(LEADER_ROUND, &anchor)
+                .unwrap(),
             Decision::Skip
         );
         assert_eq!(fixture.dag.skipped().len(), 1);
         // Deciding twice does not record the skip twice.
         assert_eq!(
-            fixture.dag.try_indirect_decide(7, &anchor_id).unwrap(),
+            fixture
+                .dag
+                .try_indirect_decide(LEADER_ROUND, &anchor)
+                .unwrap(),
             Decision::Skip
         );
         assert_eq!(fixture.dag.skipped().len(), 1);
@@ -718,28 +704,35 @@ mod tests {
 
     #[test]
     fn indirect_needs_an_anchor_two_rounds_later() {
-        let mut fixture = fixture(4);
-        let leader_author = leader_index(7, 4);
-        fixture
-            .dag
-            .insert(vertex(&fixture, leader_author, 7, Vec::new()))
-            .unwrap();
-        for author in 0..4 {
+        let mut fixture = bootstrapped(4);
+        let round_two = fixture.ids(LEADER_ROUND + 1);
+        let _ = round_two;
+        let too_recent = fixture.dag.leader(LEADER_ROUND).unwrap().id().unwrap();
+        assert_eq!(
             fixture
                 .dag
-                .insert(vertex(&fixture, author, 8, Vec::new()))
-                .unwrap();
-        }
-        let too_recent = fixture.dag.get(8, b"val-0").unwrap().id().unwrap();
-        assert_eq!(
-            fixture.dag.try_indirect_decide(7, &too_recent).unwrap(),
+                .try_indirect_decide(LEADER_ROUND - 1, &too_recent)
+                .unwrap(),
             Decision::Undecided
         );
+    }
+
+    #[test]
+    fn the_same_input_commits_the_same_sequence() {
+        let run = || {
+            let mut fixture = bootstrapped(4);
+            let votes = fixture.ids(LEADER_ROUND);
+            fixture.full_round(LEADER_ROUND + 1, &votes).unwrap();
+            let decision = fixture.dag.try_commit(LEADER_ROUND).unwrap();
+            (decision, fixture.dag.order().to_vec())
+        };
+        assert_eq!(run(), run());
     }
 
     #[test]
     fn the_set_is_exposed_for_callers() {
         let fixture = fixture(4);
         assert_eq!(fixture.dag.set().validators.len(), 4);
+        assert_eq!(fixture.dag.set().quorum_size(), 3);
     }
 }

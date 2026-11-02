@@ -50,19 +50,19 @@ Done:
 - `validator::vertex`: the uncertified alternative — one signature per block with
   votes expressed as references, a content-addressed id, and `tally_votes` with
   one count per author. `karsa certify` runs both styles on the same round.
-- `validator::dag`: vertices keyed by `(round, author)`, deterministic leader
-  election, and the direct commit rule — commit on a vote supermajority, skip on
-  an observed non-vote supermajority, otherwise undecided — plus the indirect
-  rule that resolves an earlier slot through a committed anchor: inside the
-  anchor's history commits, outside it skips, and one round later is undecided.
-  History commits once, in `(round, author)` order.
+- `validator::dag`: vertices keyed by `(round, author)`, a shape rule that
+  requires every non-genesis vertex to reference a quorum of distinct
+  previous-round authors, deterministic leader election, and the direct commit
+  rule — commit on a vote supermajority, skip on an observed non-vote
+  supermajority, otherwise undecided — plus the indirect rule that resolves an
+  earlier slot through a committed anchor.
 - `karsa node`: the same HTTP pipeline as the V node (decode, policy lookup,
   signature verification, per-sender replay protection) on axum, plus the
   validator schedule: `GET /validators`, `POST /validators/{id}/keys`
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 141 tests in the default workspace build (142 with `--all-features`),
+- 143 tests in the default workspace build (144 with `--all-features`),
   including RFC 8032 vectors, ML-DSA-65 and SLH-DSA roundtrip and context
   binding, deterministic signing, envelope and policy behaviour, validator
   rotation, validator key registration over HTTP, certificate encoding and
