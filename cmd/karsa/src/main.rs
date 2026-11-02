@@ -13,6 +13,7 @@
 //! karsa chain                      order and execute a small chain end to end
 //! karsa net                        exchange vertices between nodes and check convergence
 //! karsa persist                    save, drop, reopen, and replay a node's state
+//! karsa audit                      re-derive the certified state root from disk
 //! karsa migrate                    rotate validator keys across an epoch boundary
 //! karsa sigbench                   measure transaction verification throughput
 //! karsa sweep                      run the network simulation across committee sizes
@@ -23,6 +24,7 @@
 //! ```
 
 mod acvp;
+mod audit;
 mod bandwidth;
 mod certify;
 mod chain;
@@ -131,6 +133,19 @@ enum Command {
         /// Rounds that carry transactions.
         #[arg(long, default_value_t = 4)]
         rounds: u64,
+        /// Keep every vertex and payload so that `karsa audit` can re-derive the chain.
+        #[arg(long)]
+        keep_history: bool,
+    },
+    /// Re-derive the certified state root from the stored data, and say where
+    /// trust begins.
+    Audit {
+        /// Directory the store was written to.
+        #[arg(long, default_value = "karsa-store")]
+        path: PathBuf,
+        /// Validators in the committee the chain was produced by.
+        #[arg(default_value_t = 4)]
+        validators: usize,
     },
     /// Exchange vertices between validator nodes and check convergence.
     Net {
@@ -216,7 +231,9 @@ fn main() -> ExitCode {
             path,
             validators,
             rounds,
-        } => persist::run(path, validators, rounds),
+            keep_history,
+        } => persist::run(path, validators, rounds, keep_history),
+        Command::Audit { path, validators } => audit::run(path, validators),
         Command::Bandwidth {
             validators,
             tps,

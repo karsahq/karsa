@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use erasure::Code;
 use exec::State;
 use store::{PruneReport, Roots, Store};
-use validator::{Dag, Pacemaker, PacemakerConfig, Step, VertexId, commit_root};
+use validator::{Dag, VertexId, commit_root};
 
 use crate::chain;
 
@@ -38,11 +38,12 @@ fn human(bytes: u64) -> String {
 }
 
 /// What a save wrote.
-struct Saved {
+pub(crate) struct Saved {
     vertices_before: usize,
     batches_before: usize,
     applied_total: usize,
     prune_round: u64,
+    keep_history: bool,
     report: PruneReport,
     roots: Roots,
 }
@@ -87,12 +88,13 @@ fn apply_until(
 /// The shard is what makes pruning safe: the node drops a payload only when a
 /// shard of it is already on disk, so the chain is never the sole holder of data
 /// it then forgets. One store plays one validator here, so it keeps shard 0.
-fn save(
+pub(crate) fn save(
     store: &Store,
     simulation: &chain::Simulation,
     prune_round: u64,
     accounts: &[chain::Account],
     validators: usize,
+    keep_history: bool,
 ) -> Result<Saved, Box<dyn Error>> {
     let highest = simulation.dag.highest_round().unwrap_or(0);
     let mut vertices_before = 0usize;
@@ -123,15 +125,25 @@ fn save(
         state_root: snapshot.state_root(),
     };
     store.put_roots(roots)?;
+    // The certified headers are what an auditor has to compare against. Without
+    // them the stored roots are local arithmetic with nothing to appeal to.
+    for (header, certificate) in &simulation.certified {
+        store.put_header(header, certificate)?;
+    }
     store.sync()?;
 
-    let report = store.prune_below(prune_round, 1)?;
+    let report = if keep_history {
+        PruneReport::default()
+    } else {
+        store.prune_below(prune_round, 1)?
+    };
 
     Ok(Saved {
         vertices_before,
         batches_before,
         applied_total: simulation.report.applied,
         prune_round,
+        keep_history,
         report,
         roots: Roots {
             commit_root: roots.commit_root,
@@ -156,7 +168,7 @@ fn replay(store: &Store, validators: usize) -> Result<Replayed, Box<dyn Error>> 
         dag.insert(vertex.clone())?;
     }
 
-    let committed = settle(&mut dag, snapshot.round + 1)?;
+    let committed = chain::settle(&mut dag, snapshot.round + 1)?;
 
     let mut batches = BTreeMap::new();
     for batch in store.batches()? {
@@ -187,22 +199,12 @@ fn replay(store: &Store, validators: usize) -> Result<Replayed, Box<dyn Error>> 
     })
 }
 
-/// Replays the pacemaker until it stops making progress.
-fn settle(dag: &mut Dag, start_round: u64) -> Result<usize, Box<dyn Error>> {
-    let mut pacemaker = Pacemaker::new(PacemakerConfig { timeout_ticks: 3 }, start_round);
-    let mut quiet = 0usize;
-    let mut ticks = 0usize;
-    while quiet < 2 && ticks < 256 {
-        match pacemaker.tick(dag)? {
-            Step::Advanced { .. } => quiet = 0,
-            Step::Waiting { .. } | Step::TimedOut { .. } => quiet += 1,
-        }
-        ticks += 1;
-    }
-    Ok(dag.order().len())
-}
-
-pub fn run(path: PathBuf, validators: usize, rounds: u64) -> Result<(), Box<dyn Error>> {
+pub fn run(
+    path: PathBuf,
+    validators: usize,
+    rounds: u64,
+    keep_history: bool,
+) -> Result<(), Box<dyn Error>> {
     if validators < 4 {
         return Err("validators must be at least 4 so that a quorum is not everyone".into());
     }
@@ -212,7 +214,14 @@ pub fn run(path: PathBuf, validators: usize, rounds: u64) -> Result<(), Box<dyn 
         let simulation = chain::simulate(validators, rounds)?;
         let accounts = chain::accounts(validators)?;
         let prune_round = (rounds / 2).max(1);
-        save(&store, &simulation, prune_round, &accounts, validators)?
+        save(
+            &store,
+            &simulation,
+            prune_round,
+            &accounts,
+            validators,
+            keep_history,
+        )?
         // The simulation is dropped here: everything below reads from disk only.
     };
     let replayed = replay(&store, validators)?;
@@ -221,17 +230,23 @@ pub fn run(path: PathBuf, validators: usize, rounds: u64) -> Result<(), Box<dyn 
     println!("== Persistence: save, prune, drop, reopen, replay ==");
     println!("  store:          {}", store.path().display());
     println!(
-        "  saved:          {} vertices, {} batches, one shard each",
-        saved.vertices_before, saved.batches_before
+        "  saved:          {} vertices, {} batches, one shard each, {} certified headers",
+        saved.vertices_before,
+        saved.batches_before,
+        store.headers()?.len()
     );
-    println!(
-        "  pruned:         {} vertices and {} payloads below round {} ({} left, {} freed)",
-        saved.report.vertices,
-        saved.report.batches_dropped,
-        saved.prune_round,
-        saved.report.batches_held,
-        human(saved.report.bytes_freed)
-    );
+    if saved.keep_history {
+        println!("  pruned:         nothing; every payload is on disk for an audit");
+    } else {
+        println!(
+            "  pruned:         {} vertices and {} payloads below round {} ({} left, {} freed)",
+            saved.report.vertices,
+            saved.report.batches_dropped,
+            saved.prune_round,
+            saved.report.batches_held,
+            human(saved.report.bytes_freed)
+        );
+    }
     println!(
         "  kept:           {} vertices, {} batches (the tail plus the window)",
         replayed.vertices, replayed.batches
@@ -309,7 +324,7 @@ mod tests {
 
         let saved = {
             let simulation = chain::simulate(4, 4).unwrap();
-            save(&store, &simulation, 2, &accounts, 4).unwrap()
+            save(&store, &simulation, 2, &accounts, 4, false).unwrap()
         };
         let replayed = replay(&store, 4).unwrap();
 
@@ -332,7 +347,7 @@ mod tests {
 
         let saved = {
             let simulation = chain::simulate(4, 2).unwrap();
-            save(&store, &simulation, 0, &accounts, 4).unwrap()
+            save(&store, &simulation, 0, &accounts, 4, false).unwrap()
         };
         assert_eq!(
             saved.report.vertices, 4,
@@ -353,7 +368,7 @@ mod tests {
 
         let saved = {
             let simulation = chain::simulate(4, 6).unwrap();
-            save(&store, &simulation, 3, &accounts, 4).unwrap()
+            save(&store, &simulation, 3, &accounts, 4, false).unwrap()
         };
         assert!(
             saved.report.batches_dropped > 0,

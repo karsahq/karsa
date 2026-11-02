@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use crypto::CryptoError;
 use tx::batch::Batch;
-use validator::Vertex;
+use validator::{Certificate, Header, Vertex};
 
 /// Where the last reported roots are kept.
 const ROOTS_FILE: &str = "roots";
@@ -37,6 +37,8 @@ const BATCHES_FILE: &str = "batches.log";
 const SNAPSHOT_FILE: &str = "snapshot";
 /// The erasure-coded shard log.
 const SHARDS_FILE: &str = "shards.log";
+/// The certified header log.
+const HEADERS_FILE: &str = "headers.log";
 /// Version of the roots record.
 const ROOTS_VERSION: u16 = 1;
 
@@ -119,6 +121,19 @@ pub struct StoredShard {
     pub index: u16,
     /// Shard bytes.
     pub bytes: Vec<u8>,
+}
+
+/// A finalised header together with the quorum certificate that finalised it.
+///
+/// The certificate is what makes the header a claim the chain agreed on rather
+/// than a number a node computed; the roots inside it are what an auditor checks
+/// the stored data against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertifiedHeader {
+    /// The header itself, including `state_root` and `dag_root`.
+    pub header: Header,
+    /// The quorum certificate over the header id.
+    pub certificate: Certificate,
 }
 
 /// A directory holding a node's append-only state.
@@ -313,6 +328,58 @@ impl Store {
         let mut shards: Vec<StoredShard> = seen.into_values().collect();
         shards.sort_by(|a, b| a.digest.cmp(&b.digest).then(a.index.cmp(&b.index)));
         Ok(shards)
+    }
+
+    /// Appends a certified header.
+    ///
+    /// A store that cannot show which headers the chain finalised cannot be
+    /// audited at all: the roots it holds would be local arithmetic with nothing
+    /// to compare against. Appending the same height twice is harmless on read —
+    /// the last one wins.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on write failure, [`StoreError::Decode`] when either
+    /// object does not encode or the record exceeds the length field.
+    pub fn put_header(&self, header: &Header, certificate: &Certificate) -> Result<(), StoreError> {
+        let header = header.encode()?;
+        let certificate = certificate.encode()?;
+        let mut record = Vec::with_capacity(8 + header.len() + certificate.len());
+        let header_len = u32::try_from(header.len()).map_err(|_| {
+            StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::FieldTooLong,
+                "header does not fit a u32 length",
+            ))
+        })?;
+        let certificate_len = u32::try_from(certificate.len()).map_err(|_| {
+            StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::FieldTooLong,
+                "certificate does not fit a u32 length",
+            ))
+        })?;
+        record.extend_from_slice(&header_len.to_le_bytes());
+        record.extend_from_slice(&header);
+        record.extend_from_slice(&certificate_len.to_le_bytes());
+        record.extend_from_slice(&certificate);
+        append_record(&self.path_of(HEADERS_FILE), &record)?;
+        Ok(())
+    }
+
+    /// Reads every certified header, last write per height, sorted by height.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on read failure, [`StoreError::Decode`] when a record is
+    /// short or either object does not decode.
+    pub fn headers(&self) -> Result<Vec<CertifiedHeader>, StoreError> {
+        let records: Vec<CertifiedHeader> =
+            read_records(&self.path_of(HEADERS_FILE), decode_header_record)?;
+        let mut by_height: std::collections::BTreeMap<u64, CertifiedHeader> =
+            std::collections::BTreeMap::new();
+        for record in records {
+            by_height.insert(record.header.height, record);
+        }
+        Ok(by_height.into_values().collect())
     }
 
     /// Writes a state snapshot taken at `round`, replacing any previous one.
@@ -524,6 +591,53 @@ impl Store {
             state_root,
         }))
     }
+}
+
+/// Decodes one `u32 header len || header || u32 certificate len || certificate`.
+fn decode_header_record(bytes: &[u8]) -> Result<CertifiedHeader, CryptoError> {
+    if bytes.len() < 8 {
+        return Err(CryptoError::new(
+            crypto::CryptoErrorKind::TruncatedInput,
+            "header record is shorter than its two length fields",
+        ));
+    }
+    let header_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let certificate_start: usize = 4;
+    let Some(certificate_length_start) = certificate_start.checked_add(header_len) else {
+        return Err(CryptoError::new(
+            crypto::CryptoErrorKind::TruncatedInput,
+            "header length overflows",
+        ));
+    };
+    if certificate_length_start + 4 > bytes.len() {
+        return Err(CryptoError::new(
+            crypto::CryptoErrorKind::TruncatedInput,
+            "header body is shorter than its length field",
+        ));
+    }
+    let certificate_len = u32::from_le_bytes([
+        bytes[certificate_length_start],
+        bytes[certificate_length_start + 1],
+        bytes[certificate_length_start + 2],
+        bytes[certificate_length_start + 3],
+    ]) as usize;
+    let certificate_start = certificate_length_start + 4;
+    let Some(certificate_end) = certificate_start.checked_add(certificate_len) else {
+        return Err(CryptoError::new(
+            crypto::CryptoErrorKind::TruncatedInput,
+            "certificate length overflows",
+        ));
+    };
+    if certificate_end > bytes.len() {
+        return Err(CryptoError::new(
+            crypto::CryptoErrorKind::TruncatedInput,
+            "certificate body is shorter than its length field",
+        ));
+    }
+    Ok(CertifiedHeader {
+        header: Header::decode(&bytes[4..certificate_length_start])?,
+        certificate: Certificate::decode(&bytes[certificate_start..certificate_end])?,
+    })
 }
 
 fn rewrite(path: &Path, contents: &[u8]) -> Result<(), StoreError> {
@@ -840,6 +954,62 @@ mod tests {
         let report = store.prune_below(4, 1).unwrap();
         assert_eq!(report.batches_dropped, 0);
         assert_eq!(store.batches().unwrap(), vec![kept]);
+    }
+
+    fn header(height: u64) -> Header {
+        Header {
+            chain_id: b"karsa-store-1".to_vec(),
+            epoch: 1,
+            height,
+            round: height,
+            state_root: [u8::try_from(height).unwrap(); 32],
+            dag_root: [7u8; 32],
+            previous: [0u8; 32],
+            applied: height * 10,
+        }
+    }
+
+    fn certificate(height: u64) -> Certificate {
+        Certificate {
+            chain_id: b"karsa-store-1".to_vec(),
+            epoch: 1,
+            round: height,
+            vertex_id: header(height).id().unwrap().to_vec(),
+            validator_set_id: b"set".to_vec(),
+            signer_bitmap: validator::bitmap_of(4, 3),
+            signatures: vec![vec![0u8; 64]; 3],
+        }
+    }
+
+    #[test]
+    fn certified_headers_round_trip_and_the_last_write_per_height_wins() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        store.put_header(&header(1), &certificate(1)).unwrap();
+        store.put_header(&header(2), &certificate(2)).unwrap();
+        store.put_header(&header(2), &certificate(2)).unwrap();
+
+        let read = store.headers().unwrap();
+        assert_eq!(read.len(), 2, "one row per height, ordered");
+        assert_eq!(read[0].header, header(1));
+        assert_eq!(read[1].header, header(2));
+        assert_eq!(read[1].certificate, certificate(2));
+    }
+
+    #[test]
+    fn a_truncated_header_record_is_an_error_not_an_empty_store() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        store.put_header(&header(1), &certificate(1)).unwrap();
+
+        // Claim a header body longer than the record holds.
+        let path = dir.0.join(HEADERS_FILE);
+        let mut bytes = fs::read(&path).unwrap();
+        let start: usize = 4;
+        bytes[start..start + 4].copy_from_slice(&9_999u32.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(matches!(store.headers(), Err(StoreError::Decode(_))));
     }
 
     #[test]

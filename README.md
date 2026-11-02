@@ -15,7 +15,7 @@ not part of this repository.
 | `crates/net/` | Rust: vertex dissemination between nodes, deterministic scheduling |
 | `crates/store/` | Rust: append-only on-disk vertices, batches, and roots |
 | `crates/erasure/` | Rust: Reed-Solomon over GF(2^8) for sharded storage |
-| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `dagsim`, `chain`, `net`, `persist`, `migrate`, `sigbench`, `sweep`, `shards` |
+| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `dagsim`, `chain`, `net`, `persist`, `audit`, `migrate`, `sigbench`, `sweep`, `shards` |
 | `.cargo/config.toml` | sccache as rustc wrapper, mold as linker |
 | `scripts/rust-check.sh` | Rust gate: fmt, clippy, tests |
 | `scripts/acvp-rust.sh` | Downloads the ACVP vectors and runs the checker |
@@ -133,13 +133,22 @@ Done:
   an account proof against the certified `state_root` and a commit proof against
   the certified `dag_root`. The conservation invariant and the determinism of the
   state root are checked on every run.
+- `karsa audit`: the link between the two committed roots. It verifies every
+  certificate in the stored header chain, re-inserts the stored vertices (verifying
+  every consensus signature), lets the pacemaker reproduce the commit order,
+  recomputes `dag_root` per height, applies the batches and compares `state_root`.
+  A full-history store is re-derived from genesis — 7 of 7 heights matched on both
+  roots — while a pruned store is audited only above its snapshot (4 of 4 state
+  roots, `dag_root` unchecked), and it prints which of the two it did. A test
+  covers a quorum certifying a wrong state root: the certificate is valid, and only
+  re-deriving the state catches it.
 - `karsa node`: the same HTTP pipeline as the V node (decode, policy lookup,
   signature verification, per-sender replay protection) on axum, plus the
   validator schedule: `GET /validators`, `POST /validators/{id}/keys`
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 236 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 242 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
@@ -149,8 +158,10 @@ Done:
   finality and replay refusal, cross-node convergence with and without a crashed
   validator, store round-trips, torn-tail tolerance, pruning, the retention rule
   (a sharded payload is dropped, an unsharded one is held, an in-window one stays),
-  replay-to-the-same-
-  roots, in-process HTTP tests, and
+  certified-header round-trips and their truncation, replay-to-the-same-
+  roots, auditing a full-history store from genesis, auditing a pruned store above
+  its snapshot, catching a quorum that certified a wrong state root, in-process HTTP
+  tests, and
   **byte-for-byte parity checks** against V for the signing payloads and for a
   complete signed envelope.
 - `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors (the same result as
@@ -200,6 +211,8 @@ cargo run -p karsa -- dagsim            # DAG commit rule on fixed scenarios
 cargo run -p karsa -- bandwidth         # per-node dissemination model
 cargo run -p karsa -- dagbench
 cargo run -p karsa -- loadtest 20000 16
+cargo run -p karsa -- persist --keep-history 4 --rounds 6
+cargo run -p karsa -- audit 4               # re-derive both committed roots
 ./scripts/rust-check.sh
 ./scripts/acvp-rust.sh       # downloads vectors on first use
 ```
@@ -265,6 +278,13 @@ Rust port reproduces its measurements.
     total), while a 1-day window costs 302 GB and erases the saving (311 GB total).
     So the window has to be hours, and its purpose is serving a peer that is behind,
     not serving history.
+13. **The two committed roots are linked by replay, and pruning weakens it.**
+    `karsa audit` re-derives `dag_root` and `state_root` from the stored data and
+    checks both against the certified header: 7 of 7 heights on a full-history
+    store. A pruned store can only be audited above its snapshot (4 of 4 state
+    roots, `dag_root` unchecked), so the retention window is also the audit window.
+    This is checkable, not small: a light client still cannot verify it, which is
+    the case a zk or fraud proof would cover.
 
 ## Port plan
 

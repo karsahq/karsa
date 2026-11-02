@@ -25,7 +25,7 @@ use tx::envelope::{PROTOCOL_VERSION_V1, Transaction};
 use tx::policy::{AuthKey, AuthPolicy, AuthPolicyKind, Authorization, KeyStatus};
 use validator::{
     Certificate, CommitProof, Dag, Header, HeaderChain, NO_EXPIRY, Pacemaker, PacemakerConfig,
-    ValidatorKey, ValidatorRecord, ValidatorSet, Vertex, bitmap_of, commit_root,
+    Step, ValidatorKey, ValidatorRecord, ValidatorSet, Vertex, bitmap_of, commit_root,
 };
 
 const CHAIN_ID: &[u8] = b"karsa-chain-1";
@@ -146,7 +146,10 @@ fn signed_transaction(
 }
 
 /// Signs `header` with a quorum of the consensus keys.
-fn certify(consensus: &[Consensus], header: &Header) -> Result<Certificate, Box<dyn Error>> {
+pub(crate) fn certify(
+    consensus: &[Consensus],
+    header: &Header,
+) -> Result<Certificate, Box<dyn Error>> {
     let quorum = consensus.len() * 2 / 3 + 1;
     let mut certificate = Certificate {
         chain_id: header.chain_id.clone(),
@@ -207,6 +210,9 @@ pub(crate) struct Simulation {
     pub(crate) batches: HashMap<[u8; 32], Batch>,
     pub(crate) state: State,
     pub(crate) report: Report,
+    /// One certified header per committed round, in height order. This is what an
+    /// auditor compares the stored data against.
+    pub(crate) certified: Vec<(Header, Certificate)>,
 }
 
 pub(crate) fn simulate(validators: usize, data_rounds: u64) -> Result<Simulation, Box<dyn Error>> {
@@ -310,8 +316,9 @@ pub(crate) fn simulate(validators: usize, data_rounds: u64) -> Result<Simulation
         state_root: genesis_header.state_root,
         dag_root: genesis_header.dag_root,
     }];
-    let mut head = genesis_header;
+    let mut head = genesis_header.clone();
     let mut signed_headers = 0usize;
+    let mut certified = Vec::new();
     let mut commit_proof: Option<(u64, CommitProof)> = None;
 
     let order = dag.order().to_vec();
@@ -357,6 +364,7 @@ pub(crate) fn simulate(validators: usize, data_rounds: u64) -> Result<Simulation
         };
         let certificate = certify(&consensus, &header)?;
         chain.advance(&header, &certificate)?;
+        certified.push((header.clone(), certificate.clone()));
         headers.push(HeaderView {
             height: header.height,
             round,
@@ -406,7 +414,26 @@ pub(crate) fn simulate(validators: usize, data_rounds: u64) -> Result<Simulation
         batches,
         state,
         report,
+        certified,
     })
+}
+
+/// Replays the pacemaker until it stops making progress.
+///
+/// Shared by `persist` and `audit` so that a replay and an audit cannot disagree
+/// about when the commit cursor is done moving.
+pub(crate) fn settle(dag: &mut Dag, start_round: u64) -> Result<usize, Box<dyn Error>> {
+    let mut pacemaker = Pacemaker::new(PacemakerConfig { timeout_ticks: 3 }, start_round);
+    let mut quiet = 0usize;
+    let mut ticks = 0usize;
+    while quiet < 2 && ticks < 256 {
+        match pacemaker.tick(dag)? {
+            Step::Advanced { .. } => quiet = 0,
+            Step::Waiting { .. } | Step::TimedOut { .. } => quiet += 1,
+        }
+        ticks += 1;
+    }
+    Ok(dag.order().len())
 }
 
 /// The account state before any transaction: every account at its genesis balance.
