@@ -1,19 +1,25 @@
 //! Saves a node's state, drops it, reopens, and replays — then compares the roots.
 //!
 //! The point is not that bytes reach a disk. It is that a restart either
-//! reproduces the same chain or says so. Only the three things a node cannot
-//! recompute are written: the vertices it received, the batches they name, and
-//! the roots it last reported. Ordering and account state are replayed from those,
-//! and the replay must land on exactly the saved roots.
+//! reproduces the same chain or says so.
 //!
-//! The validator set is configuration, so it is rebuilt from the same deterministic
-//! seeds rather than stored. Storing it is the obvious next step and is not done
-//! here, which is why the replay takes the set as input.
+//! # Why a snapshot
+//!
+//! Replaying only vertices makes restart cost grow without bound: every restart
+//! re-executes every transaction since genesis. So the store also keeps a state
+//! snapshot at a prune point, drops every vertex and batch at or below it, and a
+//! restart replays only the tail. The vertices are still needed above the snapshot
+//! — the commit rule walks them — but everything below is already in the state.
+//!
+//! The cost of that is stated in `docs/crypto-registry.md` §8.16: a pruned node can
+//! no longer re-validate the reference rule across the boundary, and it cannot
+//! reproduce the historical commit root, because the sequence it committed is gone.
 
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::PathBuf;
 
+use exec::State;
 use store::{Roots, Store};
 use validator::{Dag, Pacemaker, PacemakerConfig, Step, VertexId, commit_root};
 
@@ -21,9 +27,11 @@ use crate::chain;
 
 /// What a save wrote.
 struct Saved {
-    vertices: usize,
-    batches: usize,
-    applied: usize,
+    vertices_before: usize,
+    vertices_after: usize,
+    batches_after: usize,
+    applied_total: usize,
+    prune_round: u64,
     roots: Roots,
 }
 
@@ -33,51 +41,97 @@ struct Replayed {
     batches: usize,
     applied: usize,
     committed: usize,
-    commit_root: [u8; 32],
     state_root: [u8; 32],
+    tail_commit_root: [u8; 32],
 }
 
-/// Writes the vertices, the batches, and the roots a node last reported.
-fn save(store: &Store, simulation: &chain::Simulation) -> Result<Saved, Box<dyn Error>> {
+/// Applies every committed batch at or below `round` into `state`.
+fn apply_until(
+    simulation: &chain::Simulation,
+    accounts: &[chain::Account],
+    round: u64,
+) -> Result<(State, usize), Box<dyn Error>> {
+    let mut state = chain::genesis_state(accounts)?;
+    let mut applied = 0usize;
+    let mut rejected: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for id in simulation.dag.order() {
+        if id.round > round {
+            break;
+        }
+        let Some(vertex) = simulation.dag.get(id.round, &id.author) else {
+            continue;
+        };
+        let Some(batch) = simulation.batches.get(&vertex.payload_hash) else {
+            continue;
+        };
+        applied += chain::apply_batch(&mut state, accounts, batch, &mut rejected);
+    }
+    Ok((state, applied))
+}
+
+/// Writes the vertices, the batches, the snapshot, and the roots a node reported.
+fn save(
+    store: &Store,
+    simulation: &chain::Simulation,
+    prune_round: u64,
+    accounts: &[chain::Account],
+) -> Result<Saved, Box<dyn Error>> {
     let highest = simulation.dag.highest_round().unwrap_or(0);
-    let mut vertices = 0usize;
+    let mut vertices_before = 0usize;
     for round in 0..=highest {
         for record in &simulation.dag.set().validators {
             if let Some(vertex) = simulation.dag.get(round, &record.validator_id) {
                 store.append_vertex(vertex)?;
-                vertices += 1;
+                vertices_before += 1;
             }
         }
     }
-
     for batch in simulation.batches.values() {
         store.put_batch(batch)?;
     }
 
+    let (snapshot, _) = apply_until(simulation, accounts, prune_round)?;
+    store.put_snapshot(prune_round, &snapshot.encode()?)?;
+
     let roots = Roots {
         commit_root: commit_root(simulation.dag.order()),
-        state_root: simulation.state.state_root(),
+        state_root: snapshot.state_root(),
     };
     store.put_roots(roots)?;
     store.sync()?;
 
+    store.prune_below(prune_round)?;
+
     Ok(Saved {
-        vertices,
-        batches: simulation.batches.len(),
-        applied: simulation.report.applied,
-        roots,
+        vertices_before,
+        vertices_after: store.vertices()?.len(),
+        batches_after: store.batches()?.len(),
+        applied_total: simulation.report.applied,
+        prune_round,
+        roots: Roots {
+            commit_root: roots.commit_root,
+            state_root: simulation.state.state_root(),
+        },
     })
 }
 
-/// Rebuilds the chain from disk only.
+/// Rebuilds the chain from a snapshot plus the retained tail.
 fn replay(store: &Store, validators: usize) -> Result<Replayed, Box<dyn Error>> {
+    let snapshot = store
+        .snapshot()?
+        .ok_or("the store has no snapshot; nothing to replay from")?;
+    let mut state = State::decode(&snapshot.state)?;
+
     let (set, _consensus) = chain::consensus_set(validators)?;
     let mut dag = Dag::new(set);
+    dag.set_floor(snapshot.round);
+
     let vertices = store.vertices()?;
     for vertex in &vertices {
         dag.insert(vertex.clone())?;
     }
-    let committed = settle(&mut dag)?;
+
+    let committed = settle(&mut dag, snapshot.round + 1)?;
 
     let mut batches = BTreeMap::new();
     for batch in store.batches()? {
@@ -85,7 +139,6 @@ fn replay(store: &Store, validators: usize) -> Result<Replayed, Box<dyn Error>> 
     }
 
     let accounts = chain::accounts(validators)?;
-    let mut state = chain::genesis_state(&accounts)?;
     let mut rejected: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut applied = 0usize;
     let order: Vec<VertexId> = dag.order().to_vec();
@@ -104,18 +157,16 @@ fn replay(store: &Store, validators: usize) -> Result<Replayed, Box<dyn Error>> 
         batches: batches.len(),
         applied,
         committed,
-        commit_root: commit_root(&order),
         state_root: state.state_root(),
+        tail_commit_root: commit_root(&order),
     })
 }
 
 /// Replays the pacemaker until it stops making progress.
-fn settle(dag: &mut Dag) -> Result<usize, Box<dyn Error>> {
-    let mut pacemaker = Pacemaker::new(PacemakerConfig { timeout_ticks: 3 }, 1);
+fn settle(dag: &mut Dag, start_round: u64) -> Result<usize, Box<dyn Error>> {
+    let mut pacemaker = Pacemaker::new(PacemakerConfig { timeout_ticks: 3 }, start_round);
     let mut quiet = 0usize;
     let mut ticks = 0usize;
-    // Two quiet ticks in a row is quiescence: the first may only have advanced the
-    // stall counter.
     while quiet < 2 && ticks < 256 {
         match pacemaker.tick(dag)? {
             Step::Advanced { .. } => quiet = 0,
@@ -134,49 +185,58 @@ pub fn run(path: PathBuf, validators: usize, rounds: u64) -> Result<(), Box<dyn 
     let store = Store::open(&path)?;
     let saved = {
         let simulation = chain::simulate(validators, rounds)?;
-        save(&store, &simulation)?
+        let accounts = chain::accounts(validators)?;
+        let prune_round = (rounds / 2).max(1);
+        save(&store, &simulation, prune_round, &accounts)?
         // The simulation is dropped here: everything below reads from disk only.
     };
     let replayed = replay(&store, validators)?;
     let stored = store.roots()?;
 
-    println!("== Persistence: save, drop, reopen, replay ==");
+    println!("== Persistence: save, prune, drop, reopen, replay ==");
     println!("  store:          {}", store.path().display());
     println!(
-        "  saved:          {} vertices, {} batches, {} applied",
-        saved.vertices, saved.batches, saved.applied
+        "  saved:          {} vertices, pruned to {} at round {} ({} batches kept)",
+        saved.vertices_before, saved.vertices_after, saved.prune_round, saved.batches_after
     );
     println!(
-        "  reopened:       {} vertices, {} batches, {} committed",
-        replayed.vertices, replayed.batches, replayed.committed
+        "  kept:           {} vertices, {} batches (only what the tail names)",
+        replayed.vertices, replayed.batches
     );
-    println!("  replayed:       {} applied", replayed.applied);
+    println!(
+        "  applied:        {} in total, {} replayed after the snapshot",
+        saved.applied_total, replayed.applied
+    );
     println!();
-    println!(
-        "  commit root:    saved {}  replayed {}",
-        hex::encode(&saved.roots.commit_root[..6]),
-        hex::encode(&replayed.commit_root[..6])
-    );
     println!(
         "  state root:     saved {}  replayed {}",
         hex::encode(&saved.roots.state_root[..6]),
         hex::encode(&replayed.state_root[..6])
     );
+    println!(
+        "  tail commit:    {} over {} committed rounds",
+        hex::encode(&replayed.tail_commit_root[..6]),
+        replayed.committed
+    );
     println!();
     println!(
-        "  commit history reproduced: {}",
-        replayed.commit_root == saved.roots.commit_root
-    );
-    println!(
-        "  account state reproduced:  {}",
+        "  account state reproduced: {}",
         replayed.state_root == saved.roots.state_root
     );
-    println!("  roots record intact:       {}", stored.is_some());
+    println!("  roots record intact:      {}", stored.is_some());
+    println!(
+        "  replay work:              {} of {} transactions ({:.0}% skipped)",
+        replayed.applied,
+        saved.applied_total,
+        if saved.applied_total == 0 {
+            0.0
+        } else {
+            100.0 * (1.0 - replayed.applied as f64 / saved.applied_total as f64)
+        }
+    );
 
-    if replayed.commit_root != saved.roots.commit_root
-        || replayed.state_root != saved.roots.state_root
-    {
-        return Err("replay diverged from the saved roots".into());
+    if replayed.state_root != saved.roots.state_root {
+        return Err("replay diverged from the saved state root".into());
     }
     Ok(())
 }
@@ -209,40 +269,42 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_chain_replays_to_the_same_roots() {
+    fn a_pruned_store_replays_to_the_same_state_root() {
         let dir = TempDir::new();
         let store = Store::open(&dir.0).unwrap();
+        let accounts = chain::accounts(4).unwrap();
 
         let saved = {
             let simulation = chain::simulate(4, 4).unwrap();
-            save(&store, &simulation).unwrap()
+            save(&store, &simulation, 2, &accounts).unwrap()
         };
         let replayed = replay(&store, 4).unwrap();
 
-        assert_eq!(replayed.commit_root, saved.roots.commit_root);
         assert_eq!(replayed.state_root, saved.roots.state_root);
-        assert_eq!(replayed.applied, saved.applied);
+        assert!(
+            replayed.applied < saved.applied_total,
+            "the snapshot did work"
+        );
+        assert!(
+            replayed.vertices < saved.vertices_before,
+            "pruning removed vertices"
+        );
     }
 
     #[test]
-    fn a_torn_final_append_does_not_change_the_roots() {
+    fn pruning_at_zero_drops_only_the_genesis_round() {
         let dir = TempDir::new();
         let store = Store::open(&dir.0).unwrap();
+        let accounts = chain::accounts(4).unwrap();
+
         let saved = {
-            let simulation = chain::simulate(4, 3).unwrap();
-            save(&store, &simulation).unwrap()
+            let simulation = chain::simulate(4, 2).unwrap();
+            save(&store, &simulation, 0, &accounts).unwrap()
         };
-
-        // Cut the last vertex record in half, as a crash mid-append would.
-        let path = dir.0.join("vertices.log");
-        let bytes = fs::read(&path).unwrap();
-        fs::write(&path, &bytes[..bytes.len() - 5]).unwrap();
-
-        let replayed = replay(&store, 4).unwrap();
-        // The lost vertex is the last one appended; losing it must not corrupt the
-        // rest, so the commit root may differ but the replay must still succeed and
-        // stay consistent with what remains.
-        assert!(replayed.vertices + 1 == saved.vertices);
-        assert!(replayed.applied <= saved.applied);
+        assert_eq!(
+            saved.vertices_after + 4,
+            saved.vertices_before,
+            "round 0 holds one vertex per validator"
+        );
     }
 }

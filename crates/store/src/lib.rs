@@ -33,6 +33,8 @@ const ROOTS_FILE: &str = "roots";
 const VERTICES_FILE: &str = "vertices.log";
 /// The batch log.
 const BATCHES_FILE: &str = "batches.log";
+/// The state snapshot.
+const SNAPSHOT_FILE: &str = "snapshot";
 /// Version of the roots record.
 const ROOTS_VERSION: u16 = 1;
 
@@ -82,6 +84,15 @@ pub struct Roots {
     pub commit_root: [u8; 32],
     /// Merkle root over the account state.
     pub state_root: [u8; 32],
+}
+
+/// An execution-state snapshot taken at a prune point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    /// Highest round covered by the snapshot. Everything at or below it is gone.
+    pub round: u64,
+    /// The encoded state, opaque to this crate.
+    pub state: Vec<u8>,
 }
 
 /// A directory holding a node's append-only state.
@@ -200,6 +211,132 @@ impl Store {
         Ok(())
     }
 
+    /// Writes a state snapshot taken at `round`, replacing any previous one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on write failure, [`StoreError::Decode`] when the state
+    /// does not fit the record length field.
+    pub fn put_snapshot(&self, round: u64, state: &[u8]) -> Result<(), StoreError> {
+        let length = u32::try_from(state.len()).map_err(|_| {
+            StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::FieldTooLong,
+                "snapshot does not fit a u32 length",
+            ))
+        })?;
+        let mut record = Vec::with_capacity(14 + state.len());
+        record.extend_from_slice(&ROOTS_VERSION.to_le_bytes());
+        record.extend_from_slice(&round.to_le_bytes());
+        record.extend_from_slice(&length.to_le_bytes());
+        record.extend_from_slice(state);
+
+        let temporary = self.path_of("snapshot.tmp");
+        {
+            let mut file = File::create(&temporary)?;
+            file.write_all(&record)?;
+        }
+        fs::rename(&temporary, self.path_of(SNAPSHOT_FILE))?;
+        Ok(())
+    }
+
+    /// Reads the state snapshot, if one was written.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on read failure, [`StoreError::Decode`] when the record is
+    /// short or carries an unknown version.
+    pub fn snapshot(&self) -> Result<Option<Snapshot>, StoreError> {
+        let path = self.path_of(SNAPSHOT_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let record = fs::read(&path)?;
+        if record.len() < 14 {
+            return Err(StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::TruncatedInput,
+                "snapshot is shorter than its header",
+            )));
+        }
+        let version = u16::from_le_bytes([record[0], record[1]]);
+        if version != ROOTS_VERSION {
+            return Err(StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::MalformedCertificate,
+                format!("unsupported snapshot version {version}"),
+            )));
+        }
+        let mut round = [0u8; 8];
+        round.copy_from_slice(&record[2..10]);
+        let mut length = [0u8; 4];
+        length.copy_from_slice(&record[10..14]);
+        let length = u32::from_le_bytes(length) as usize;
+        let start = 14usize;
+        let Some(end) = start.checked_add(length) else {
+            return Err(StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::TruncatedInput,
+                "snapshot length overflows",
+            )));
+        };
+        if end > record.len() {
+            return Err(StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::TruncatedInput,
+                "snapshot body is shorter than its length field",
+            )));
+        }
+        Ok(Some(Snapshot {
+            round: u64::from_le_bytes(round),
+            state: record[start..end].to_vec(),
+        }))
+    }
+
+    /// Drops every vertex at or below `round`, and every batch no kept vertex names.
+    ///
+    /// Both logs are rewritten through a temporary file and renamed into place, so a
+    /// crash leaves either the old log or the new one.
+    ///
+    /// Returns how many vertices were removed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on read or write failure, [`StoreError::Decode`] when a
+    /// record does not decode.
+    pub fn prune_below(&self, round: u64) -> Result<usize, StoreError> {
+        let vertices = self.vertices()?;
+        let before = vertices.len();
+        let kept: Vec<&Vertex> = vertices
+            .iter()
+            .filter(|vertex| vertex.round > round)
+            .collect();
+        let removed = before - kept.len();
+        if removed == 0 {
+            return Ok(0);
+        }
+
+        let mut hashes = std::collections::HashSet::new();
+        for vertex in &kept {
+            hashes.insert(vertex.payload_hash);
+        }
+
+        let mut encoded = Vec::new();
+        for vertex in &kept {
+            let bytes = vertex.encode()?;
+            encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            encoded.extend_from_slice(&bytes);
+        }
+        rewrite(&self.path_of(VERTICES_FILE), &encoded)?;
+
+        let mut kept_batches = Vec::new();
+        for batch in self.batches()? {
+            if hashes.contains(&batch.digest()?) {
+                let bytes = batch.encode()?;
+                kept_batches.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                kept_batches.extend_from_slice(&bytes);
+            }
+        }
+        rewrite(&self.path_of(BATCHES_FILE), &kept_batches)?;
+
+        Ok(removed)
+    }
+
     /// Reads the last reported roots, if any were ever written.
     ///
     /// # Errors
@@ -233,6 +370,16 @@ impl Store {
             state_root,
         }))
     }
+}
+
+fn rewrite(path: &Path, contents: &[u8]) -> Result<(), StoreError> {
+    let temporary = path.with_extension("tmp");
+    {
+        let mut file = File::create(&temporary)?;
+        file.write_all(contents)?;
+    }
+    fs::rename(&temporary, path)?;
+    Ok(())
 }
 
 fn append_record(path: &Path, payload: &[u8]) -> Result<(), StoreError> {
@@ -412,6 +559,65 @@ mod tests {
 
         let store = Store::open(&dir.0).unwrap();
         assert!(matches!(store.batches(), Err(StoreError::Decode(_))));
+    }
+
+    #[test]
+    fn a_snapshot_round_trips() {
+        let dir = TempDir::new();
+        {
+            let store = Store::open(&dir.0).unwrap();
+            store.put_snapshot(4, b"encoded state").unwrap();
+        }
+        let store = Store::open(&dir.0).unwrap();
+        assert_eq!(
+            store.snapshot().unwrap(),
+            Some(Snapshot {
+                round: 4,
+                state: b"encoded state".to_vec(),
+            })
+        );
+    }
+
+    fn vertex(round: u64, batch: &Batch) -> Vertex {
+        // The store only encodes and decodes, so a placeholder signature is enough
+        // here; verification is the DAG's job, not the store's.
+        Vertex {
+            chain_id: b"karsa-store-1".to_vec(),
+            epoch: 1,
+            round,
+            author: b"val-0".to_vec(),
+            payload_hash: batch.digest().unwrap(),
+            references: Vec::new(),
+            signature: vec![0u8; 64],
+        }
+    }
+
+    #[test]
+    fn pruning_keeps_only_the_tail_and_the_batches_it_names() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        for round in 0..4u64 {
+            let payload = batch(round + 1);
+            store.put_batch(&payload).unwrap();
+            store.append_vertex(&vertex(round, &payload)).unwrap();
+        }
+        assert_eq!(store.vertices().unwrap().len(), 4);
+        assert_eq!(store.batches().unwrap().len(), 4);
+
+        let removed = store.prune_below(1).unwrap();
+        assert_eq!(removed, 2, "rounds 0 and 1 are dropped");
+
+        let kept: Vec<u64> = store
+            .vertices()
+            .unwrap()
+            .iter()
+            .map(|vertex| vertex.round)
+            .collect();
+        assert_eq!(kept, vec![2, 3]);
+
+        let batches = store.batches().unwrap();
+        assert_eq!(batches.len(), 2, "only named batches survive");
+        assert_eq!(batches, vec![batch(3), batch(4)]);
     }
 
     #[test]

@@ -93,10 +93,11 @@ Done:
   nodes with the same DAG commit different sequences. The anchor is now
   quorum-backed rather than committed, and emission stays ordered.
 - `store`: append-only logs of `u32 len || payload` records for vertices and
-  batches, plus an atomically replaced roots file. A torn tail from a crash is
-  ignored; a complete record that does not decode is an error. `karsa persist`
-  saves, drops the simulation, reopens, replays, and fails unless both roots come
-  back identical.
+  batches, plus atomically replaced snapshot and roots files. A torn tail from a
+  crash is ignored; a complete record that does not decode is an error. Pruning
+  drops everything at or below a state snapshot, so restart replays only the tail.
+  `karsa persist` saves, prunes, drops the simulation, reopens, replays, and fails
+  unless the state root comes back identical.
 - `karsa chain`: order and execute a small chain end to end — sign, batch, name by
   vertex, commit through the DAG and the pacemaker, apply, certify one header per
   committed round, verify the header chain the way a light client would, and check
@@ -109,7 +110,7 @@ Done:
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 211 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 219 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
@@ -117,8 +118,8 @@ Done:
   encoding, the account state machine, Merkle inclusion, promotion and
   multi-domain leaf properties, commit-proof membership and prefix binding, header
   finality and replay refusal, cross-node convergence with and without a crashed
-  validator, store round-trips and torn-tail tolerance, replay-to-the-same-roots,
-  in-process HTTP tests, and
+  validator, store round-trips, torn-tail tolerance, pruning, replay-to-the-same-
+  roots, in-process HTTP tests, and
   **byte-for-byte parity checks** against V for the signing payloads and for a
   complete signed envelope.
 - `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors (the same result as

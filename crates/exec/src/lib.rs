@@ -30,6 +30,9 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
+use crypto::encoding::Encoder;
+use crypto::{CryptoError, CryptoErrorKind};
+
 use tx::batch::Batch;
 use tx::envelope::Transaction;
 
@@ -174,6 +177,64 @@ impl State {
         &self.balances
     }
 
+    /// Writes the whole state canonically.
+    ///
+    /// This is what a snapshot is made of. Encoding is ordered by account, so two
+    /// nodes with the same accounts write the same bytes and the same root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoErrorKind::FieldTooLong`] for an oversized account id.
+    pub fn encode(&self) -> Result<Vec<u8>, CryptoError> {
+        let count = u32::try_from(self.balances.len()).map_err(|_| {
+            CryptoError::new(
+                CryptoErrorKind::FieldTooLong,
+                "account count does not fit a u32",
+            )
+        })?;
+        let mut encoder = Encoder::with_capacity(8 + self.balances.len() * 48);
+        encoder.put_u32(count);
+        for (account, balance) in &self.balances {
+            encoder.put_bytes(account)?;
+            encoder.put_u64(*balance);
+            encoder.put_u64(self.sequence(account));
+        }
+        Ok(encoder.finish())
+    }
+
+    /// Reads a canonical state encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoErrorKind::TruncatedInput`],
+    /// [`CryptoErrorKind::TrailingBytes`], or
+    /// [`CryptoErrorKind::DuplicateValidatorId`] when an account appears twice.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let mut decoder = crypto::encoding::Decoder::new(bytes);
+        let count = decoder.read_u32()? as usize;
+        let mut balances = BTreeMap::new();
+        let mut sequences = BTreeMap::new();
+        for _ in 0..count {
+            let account = decoder.read_bytes()?.to_vec();
+            let balance = decoder.read_u64()?;
+            let sequence = decoder.read_u64()?;
+            if balances.insert(account.clone(), balance).is_some() {
+                return Err(CryptoError::new(
+                    CryptoErrorKind::DuplicateValidatorId,
+                    "an account appears twice in the state encoding",
+                ));
+            }
+            if sequence > 0 {
+                sequences.insert(account, sequence);
+            }
+        }
+        decoder.finish()?;
+        Ok(Self {
+            balances,
+            sequences,
+        })
+    }
+
     /// Applies a batch in order, returning one outcome per transaction.
     #[must_use]
     pub fn apply(&mut self, batch: &Batch) -> Vec<Outcome> {
@@ -296,6 +357,7 @@ impl AccountProof {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crypto::CryptoErrorKind;
     use tx::envelope::PROTOCOL_VERSION_V1;
 
     const NOW: u64 = 1_000;
@@ -462,6 +524,35 @@ mod tests {
         backward.credit(b"alice", 10).unwrap();
 
         assert_eq!(forward.state_root(), backward.state_root());
+    }
+
+    #[test]
+    fn a_state_roundtrips_and_keeps_its_root() {
+        let mut state = genesis();
+        let _ = state.apply(&Batch::new(vec![transaction(b"alice", 1, b"bob", 250)]));
+        let encoded = state.encode().unwrap();
+        let decoded = State::decode(&encoded).unwrap();
+
+        assert_eq!(decoded, state);
+        assert_eq!(decoded.state_root(), state.state_root());
+        assert_eq!(decoded.sequence(b"alice"), 1);
+    }
+
+    #[test]
+    fn a_tampered_state_encoding_does_not_decode() {
+        let state = genesis();
+        let mut encoded = state.encode().unwrap();
+        encoded.pop();
+        assert_eq!(
+            State::decode(&encoded).unwrap_err().kind(),
+            CryptoErrorKind::TruncatedInput
+        );
+    }
+
+    #[test]
+    fn the_empty_state_roundtrips() {
+        let empty = State::new();
+        assert_eq!(State::decode(&empty.encode().unwrap()).unwrap(), empty);
     }
 
     #[test]

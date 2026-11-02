@@ -58,6 +58,11 @@ pub struct Dag {
     committed: HashSet<[u8; 32]>,
     order: Vec<VertexId>,
     skipped: Vec<SkippedRound>,
+    /// Highest round that has been committed and dropped, if any.
+    ///
+    /// Everything at or below it is already reflected in a state snapshot, so the
+    /// node neither stores nor re-decides it.
+    floor: Option<u64>,
 }
 
 impl Dag {
@@ -70,7 +75,40 @@ impl Dag {
             committed: HashSet::new(),
             order: Vec::new(),
             skipped: Vec::new(),
+            floor: None,
         }
+    }
+
+    /// The highest round this node has pruned, if any.
+    #[must_use]
+    pub fn floor(&self) -> Option<u64> {
+        self.floor
+    }
+
+    /// Treats every round at or below `round` as committed and drops it.
+    ///
+    /// Returns how many vertices were removed. Pruning is a statement that a state
+    /// snapshot already covers those rounds, which is why nothing below the floor is
+    /// stored or re-decided.
+    ///
+    /// The floor only ever rises, so calling this with a lower value is a no-op.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic; a lower value simply leaves the floor unchanged.
+    pub fn set_floor(&mut self, round: u64) -> usize {
+        let floor = match self.floor {
+            Some(current) => current.max(round),
+            None => round,
+        };
+        self.floor = Some(floor);
+        let before = self.vertices.len();
+        self.vertices.retain(|(round, _), _| *round > floor);
+        before - self.vertices.len()
+    }
+
+    fn is_pruned(&self, round: u64) -> bool {
+        self.floor.is_some_and(|floor| round <= floor)
     }
 
     /// The validator set this DAG resolves keys against.
@@ -99,6 +137,11 @@ impl Dag {
     /// [`CryptoErrorKind::InvalidVertex`] when the reference rule is not met.
     pub fn insert(&mut self, vertex: Vertex) -> Result<VertexId, CryptoError> {
         vertex.verify(&self.set)?;
+        // Below the floor the vertex is already committed and its state is in a
+        // snapshot. It is still signature-checked, then dropped.
+        if self.is_pruned(vertex.round) {
+            return vertex.id();
+        }
         self.check_round_references(&vertex)?;
         let key = (vertex.round, vertex.author.clone());
         if let Some(existing) = self.vertices.get(&key) {
@@ -115,6 +158,12 @@ impl Dag {
             return Ok(());
         }
         let previous = vertex.round - 1;
+        // A pruned previous round cannot be checked: the vertices are gone. The
+        // first retained round is therefore accepted on its author's signature, and
+        // a bad reference list simply fails to vote later.
+        if self.is_pruned(previous) {
+            return Ok(());
+        }
         let registered = |author: &[u8]| {
             self.set
                 .validators
@@ -254,6 +303,11 @@ impl Dag {
             if !seen.insert(current.clone()) {
                 continue;
             }
+            // Pruned ancestors are already committed and already reflected in the
+            // state snapshot, so the block stops there instead of failing.
+            if self.is_pruned(current.round) {
+                continue;
+            }
             let vertex = self
                 .vertices
                 .get(&(current.round, current.author.clone()))
@@ -268,7 +322,11 @@ impl Dag {
 
         // Deduplicate, drop already committed, and order by (round, author) so two
         // nodes with the same history commit the same sequence.
-        collected.retain(|vertex| !self.committed.contains(&vertex.digest));
+        // Pruned vertices reach `collected` through a reference list, so they have
+        // to be dropped here as well as skipped in the walk.
+        collected.retain(|vertex| {
+            !self.committed.contains(&vertex.digest) && !self.is_pruned(vertex.round)
+        });
         collected.sort_by(|a, b| a.round.cmp(&b.round).then_with(|| a.author.cmp(&b.author)));
         collected.dedup();
 
@@ -344,6 +402,9 @@ impl Dag {
             if !seen.insert(current.clone()) {
                 continue;
             }
+            if self.is_pruned(current.round) {
+                continue;
+            }
             let vertex = self
                 .vertices
                 .get(&(current.round, current.author.clone()))
@@ -372,6 +433,9 @@ impl Dag {
                 return Ok(true);
             }
             if !seen.insert(current.clone()) {
+                continue;
+            }
+            if self.is_pruned(current.round) {
                 continue;
             }
             let vertex = self
@@ -944,6 +1008,58 @@ mod tests {
             commit_root(&[first.clone(), second.clone()]),
             commit_root(&[second, first])
         );
+    }
+
+    #[test]
+    fn pruning_drops_below_the_floor_and_stops_the_history() {
+        let mut fixture = bootstrapped(4);
+        let one = fixture.ids(LEADER_ROUND);
+        fixture.full_round(2, &one).unwrap();
+        let two = fixture.ids(2);
+        fixture.full_round(3, &two).unwrap();
+        fixture.dag.try_commit(2).unwrap();
+
+        let dropped = fixture.dag.set_floor(2);
+        assert_eq!(dropped, 12, "rounds 0..=2 hold four vertices each");
+        assert_eq!(fixture.dag.floor(), Some(2));
+        assert!(fixture.dag.get(2, b"val-0").is_none());
+        assert!(fixture.dag.get(3, b"val-0").is_some());
+
+        // Round 4 references round 3, which itself referenced the now-pruned round 2.
+        let three = fixture.ids(3);
+        fixture.full_round(4, &three).unwrap();
+        let four = fixture.ids(4);
+        fixture.full_round(5, &four).unwrap();
+
+        match fixture.dag.try_commit(4).unwrap() {
+            Decision::Commit(history) => {
+                assert!(!history.is_empty());
+                assert!(
+                    history.iter().all(|id| id.round > 2),
+                    "a pruned ancestor was emitted again"
+                );
+            }
+            other => panic!("expected a commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_vertex_below_the_floor_is_accepted_but_not_retained() {
+        let mut fixture = bootstrapped(4);
+        let vertex = fixture.dag.get(LEADER_ROUND, b"val-0").unwrap().clone();
+        fixture.dag.set_floor(LEADER_ROUND);
+
+        let id = fixture.dag.insert(vertex).expect("still signature-valid");
+        assert_eq!(id.round, LEADER_ROUND);
+        assert!(fixture.dag.get(LEADER_ROUND, b"val-0").is_none());
+    }
+
+    #[test]
+    fn the_floor_never_moves_down() {
+        let mut fixture = bootstrapped(4);
+        fixture.dag.set_floor(1);
+        assert_eq!(fixture.dag.set_floor(0), 0);
+        assert_eq!(fixture.dag.floor(), Some(1));
     }
 
     #[test]
