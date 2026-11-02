@@ -9,6 +9,8 @@ use std::error::Error;
 use std::time::Instant;
 
 use erasure::Code;
+use sha2::{Digest, Sha256};
+use store::Store;
 
 /// Transactions per batch used for the payload size.
 const TRANSACTIONS: usize = 1_000;
@@ -167,6 +169,65 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     println!("  Per day, before retention. Pruning is what turns the first row into");
     println!("  the second; the third is what a validator keeps while still being able");
     println!("  to serve recent history.");
+
+    println!();
+    println!("== Round trip through the store: one shard per node ==");
+    let code = Code::new(10, 16)?;
+    let digest: [u8; 32] = Sha256::digest(&payload).into();
+    let encoded = code.encode(&payload)?;
+
+    let mut directories = Vec::with_capacity(encoded.shards.len());
+    let mut on_disk = 0usize;
+    for (index, shard) in encoded.shards.iter().enumerate() {
+        let directory =
+            std::env::temp_dir().join(format!("karsa-shard-{}-{index}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let store = Store::open(&directory)?;
+        store.put_shard(&digest, u16::try_from(index)?, shard)?;
+        on_disk += shard.len();
+        directories.push(directory);
+    }
+    // The full payload is gone from here on: every node kept one shard.
+    drop(encoded);
+
+    let mut recovered: Vec<(usize, Vec<u8>)> = Vec::with_capacity(directories.len());
+    for (index, directory) in directories.iter().enumerate() {
+        let store = Store::open(directory)?;
+        let shards = store.shards()?;
+        let found = shards
+            .iter()
+            .find(|shard| usize::from(shard.index) == index)
+            .ok_or("a shard went missing from its own store")?;
+        recovered.push((index, found.bytes.clone()));
+    }
+    // Simulate losing every shard the code can lose.
+    let survivors: Vec<(usize, &[u8])> = recovered
+        .iter()
+        .skip(code.tolerance())
+        .map(|(index, bytes)| (*index, bytes.as_slice()))
+        .collect();
+    let rebuilt = code.decode(&survivors, payload.len())?;
+    let identical = rebuilt == payload;
+
+    println!(
+        "  {} nodes hold one shard each: {} on disk, {} original",
+        code.total(),
+        human(on_disk),
+        human(payload.len())
+    );
+    println!(
+        "  dropped {} of {} shards, rebuilt from the remaining {}: identical = {identical}",
+        code.tolerance(),
+        code.total(),
+        survivors.len()
+    );
+
+    for directory in &directories {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+    if !identical {
+        return Err("the payload did not survive the round trip".into());
+    }
 
     Ok(())
 }

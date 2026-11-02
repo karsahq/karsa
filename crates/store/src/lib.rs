@@ -35,6 +35,8 @@ const VERTICES_FILE: &str = "vertices.log";
 const BATCHES_FILE: &str = "batches.log";
 /// The state snapshot.
 const SNAPSHOT_FILE: &str = "snapshot";
+/// The erasure-coded shard log.
+const SHARDS_FILE: &str = "shards.log";
 /// Version of the roots record.
 const ROOTS_VERSION: u16 = 1;
 
@@ -93,6 +95,17 @@ pub struct Snapshot {
     pub round: u64,
     /// The encoded state, opaque to this crate.
     pub state: Vec<u8>,
+}
+
+/// One erasure-coded shard this node holds for a batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredShard {
+    /// Digest of the batch the shard belongs to.
+    pub digest: [u8; 32],
+    /// Which of the `total` shards this is.
+    pub index: u16,
+    /// Shard bytes.
+    pub bytes: Vec<u8>,
 }
 
 /// A directory holding a node's append-only state.
@@ -209,6 +222,84 @@ impl Store {
         // leaves either the old roots or the new ones, never a half-written file.
         fs::rename(&temporary, &path)?;
         Ok(())
+    }
+
+    /// Appends one erasure-coded shard.
+    ///
+    /// Model B stores a shard permanently and the full batch only for a retention
+    /// window, so this is what survives pruning. Appending the same
+    /// `(digest, index)` twice is harmless on read: the last one wins.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on write failure, [`StoreError::Decode`] when the shard is
+    /// too large for the record length field.
+    pub fn put_shard(&self, digest: &[u8; 32], index: u16, bytes: &[u8]) -> Result<(), StoreError> {
+        let length = u32::try_from(bytes.len()).map_err(|_| {
+            StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::FieldTooLong,
+                "shard does not fit a u32 length",
+            ))
+        })?;
+        let mut record = Vec::with_capacity(38 + bytes.len());
+        record.extend_from_slice(digest);
+        record.extend_from_slice(&index.to_le_bytes());
+        record.extend_from_slice(&length.to_le_bytes());
+        record.extend_from_slice(bytes);
+        append_record(&self.path_of(SHARDS_FILE), &record)?;
+        Ok(())
+    }
+
+    /// Reads every stored shard, last write per `(digest, index)` only.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on read failure, [`StoreError::Decode`] when a record is
+    /// short.
+    pub fn shards(&self) -> Result<Vec<StoredShard>, StoreError> {
+        let raw: Vec<Vec<u8>> = read_records(&self.path_of(SHARDS_FILE), |bytes| {
+            if bytes.len() < 38 {
+                return Err(CryptoError::new(
+                    crypto::CryptoErrorKind::TruncatedInput,
+                    "shard record is shorter than its header",
+                ));
+            }
+            Ok(bytes.to_vec())
+        })?;
+
+        let mut seen: std::collections::HashMap<([u8; 32], u16), StoredShard> =
+            std::collections::HashMap::new();
+        for bytes in raw {
+            let mut digest = [0u8; 32];
+            digest.copy_from_slice(&bytes[..32]);
+            let index = u16::from_le_bytes([bytes[32], bytes[33]]);
+            let length = u32::from_le_bytes([bytes[34], bytes[35], bytes[36], bytes[37]]) as usize;
+            let start: usize = 38;
+            let Some(end) = start.checked_add(length) else {
+                return Err(StoreError::Decode(CryptoError::new(
+                    crypto::CryptoErrorKind::TruncatedInput,
+                    "shard length overflows",
+                )));
+            };
+            if end > bytes.len() {
+                return Err(StoreError::Decode(CryptoError::new(
+                    crypto::CryptoErrorKind::TruncatedInput,
+                    "shard body is shorter than its length field",
+                )));
+            }
+            seen.insert(
+                (digest, index),
+                StoredShard {
+                    digest,
+                    index,
+                    bytes: bytes[start..end].to_vec(),
+                },
+            );
+        }
+
+        let mut shards: Vec<StoredShard> = seen.into_values().collect();
+        shards.sort_by(|a, b| a.digest.cmp(&b.digest).then(a.index.cmp(&b.index)));
+        Ok(shards)
     }
 
     /// Writes a state snapshot taken at `round`, replacing any previous one.
@@ -618,6 +709,37 @@ mod tests {
         let batches = store.batches().unwrap();
         assert_eq!(batches.len(), 2, "only named batches survive");
         assert_eq!(batches, vec![batch(3), batch(4)]);
+    }
+
+    #[test]
+    fn shards_round_trip_and_the_last_write_wins() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let digest = [5u8; 32];
+        store.put_shard(&digest, 0, b"first").unwrap();
+        store.put_shard(&digest, 1, b"second").unwrap();
+        store.put_shard(&digest, 0, b"replacement").unwrap();
+
+        let shards = store.shards().unwrap();
+        assert_eq!(shards.len(), 2);
+        assert_eq!(shards[0].bytes, b"replacement");
+        assert_eq!(shards[1].bytes, b"second");
+        assert_eq!(shards[0].digest, digest);
+    }
+
+    #[test]
+    fn shards_survive_pruning_because_batches_do_not() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let payload = batch(1);
+        let digest = payload.digest().unwrap();
+        store.put_batch(&payload).unwrap();
+        store.put_shard(&digest, 3, b"a shard").unwrap();
+        store.append_vertex(&vertex(0, &payload)).unwrap();
+
+        store.prune_below(0).unwrap();
+        assert!(store.batches().unwrap().is_empty(), "the batch is gone");
+        assert_eq!(store.shards().unwrap().len(), 1, "the shard remains");
     }
 
     #[test]

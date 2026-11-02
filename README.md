@@ -109,8 +109,9 @@ Done:
   unless the state root comes back identical.
 - `erasure`: Reed-Solomon over GF(2^8), non-systematic Vandermonde, any `data` of
   `total` shards reconstruct. `karsa shards` shows the storage it buys (302 GB/day
-  down to 9.45 at 1k TPS) and the CPU it costs (~36 MB/s scalar, 10% of a core at
-  1k TPS, 98% at 10k).
+  down to 9.45 at 1k TPS), the CPU it costs (~36 MB/s scalar, 10% of a core at 1k
+  TPS, 98% at 10k), and a round trip through the real store: sixteen directories
+  with one shard each, six discarded, payload rebuilt intact.
 - `karsa loadtest`: the node's admission path. ~55k accepted tx/s at 16
   connections, which is 64% of the verification ceiling; the rest is HTTP and
   serialisation, not crypto.
@@ -133,7 +134,7 @@ Done:
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 231 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 233 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
