@@ -10,6 +10,7 @@
 //! karsa register-demo [epoch]      print a signed validator key rotation body
 //! karsa certify [n]                build, encode, and verify a DAG certificate
 //! karsa dagsim                     run the DAG commit rule on fixed scenarios
+//! karsa chain                      order and execute a small chain end to end
 //! karsa bandwidth                  model per-node dissemination bandwidth
 //! karsa dagbench                   measure DAG certificate and header cost
 //! karsa loadtest [count] [conc]    drive the node and report tx/s
@@ -18,6 +19,7 @@
 mod acvp;
 mod bandwidth;
 mod certify;
+mod chain;
 mod dagbench;
 mod dagsim;
 mod demo;
@@ -65,6 +67,15 @@ enum Command {
         #[arg(default_value_t = 4)]
         validators: usize,
     },
+    /// Order and execute a small chain end to end.
+    Chain {
+        /// Validators in the simulated committee (at least 4).
+        #[arg(default_value_t = 4)]
+        validators: usize,
+        /// Rounds that carry transactions.
+        #[arg(long, default_value_t = 4)]
+        rounds: u64,
+    },
     /// Model per-node bandwidth for certificate and payload dissemination.
     Bandwidth {
         /// Validators in the set.
@@ -110,6 +121,7 @@ fn main() -> ExitCode {
         }
         Command::Certify { validators } => certify::run(validators),
         Command::Dagsim { validators } => dagsim::run(validators),
+        Command::Chain { validators, rounds } => chain::run(validators, rounds),
         Command::Bandwidth {
             validators,
             tps,

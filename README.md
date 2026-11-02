@@ -9,9 +9,10 @@ not part of this repository.
 | Path | Contents |
 | ---- | -------- |
 | `crates/crypto/` | Rust: registry, canonical encoding, domain separation, schemes |
-| `crates/tx/` | Rust: transaction envelope and authorization policy |
-| `crates/validator/` | Rust: epoch-bound validator key schedule |
-| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest` |
+| `crates/tx/` | Rust: transaction envelope, authorization policy, batches |
+| `crates/exec/` | Rust: deterministic account state machine over committed batches |
+| `crates/validator/` | Rust: epoch-bound validator key schedule, DAG, pacemaker |
+| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `dagsim`, `chain` |
 | `.cargo/config.toml` | sccache as rustc wrapper, mold as linker |
 | `scripts/rust-check.sh` | Rust gate: fmt, clippy, tests |
 | `scripts/acvp-rust.sh` | Downloads the ACVP vectors and runs the checker |
@@ -62,20 +63,28 @@ Done:
   means "request the vertices I am missing", never "decide without them". The
   cursor can overtake a leader whose vertex never arrived by earning an anchor
   from a later round, which is what makes an absent leader provably skippable.
+- `tx::batch`: the data plane unit. A vertex names a batch by SHA-256 digest and
+  never carries payload, so consensus messages stay at their measured size.
+- `exec`: a deterministic account state machine over committed batches. Balances
+  and per-sender sequences live in `BTreeMap`s, rejections are values rather than
+  errors, and `state_root` is order-independent by construction.
+- `karsa chain`: order and execute a small chain end to end — sign, batch, name by
+  vertex, commit through the DAG and the pacemaker, then apply — and check the
+  conservation invariant and the determinism of the state root on every run.
 - `karsa node`: the same HTTP pipeline as the V node (decode, policy lookup,
   signature verification, per-sender replay protection) on axum, plus the
   validator schedule: `GET /validators`, `POST /validators/{id}/keys`
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 155 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 173 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
-  the DAG direct and indirect commit rules, the deterministic pacemaker, and
-  batch-vs-individual verification equality, in-process HTTP tests, and
-  **byte-for-byte parity checks** against V for the signing payloads and for a
-  complete signed envelope.
+  the DAG direct and indirect commit rules, the deterministic pacemaker, batch
+  encoding, the account state machine, in-process HTTP tests, and **byte-for-byte
+  parity checks** against V for the signing payloads and for a complete signed
+  envelope.
 - `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors (the same result as
   the V prototype) and **14/14** NIST SLH-DSA-SHA2-128s sigVer vectors.
 

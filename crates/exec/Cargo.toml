@@ -1,0 +1,15 @@
+[package]
+name = "exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Karsa deterministic state machine over committed batches"
+
+[dependencies]
+crypto = { path = "../crypto" }
+sha2 = "0.10"
+tx = { path = "../tx" }
+
+[lints]
+workspace = true

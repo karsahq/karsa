@@ -384,6 +384,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "exec"
+version = "0.1.0"
+dependencies = [
+ "crypto",
+ "sha2 0.10.9",
+ "tx",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -592,6 +601,7 @@ dependencies = [
  "axum",
  "clap",
  "crypto",
+ "exec",
  "hex",
  "http-body-util",
  "serde",
