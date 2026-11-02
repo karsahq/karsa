@@ -80,6 +80,7 @@ struct NodeResult {
     bytes_out: u64,
     latencies: Vec<u64>,
     commit_root: [u8; 32],
+    order: Vec<validator::VertexId>,
 }
 
 fn address(port_base: u16, index: usize) -> String {
@@ -295,7 +296,19 @@ async fn node_task(
                         Err(error) => return Err(format!("node {index} cannot author: {error}")),
                     }
                 }
-                node.commit().map_err(|error| format!("node {index} cannot commit: {error}"))?;
+                // A commit whose leader history is not fully here yet is a
+                // delivery condition, not a failure: the referenced vertex may
+                // still be in a peer's queue. Leaving the cursor where it is and
+                // retrying on the next tick is what keeps a slow link from
+                // killing a validator.
+                let step = node.commit();
+                match step {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == CryptoErrorKind::MissingReference => {}
+                    Err(error) => {
+                        return Err(format!("node {index} cannot commit: {error}"));
+                    }
+                }
                 if !announced && node.round() > config.rounds {
                     announced = true;
                     let _ = ready.send(index).await;
@@ -316,6 +329,7 @@ async fn node_task(
         bytes_out: bytes_out.load(Ordering::Relaxed),
         latencies,
         commit_root: commit_root(node.dag().order()),
+        order: node.dag().order().to_vec(),
     })
 }
 
@@ -396,6 +410,9 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
                 _ = &mut deadline => break,
             }
         }
+        // Measured before the drain, so it is the authoring pace rather than the
+        // pace plus a fixed 500 ms wait for the last frames.
+        let authoring = started.elapsed();
         tokio::time::sleep(config.drain).await;
         let _ = shutdown_tx.send(true);
 
@@ -407,10 +424,10 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
                 Err(error) => eprintln!("node panicked or was cancelled: {error}"),
             }
         }
-        (results, announced, started.elapsed())
+        (results, announced, authoring, started.elapsed())
     });
 
-    let (mut results, announced, elapsed) = results;
+    let (mut results, announced, authoring, elapsed) = results;
     results.sort_by_key(|result| result.index);
     if results.is_empty() {
         return Err("no node reported a result".into());
@@ -435,6 +452,15 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         announced,
         config.validators
     );
+    if announced == config.validators {
+        let pace = (config.rounds + 1) as f64 / authoring.as_secs_f64();
+        println!(
+            "  authoring:  {} for {} rounds per node ({pace:.1} rounds/s, {:.2} ms/round)",
+            millis(u64::try_from(authoring.as_nanos()).unwrap_or(u64::MAX)),
+            config.rounds + 1,
+            authoring.as_secs_f64() * 1e3 / (config.rounds + 1) as f64
+        );
+    }
     println!();
     println!(
         "  {}  {}  {}  {}  {}  {}  {}  {}",
@@ -491,6 +517,71 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     if !agreed {
         for (index, root) in roots.iter().enumerate() {
             println!("    val-{index} {}", hex::encode(&root[..6]));
+        }
+        // A root difference is either a different committed *set* or the same set
+        // in a different order. Say which one, because they have different causes.
+        let reference = &results[0].order;
+        for result in &results[1..] {
+            let first_order = reference
+                .iter()
+                .zip(&result.order)
+                .position(|(left, right)| left != right);
+            let mut left_only: Vec<_> = reference
+                .iter()
+                .filter(|vertex| !result.order.contains(vertex))
+                .collect();
+            let mut right_only: Vec<_> = result
+                .order
+                .iter()
+                .filter(|vertex| !reference.contains(vertex))
+                .collect();
+            left_only.sort_by_key(|vertex| (vertex.round, vertex.author.clone()));
+            right_only.sort_by_key(|vertex| (vertex.round, vertex.author.clone()));
+            if first_order.is_some() || !left_only.is_empty() || !right_only.is_empty() {
+                println!(
+                    "    val-0 vs val-{}: first order difference at {:?}, set {} vs {} ({} only in val-0, {} only in val-{})",
+                    result.index,
+                    first_order,
+                    reference.len(),
+                    result.order.len(),
+                    left_only.len(),
+                    right_only.len(),
+                    result.index
+                );
+                for vertex in left_only.iter().take(3) {
+                    println!(
+                        "      only val-0: round {} {}",
+                        vertex.round,
+                        String::from_utf8_lossy(&vertex.author)
+                    );
+                }
+                for vertex in right_only.iter().take(3) {
+                    println!(
+                        "      only val-{}: round {} {}",
+                        result.index,
+                        vertex.round,
+                        String::from_utf8_lossy(&vertex.author)
+                    );
+                }
+                if let Some(position) = first_order {
+                    let start = position.saturating_sub(3);
+                    let end = (position + 4).min(reference.len().min(result.order.len()));
+                    for (index, (left, right)) in reference.iter().zip(&result.order).enumerate() {
+                        if index < start || index >= end {
+                            continue;
+                        }
+                        println!(
+                            "      [{index}] val-0 round {} {}  |  val-{} round {} {}{}",
+                            left.round,
+                            String::from_utf8_lossy(&left.author),
+                            result.index,
+                            right.round,
+                            String::from_utf8_lossy(&right.author),
+                            if index == position { "  <-- first" } else { "" }
+                        );
+                    }
+                }
+            }
         }
     }
 

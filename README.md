@@ -149,20 +149,26 @@ Done:
   frame left untouched, an oversized length refused before allocating, and a body
   shorter than its own header refused.
 - `karsa live`: the DAG on real loopback sockets, full mesh, one listener per
-  node. Verified at n = 2, 4, 6, 8, and 10 for 21 rounds: every size converged on
-  the same commit root, with p50 delivery latency 0.20 → 1.70 ms and p99 0.35 →
-  40 ms as the mesh grew from 1 link to 90. Delivery order there is not the
-  simulator's: a vertex can arrive before the round it references, which is why
-  the node defers it and retries after the next successful insert. The per-peer
-  queue is bounded and awaited, so backpressure replaces a drop policy; that makes
-  a slow node everyone's problem, which `--slow-ms` exists to show.
+  node. Verified at n = 2, 4, 6, 8, 10, and 20 for 21 rounds: every size
+  converged on the same commit root. On an AMD Ryzen 7 6800U (8 cores / 16
+  threads), n = 10
+  authoring ran at 5.5–8.7 ms/round with p99 37–50 ms; n = 20 at 23.5–31.6
+  ms/round with p99 81–97 ms. Delivery order is not the simulator's: a vertex can
+  arrive before the round it references, which is why the node defers it and
+  retries after the next successful insert. The per-peer queue is bounded and
+  awaited, so backpressure replaces a drop policy; `--slow-ms 5` on one validator
+  slows authoring by 7–9× and pushes p99 to ~0.8–1.0 s while the commit root stays
+  identical and the deferral count stays at zero. Getting that last sentence to
+  hold required two fixes: a `missing_reference` during commit is now a retry, not
+  a node failure, and an indirect commit no longer mutates history before the
+  direct non-vote rule has been ruled out (see design finding 15).
 - `karsa node`: the same HTTP pipeline as the V node (decode, policy lookup,
   signature verification, per-sender replay protection) on axum, plus the
   validator schedule: `GET /validators`, `POST /validators/{id}/keys`
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 246 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 247 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
@@ -174,8 +180,9 @@ Done:
   (a sharded payload is dropped, an unsharded one is held, an in-window one stays),
   certified-header round-trips and their truncation, replay-to-the-same-
   roots, auditing a full-history store from genesis, auditing a pruned store above
-  its snapshot, catching a quorum that certified a wrong state root, in-process HTTP
-  tests, and
+  its snapshot, catching a quorum that certified a wrong state root, the
+  pacemaker refusing to emit history for an indirect commit it defers, in-process
+  HTTP tests, and
   **byte-for-byte parity checks** against V for the signing payloads and for a
   complete signed envelope.
 - `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors (the same result as
@@ -301,13 +308,25 @@ Rust port reproduces its measurements.
     This is checkable, not small: a light client still cannot verify it, which is
     the case a zk or fraud proof would cover.
 14. **A real transport changes the order, not the rules.** On loopback sockets at
-    n = 2…10 every committee converged on the same commit root, but delivery order
+    n = 2…20 every committee converged on the same commit root, but delivery order
     is no longer the simulator's: a vertex can arrive before the round it
     references. The DAG's shape rule absorbs most of that, and the rest is deferred
     and retried. With a bounded per-peer queue and no drop policy, a slow reader
     applies backpressure to its sender instead of losing a vertex — which is the
     head-of-line problem a dissemination design has to answer, and the reason
     `--slow-ms` exists.
+15. **Backpressure is a latency cost; it also exposed a convergence bug.** With
+    one validator delayed by 5 ms per frame, authoring fell from 5.5–8.7 to
+    54.5–57.0 ms/round and p99 rose from 37–50 ms to 0.8–1.0 s, while the commit
+    root stayed identical and nothing was deferred. The first version of that run
+    was not trustworthy: a `missing_reference` during commit killed a node, and an
+    indirect commit could beat a direct non-vote skip, so two nodes with the same
+    final DAG committed the same vertices in different orders. Both are fixed —
+    commit now waits for the referenced vertex, and an indirect commit is only
+    taken when more than `f` voters are held, before any history is emitted — and
+    30/30 slow runs, 30/30 n = 10, 10/10 n = 20, and 5/5 n = 20 with `--slow-ms`
+    converged. The transport still blocks rather than drops; repair is the next
+    step, not a property this run has.
 
 ## Port plan
 

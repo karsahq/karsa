@@ -188,6 +188,19 @@ Keep the OpenSSL path as the reference implementation: it is what passed the
 NIST vectors, and a second backend lets the Rust version cross-check itself
 against the V results.
 
+## Linker on a machine without clang
+
+`.cargo/config.toml` names `clang`. Where clang is not installed, override the
+linker per invocation rather than editing the committed config:
+
+```bash
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc cargo build --release
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc CARGO=$(command -v cargo) ./scripts/rust-check.sh
+```
+
+gcc accepts the existing `-C link-arg=-fuse-ld=mold`, so mold is still used and
+the artifact check above is unchanged.
+
 ## If the build produces an unusable binary
 
 Symptom: `cargo build` finishes, then `./target/release/karsa` reports

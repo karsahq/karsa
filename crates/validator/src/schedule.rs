@@ -291,6 +291,16 @@ impl ValidatorSet {
     pub fn quorum_size(&self) -> usize {
         self.validators.len() * 2 / 3 + 1
     }
+
+    /// Largest number of validators that may be faulty while the quorum still
+    /// intersects every other quorum.
+    ///
+    /// A node that holds more than this many votes for a leader has seen enough
+    /// that no supermajority of non-votes can still exist in the round.
+    #[must_use]
+    pub fn max_faulty(&self) -> usize {
+        self.validators.len().saturating_sub(self.quorum_size())
+    }
 }
 
 #[cfg(test)]

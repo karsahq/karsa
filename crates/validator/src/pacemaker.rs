@@ -192,7 +192,12 @@ impl Pacemaker {
             match self.advance_once(dag)? {
                 Advance::Commit => commits += 1,
                 Advance::Skip => skips += 1,
-                Advance::Anchor => anchors += 1,
+                Advance::Anchor => {
+                    // Recording an anchor does not move the cursor, so another
+                    // pass in the same tick would return the same anchor forever.
+                    anchors += 1;
+                    break;
+                }
                 Advance::Stalled => break,
             }
         }
@@ -242,27 +247,43 @@ impl Pacemaker {
         }
 
         // An anchor two or more rounds ahead is what makes an earlier slot
-        // decidable at all, so nothing else is worth trying without one.
-        if let Some(anchor) = self.anchor.clone()
-            && anchor.round >= round + 2
-        {
-            match dag.try_indirect_decide(round, &anchor)? {
-                Decision::Commit(_) => {
-                    self.set_anchor(dag, round)?;
-                    self.cursor = round + 1;
-                    return Ok(Advance::Commit);
-                }
-                Decision::Skip => {
-                    self.cursor = round + 1;
-                    return Ok(Advance::Skip);
-                }
-                Decision::Undecided => {
-                    // Reaching here means the leader is absent: the indirect rule
-                    // bails out before checking reachability when the node does
-                    // not hold the leader's vertex.
-                    if self.skip_absent_leader(dag, &anchor)? {
+        // decidable at all. Use the *lowest* usable one and never skip over a
+        // round whose status is still unknown: a higher anchor can contain a
+        // leader the lower one does not, so choosing it early would make the
+        // commit order depend on when data arrived rather than on the DAG.
+        if let Some(anchor) = self.stable_anchor(dag, round)? {
+            // `try_indirect_decide` commits the leader's history as a side effect.
+            // Check the race against the direct skip rule *before* calling it, so a
+            // deferred decision cannot leave committed vertices behind.
+            let reachable = if let Some(leader) = dag.leader(round) {
+                let leader_id = leader.id()?;
+                Some(dag.is_ancestor(&leader_id, &anchor)?)
+            } else {
+                None
+            };
+            if reachable == Some(true) && dag.held_voters(round)? <= dag.set().max_faulty() {
+                // Leave the slot to the direct rule: a non-vote quorum may still
+                // exist, and a skip must not race a commit.
+            } else {
+                let indirect = dag.try_indirect_decide(round, &anchor)?;
+                match indirect {
+                    Decision::Commit(_) => {
+                        self.set_anchor(dag, round)?;
+                        self.cursor = round + 1;
+                        return Ok(Advance::Commit);
+                    }
+                    Decision::Skip => {
                         self.cursor = round + 1;
                         return Ok(Advance::Skip);
+                    }
+                    Decision::Undecided => {
+                        // Reaching here means the leader is absent: the indirect
+                        // rule bails out before checking reachability when the
+                        // node does not hold the leader's vertex.
+                        if self.skip_absent_leader(dag, &anchor)? {
+                            self.cursor = round + 1;
+                            return Ok(Advance::Skip);
+                        }
                     }
                 }
             }
@@ -276,6 +297,45 @@ impl Pacemaker {
         }
 
         Ok(Advance::Stalled)
+    }
+
+    /// Finds the lowest anchor that can decide `round` without guessing about a
+    /// round in between.
+    ///
+    /// An anchor at round `a` probes every round `q` in `round + 2 .. a`. If `q`
+    /// is already anchored it is not the lowest; that cannot happen because the
+    /// scan is ascending. If the anchor's history **proves** the leader of `q`
+    /// absent, the round can be passed over. Anything else — the leader is held
+    /// but its votes are not, or the anchor's walk reaches a vertex this node does
+    /// not hold — means the answer is unknown, so this node waits.
+    ///
+    /// Using a higher anchor while a lower one is still possible is what makes
+    /// two nodes with the same final DAG commit the same vertices in different
+    /// orders: the higher one can carry a leader the lower one does not, so one
+    /// node commits that leader's slot while the other skips it and commits the
+    /// vertex later as an ancestor.
+    fn stable_anchor(&self, dag: &Dag, round: u64) -> Result<Option<VertexId>, CryptoError> {
+        let start = round + 2;
+        for candidate in start..=self.observed {
+            let Some(anchor) = dag.is_anchored(candidate)? else {
+                continue;
+            };
+            for between in start..candidate {
+                let Some(author) = dag.leader_author(between) else {
+                    continue;
+                };
+                match dag.history_contains_author(&anchor, between, author) {
+                    // Proved absent: this round can never anchor, so passing it
+                    // cannot change the decision.
+                    Ok(false) => {}
+                    // Present in the anchor's history, or the walk is incomplete:
+                    // the round may still anchor, so wait for that data.
+                    Ok(true) | Err(_) => return Ok(None),
+                }
+            }
+            return Ok(Some(anchor));
+        }
+        Ok(None)
     }
 
     /// Records `round`'s leader as the anchor after a commit there.
@@ -335,11 +395,9 @@ impl Pacemaker {
     /// sequences from the same DAG. The anchor only unlocks the indirect rule; the
     /// emission happens when the cursor reaches that round.
     fn probe(&self, dag: &Dag) -> Result<Option<VertexId>, CryptoError> {
-        let floor = match &self.anchor {
-            Some(anchor) => anchor.round.saturating_add(1).max(self.cursor + 1),
-            None => self.cursor + 1,
-        };
-        for round in floor..=self.observed {
+        // Always report the lowest supported leader: a stale higher anchor would
+        // hide a lower one that later decides an earlier slot differently.
+        for round in self.cursor.saturating_add(1)..=self.observed {
             if let Some(id) = dag.is_anchored(round)? {
                 return Ok(Some(id));
             }
@@ -554,6 +612,53 @@ mod tests {
         assert_eq!(skipped.round, 5);
         assert_eq!(skipped.author, b"val-1");
         assert_eq!(skipped.digest, None);
+    }
+
+    #[test]
+    fn a_deferred_indirect_commit_does_not_emit_history() {
+        // Round 1 is led by `val-1`. Round 2 has one voter for it, two non-voters,
+        // and one absent author, so the direct rule is undecided (no vote quorum,
+        // and only two observed non-votes). An anchor at round 3 reaches the
+        // leader, but only one voter is held (f = 1), so a non-vote quorum could
+        // still exist. The pacemaker must wait without committing the history it
+        // inspected.
+        let mut fixture = chain(1, &[]);
+        let round_one = fixture.ids(1);
+        let non_voter_refs: Vec<VertexId> = round_one
+            .iter()
+            .filter(|id| id.author != b"val-1")
+            .cloned()
+            .collect();
+
+        for author in 0..fixture.count() {
+            if author == 1 {
+                continue; // absent: the fourth vote/non-vote never arrives
+            }
+            let references = if author == 0 {
+                round_one.clone() // the single voter
+            } else {
+                non_voter_refs.clone()
+            };
+            let vertex = vertex(&fixture, author, 2, references);
+            fixture.dag.insert(vertex).unwrap();
+        }
+        assert_eq!(fixture.dag.held_voters(1).unwrap(), 1);
+        assert_eq!(fixture.dag.skipped().len(), 0);
+
+        // Round 3 references all three held round-2 vertices, and round 4 does the
+        // same for round 3, so the round-3 leader is anchored.
+        fixture.add_round(3).unwrap();
+        fixture.add_round(4).unwrap();
+
+        let mut pacemaker = pacemaker(3);
+        pacemaker.tick(&mut fixture.dag).unwrap();
+
+        assert!(
+            fixture.dag.order().is_empty(),
+            "a deferred indirect commit must not leave history behind"
+        );
+        assert_eq!(pacemaker.cursor(), 1);
+        assert!(fixture.dag.skipped().is_empty());
     }
 
     #[test]

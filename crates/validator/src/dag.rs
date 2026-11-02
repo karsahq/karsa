@@ -330,6 +330,29 @@ impl Dag {
         Ok(Decision::Undecided)
     }
 
+    /// Number of held vertices in `round + 1` that vote for the leader of
+    /// `round`.
+    ///
+    /// Used by the pacemaker to decide whether an indirect commit is safe: if
+    /// more than `f` votes are held, a supermajority of non-votes cannot exist,
+    /// so the direct rule can never later decide to skip the same slot.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`tally_votes`].
+    pub fn held_voters(&self, round: u64) -> Result<usize, CryptoError> {
+        let Some(leader) = self.leader(round) else {
+            return Ok(0);
+        };
+        let leader_id = leader.id()?;
+        let candidates: Vec<Vertex> = self
+            .round_vertices(round + 1)
+            .into_iter()
+            .cloned()
+            .collect();
+        Ok(tally_votes(&self.set, &leader_id, &candidates, &self.schedule)?.len())
+    }
+
     /// Collects `id` and its ancestors that are not yet committed, in a
     /// deterministic order.
     fn commit_history(&mut self, id: &VertexId) -> Result<Vec<VertexId>, CryptoError> {
