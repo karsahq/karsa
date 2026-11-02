@@ -22,23 +22,23 @@
 //!
 //! - `cursor` is the lowest round whose leader is not yet decided. It only moves
 //!   forward, never back.
-//! - `anchor` is the leader of the highest round the DAG already supports, meaning
-//!   a quorum of the next round references it. It is not necessarily emitted yet:
-//!   emission happens only when the cursor reaches that round, so the committed
-//!   sequence stays a function of the DAG rather than of arrival order.
+//! - the anchor is not stored. It is derived from the DAG on every tick: a round is
+//!   anchored when a quorum of the next round references its leader. The pacemaker
+//!   uses the *lowest* anchored round two or more rounds ahead that skips only
+//!   rounds whose leader its history proves absent. Deriving it rather than caching
+//!   it is what stops two nodes with the same final DAG from deciding differently.
 //!
 //! A leader whose vertex never arrives blocks the cursor. It cannot be skipped
 //! from local knowledge alone: another node may hold it and commit it. So the
 //! pacemaker does something narrower and provable: it looks for an anchor, and if
-//! a committed anchor two or more rounds later does not reach the missing leader,
+//! an anchored round two or more rounds later does not reach the missing leader,
 //! that leader can never be committed by anyone, and the round is skippable.
 //!
-//! To find such an anchor the cursor has to look past itself. [`Pacemaker::probe`]
-//! only *finds* one; it never emits. Emitting out of cursor order was a real bug:
-//! two nodes with the same final DAG committed different sequences, because the
-//! one that had more data at the time probed further first. `crates/net` caught
-//! that, and the fix is that the anchor unlocks the indirect rule while emission
-//! stays ordered.
+//! To find such an anchor the cursor has to look past itself. The anchor never
+//! emits: emission happens only when the cursor reaches that round, because
+//! emitting out of cursor order was a real bug — two nodes with the same final DAG
+//! committed different sequences, because the one that had more data at the time
+//! probed further first.
 
 use crypto::{CryptoError, CryptoErrorKind};
 
@@ -106,10 +106,29 @@ enum Advance {
     Commit,
     /// The cursor skipped its leader.
     Skip,
-    /// A leader ahead of the cursor has quorum support, so the anchor moved.
+    /// A leader ahead of the cursor already has quorum support, so the DAG is
+    /// growing even though the cursor cannot move yet.
     Anchor,
     /// Nothing could be decided.
     Stalled,
+}
+
+/// Whether the leader of the cursor round is provably reachable from an anchor.
+///
+/// Three states, not two: "this node cannot tell" is not the same as "not
+/// reachable", and only one of them permits a decision. Collapsing them is how a
+/// node ends up deciding on a history it only partly holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// The anchor's history contains the leader.
+    Yes,
+    /// The leader is held, and it is not on the anchored history.
+    No,
+    /// The leader's own vertex is not held; the indirect rule's absence proof
+    /// decides whether the round may be skipped.
+    Missing,
+    /// The walk reached a vertex this node does not hold, so nothing is proved.
+    Unknown,
 }
 
 /// Drives a [`Dag`] forward one round at a time.
@@ -117,7 +136,6 @@ enum Advance {
 pub struct Pacemaker {
     config: PacemakerConfig,
     cursor: u64,
-    anchor: Option<VertexId>,
     observed: u64,
     ticks_waited: u32,
     timeouts: u64,
@@ -133,7 +151,6 @@ impl Pacemaker {
         Self {
             config,
             cursor: start_round,
-            anchor: None,
             observed: start_round,
             ticks_waited: 0,
             timeouts: 0,
@@ -144,14 +161,6 @@ impl Pacemaker {
     #[must_use]
     pub fn cursor(&self) -> u64 {
         self.cursor
-    }
-
-    /// The leader of the highest round the DAG supports, if any.
-    ///
-    /// Quorum-backed, not necessarily emitted: see the module documentation.
-    #[must_use]
-    pub fn anchor(&self) -> Option<&VertexId> {
-        self.anchor.as_ref()
     }
 
     /// Highest round this node holds any vertex for.
@@ -235,7 +244,6 @@ impl Pacemaker {
 
         match dag.try_commit(round)? {
             Decision::Commit(_) => {
-                self.set_anchor(dag, round)?;
                 self.cursor = round + 1;
                 return Ok(Advance::Commit);
             }
@@ -252,23 +260,37 @@ impl Pacemaker {
         // leader the lower one does not, so choosing it early would make the
         // commit order depend on when data arrived rather than on the DAG.
         if let Some(anchor) = self.stable_anchor(dag, round)? {
-            // `try_indirect_decide` commits the leader's history as a side effect.
-            // Check the race against the direct skip rule *before* calling it, so a
-            // deferred decision cannot leave committed vertices behind.
-            let reachable = if let Some(leader) = dag.leader(round) {
-                let leader_id = leader.id()?;
-                Some(dag.is_ancestor(&leader_id, &anchor)?)
-            } else {
-                None
+            // `try_indirect_decide` commits the leader's history as a side effect,
+            // so the two ways this node could be wrong are ruled out first: a walk
+            // it cannot finish (nothing is proved), and a skip that could still win
+            // (a non-vote quorum may exist, and a skip must not race a commit).
+            let reach = match dag.leader(round) {
+                Some(leader) => {
+                    let leader_id = leader.id()?;
+                    match dag.is_ancestor(&leader_id, &anchor) {
+                        Ok(true) => Reach::Yes,
+                        Ok(false) => Reach::No,
+                        // A partial walk proves nothing. Deciding anyway is how the
+                        // commit order starts to depend on arrival timing.
+                        Err(error) if error.kind() == CryptoErrorKind::MissingReference => {
+                            Reach::Unknown
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                // Not held: the indirect rule's own absence proof decides.
+                None => Reach::Missing,
             };
-            if reachable == Some(true) && dag.held_voters(round)? <= dag.set().max_faulty() {
-                // Leave the slot to the direct rule: a non-vote quorum may still
-                // exist, and a skip must not race a commit.
-            } else {
-                let indirect = dag.try_indirect_decide(round, &anchor)?;
-                match indirect {
+
+            let decision = match reach {
+                Reach::Unknown => None,
+                Reach::Yes if dag.held_voters(round)? <= dag.set().max_faulty() => None,
+                _ => Some(dag.try_indirect_decide(round, &anchor)?),
+            };
+
+            if let Some(decision) = decision {
+                match decision {
                     Decision::Commit(_) => {
-                        self.set_anchor(dag, round)?;
                         self.cursor = round + 1;
                         return Ok(Advance::Commit);
                     }
@@ -289,10 +311,9 @@ impl Pacemaker {
             }
         }
 
-        // The cursor is stuck. Earn an anchor from a later round instead of
-        // waiting for data that may never come.
-        if let Some(anchor) = self.probe(dag)? {
-            self.anchor = Some(anchor);
+        // The cursor is stuck. Note an anchored round ahead so the stall counter
+        // does not fire while the DAG is still growing.
+        if self.has_anchored_ahead(dag)? {
             return Ok(Advance::Anchor);
         }
 
@@ -338,22 +359,6 @@ impl Pacemaker {
         Ok(None)
     }
 
-    /// Records `round`'s leader as the anchor after a commit there.
-    fn set_anchor(&mut self, dag: &Dag, round: u64) -> Result<(), CryptoError> {
-        let Some(leader) = dag.leader(round) else {
-            return Ok(());
-        };
-        let anchor = leader.id()?;
-        let better = match &self.anchor {
-            None => true,
-            Some(current) => anchor.round > current.round,
-        };
-        if better {
-            self.anchor = Some(anchor);
-        }
-        Ok(())
-    }
-
     /// Skips a leader whose vertex this node never received, when an anchor proves
     /// it can never be committed.
     ///
@@ -386,23 +391,19 @@ impl Pacemaker {
         Ok(dag.record_skip(round, author, None))
     }
 
-    /// Finds the lowest leader ahead of the cursor that the DAG already supports,
-    /// and returns it as a new anchor.
+    /// Whether any round ahead of the cursor already has quorum support.
     ///
-    /// Finding an anchor is not a commit. Emitting here would put a later leader's
-    /// history into the sequence before the rounds in front of it, so two nodes
-    /// that found the same anchor at different times would commit different
-    /// sequences from the same DAG. The anchor only unlocks the indirect rule; the
-    /// emission happens when the cursor reaches that round.
-    fn probe(&self, dag: &Dag) -> Result<Option<VertexId>, CryptoError> {
-        // Always report the lowest supported leader: a stale higher anchor would
-        // hide a lower one that later decides an earlier slot differently.
+    /// This is progress for the stall counter, not a decision: the cursor does not
+    /// move and nothing is emitted. It is also not cached — [`Pacemaker::stable_anchor`]
+    /// recomputes what may be decided for every tick, so a value seen earlier can
+    /// never make two nodes decide differently.
+    fn has_anchored_ahead(&self, dag: &Dag) -> Result<bool, CryptoError> {
         for round in self.cursor.saturating_add(1)..=self.observed {
-            if let Some(id) = dag.is_anchored(round)? {
-                return Ok(Some(id));
+            if dag.is_anchored(round)?.is_some() {
+                return Ok(true);
             }
         }
-        Ok(None)
+        Ok(false)
     }
 }
 

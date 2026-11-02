@@ -328,6 +328,18 @@ Rust port reproduces its measurements.
     converged. The transport still blocks rather than drops; repair is the next
     step, not a property this run has.
 
+The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
+    tick instead of cached, an indirect commit requires more than `f` held voters,
+    and a round whose leader the anchored history proves absent is the only kind an
+    anchor may skip. Two consequences worth naming. First, a walk this node cannot
+    finish now *waits* instead of returning an error through `Pacemaker::tick` — a
+    partial history proves nothing, and letting that error escape would have made
+    `karsa persist` treat a delivery gap as corruption. Second, there is no cached
+    anchor left to disagree with the derived one, so the commit order is a function
+    of the DAG and not of when data arrived. Reverting only `pacemaker.rs` makes the
+    regression test fail with "a deferred indirect commit must not leave history
+    behind", which is the check that the test is not passing by accident.
+
 ## Port plan
 
 | Stage | Crate | State |
