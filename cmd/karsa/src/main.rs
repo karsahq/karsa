@@ -14,6 +14,7 @@
 //! karsa net                        exchange vertices between nodes and check convergence
 //! karsa persist                    save, drop, reopen, and replay a node's state
 //! karsa migrate                    rotate validator keys across an epoch boundary
+//! karsa sigbench                   measure transaction verification throughput
 //! karsa bandwidth                  model per-node dissemination bandwidth
 //! karsa dagbench                   measure DAG certificate and header cost
 //! karsa loadtest [count] [conc]    drive the node and report tx/s
@@ -31,6 +32,7 @@ mod migrate;
 mod netrun;
 mod node;
 mod persist;
+mod sigbench;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -81,6 +83,15 @@ enum Command {
         /// Rounds that carry transactions.
         #[arg(long, default_value_t = 4)]
         rounds: u64,
+    },
+    /// Measure transaction signature verification throughput and scaling.
+    Sigbench {
+        /// Signature algorithm to measure.
+        #[arg(long, default_value = "ed25519")]
+        algorithm: String,
+        /// Highest thread count to measure.
+        #[arg(long, default_value_t = 8)]
+        threads: usize,
     },
     /// Rotate validator keys across an epoch boundary and keep committing.
     Migrate {
@@ -167,6 +178,7 @@ fn main() -> ExitCode {
             crashed,
         } => netrun::run(validators, jitter, crashed),
         Command::Migrate { validators, rounds } => migrate::run(validators, rounds),
+        Command::Sigbench { algorithm, threads } => sigbench::run(&algorithm, threads),
         Command::Persist {
             path,
             validators,

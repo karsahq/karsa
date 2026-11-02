@@ -14,7 +14,7 @@ not part of this repository.
 | `crates/validator/` | Rust: epoch-bound validator key schedule, DAG, pacemaker, headers |
 | `crates/net/` | Rust: vertex dissemination between nodes, deterministic scheduling |
 | `crates/store/` | Rust: append-only on-disk vertices, batches, and roots |
-| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `dagsim`, `chain`, `net`, `persist`, `migrate` |
+| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `dagsim`, `chain`, `net`, `persist`, `migrate`, `sigbench` |
 | `.cargo/config.toml` | sccache as rustc wrapper, mold as linker |
 | `scripts/rust-check.sh` | Rust gate: fmt, clippy, tests |
 | `scripts/acvp-rust.sh` | Downloads the ACVP vectors and runs the checker |
@@ -104,6 +104,10 @@ Done:
   drops everything at or below a state snapshot, so restart replays only the tail.
   `karsa persist` saves, prunes, drops the simulation, reopens, replays, and fails
   unless the state root comes back identical.
+- `karsa sigbench`: the TPS ceiling. Measures transaction verification through the
+  full policy path and how it scales across threads: 22.5k tx/s on one core,
+  90k on eight hardware threads of a 2014 quad-core. Release builds only — a debug
+  build reports ~130 tx/s and means nothing.
 - `karsa chain`: order and execute a small chain end to end — sign, batch, name by
   vertex, commit through the DAG and the pacemaker, apply, certify one header per
   committed round, verify the header chain the way a light client would, and check
