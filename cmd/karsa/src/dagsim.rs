@@ -183,9 +183,33 @@ pub fn run(validators: usize) -> Result<(), Box<dyn Error>> {
         "  deterministic: {} (same input, same decision and same committed count)",
         first.decision == second.decision && first.committed == second.committed
     );
+
     println!();
-    println!("  Not modelled: indirect commit through an anchor, waves, a pacemaker,");
-    println!("  asynchrony, networking, and execution. This decides one round at a time.");
+    println!("== Indirect rule: deciding an earlier slot through a committed anchor ==");
+    for (label, anchored) in [
+        ("leader inside the anchor history", true),
+        ("no path from the committed anchor", false),
+    ] {
+        let outcome = indirect(validators, anchored)?;
+        println!(
+            "  {}  decision {:<10} committed {}  skipped {}",
+            pad(label, 36),
+            outcome.decision,
+            outcome.committed,
+            outcome.skipped
+        );
+        println!(
+            "  {}  anchor one round too recent: {}",
+            pad("", 36),
+            outcome.too_recent
+        );
+    }
+
+    println!();
+    println!("  Indirect skip assumes every vertex references a supermajority of the");
+    println!("  previous round; this simulator does not enforce that rule.");
+    println!("  Not modelled: waves or pipelining, a pacemaker, asynchrony, networking,");
+    println!("  and execution.");
 
     Ok(())
 }
@@ -280,4 +304,71 @@ fn with_history(validators: usize) -> Result<Outcome, Box<dyn Error>> {
     }
     let decision = sim.dag.try_commit(LEADER_ROUND)?;
     outcome(decision, "leader plus two ancestors, committed once")
+}
+
+/// One indirect-decision run: an earlier slot decided through a committed anchor.
+struct IndirectOutcome {
+    decision: &'static str,
+    committed: usize,
+    skipped: usize,
+    too_recent: &'static str,
+}
+
+fn indirect(validators: usize, anchored: bool) -> Result<IndirectOutcome, Box<dyn Error>> {
+    let mut sim = Sim::new(validators)?;
+    let leader = sim.insert_leader(Vec::new())?;
+
+    // Round 8 carries the votes for the round-7 leader. Only the anchored case
+    // makes them reachable from later history.
+    for author in 0..validators {
+        let references = if anchored && author < 2 {
+            vec![leader.clone()]
+        } else {
+            Vec::new()
+        };
+        sim.insert(sim.vertex(author, LEADER_ROUND + 1, references)?)?;
+    }
+    let votes: Vec<VertexId> = (0..validators)
+        .map(|author| {
+            sim.dag
+                .get(LEADER_ROUND + 1, format!("val-{author}").as_bytes())
+                .expect("round 8 was just inserted")
+                .id()
+                .expect("vertex id")
+        })
+        .collect();
+
+    // Round 9 references the whole round 8, and round 10 commits its leader.
+    for author in 0..validators {
+        sim.insert(sim.vertex(author, LEADER_ROUND + 2, votes.clone())?)?;
+    }
+    let anchor_author = usize::try_from(LEADER_ROUND + 2)? % validators;
+    let anchor = sim
+        .dag
+        .get(LEADER_ROUND + 2, format!("val-{anchor_author}").as_bytes())
+        .expect("the round-9 leader was inserted")
+        .id()?;
+    for author in 0..validators {
+        sim.insert(sim.vertex(author, LEADER_ROUND + 3, vec![anchor.clone()])?)?;
+    }
+    sim.dag.try_commit(LEADER_ROUND + 2)?;
+
+    // An anchor only one round later has not had the chance to carry a quorum path.
+    let too_recent_anchor = sim
+        .dag
+        .get(LEADER_ROUND + 1, b"val-0")
+        .expect("round 8 was inserted")
+        .id()?;
+    let too_recent = describe(
+        &sim.dag
+            .try_indirect_decide(LEADER_ROUND, &too_recent_anchor)?,
+    );
+
+    let decision = sim.dag.try_indirect_decide(LEADER_ROUND, &anchor)?;
+    Ok(IndirectOutcome {
+        decision: describe(&decision),
+        committed: committed_count(&decision),
+        skipped: sim.dag.skipped().len(),
+        too_recent,
+    })
 }

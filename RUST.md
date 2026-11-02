@@ -126,7 +126,7 @@ Status of the first stage:
   algorithm registry (same frozen IDs and sizes as V), domain-separated
   payloads, and the `SignatureScheme` trait with Ed25519, ML-DSA-65, and
   SLH-DSA-SHA2-128s implementations.
-- 138 tests pass in the workspace default build (139 with `--all-features`), 30
+- 141 tests pass in the workspace default build (142 with `--all-features`), 30
   of them in `crypto` alone without PQ backends: RFC 8032 vectors, ML-DSA and
   SLH-DSA roundtrip and context binding, deterministic signing, key generation,
   envelope and policy behaviour, validator rotation and quorum-safe counting,
@@ -150,11 +150,13 @@ Status of the first stage:
   retired-key, and shape-mismatch cases are all rejected with protocol codes. It
   then runs the same round as vertex claims (one signature per block) and prints
   the metadata reduction.
-- `karsa dagsim` runs the direct commit rule on fixed scenarios: a vote
+- `karsa dagsim` runs the direct and indirect rules on fixed scenarios: a vote
   supermajority commits, an observed non-vote supermajority skips, and a partially
   observed round stays undecided, which is the rule that stops absence from
-  finalising a slot. A referenced vertex that is not held fails with
-  `missing_reference` instead of committing a partial history.
+  finalising a slot. A later committed anchor then resolves an earlier slot that
+  the direct rule could not: inside its history commits, outside it skips. A
+  referenced vertex that is not held fails with `missing_reference`, and the
+  indirect skip documents that it assumes the supermajority-reference rule.
 - `karsa bandwidth` re-derives the dissemination arithmetic: per-node egress is
   `(n-1)/n` of the originator total for any fanout, so batching and certificate
   size move the number and fanout does not. It also prices three consensus
