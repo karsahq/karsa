@@ -1,0 +1,14 @@
+[package]
+name = "net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Karsa deterministic vertex dissemination between validator nodes"
+
+[dependencies]
+crypto = { path = "../crypto" }
+validator = { path = "../validator" }
+
+[lints]
+workspace = true

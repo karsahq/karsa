@@ -180,6 +180,35 @@ impl Dag {
             .collect()
     }
 
+    /// Returns the leader of `round` if a quorum of the next round references it,
+    /// without committing anything.
+    ///
+    /// This is what the pacemaker uses to find an anchor. It deliberately does not
+    /// emit a commit: emitting out of cursor order would make the committed
+    /// sequence depend on arrival order, which two nodes with the same DAG may not
+    /// share.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`tally_votes`].
+    pub fn is_anchored(&self, round: u64) -> Result<Option<VertexId>, CryptoError> {
+        let Some(leader) = self.leader(round) else {
+            return Ok(None);
+        };
+        let leader_id = leader.id()?;
+        let candidates: Vec<Vertex> = self
+            .round_vertices(round + 1)
+            .into_iter()
+            .cloned()
+            .collect();
+        let voters = tally_votes(&self.set, &leader_id, &candidates)?;
+        if self.set.has_supermajority(voters.len()) {
+            Ok(Some(leader_id))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Asks this node to decide the leader of `round`.
     ///
     /// # Errors

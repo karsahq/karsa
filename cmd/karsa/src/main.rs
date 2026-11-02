@@ -11,6 +11,7 @@
 //! karsa certify [n]                build, encode, and verify a DAG certificate
 //! karsa dagsim                     run the DAG commit rule on fixed scenarios
 //! karsa chain                      order and execute a small chain end to end
+//! karsa net                        exchange vertices between nodes and check convergence
 //! karsa bandwidth                  model per-node dissemination bandwidth
 //! karsa dagbench                   measure DAG certificate and header cost
 //! karsa loadtest [count] [conc]    drive the node and report tx/s
@@ -24,6 +25,7 @@ mod dagbench;
 mod dagsim;
 mod demo;
 mod loadtest;
+mod netrun;
 mod node;
 
 use std::path::PathBuf;
@@ -76,6 +78,18 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         rounds: u64,
     },
+    /// Exchange vertices between validator nodes and check convergence.
+    Net {
+        /// Validators in the simulated committee (at least 4).
+        #[arg(default_value_t = 4)]
+        validators: usize,
+        /// Extra per-link delay, derived from a seeded hash.
+        #[arg(long, default_value_t = 2)]
+        jitter: u64,
+        /// Validator index that never participates.
+        #[arg(long)]
+        crashed: Option<usize>,
+    },
     /// Model per-node bandwidth for certificate and payload dissemination.
     Bandwidth {
         /// Validators in the set.
@@ -122,6 +136,11 @@ fn main() -> ExitCode {
         Command::Certify { validators } => certify::run(validators),
         Command::Dagsim { validators } => dagsim::run(validators),
         Command::Chain { validators, rounds } => chain::run(validators, rounds),
+        Command::Net {
+            validators,
+            jitter,
+            crashed,
+        } => netrun::run(validators, jitter, crashed),
         Command::Bandwidth {
             validators,
             tps,

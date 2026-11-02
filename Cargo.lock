@@ -605,6 +605,7 @@ dependencies = [
  "exec",
  "hex",
  "http-body-util",
+ "net",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -684,6 +685,14 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys",
+]
+
+[[package]]
+name = "net"
+version = "0.1.0"
+dependencies = [
+ "crypto",
+ "validator",
 ]
 
 [[package]]

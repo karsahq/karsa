@@ -11,8 +11,9 @@ not part of this repository.
 | `crates/crypto/` | Rust: registry, canonical encoding, domain separation, schemes |
 | `crates/tx/` | Rust: transaction envelope, authorization policy, batches |
 | `crates/exec/` | Rust: deterministic account state machine over committed batches |
-| `crates/validator/` | Rust: epoch-bound validator key schedule, DAG, pacemaker |
-| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `dagsim`, `chain` |
+| `crates/validator/` | Rust: epoch-bound validator key schedule, DAG, pacemaker, headers |
+| `crates/net/` | Rust: vertex dissemination between nodes, deterministic scheduling |
+| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `dagsim`, `chain`, `net` |
 | `.cargo/config.toml` | sccache as rustc wrapper, mold as linker |
 | `scripts/rust-check.sh` | Rust gate: fmt, clippy, tests |
 | `scripts/acvp-rust.sh` | Downloads the ACVP vectors and runs the checker |
@@ -85,6 +86,11 @@ Done:
   committed vertices in commit order, and `CommitProof` proves one vertex was part
   of the commit a header names. The proof is taken against the commit prefix at
   that height, so it does not verify against a later header.
+- `net`: `n` nodes that each own a DAG and exchange only vertices, with delivery
+  latency derived from a seeded hash so a run is reproducible. It caught a real
+  ordering bug: probing for an anchor by *committing* out of cursor order made two
+  nodes with the same DAG commit different sequences. The anchor is now
+  quorum-backed rather than committed, and emission stays ordered.
 - `karsa chain`: order and execute a small chain end to end — sign, batch, name by
   vertex, commit through the DAG and the pacemaker, apply, certify one header per
   committed round, verify the header chain the way a light client would, and check
@@ -97,14 +103,15 @@ Done:
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 197 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 203 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
   the DAG direct and indirect commit rules, the deterministic pacemaker, batch
   encoding, the account state machine, Merkle inclusion, promotion and
   multi-domain leaf properties, commit-proof membership and prefix binding, header
-  finality and replay refusal, in-process HTTP tests, and
+  finality and replay refusal, cross-node convergence with and without a crashed
+  validator, in-process HTTP tests, and
   **byte-for-byte parity checks** against V for the signing payloads and for a
   complete signed envelope.
 - `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors (the same result as

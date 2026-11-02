@@ -22,8 +22,10 @@
 //!
 //! - `cursor` is the lowest round whose leader is not yet decided. It only moves
 //!   forward, never back.
-//! - `anchor` is the leader of the highest round this node has committed. The
-//!   indirect rule resolves an earlier round against it.
+//! - `anchor` is the leader of the highest round the DAG already supports, meaning
+//!   a quorum of the next round references it. It is not necessarily emitted yet:
+//!   emission happens only when the cursor reaches that round, so the committed
+//!   sequence stays a function of the DAG rather than of arrival order.
 //!
 //! A leader whose vertex never arrives blocks the cursor. It cannot be skipped
 //! from local knowledge alone: another node may hold it and commit it. So the
@@ -31,10 +33,12 @@
 //! a committed anchor two or more rounds later does not reach the missing leader,
 //! that leader can never be committed by anyone, and the round is skippable.
 //!
-//! To find such an anchor the cursor has to be overtaken. [`Pacemaker::probe`]
-//! commits later leaders ahead of the cursor purely to earn an anchor. The
-//! sequence it emits is still a function of the DAG, not of arrival order; the
-//! tests pin that down.
+//! To find such an anchor the cursor has to look past itself. [`Pacemaker::probe`]
+//! only *finds* one; it never emits. Emitting out of cursor order was a real bug:
+//! two nodes with the same final DAG committed different sequences, because the
+//! one that had more data at the time probed further first. `crates/net` caught
+//! that, and the fix is that the anchor unlocks the indirect rule while emission
+//! stays ordered.
 
 use crypto::{CryptoError, CryptoErrorKind};
 
@@ -66,10 +70,14 @@ pub enum Step {
         from: u64,
         /// Lowest undecided round after the tick.
         cursor: u64,
-        /// Leaders committed by this tick, including anchors ahead of `cursor`.
+        /// Leaders committed by this tick.
         commits: usize,
         /// Rounds skipped by this tick.
         skips: usize,
+        /// Anchors found ahead of `cursor`. An anchor is quorum-supported but not
+        /// yet emitted: emission happens in cursor order so that two nodes with the
+        /// same DAG commit the same sequence.
+        anchors: usize,
     },
     /// Nothing could be decided and the stall is shorter than the timeout.
     Waiting {
@@ -98,7 +106,7 @@ enum Advance {
     Commit,
     /// The cursor skipped its leader.
     Skip,
-    /// A leader ahead of the cursor committed, so the anchor moved.
+    /// A leader ahead of the cursor has quorum support, so the anchor moved.
     Anchor,
     /// Nothing could be decided.
     Stalled,
@@ -138,7 +146,9 @@ impl Pacemaker {
         self.cursor
     }
 
-    /// The leader of the highest round this node has committed, if any.
+    /// The leader of the highest round the DAG supports, if any.
+    ///
+    /// Quorum-backed, not necessarily emitted: see the module documentation.
     #[must_use]
     pub fn anchor(&self) -> Option<&VertexId> {
         self.anchor.as_ref()
@@ -177,21 +187,24 @@ impl Pacemaker {
         let from = self.cursor;
         let mut commits = 0usize;
         let mut skips = 0usize;
+        let mut anchors = 0usize;
         loop {
             match self.advance_once(dag)? {
-                Advance::Commit | Advance::Anchor => commits += 1,
+                Advance::Commit => commits += 1,
                 Advance::Skip => skips += 1,
+                Advance::Anchor => anchors += 1,
                 Advance::Stalled => break,
             }
         }
 
-        if commits > 0 || skips > 0 {
+        if commits > 0 || skips > 0 || anchors > 0 {
             self.ticks_waited = 0;
             return Ok(Step::Advanced {
                 from,
                 cursor: self.cursor,
                 commits,
                 skips,
+                anchors,
             });
         }
 
@@ -313,30 +326,23 @@ impl Pacemaker {
         Ok(dag.record_skip(round, author, None))
     }
 
-    /// Commits the lowest later leader that the DAG already supports, and returns
-    /// it as a new anchor.
+    /// Finds the lowest leader ahead of the cursor that the DAG already supports,
+    /// and returns it as a new anchor.
     ///
-    /// This is what lets the cursor overtake a missing leader: commits are ordered
-    /// by round, and a committed leader is only an anchor, not a resolution of the
-    /// rounds before it.
-    fn probe(&mut self, dag: &mut Dag) -> Result<Option<VertexId>, CryptoError> {
+    /// Finding an anchor is not a commit. Emitting here would put a later leader's
+    /// history into the sequence before the rounds in front of it, so two nodes
+    /// that found the same anchor at different times would commit different
+    /// sequences from the same DAG. The anchor only unlocks the indirect rule; the
+    /// emission happens when the cursor reaches that round.
+    fn probe(&self, dag: &Dag) -> Result<Option<VertexId>, CryptoError> {
         let floor = match &self.anchor {
             Some(anchor) => anchor.round.saturating_add(1).max(self.cursor + 1),
             None => self.cursor + 1,
         };
         for round in floor..=self.observed {
-            let Decision::Commit(history) = dag.try_commit(round)? else {
-                continue;
-            };
-            // An empty history means this leader was already pulled in as someone
-            // else's ancestor, so it cannot move the anchor forward.
-            if history.is_empty() {
-                continue;
+            if let Some(id) = dag.is_anchored(round)? {
+                return Ok(Some(id));
             }
-            let Some(leader) = dag.leader(round) else {
-                continue;
-            };
-            return Ok(Some(leader.id()?));
         }
         Ok(None)
     }
@@ -519,7 +525,8 @@ mod tests {
                 from: 1,
                 cursor: 8,
                 commits: 7,
-                skips: 0
+                skips: 0,
+                anchors: 0
             }
         );
         assert!(fixture.dag.skipped().is_empty());
@@ -719,7 +726,8 @@ mod tests {
                 from: 1,
                 cursor: 8,
                 commits: 7,
-                skips: 0
+                skips: 0,
+                anchors: 0
             }
         );
         assert!(fixture.dag.skipped().is_empty());
