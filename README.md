@@ -14,7 +14,7 @@ not part of this repository.
 | `crates/validator/` | Rust: epoch-bound validator key schedule, DAG, pacemaker, headers |
 | `crates/net/` | Rust: vertex dissemination between nodes, deterministic scheduling |
 | `crates/store/` | Rust: append-only on-disk vertices, batches, and roots |
-| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `dagsim`, `chain`, `net`, `persist`, `migrate`, `sigbench` |
+| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `dagsim`, `chain`, `net`, `persist`, `migrate`, `sigbench`, `sweep` |
 | `.cargo/config.toml` | sccache as rustc wrapper, mold as linker |
 | `scripts/rust-check.sh` | Rust gate: fmt, clippy, tests |
 | `scripts/acvp-rust.sh` | Downloads the ACVP vectors and runs the checker |
@@ -22,8 +22,10 @@ not part of this repository.
 | `RUST.md` | Toolchain decisions and crate choices |
 
 The design notes (`docs/architecture.md`, `docs/crypto-registry.md`,
-`docs/consensus-notes.md`) are unpublished and git-ignored; the spec they
-contain is still normative for this code.
+`docs/consensus-notes.md`, `docs/decisions.md`) are unpublished and git-ignored;
+the spec they contain is still normative for this code. `decisions.md` records the
+choices that would be expensive to reverse, and says which ones are decided and
+which are still open.
 
 ## Rust port
 
@@ -104,6 +106,9 @@ Done:
   drops everything at or below a state snapshot, so restart replays only the tail.
   `karsa persist` saves, prunes, drops the simulation, reopens, replays, and fails
   unless the state root comes back identical.
+- `karsa sweep`: the network simulation across committee sizes, with fault
+  tolerance and quorum printed next to each row. Below n=4 the quorum is everyone,
+  so those rows show the floor rather than recommend it.
 - `karsa sigbench`: the TPS ceiling. Measures transaction verification through the
   full policy path and how it scales across threads: 22.5k tx/s on one core,
   90k on eight hardware threads of a 2014 quad-core. Release builds only — a debug
@@ -120,7 +125,7 @@ Done:
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 221 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 222 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,

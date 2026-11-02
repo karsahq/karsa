@@ -39,7 +39,11 @@ const EPOCH: u64 = 1;
 /// How the simulated network is configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SimConfig {
-    /// Number of validators. Must be at least 4 so a quorum is not everyone.
+    /// Number of validators.
+    ///
+    /// Below four the quorum is everyone, so a single silent validator halts the
+    /// chain. That is allowed for measurement — `karsa sweep` reports the fault
+    /// tolerance next to the number — but it is not a BFT configuration.
     pub validators: usize,
     /// Deliveries always take at least this many ticks.
     pub latency_ticks: u64,
@@ -251,13 +255,13 @@ impl Simulator {
     ///
     /// # Errors
     ///
-    /// Returns an error when the validator count is below 4, or when the set or a
+    /// Returns an error when the validator count is below 2, or when the set or a
     /// key cannot be built.
     pub fn new(config: SimConfig) -> Result<Self, CryptoError> {
-        if config.validators < 4 {
+        if config.validators < 2 {
             return Err(CryptoError::new(
                 CryptoErrorKind::InvalidVertex,
-                "at least 4 validators are required so a quorum is not everyone",
+                "at least 2 validators are required",
             ));
         }
 
@@ -576,9 +580,27 @@ mod tests {
     }
 
     #[test]
-    fn fewer_than_four_validators_is_refused() {
+    fn fewer_than_two_validators_is_refused() {
         let mut small = config(0, None);
-        small.validators = 3;
+        small.validators = 1;
         assert!(Simulator::new(small).is_err());
+    }
+
+    #[test]
+    fn two_validators_converge_but_tolerate_no_faults() {
+        let mut pair = config(0, None);
+        pair.validators = 2;
+        let summary = Simulator::new(pair).unwrap().run(6).unwrap();
+        assert!(summary.same_dag);
+        assert!(summary.same_order);
+
+        // With two validators the quorum is both of them: one silent node halts it.
+        let mut halved = config(0, Some(1));
+        halved.validators = 2;
+        let summary = Simulator::new(halved).unwrap().run(6).unwrap();
+        assert_eq!(
+            summary.committed[0], 0,
+            "one node cannot form a quorum alone"
+        );
     }
 }
