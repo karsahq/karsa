@@ -13,6 +13,7 @@
 //! karsa chain                      order and execute a small chain end to end
 //! karsa net                        exchange vertices between nodes and check convergence
 //! karsa persist                    save, drop, reopen, and replay a node's state
+//! karsa migrate                    rotate validator keys across an epoch boundary
 //! karsa bandwidth                  model per-node dissemination bandwidth
 //! karsa dagbench                   measure DAG certificate and header cost
 //! karsa loadtest [count] [conc]    drive the node and report tx/s
@@ -26,6 +27,7 @@ mod dagbench;
 mod dagsim;
 mod demo;
 mod loadtest;
+mod migrate;
 mod netrun;
 mod node;
 mod persist;
@@ -78,6 +80,15 @@ enum Command {
         validators: usize,
         /// Rounds that carry transactions.
         #[arg(long, default_value_t = 4)]
+        rounds: u64,
+    },
+    /// Rotate validator keys across an epoch boundary and keep committing.
+    Migrate {
+        /// Validators in the simulated committee (at least 4).
+        #[arg(default_value_t = 4)]
+        validators: usize,
+        /// Data rounds to run.
+        #[arg(default_value_t = 8)]
         rounds: u64,
     },
     /// Save, drop, reopen, and replay a node's state, then compare the roots.
@@ -155,6 +166,7 @@ fn main() -> ExitCode {
             jitter,
             crashed,
         } => netrun::run(validators, jitter, crashed),
+        Command::Migrate { validators, rounds } => migrate::run(validators, rounds),
         Command::Persist {
             path,
             validators,

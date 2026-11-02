@@ -14,8 +14,8 @@ use crypto::scheme::Ed25519Scheme;
 use crypto::{CryptoError, CryptoErrorKind};
 use sha2::{Digest, Sha256};
 use validator::{
-    Certificate, NO_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet, Vertex, VertexId,
-    bitmap_of, tally_votes,
+    Certificate, EpochSchedule, NO_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet, Vertex,
+    VertexId, bitmap_of, tally_votes,
 };
 
 const CHAIN_ID: &[u8] = b"karsa-certify-1";
@@ -276,12 +276,17 @@ fn measure_vertex_round(
     for _ in 0..MEASUREMENT_ROUNDS {
         let start = Instant::now();
         for vote in &votes {
-            vote.verify(set)?;
+            vote.verify(set, CERTIFICATE_EPOCH)?;
         }
         verify_ns = verify_ns.min(start.elapsed().as_nanos());
     }
 
-    let voters = tally_votes(set, &leader_id, &votes)?;
+    let voters = tally_votes(
+        set,
+        &leader_id,
+        &votes,
+        &EpochSchedule::single(CERTIFICATE_EPOCH),
+    )?;
     Ok(VertexRound {
         vertex_bytes: encoded.len(),
         verify_ns,

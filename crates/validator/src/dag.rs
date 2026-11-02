@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashSet};
 use crypto::merkle::{MerkleProof, MerkleTree};
 use crypto::{CryptoError, CryptoErrorKind};
 
-use crate::schedule::ValidatorSet;
+use crate::schedule::{EpochSchedule, ValidatorSet};
 use crate::vertex::{Vertex, VertexId, tally_votes};
 
 /// The outcome of asking a round to decide.
@@ -58,6 +58,8 @@ pub struct Dag {
     committed: HashSet<[u8; 32]>,
     order: Vec<VertexId>,
     skipped: Vec<SkippedRound>,
+    /// Which epoch each round belongs to.
+    schedule: EpochSchedule,
     /// Highest round that has been committed and dropped, if any.
     ///
     /// Everything at or below it is already reflected in a state snapshot, so the
@@ -69,14 +71,49 @@ impl Dag {
     /// Creates an empty DAG for `set`.
     #[must_use]
     pub fn new(set: ValidatorSet) -> Self {
+        let epoch = set.epoch;
         Self {
             set,
             vertices: BTreeMap::new(),
             committed: HashSet::new(),
             order: Vec::new(),
             skipped: Vec::new(),
+            schedule: EpochSchedule::single(epoch),
             floor: None,
         }
+    }
+
+    /// Creates an empty DAG whose set advances one epoch every `rounds_per_epoch`
+    /// rounds, starting at the set's own epoch.
+    ///
+    /// This is the hook a key rotation hangs on: the validator identities stay
+    /// fixed, only their active keys change with the epoch, so quorum intersection
+    /// across the boundary is preserved and no round has to be re-decided.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic; a zero length is treated as one epoch for the whole DAG.
+    #[must_use]
+    pub fn with_epoch_length(set: ValidatorSet, rounds_per_epoch: u64) -> Self {
+        let base = set.epoch;
+        let mut dag = Self::new(set);
+        dag.schedule = EpochSchedule::advancing(base, rounds_per_epoch);
+        dag
+    }
+
+    /// The epoch a round belongs to.
+    ///
+    /// Derived from the round alone, never read from a message, so every node
+    /// computes the same epoch for the same round.
+    #[must_use]
+    pub fn epoch_of(&self, round: u64) -> u64 {
+        self.schedule.epoch_of(round)
+    }
+
+    /// The round-to-epoch mapping this DAG verifies against.
+    #[must_use]
+    pub fn epoch_schedule(&self) -> EpochSchedule {
+        self.schedule
     }
 
     /// The highest round this node has pruned, if any.
@@ -136,7 +173,7 @@ impl Dag {
     /// Propagates [`Vertex::verify`], and returns
     /// [`CryptoErrorKind::InvalidVertex`] when the reference rule is not met.
     pub fn insert(&mut self, vertex: Vertex) -> Result<VertexId, CryptoError> {
-        vertex.verify(&self.set)?;
+        vertex.verify(&self.set, self.epoch_of(vertex.round))?;
         // Below the floor the vertex is already committed and its state is in a
         // snapshot. It is still signature-checked, then dropped.
         if self.is_pruned(vertex.round) {
@@ -250,7 +287,7 @@ impl Dag {
             .into_iter()
             .cloned()
             .collect();
-        let voters = tally_votes(&self.set, &leader_id, &candidates)?;
+        let voters = tally_votes(&self.set, &leader_id, &candidates, &self.schedule)?;
         if self.set.has_supermajority(voters.len()) {
             Ok(Some(leader_id))
         } else {
@@ -276,7 +313,7 @@ impl Dag {
             .into_iter()
             .cloned()
             .collect();
-        let voters = tally_votes(&self.set, &leader_id, &candidates)?;
+        let voters = tally_votes(&self.set, &leader_id, &candidates, &self.schedule)?;
 
         if self.set.has_supermajority(voters.len()) {
             let history = self.commit_history(&leader_id)?;
@@ -1060,6 +1097,119 @@ mod tests {
         fixture.dag.set_floor(1);
         assert_eq!(fixture.dag.set_floor(0), 0);
         assert_eq!(fixture.dag.floor(), Some(1));
+    }
+
+    /// The retiring and replacement private key for one validator.
+    type RotatingKeys = (Vec<u8>, Vec<u8>);
+
+    /// Builds a set where every validator rotates from an old to a new key at
+    /// epoch 2, returning the two private keys per validator.
+    fn rotating_set(count: usize) -> (ValidatorSet, Vec<RotatingKeys>) {
+        let mut private = Vec::with_capacity(count);
+        let mut validators = Vec::with_capacity(count);
+        for index in 0..count {
+            let old_seed = [u8::try_from(index + 1).unwrap(); 32];
+            let new_seed = [u8::try_from(index + 51).unwrap(); 32];
+            let old_public = Ed25519Scheme::public_key_from_seed(&old_seed).unwrap();
+            let new_public = Ed25519Scheme::public_key_from_seed(&new_seed).unwrap();
+            validators.push(ValidatorRecord {
+                validator_id: format!("val-{index}").into_bytes(),
+                keys: vec![
+                    ValidatorKey {
+                        key_id: format!("val-{index}-old").into_bytes(),
+                        algorithm_id: ALG_ED25519,
+                        public_key: old_public.to_vec(),
+                        activation_epoch: 0,
+                        retirement_epoch: 2,
+                    },
+                    ValidatorKey {
+                        key_id: format!("val-{index}-new").into_bytes(),
+                        algorithm_id: ALG_ED25519,
+                        public_key: new_public.to_vec(),
+                        activation_epoch: 2,
+                        retirement_epoch: NO_EXPIRY,
+                    },
+                ],
+            });
+
+            let mut old_private = Vec::new();
+            old_private.extend_from_slice(&old_seed);
+            old_private.extend_from_slice(&old_public);
+            let mut new_private = Vec::new();
+            new_private.extend_from_slice(&new_seed);
+            new_private.extend_from_slice(&new_public);
+            private.push((old_private, new_private));
+        }
+        let set = ValidatorSet {
+            epoch: 0,
+            validators,
+        };
+        set.validate().unwrap();
+        (set, private)
+    }
+
+    #[test]
+    fn a_key_rotation_at_an_epoch_boundary_does_not_stop_the_chain() {
+        let count = 4;
+        let (set, private) = rotating_set(count);
+        let mut dag = Dag::with_epoch_length(set, 2);
+
+        // Two rounds per epoch, so the rotation lands at round 4.
+        assert_eq!(dag.epoch_of(3), 1);
+        assert_eq!(dag.epoch_of(4), 2);
+
+        for round in 0..=8u64 {
+            let epoch = dag.epoch_of(round);
+            let references: Vec<VertexId> = (0..count)
+                .filter_map(|author| {
+                    dag.get(round.wrapping_sub(1), format!("val-{author}").as_bytes())
+                        .and_then(|vertex| vertex.id().ok())
+                })
+                .collect();
+            for (author, pair) in private.iter().enumerate() {
+                let key = if epoch < 2 { &pair.0 } else { &pair.1 };
+                let mut vertex = Vertex {
+                    chain_id: b"karsa-epoch-1".to_vec(),
+                    epoch,
+                    round,
+                    author: format!("val-{author}").into_bytes(),
+                    payload_hash: [0u8; 32],
+                    references: references.clone(),
+                    signature: Vec::new(),
+                };
+                let payload = vertex.signing_payload().unwrap();
+                vertex.signature = Ed25519Scheme.sign(key, &payload).unwrap();
+                dag.insert(vertex)
+                    .expect("a rotated schedule accepts its own key");
+            }
+        }
+
+        // The leader of round 3 needs votes from round 4, which belongs to the next
+        // epoch and is signed with a different key.
+        assert!(matches!(dag.try_commit(3).unwrap(), Decision::Commit(_)));
+        assert!(matches!(dag.try_commit(4).unwrap(), Decision::Commit(_)));
+    }
+
+    #[test]
+    fn a_retired_key_cannot_sign_after_the_rotation() {
+        let (set, private) = rotating_set(4);
+        let mut stale = Vertex {
+            chain_id: b"karsa-epoch-1".to_vec(),
+            epoch: 2,
+            round: 4,
+            author: b"val-0".to_vec(),
+            payload_hash: [0u8; 32],
+            references: Vec::new(),
+            signature: Vec::new(),
+        };
+        let payload = stale.signing_payload().unwrap();
+        stale.signature = Ed25519Scheme.sign(&private[0].0, &payload).unwrap();
+
+        // The schedule resolves epoch 2 to the new key, so the old key's signature
+        // simply does not match. Either outcome keeps the retired key out; what
+        // matters is that it never verifies.
+        assert!(stale.verify(&set, 2).is_err());
+        assert!(stale.verify(&set, 2).is_err(), "deterministic, not flaky");
     }
 
     #[test]

@@ -123,6 +123,55 @@ impl ValidatorRecord {
     }
 }
 
+/// Maps rounds to epochs.
+///
+/// A key rotation is not a validator-set change: the identities stay fixed and only
+/// their active keys move. That is why quorum intersection survives the boundary —
+/// intersection is over validator ids, not over keys — and why no round has to be
+/// re-decided when the algorithm changes.
+///
+/// The mapping is a function of the round alone, so every node derives the same
+/// epoch for the same round without trusting the message that carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochSchedule {
+    /// Epoch that round 0 belongs to.
+    pub base: u64,
+    /// Rounds per epoch, or `None` when the whole DAG is one epoch.
+    pub rounds_per_epoch: Option<u64>,
+}
+
+impl EpochSchedule {
+    /// A schedule in which every round is in `epoch`.
+    #[must_use]
+    pub fn single(epoch: u64) -> Self {
+        Self {
+            base: epoch,
+            rounds_per_epoch: None,
+        }
+    }
+
+    /// A schedule that advances one epoch every `rounds_per_epoch` rounds.
+    ///
+    /// A zero length is treated as "one epoch", because a span of zero rounds is
+    /// not a schedule.
+    #[must_use]
+    pub fn advancing(base: u64, rounds_per_epoch: u64) -> Self {
+        Self {
+            base,
+            rounds_per_epoch: Some(rounds_per_epoch).filter(|length| *length > 0),
+        }
+    }
+
+    /// The epoch `round` belongs to.
+    #[must_use]
+    pub fn epoch_of(&self, round: u64) -> u64 {
+        match self.rounds_per_epoch {
+            Some(length) => self.base + round / length,
+            None => self.base,
+        }
+    }
+}
+
 /// One signature presented for a consensus message.
 ///
 /// Both `validator_id` and `key_id` are explicit, so a verifier never has to guess
@@ -179,9 +228,13 @@ impl ValidatorSet {
     /// that contributed.
     ///
     /// Each validator is counted once even when two of its keys sign, which is the
-    /// rule that stops an overlapping migration from becoming extra voting power.
-    /// A duplicate signature is ignored rather than rejected, because during a
-    /// migration window the same validator may legitimately present both keys.
+    /// rule that stops a rotation from becoming extra voting power. A duplicate
+    /// signature is ignored rather than rejected.
+    ///
+    /// Exactly one key per validator is active at any epoch (`active_key` enforces
+    /// it), so a rotation switches keys at a boundary rather than overlapping. An
+    /// overlapping window would need every active key to sign, and a vertex carries
+    /// one signature; until that changes, the switch is atomic.
     ///
     /// # Errors
     ///

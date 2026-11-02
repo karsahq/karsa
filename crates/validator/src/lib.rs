@@ -18,5 +18,7 @@ pub use certificate::{
 pub use dag::{CommitProof, Dag, Decision, SkippedRound, commit_leaf, commit_root};
 pub use header::{HEADER_VERSION_V1, Header, HeaderChain};
 pub use pacemaker::{Pacemaker, PacemakerConfig, Step};
-pub use schedule::{NO_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet, ValidatorSignature};
+pub use schedule::{
+    EpochSchedule, NO_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet, ValidatorSignature,
+};
 pub use vertex::{VERTEX_VERSION_V1, Vertex, VertexId, tally_votes};

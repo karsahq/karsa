@@ -16,7 +16,7 @@ use crypto::scheme::verify_signature;
 use crypto::{CryptoError, CryptoErrorKind};
 use sha2::{Digest, Sha256};
 
-use crate::schedule::ValidatorSet;
+use crate::schedule::{EpochSchedule, ValidatorSet};
 
 /// Canonical vertex encoding version.
 pub const VERTEX_VERSION_V1: u16 = 1;
@@ -175,9 +175,14 @@ impl Vertex {
 
     /// Verifies the author's signature against the schedule.
     ///
-    /// The author's key is resolved from the schedule at the vertex epoch, so a
-    /// vertex never names a key: a rotated-out key cannot sign, and a key that is
-    /// not active yet cannot vote early.
+    /// The author's key is resolved from the schedule at `epoch`, so a vertex
+    /// never names a key: a rotated-out key cannot sign, and a key that is not
+    /// active yet cannot vote early.
+    ///
+    /// `epoch` is passed in rather than read from the vertex on purpose. A vertex
+    /// that declared its own epoch could name an epoch in which a retired key was
+    /// still active and keep signing with it. The caller derives the epoch from the
+    /// round, which every node computes the same way.
     ///
     /// # Errors
     ///
@@ -186,13 +191,13 @@ impl Vertex {
     /// [`CryptoErrorKind::KeyNotActive`] or [`CryptoErrorKind::KeyAmbiguous`] from
     /// the schedule, plus any verification error from
     /// [`crypto::scheme::verify_signature`].
-    pub fn verify(&self, set: &ValidatorSet) -> Result<(), CryptoError> {
-        if self.epoch != set.epoch {
+    pub fn verify(&self, set: &ValidatorSet, epoch: u64) -> Result<(), CryptoError> {
+        if self.epoch != epoch {
             return Err(CryptoError::new(
                 CryptoErrorKind::KeyOutOfWindow,
                 format!(
-                    "vertex claims epoch {} but the set describes {}",
-                    self.epoch, set.epoch
+                    "vertex claims epoch {} but round maps to {epoch}",
+                    self.epoch
                 ),
             ));
         }
@@ -202,7 +207,7 @@ impl Vertex {
                 "vertex from an unregistered validator",
             )
         })?;
-        let key = record.active_key(self.epoch)?;
+        let key = record.active_key(epoch)?;
         let payload = self.signing_payload()?;
         verify_signature(key.algorithm_id, &key.public_key, &payload, &self.signature)
     }
@@ -233,11 +238,15 @@ pub fn tally_votes(
     set: &ValidatorSet,
     leader: &VertexId,
     candidates: &[Vertex],
+    schedule: &EpochSchedule,
 ) -> Result<Vec<Vec<u8>>, CryptoError> {
     let voting_round = leader.round + 1;
     let mut voters: Vec<Vec<u8>> = Vec::new();
     for candidate in candidates.iter().filter(|v| v.round == voting_round) {
-        candidate.verify(set)?;
+        // Each voter is checked at the epoch its own round belongs to. The round
+        // that votes for a leader can be the first round of the next epoch, so
+        // using the leader's epoch would reject a legitimate vote at the boundary.
+        candidate.verify(set, schedule.epoch_of(candidate.round))?;
         if !candidate.references.iter().any(|r| r == leader) {
             continue;
         }
@@ -323,7 +332,7 @@ mod tests {
         let leader_id = leader.id().unwrap();
         let vote = vertex(1, 8, vec![leader_id], &signers);
 
-        vote.verify(&set).unwrap();
+        vote.verify(&set, EPOCH).unwrap();
         let encoded = vote.encode().unwrap();
         let decoded = Vertex::decode(&encoded).unwrap();
         assert_eq!(decoded, vote);
@@ -336,11 +345,11 @@ mod tests {
         let a = vertex(0, 7, Vec::new(), &signers);
         let b = vertex(1, 7, Vec::new(), &signers);
         let mut vote = vertex(2, 8, vec![a.id().unwrap()], &signers);
-        vote.verify(&set).unwrap();
+        vote.verify(&set, EPOCH).unwrap();
 
         // Re-point the reference at a different leader: the old signature must die.
         vote.references = vec![b.id().unwrap()];
-        let error = vote.verify(&set).unwrap_err();
+        let error = vote.verify(&set, EPOCH).unwrap_err();
         assert_eq!(error.kind(), CryptoErrorKind::InvalidSignature);
     }
 
@@ -359,7 +368,8 @@ mod tests {
             vertex(1, 8, vec![leader_id.clone()], &signers),
             vertex(2, 9, vec![leader_id.clone()], &signers),
         ];
-        let voters = tally_votes(&set, &leader_id, &candidates).unwrap();
+        let voters =
+            tally_votes(&set, &leader_id, &candidates, &EpochSchedule::single(EPOCH)).unwrap();
         assert_eq!(voters.len(), 3);
         assert!(set.has_supermajority(voters.len()));
     }
@@ -375,7 +385,8 @@ mod tests {
             vertex(1, 8, vec![leader_id.clone()], &signers),
             vertex(2, 8, vec![other.id().unwrap()], &signers),
         ];
-        let voters = tally_votes(&set, &leader_id, &candidates).unwrap();
+        let voters =
+            tally_votes(&set, &leader_id, &candidates, &EpochSchedule::single(EPOCH)).unwrap();
         assert_eq!(voters, vec![b"val-1".to_vec()]);
     }
 
@@ -387,7 +398,7 @@ mod tests {
         let vote = vertex(1, 8, vec![leader_id.clone()], &signers);
 
         set.validators[1].keys[0].retirement_epoch = EPOCH;
-        let error = vote.verify(&set).unwrap_err();
+        let error = vote.verify(&set, EPOCH).unwrap_err();
         assert_eq!(error.kind(), CryptoErrorKind::KeyNotActive);
     }
 
@@ -396,7 +407,7 @@ mod tests {
         let (set, signers) = validator_set(2);
         let mut vote = vertex(0, 7, Vec::new(), &signers);
         vote.author = b"val-9".to_vec();
-        let error = vote.verify(&set).unwrap_err();
+        let error = vote.verify(&set, EPOCH).unwrap_err();
         assert_eq!(error.kind(), CryptoErrorKind::UnknownValidator);
     }
 
@@ -405,7 +416,7 @@ mod tests {
         let (set, signers) = validator_set(2);
         let mut vote = vertex(0, 7, Vec::new(), &signers);
         vote.epoch = EPOCH + 1;
-        let error = vote.verify(&set).unwrap_err();
+        let error = vote.verify(&set, EPOCH).unwrap_err();
         assert_eq!(error.kind(), CryptoErrorKind::KeyOutOfWindow);
     }
 }

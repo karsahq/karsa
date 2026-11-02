@@ -14,7 +14,7 @@ not part of this repository.
 | `crates/validator/` | Rust: epoch-bound validator key schedule, DAG, pacemaker, headers |
 | `crates/net/` | Rust: vertex dissemination between nodes, deterministic scheduling |
 | `crates/store/` | Rust: append-only on-disk vertices, batches, and roots |
-| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `dagsim`, `chain`, `net`, `persist` |
+| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `dagsim`, `chain`, `net`, `persist`, `migrate` |
 | `.cargo/config.toml` | sccache as rustc wrapper, mold as linker |
 | `scripts/rust-check.sh` | Rust gate: fmt, clippy, tests |
 | `scripts/acvp-rust.sh` | Downloads the ACVP vectors and runs the checker |
@@ -77,6 +77,12 @@ Done:
   proofs let a client holding only the root read one balance without trusting the
   node that served it; odd nodes are promoted rather than duplicated, so two
   account sets cannot share a root.
+- `validator::EpochSchedule`: maps rounds to epochs as a pure function of the
+  round, which is what lets a key rotation cross a boundary without a restart.
+  `karsa migrate` runs it end to end. PQ is registered but not active: the default
+  chain is classical, and switching a validator to ML-DSA is a change to one
+  `ValidatorKey`. Overlapping keys are not supported yet — a vertex carries one
+  signature.
 - `validator::header`: committed-state headers and the finality certificate that
   names them. The header id is a domain-separated hash, and the certificate is the
   existing vote payload over that id — `n` signatures once per **commit**, not once
@@ -110,7 +116,7 @@ Done:
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 219 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 221 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
