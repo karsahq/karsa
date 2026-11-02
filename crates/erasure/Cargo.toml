@@ -1,0 +1,10 @@
+[package]
+name = "erasure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Karsa Reed-Solomon erasure coding over GF(2^8)"
+
+[lints]
+workspace = true

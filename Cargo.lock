@@ -385,6 +385,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "erasure"
+version = "0.1.0"
+
+[[package]]
 name = "exec"
 version = "0.1.0"
 dependencies = [
@@ -602,6 +606,7 @@ dependencies = [
  "axum",
  "clap",
  "crypto",
+ "erasure",
  "exec",
  "hex",
  "http-body-util",

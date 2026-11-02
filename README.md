@@ -14,7 +14,8 @@ not part of this repository.
 | `crates/validator/` | Rust: epoch-bound validator key schedule, DAG, pacemaker, headers |
 | `crates/net/` | Rust: vertex dissemination between nodes, deterministic scheduling |
 | `crates/store/` | Rust: append-only on-disk vertices, batches, and roots |
-| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `dagsim`, `chain`, `net`, `persist`, `migrate`, `sigbench`, `sweep` |
+| `crates/erasure/` | Rust: Reed-Solomon over GF(2^8) for sharded storage |
+| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `dagsim`, `chain`, `net`, `persist`, `migrate`, `sigbench`, `sweep`, `shards` |
 | `.cargo/config.toml` | sccache as rustc wrapper, mold as linker |
 | `scripts/rust-check.sh` | Rust gate: fmt, clippy, tests |
 | `scripts/acvp-rust.sh` | Downloads the ACVP vectors and runs the checker |
@@ -106,6 +107,10 @@ Done:
   drops everything at or below a state snapshot, so restart replays only the tail.
   `karsa persist` saves, prunes, drops the simulation, reopens, replays, and fails
   unless the state root comes back identical.
+- `erasure`: Reed-Solomon over GF(2^8), non-systematic Vandermonde, any `data` of
+  `total` shards reconstruct. `karsa shards` shows the storage it buys (302 GB/day
+  down to 9.45 at 1k TPS) and the CPU it costs (~36 MB/s scalar, 10% of a core at
+  1k TPS, 98% at 10k).
 - `karsa loadtest`: the node's admission path. ~55k accepted tx/s at 16
   connections, which is 64% of the verification ceiling; the rest is HTTP and
   serialisation, not crypto.
@@ -128,7 +133,7 @@ Done:
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 222 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 231 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,

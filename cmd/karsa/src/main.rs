@@ -16,6 +16,7 @@
 //! karsa migrate                    rotate validator keys across an epoch boundary
 //! karsa sigbench                   measure transaction verification throughput
 //! karsa sweep                      run the network simulation across committee sizes
+//! karsa shards                     erasure-code a batch and reconstruct it
 //! karsa bandwidth                  model per-node dissemination bandwidth
 //! karsa dagbench                   measure DAG certificate and header cost
 //! karsa loadtest [count] [conc]    drive the node and report tx/s
@@ -33,6 +34,7 @@ mod migrate;
 mod netrun;
 mod node;
 mod persist;
+mod shards;
 mod sigbench;
 mod sweep;
 
@@ -86,6 +88,8 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         rounds: u64,
     },
+    /// Erasure-code a batch payload and reconstruct it after losing shards.
+    Shards,
     /// Run the network simulation across a range of committee sizes.
     Sweep {
         /// Comma-separated committee sizes, e.g. 2,4,6,8,10.
@@ -193,6 +197,7 @@ fn main() -> ExitCode {
         } => netrun::run(validators, jitter, crashed),
         Command::Migrate { validators, rounds } => migrate::run(validators, rounds),
         Command::Sigbench { algorithm, threads } => sigbench::run(&algorithm, threads),
+        Command::Shards => shards::run(),
         Command::Sweep {
             sizes,
             jitter,

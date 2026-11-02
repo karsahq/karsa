@@ -7,6 +7,7 @@ members = [
     "crates/validator",
     "crates/net",
     "crates/store",
+    "crates/erasure",
     "cmd/karsa",
 ]
 

@@ -10,6 +10,7 @@ description = "Karsa command-line entry point"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 crypto = { path = "../../crates/crypto", features = ["pq-openssl", "pq-slh"] }
+erasure = { path = "../../crates/erasure" }
 exec = { path = "../../crates/exec" }
 hex = "0.4"
 net = { path = "../../crates/net" }
