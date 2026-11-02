@@ -1,19 +1,22 @@
-//! A round-based DAG with a direct commit rule.
+//! A round-based DAG: vertices, leader election, and the commit rules.
 //!
-//! This is the first half of a DAG-BFT engine, and deliberately only the first
-//! half. What is here:
+//! What is here:
 //!
 //! - vertices stored one per `(round, author)`, verified against the schedule;
 //! - deterministic leader election as a function of the round;
 //! - the **direct** rule: a leader with a supermajority of next-round votes
 //!   commits, a leader with a supermajority of next-round non-votes is skipped,
 //!   and anything else is undecided;
+//! - the **indirect** rule: a committed anchor two or more rounds later settles an
+//!   earlier slot by reachability;
 //! - causal history: a commit includes the leader's ancestors, each exactly once.
 //!
-//! What is **not** here, and must not be assumed: indirect commit through an
-//! anchor, waves or pipelining, a pacemaker, and any treatment of asynchrony. In
-//! particular, absence of a vote is never evidence: a leader is only skipped when
-//! a supermajority is *observed* not to reference it.
+//! What is **not** here, and must not be assumed: waves or pipelining, and any
+//! treatment of asynchrony. In particular, absence of a vote is never evidence: a
+//! leader is only skipped when a supermajority is *observed* not to reference it,
+//! when a committed anchor two or more rounds later does not reach it, or when
+//! `crate::Pacemaker` proves from an anchor that its vertex cannot exist. Driving
+//! rounds forward is the pacemaker's job, not this module's.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -33,13 +36,27 @@ pub enum Decision {
     Undecided,
 }
 
+/// A round whose leader this node has decided to skip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedRound {
+    /// The round whose leader was skipped.
+    pub round: u64,
+    /// The elected author of that round.
+    pub author: Vec<u8>,
+    /// Digest of the leader's vertex, or `None` when this node never received it.
+    ///
+    /// A missing digest matters: it records a skip argued from an anchor rather
+    /// than from the leader's own content.
+    pub digest: Option<[u8; 32]>,
+}
+
 /// Vertices this node holds, plus what it has already committed.
 pub struct Dag {
     set: ValidatorSet,
     vertices: BTreeMap<(u64, Vec<u8>), Vertex>,
     committed: HashSet<[u8; 32]>,
     order: Vec<VertexId>,
-    skipped: Vec<VertexId>,
+    skipped: Vec<SkippedRound>,
 }
 
 impl Dag {
@@ -129,16 +146,28 @@ impl Dag {
         self.vertices.get(&(round, author.to_vec()))
     }
 
-    /// The elected leader of `round`, if this node has it.
+    /// The elected author of `round`, whether or not this node holds their vertex.
     ///
     /// Election is `round % n` over the set order: deterministic and trivial on
     /// purpose. A real deployment wants a stake-weighted or VRF schedule, which is
     /// a different problem from the commit rule.
     #[must_use]
-    pub fn leader(&self, round: u64) -> Option<&Vertex> {
+    pub fn leader_author(&self, round: u64) -> Option<&[u8]> {
         let index = usize::try_from(round).ok()? % self.set.validators.len();
-        let author = &self.set.validators[index].validator_id;
+        Some(&self.set.validators[index].validator_id)
+    }
+
+    /// The elected leader of `round`, if this node has it.
+    #[must_use]
+    pub fn leader(&self, round: u64) -> Option<&Vertex> {
+        let author = self.leader_author(round)?;
         self.get(round, author)
+    }
+
+    /// The highest round this node holds any vertex for.
+    #[must_use]
+    pub fn highest_round(&self) -> Option<u64> {
+        self.vertices.keys().next_back().map(|(round, _)| *round)
     }
 
     /// Vertices in the round after `round` that this node holds.
@@ -179,6 +208,7 @@ impl Dag {
         // unknown, not against the leader, so it cannot produce a skip.
         let non_voters = candidates.len() - voters.len();
         if self.set.has_supermajority(non_voters) {
+            self.record_skip(round, leader_id.author.clone(), Some(leader_id.digest));
             return Ok(Decision::Skip);
         }
         Ok(Decision::Undecided)
@@ -197,16 +227,7 @@ impl Dag {
             let vertex = self
                 .vertices
                 .get(&(current.round, current.author.clone()))
-                .ok_or_else(|| {
-                    CryptoError::new(
-                        CryptoErrorKind::MissingReference,
-                        format!(
-                            "vertex {}@{} is referenced but not held",
-                            String::from_utf8_lossy(&current.author),
-                            current.round
-                        ),
-                    )
-                })?;
+                .ok_or_else(|| missing(&current))?;
             if self.committed.contains(&current.digest) {
                 continue;
             }
@@ -236,8 +257,64 @@ impl Dag {
 
     /// Slots this node has decided to skip, in decision order.
     #[must_use]
-    pub fn skipped(&self) -> &[VertexId] {
+    pub fn skipped(&self) -> &[SkippedRound] {
         &self.skipped
+    }
+
+    /// Records a skipped round.
+    ///
+    /// Returns whether the record is new. A round is skipped at most once, so a
+    /// second decision to skip it is a no-op.
+    pub(crate) fn record_skip(
+        &mut self,
+        round: u64,
+        author: Vec<u8>,
+        digest: Option<[u8; 32]>,
+    ) -> bool {
+        if self.skipped.iter().any(|entry| entry.round == round) {
+            return false;
+        }
+        self.skipped.push(SkippedRound {
+            round,
+            author,
+            digest,
+        });
+        true
+    }
+
+    /// Returns whether `anchor`'s causal history contains a vertex at
+    /// `(round, author)`.
+    ///
+    /// This answers a question about a vertex the node may not hold: an anchor can
+    /// prove that a leader exists without the node having received that leader, and
+    /// it can equally prove that no such leader can ever be committed.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoErrorKind::MissingReference`] when the walk reaches a vertex this
+    /// node does not hold, which means the answer is unknown rather than negative.
+    pub fn history_contains_author(
+        &self,
+        anchor: &VertexId,
+        round: u64,
+        author: &[u8],
+    ) -> Result<bool, CryptoError> {
+        let mut seen: HashSet<VertexId> = HashSet::new();
+        let mut stack = vec![anchor.clone()];
+        while let Some(current) = stack.pop() {
+            if current.round == round && current.author == author {
+                return Ok(true);
+            }
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            let vertex = self
+                .vertices
+                .get(&(current.round, current.author.clone()))
+                .ok_or_else(|| missing(&current))?;
+            stack.extend(vertex.references.iter().cloned());
+        }
+        Ok(false)
     }
 
     /// Returns whether `ancestor` is reachable from `descendant` through
@@ -264,16 +341,7 @@ impl Dag {
             let vertex = self
                 .vertices
                 .get(&(current.round, current.author.clone()))
-                .ok_or_else(|| {
-                    CryptoError::new(
-                        CryptoErrorKind::MissingReference,
-                        format!(
-                            "vertex {}@{} is referenced but not held",
-                            String::from_utf8_lossy(&current.author),
-                            current.round
-                        ),
-                    )
-                })?;
+                .ok_or_else(|| missing(&current))?;
             stack.extend(vertex.references.iter().cloned());
         }
         Ok(false)
@@ -293,9 +361,8 @@ impl Dag {
     ///   undecided.
     ///
     /// The skip half assumes the protocol rule that every vertex references a
-    /// supermajority of the previous round. This simulator does not enforce that
-    /// rule, so on an arbitrary DAG the argument does not hold — stated here rather
-    /// than hidden.
+    /// supermajority of the previous round. [`Dag::insert`] enforces that rule, so
+    /// the argument holds for any DAG this node accepted.
     ///
     /// # Errors
     ///
@@ -318,11 +385,21 @@ impl Dag {
             let history = self.commit_history(&leader_id)?;
             return Ok(Decision::Commit(history));
         }
-        if !self.skipped.contains(&leader_id) {
-            self.skipped.push(leader_id);
-        }
+        self.record_skip(round, leader_id.author.clone(), Some(leader_id.digest));
         Ok(Decision::Skip)
     }
+}
+
+/// The error for a vertex that is referenced but not held.
+fn missing(id: &VertexId) -> CryptoError {
+    CryptoError::new(
+        CryptoErrorKind::MissingReference,
+        format!(
+            "vertex {}@{} is referenced but not held",
+            String::from_utf8_lossy(&id.author),
+            id.round
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -734,5 +811,48 @@ mod tests {
         let fixture = fixture(4);
         assert_eq!(fixture.dag.set().validators.len(), 4);
         assert_eq!(fixture.dag.set().quorum_size(), 3);
+    }
+
+    #[test]
+    fn the_leader_author_is_known_without_holding_the_vertex() {
+        let fixture = fixture(4);
+        assert_eq!(fixture.dag.leader_author(1), Some(&b"val-1"[..]));
+        assert!(fixture.dag.leader(1).is_none());
+        assert_eq!(fixture.dag.highest_round(), None);
+    }
+
+    #[test]
+    fn an_anchor_history_answers_whether_it_contains_a_slot() {
+        let mut fixture = bootstrapped(4);
+        let votes = fixture.ids(LEADER_ROUND);
+        fixture.full_round(LEADER_ROUND + 1, &votes).unwrap();
+        fixture
+            .full_round(LEADER_ROUND + 2, &fixture.ids(LEADER_ROUND + 1))
+            .unwrap();
+        let anchor = fixture.dag.leader(LEADER_ROUND + 2).unwrap().id().unwrap();
+
+        // The anchor reaches every author of the round before it.
+        for author in 0..fixture.count() {
+            let id = format!("val-{author}");
+            assert!(
+                fixture
+                    .dag
+                    .history_contains_author(&anchor, LEADER_ROUND + 1, id.as_bytes())
+                    .unwrap()
+            );
+        }
+        // It does not reach a slot nobody authored, nor a round it never saw.
+        assert!(
+            !fixture
+                .dag
+                .history_contains_author(&anchor, LEADER_ROUND + 1, b"val-unknown")
+                .unwrap()
+        );
+        assert!(
+            !fixture
+                .dag
+                .history_contains_author(&anchor, LEADER_ROUND + 9, b"val-0")
+                .unwrap()
+        );
     }
 }

@@ -56,20 +56,26 @@ Done:
   rule — commit on a vote supermajority, skip on an observed non-vote
   supermajority, otherwise undecided — plus the indirect rule that resolves an
   earlier slot through a committed anchor.
+- `validator::pacemaker`: drives the decision cursor forward one round at a time.
+  Ticks are logical events, never wall-clock, so the same DAG plus the same tick
+  order always produces the same output. A timeout is reported, not acted on: it
+  means "request the vertices I am missing", never "decide without them". The
+  cursor can overtake a leader whose vertex never arrived by earning an anchor
+  from a later round, which is what makes an absent leader provably skippable.
 - `karsa node`: the same HTTP pipeline as the V node (decode, policy lookup,
   signature verification, per-sender replay protection) on axum, plus the
   validator schedule: `GET /validators`, `POST /validators/{id}/keys`
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 143 tests in the default workspace build (144 with `--all-features`),
-  including RFC 8032 vectors, ML-DSA-65 and SLH-DSA roundtrip and context
-  binding, deterministic signing, envelope and policy behaviour, validator
-  rotation, validator key registration over HTTP, certificate encoding and
-  quorum rejection, vertex encoding and vote tallying, the DAG direct and
-  indirect commit rules, batch-vs-individual verification equality, in-process
-  HTTP tests, and **byte-for-byte parity checks** against V for the signing
-  payloads and for a complete signed envelope.
+- 155 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+  and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
+  policy behaviour, validator rotation, validator key registration over HTTP,
+  certificate encoding and quorum rejection, vertex encoding and vote tallying,
+  the DAG direct and indirect commit rules, the deterministic pacemaker, and
+  batch-vs-individual verification equality, in-process HTTP tests, and
+  **byte-for-byte parity checks** against V for the signing payloads and for a
+  complete signed envelope.
 - `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors (the same result as
   the V prototype) and **14/14** NIST SLH-DSA-SHA2-128s sigVer vectors.
 

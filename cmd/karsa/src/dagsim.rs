@@ -11,7 +11,8 @@ use std::error::Error;
 use crypto::registry::ALG_ED25519;
 use crypto::scheme::Ed25519Scheme;
 use validator::{
-    Dag, Decision, NO_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet, Vertex, VertexId,
+    Dag, Decision, NO_EXPIRY, Pacemaker, PacemakerConfig, Step, ValidatorKey, ValidatorRecord,
+    ValidatorSet, Vertex, VertexId,
 };
 
 const CHAIN_ID: &[u8] = b"karsa-dagsim-1";
@@ -100,7 +101,20 @@ impl Sim {
         round: u64,
         references: &[VertexId],
     ) -> Result<(), crypto::CryptoError> {
+        self.fill_round_except(round, references, &[])
+    }
+
+    /// Inserts one vertex per validator except the listed authors.
+    fn fill_round_except(
+        &mut self,
+        round: u64,
+        references: &[VertexId],
+        absent: &[usize],
+    ) -> Result<(), crypto::CryptoError> {
         for author in 0..self.count() {
+            if absent.contains(&author) {
+                continue;
+            }
             let vertex = self.vertex(author, round, references.to_vec())?;
             self.insert(vertex)?;
         }
@@ -252,15 +266,118 @@ pub fn run(validators: usize) -> Result<(), Box<dyn Error>> {
     }
 
     println!();
+    println!("== Pacemaker: deciding rounds forward without a clock ==");
+    let scenarios = [
+        ("every round fills", 8u64, Vec::new()),
+        (
+            "leader of round 5 absent",
+            8u64,
+            vec![(5u64, usize::try_from(5u64).unwrap_or(0) % validators)],
+        ),
+        ("nothing arrives after genesis", 0u64, Vec::new()),
+    ];
+    println!("  ticks per scenario: 5, timeout 3 ticks, anchor must be 2 rounds ahead");
+    println!();
+    println!(
+        "  {}  {}  {}  {}  {}  detail",
+        pad("scenario", 30),
+        pad("cursor", 7),
+        pad("commits", 8),
+        pad("skips", 6),
+        pad("timeouts", 9)
+    );
+    for (label, upto, absent) in &scenarios {
+        let run = pacemaker_run(validators, *upto, absent, 5)?;
+        println!(
+            "  {}  {}  {}  {}  {}  {}",
+            pad(label, 30),
+            pad(&run.cursor.to_string(), 7),
+            pad(&run.commits.to_string(), 8),
+            pad(&run.skips.to_string(), 6),
+            pad(&run.timeouts.to_string(), 9),
+            run.detail
+        );
+    }
+
+    println!();
     println!(
         "  deterministic: {} (same input, same decision)",
         all_vote(validators)?.decision == all_vote(validators)?.decision
     );
     println!();
-    println!("  Not modelled: waves or pipelining, a pacemaker, asynchrony, networking,");
-    println!("  and execution.");
+    println!("  Not modelled: waves or pipelining, asynchrony, networking, and execution.");
 
     Ok(())
+}
+
+/// One pacemaker run, summarised.
+struct PacemakerOutcome {
+    cursor: u64,
+    commits: usize,
+    skips: usize,
+    timeouts: u64,
+    detail: String,
+}
+
+/// Builds rounds `0..=upto`, omitting the listed `(round, author)` pairs, then
+/// drives the pacemaker for a fixed number of logical ticks.
+fn pacemaker_run(
+    validators: usize,
+    upto: u64,
+    absent: &[(u64, usize)],
+    ticks: usize,
+) -> Result<PacemakerOutcome, Box<dyn Error>> {
+    let mut sim = Sim::new(validators)?;
+    for round in 0..=upto {
+        let references = if round == 0 {
+            Vec::new()
+        } else {
+            sim.ids(round - 1)
+        };
+        let skip: Vec<usize> = absent
+            .iter()
+            .filter(|(at, _)| *at == round)
+            .map(|(_, author)| *author)
+            .collect();
+        sim.fill_round_except(round, &references, &skip)?;
+    }
+
+    let mut pacemaker = Pacemaker::new(PacemakerConfig { timeout_ticks: 3 }, LEADER_ROUND);
+    let mut commits = 0usize;
+    let mut skips = 0usize;
+    for _ in 0..ticks {
+        if let Step::Advanced {
+            commits: new_commits,
+            skips: new_skips,
+            ..
+        } = pacemaker.tick(&mut sim.dag)?
+        {
+            commits += new_commits;
+            skips += new_skips;
+        }
+    }
+
+    let detail = match sim.dag.skipped().first() {
+        Some(skipped) => format!(
+            "skipped {}@{} (vertex never received: {})",
+            String::from_utf8_lossy(&skipped.author),
+            skipped.round,
+            skipped.digest.is_none()
+        ),
+        None => format!(
+            "{} rounds held, {} committed",
+            sim.dag.highest_round().map_or(0, |round| round + 1),
+            sim.dag.order().len()
+        ),
+    };
+
+    Ok(PacemakerOutcome {
+        cursor: pacemaker.cursor(),
+        commits,
+        skips,
+        timeouts: pacemaker.timeouts(),
+        detail,
+    })
 }
 
 fn all_vote(validators: usize) -> Result<Outcome, Box<dyn Error>> {
