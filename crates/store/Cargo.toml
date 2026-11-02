@@ -1,0 +1,15 @@
+[package]
+name = "store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Karsa append-only on-disk state for vertices, batches, and roots"
+
+[dependencies]
+crypto = { path = "../crypto" }
+tx = { path = "../tx" }
+validator = { path = "../validator" }
+
+[lints]
+workspace = true

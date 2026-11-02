@@ -6,6 +6,7 @@ members = [
     "crates/exec",
     "crates/validator",
     "crates/net",
+    "crates/store",
     "cmd/karsa",
 ]
 

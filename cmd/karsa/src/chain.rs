@@ -35,17 +35,17 @@ const FEE: u64 = 1;
 const GENESIS_BALANCE: u64 = 1_000;
 
 /// One validator's consensus key.
-struct Consensus {
-    id: Vec<u8>,
-    private_key: Vec<u8>,
+pub(crate) struct Consensus {
+    pub(crate) id: Vec<u8>,
+    pub(crate) private_key: Vec<u8>,
 }
 
 /// One account: its transfer key and the policy that guards it.
-struct Account {
-    id: Vec<u8>,
-    private_key: Vec<u8>,
-    key_id: Vec<u8>,
-    policy: AuthPolicy,
+pub(crate) struct Account {
+    pub(crate) id: Vec<u8>,
+    pub(crate) private_key: Vec<u8>,
+    pub(crate) key_id: Vec<u8>,
+    pub(crate) policy: AuthPolicy,
 }
 
 /// A deterministic Ed25519 keypair from a single seed byte.
@@ -58,7 +58,9 @@ fn keypair(seed: u8) -> Result<(Vec<u8>, Vec<u8>), crypto::CryptoError> {
     Ok((public_key.to_vec(), private_key))
 }
 
-fn consensus_set(count: usize) -> Result<(ValidatorSet, Vec<Consensus>), crypto::CryptoError> {
+pub(crate) fn consensus_set(
+    count: usize,
+) -> Result<(ValidatorSet, Vec<Consensus>), crypto::CryptoError> {
     let mut validators = Vec::with_capacity(count);
     let mut keys = Vec::with_capacity(count);
     for index in 0..count {
@@ -84,7 +86,7 @@ fn consensus_set(count: usize) -> Result<(ValidatorSet, Vec<Consensus>), crypto:
     Ok((set, keys))
 }
 
-fn accounts(count: usize) -> Result<Vec<Account>, crypto::CryptoError> {
+pub(crate) fn accounts(count: usize) -> Result<Vec<Account>, crypto::CryptoError> {
     const NAMES: [&str; 4] = ["alice", "bob", "carol", "dave"];
     let mut accounts = Vec::with_capacity(count);
     for index in 0..count {
@@ -165,7 +167,7 @@ fn certify(consensus: &[Consensus], header: &Header) -> Result<Certificate, Box<
 }
 
 /// One data round, summarised.
-struct RoundReport {
+pub(crate) struct RoundReport {
     round: u64,
     transactions: usize,
     /// Distinct batch digests proposed in this round.
@@ -173,23 +175,23 @@ struct RoundReport {
 }
 
 /// Everything the command prints, computed fresh each run.
-struct Report {
-    rounds: Vec<RoundReport>,
-    committed_vertices: usize,
-    applied: usize,
-    rejected: BTreeMap<&'static str, usize>,
-    balances: BTreeMap<Vec<u8>, u64>,
-    burned: u64,
-    root: [u8; 32],
-    proof: exec::AccountProof,
-    headers: Vec<HeaderView>,
-    head: Header,
-    signed_headers: usize,
-    commit_proof: Option<(u64, CommitProof)>,
+pub(crate) struct Report {
+    pub(crate) rounds: Vec<RoundReport>,
+    pub(crate) committed_vertices: usize,
+    pub(crate) applied: usize,
+    pub(crate) rejected: BTreeMap<&'static str, usize>,
+    pub(crate) balances: BTreeMap<Vec<u8>, u64>,
+    pub(crate) burned: u64,
+    pub(crate) root: [u8; 32],
+    pub(crate) proof: exec::AccountProof,
+    pub(crate) headers: Vec<HeaderView>,
+    pub(crate) head: Header,
+    pub(crate) signed_headers: usize,
+    pub(crate) commit_proof: Option<(u64, CommitProof)>,
 }
 
 /// One row of the header table.
-struct HeaderView {
+pub(crate) struct HeaderView {
     height: u64,
     round: u64,
     applied: u64,
@@ -198,14 +200,20 @@ struct HeaderView {
     dag_root: [u8; 32],
 }
 
-fn simulate(validators: usize, data_rounds: u64) -> Result<Report, Box<dyn Error>> {
+/// Everything one simulated run produced, including the parts `karsa persist`
+/// needs to save and replay.
+pub(crate) struct Simulation {
+    pub(crate) dag: Dag,
+    pub(crate) batches: HashMap<[u8; 32], Batch>,
+    pub(crate) state: State,
+    pub(crate) report: Report,
+}
+
+pub(crate) fn simulate(validators: usize, data_rounds: u64) -> Result<Simulation, Box<dyn Error>> {
     let (set, consensus) = consensus_set(validators)?;
     let accounts = accounts(validators)?;
 
-    let mut state = State::new();
-    for account in &accounts {
-        state.credit(&account.id, GENESIS_BALANCE)?;
-    }
+    let mut state = genesis_state(&accounts)?;
 
     let mut dag = Dag::new(set.clone());
     let mut batches: HashMap<[u8; 32], Batch> = HashMap::new();
@@ -323,33 +331,7 @@ fn simulate(validators: usize, data_rounds: u64) -> Result<Report, Box<dyn Error
                 continue;
             };
 
-            // Authorization happens before execution, so an unsigned or mis-signed
-            // transaction is dropped instead of reaching the state machine.
-            let mut authorized = Vec::with_capacity(batch.len());
-            for transaction in &batch.transactions {
-                let policy = accounts
-                    .iter()
-                    .find(|account| account.id == transaction.sender)
-                    .map(|account| &account.policy);
-                match policy {
-                    None => {
-                        *rejected
-                            .entry(RejectReason::UnknownSender.as_str())
-                            .or_insert(0) += 1
-                    }
-                    Some(policy) if transaction.verify(policy, NOW).is_err() => {
-                        *rejected.entry("unauthorized").or_insert(0) += 1;
-                    }
-                    Some(_) => authorized.push(transaction.clone()),
-                }
-            }
-
-            for outcome in state.apply(&Batch::new(authorized)) {
-                match outcome.reason() {
-                    None => applied += 1,
-                    Some(reason) => *rejected.entry(reason.as_str()).or_insert(0) += 1,
-                }
-            }
+            applied += apply_batch(&mut state, &accounts, batch, &mut rejected);
         }
 
         // Round 0 is genesis and is already covered by the genesis header, so it
@@ -405,7 +387,7 @@ fn simulate(validators: usize, data_rounds: u64) -> Result<Report, Box<dyn Error
         .proof(&first_account)
         .ok_or("the state has no account to prove")?;
 
-    Ok(Report {
+    let report = Report {
         rounds,
         committed_vertices: order.len(),
         applied,
@@ -418,7 +400,61 @@ fn simulate(validators: usize, data_rounds: u64) -> Result<Report, Box<dyn Error
         head,
         signed_headers,
         commit_proof,
+    };
+    Ok(Simulation {
+        dag,
+        batches,
+        state,
+        report,
     })
+}
+
+/// The account state before any transaction: every account at its genesis balance.
+pub(crate) fn genesis_state(accounts: &[Account]) -> Result<State, exec::ExecError> {
+    let mut state = State::new();
+    for account in accounts {
+        state.credit(&account.id, GENESIS_BALANCE)?;
+    }
+    Ok(state)
+}
+
+/// Authorizes one transaction, then applies the authorized ones to `state`.
+///
+/// Shared by the simulator and the replay path: authorization is part of
+/// execution, and two copies of this logic would be two chances to disagree.
+pub(crate) fn apply_batch(
+    state: &mut State,
+    accounts: &[Account],
+    batch: &Batch,
+    rejected: &mut BTreeMap<&'static str, usize>,
+) -> usize {
+    let mut authorized = Vec::with_capacity(batch.len());
+    for transaction in &batch.transactions {
+        let policy = accounts
+            .iter()
+            .find(|account| account.id == transaction.sender)
+            .map(|account| &account.policy);
+        match policy {
+            None => {
+                *rejected
+                    .entry(RejectReason::UnknownSender.as_str())
+                    .or_insert(0) += 1
+            }
+            Some(policy) if transaction.verify(policy, NOW).is_err() => {
+                *rejected.entry("unauthorized").or_insert(0) += 1;
+            }
+            Some(_) => authorized.push(transaction.clone()),
+        }
+    }
+
+    let mut applied = 0usize;
+    for outcome in state.apply(&Batch::new(authorized)) {
+        match outcome.reason() {
+            None => applied += 1,
+            Some(reason) => *rejected.entry(reason.as_str()).or_insert(0) += 1,
+        }
+    }
+    applied
 }
 
 fn pad(value: &str, width: usize) -> String {
@@ -438,7 +474,8 @@ pub fn run(validators: usize, data_rounds: u64) -> Result<(), Box<dyn Error>> {
     }
 
     let first = simulate(validators, data_rounds)?;
-    let second = simulate(validators, data_rounds)?;
+    let second = simulate(validators, data_rounds)?.report;
+    let first = first.report;
 
     println!("== Karsa chain: order, then execute ==");
     println!("  chain:        {}", String::from_utf8_lossy(CHAIN_ID));

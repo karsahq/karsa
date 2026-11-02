@@ -12,6 +12,7 @@
 //! karsa dagsim                     run the DAG commit rule on fixed scenarios
 //! karsa chain                      order and execute a small chain end to end
 //! karsa net                        exchange vertices between nodes and check convergence
+//! karsa persist                    save, drop, reopen, and replay a node's state
 //! karsa bandwidth                  model per-node dissemination bandwidth
 //! karsa dagbench                   measure DAG certificate and header cost
 //! karsa loadtest [count] [conc]    drive the node and report tx/s
@@ -27,6 +28,7 @@ mod demo;
 mod loadtest;
 mod netrun;
 mod node;
+mod persist;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -71,6 +73,18 @@ enum Command {
     },
     /// Order and execute a small chain end to end.
     Chain {
+        /// Validators in the simulated committee (at least 4).
+        #[arg(default_value_t = 4)]
+        validators: usize,
+        /// Rounds that carry transactions.
+        #[arg(long, default_value_t = 4)]
+        rounds: u64,
+    },
+    /// Save, drop, reopen, and replay a node's state, then compare the roots.
+    Persist {
+        /// Directory the store is written to.
+        #[arg(long, default_value = "karsa-store")]
+        path: PathBuf,
         /// Validators in the simulated committee (at least 4).
         #[arg(default_value_t = 4)]
         validators: usize,
@@ -141,6 +155,11 @@ fn main() -> ExitCode {
             jitter,
             crashed,
         } => netrun::run(validators, jitter, crashed),
+        Command::Persist {
+            path,
+            validators,
+            rounds,
+        } => persist::run(path, validators, rounds),
         Command::Bandwidth {
             validators,
             tps,

@@ -1,0 +1,427 @@
+//! Append-only on-disk state for a validator node.
+//!
+//! A node that forgets everything on restart is a demo, not a node. This crate
+//! persists the three things a validator cannot recompute on its own — the
+//! vertices it received, the batches those vertices name, and the roots it last
+//! reported — and nothing else. Everything derived is replayed on open, so a
+//! restart is a replay that either reproduces the same roots or reports a
+//! disagreement rather than silently serving a different chain.
+//!
+//! # Crash safety
+//!
+//! Each log is a sequence of `u32 len || payload` records. On open, a record that
+//! is *incomplete* — fewer than four bytes for a length, or fewer bytes than the
+//! length claims — is treated as a torn tail and ignored, because that is exactly
+//! what a crash during an append leaves behind. A record that is complete but does
+//! not decode is a different thing: that is corruption, and it is an error. The
+//! two cases are deliberately not conflated.
+//!
+//! Nothing here fsyncs on every append: durability of the last record is the
+//! caller's tradeoff, and `Store::sync` exists for callers that want it.
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+use crypto::CryptoError;
+use tx::batch::Batch;
+use validator::Vertex;
+
+/// Where the last reported roots are kept.
+const ROOTS_FILE: &str = "roots";
+/// The vertex log.
+const VERTICES_FILE: &str = "vertices.log";
+/// The batch log.
+const BATCHES_FILE: &str = "batches.log";
+/// Version of the roots record.
+const ROOTS_VERSION: u16 = 1;
+
+/// A failure reading or writing the store.
+#[derive(Debug)]
+pub enum StoreError {
+    /// The filesystem refused an operation.
+    Io(std::io::Error),
+    /// A complete record did not decode.
+    Decode(CryptoError),
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "store io: {error}"),
+            Self::Decode(error) => write!(f, "store decode: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Decode(error) => Some(error),
+        }
+    }
+}
+
+impl From<std::io::Error> for StoreError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<CryptoError> for StoreError {
+    fn from(error: CryptoError) -> Self {
+        Self::Decode(error)
+    }
+}
+
+/// The two roots a node last reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Roots {
+    /// Merkle root over the committed sequence.
+    pub commit_root: [u8; 32],
+    /// Merkle root over the account state.
+    pub state_root: [u8; 32],
+}
+
+/// A directory holding a node's append-only state.
+#[derive(Debug, Clone)]
+pub struct Store {
+    root: PathBuf,
+}
+
+impl Store {
+    /// Opens (and creates) a store directory.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] when the directory cannot be created.
+    pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let root = root.as_ref().to_path_buf();
+        fs::create_dir_all(&root)?;
+        Ok(Self { root })
+    }
+
+    /// The directory this store writes to.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    fn path_of(&self, name: &str) -> PathBuf {
+        self.root.join(name)
+    }
+
+    /// Flushes both logs to the operating system.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] when a file cannot be opened or synced.
+    pub fn sync(&self) -> Result<(), StoreError> {
+        for name in [VERTICES_FILE, BATCHES_FILE] {
+            let path = self.path_of(name);
+            if path.exists() {
+                OpenOptions::new().append(true).open(&path)?.sync_all()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends one vertex.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on write failure, [`StoreError::Decode`] when the vertex
+    /// cannot be encoded.
+    pub fn append_vertex(&self, vertex: &Vertex) -> Result<(), StoreError> {
+        append_record(&self.path_of(VERTICES_FILE), &vertex.encode()?)?;
+        Ok(())
+    }
+
+    /// Reads every complete vertex record, in append order.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on read failure, [`StoreError::Decode`] when a complete
+    /// record does not decode.
+    pub fn vertices(&self) -> Result<Vec<Vertex>, StoreError> {
+        read_records(&self.path_of(VERTICES_FILE), Vertex::decode)
+    }
+
+    /// Appends one batch. Appending the same batch twice is harmless on read.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on write failure, [`StoreError::Decode`] when the batch
+    /// cannot be encoded.
+    pub fn put_batch(&self, batch: &Batch) -> Result<(), StoreError> {
+        append_record(&self.path_of(BATCHES_FILE), &batch.encode()?)?;
+        Ok(())
+    }
+
+    /// Reads every stored batch, deduplicated by digest, in first-append order.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on read failure, [`StoreError::Decode`] when a complete
+    /// record does not decode.
+    pub fn batches(&self) -> Result<Vec<Batch>, StoreError> {
+        let records: Vec<Batch> = read_records(&self.path_of(BATCHES_FILE), Batch::decode)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut unique = Vec::with_capacity(records.len());
+        for batch in records {
+            if seen.insert(batch.digest()?) {
+                unique.push(batch);
+            }
+        }
+        Ok(unique)
+    }
+
+    /// Writes the roots a node last reported, replacing any previous value.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on write failure.
+    pub fn put_roots(&self, roots: Roots) -> Result<(), StoreError> {
+        let mut record = Vec::with_capacity(68);
+        record.extend_from_slice(&ROOTS_VERSION.to_le_bytes());
+        record.extend_from_slice(&roots.commit_root);
+        record.extend_from_slice(&roots.state_root);
+
+        let path = self.path_of(ROOTS_FILE);
+        let temporary = self.path_of("roots.tmp");
+        {
+            let mut file = File::create(&temporary)?;
+            file.write_all(&record)?;
+        }
+        // Rename is atomic on the platforms this experiment targets, so a crash
+        // leaves either the old roots or the new ones, never a half-written file.
+        fs::rename(&temporary, &path)?;
+        Ok(())
+    }
+
+    /// Reads the last reported roots, if any were ever written.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on read failure.
+    pub fn roots(&self) -> Result<Option<Roots>, StoreError> {
+        let path = self.path_of(ROOTS_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let record = fs::read(&path)?;
+        if record.len() < 2 + 64 {
+            return Err(StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::TruncatedInput,
+                "roots record is shorter than its header",
+            )));
+        }
+        let version = u16::from_le_bytes([record[0], record[1]]);
+        if version != ROOTS_VERSION {
+            return Err(StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::MalformedCertificate,
+                format!("unsupported roots version {version}"),
+            )));
+        }
+        let mut commit_root = [0u8; 32];
+        commit_root.copy_from_slice(&record[2..34]);
+        let mut state_root = [0u8; 32];
+        state_root.copy_from_slice(&record[34..66]);
+        Ok(Some(Roots {
+            commit_root,
+            state_root,
+        }))
+    }
+}
+
+fn append_record(path: &Path, payload: &[u8]) -> Result<(), StoreError> {
+    let length = u32::try_from(payload.len()).map_err(|_| {
+        StoreError::Decode(CryptoError::new(
+            crypto::CryptoErrorKind::FieldTooLong,
+            "record does not fit a u32 length",
+        ))
+    })?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(&length.to_le_bytes())?;
+    file.write_all(payload)?;
+    Ok(())
+}
+
+/// Reads length-prefixed records, ignoring a torn tail.
+fn read_records<T>(
+    path: &Path,
+    decode: impl Fn(&[u8]) -> Result<T, CryptoError>,
+) -> Result<Vec<T>, StoreError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut bytes = Vec::new();
+    File::open(path)?.read_to_end(&mut bytes)?;
+
+    let mut records = Vec::new();
+    let mut cursor = 0usize;
+    while cursor + 4 <= bytes.len() {
+        let length = u32::from_le_bytes([
+            bytes[cursor],
+            bytes[cursor + 1],
+            bytes[cursor + 2],
+            bytes[cursor + 3],
+        ]) as usize;
+        let start = cursor + 4;
+        // A record the writer never finished is a torn tail, not corruption.
+        let Some(end) = start.checked_add(length) else {
+            break;
+        };
+        if end > bytes.len() {
+            break;
+        }
+        records.push(decode(&bytes[start..end])?);
+        cursor = end;
+    }
+    Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tx::envelope::{PROTOCOL_VERSION_V1, Transaction};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A per-test directory, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let unique = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path =
+                std::env::temp_dir().join(format!("karsa-store-{}-{unique}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn batch(sequence: u64) -> Batch {
+        Batch::new(vec![Transaction {
+            protocol_version: PROTOCOL_VERSION_V1,
+            chain_id: b"karsa-store-1".to_vec(),
+            sender: b"alice".to_vec(),
+            sequence,
+            fee: 1,
+            expiration: 100,
+            policy_version: 1,
+            payload: vec![sequence as u8],
+            authorization: Vec::new(),
+        }])
+    }
+
+    #[test]
+    fn an_empty_store_reads_back_empty() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        assert!(store.vertices().unwrap().is_empty());
+        assert!(store.batches().unwrap().is_empty());
+        assert_eq!(store.roots().unwrap(), None);
+    }
+
+    #[test]
+    fn batches_round_trip_and_deduplicate() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        store.put_batch(&batch(1)).unwrap();
+        store.put_batch(&batch(2)).unwrap();
+        store.put_batch(&batch(1)).unwrap();
+
+        let read = store.batches().unwrap();
+        assert_eq!(read.len(), 2, "the repeated batch is stored once");
+        assert_eq!(read[0], batch(1));
+        assert_eq!(read[1], batch(2));
+    }
+
+    #[test]
+    fn appended_data_survives_reopening() {
+        let dir = TempDir::new();
+        {
+            let store = Store::open(&dir.0).unwrap();
+            store.put_batch(&batch(7)).unwrap();
+            store
+                .put_roots(Roots {
+                    commit_root: [1u8; 32],
+                    state_root: [2u8; 32],
+                })
+                .unwrap();
+        }
+
+        let store = Store::open(&dir.0).unwrap();
+        assert_eq!(store.batches().unwrap(), vec![batch(7)]);
+        assert_eq!(
+            store.roots().unwrap(),
+            Some(Roots {
+                commit_root: [1u8; 32],
+                state_root: [2u8; 32],
+            })
+        );
+    }
+
+    #[test]
+    fn a_torn_tail_is_ignored_not_reported() {
+        let dir = TempDir::new();
+        {
+            let store = Store::open(&dir.0).unwrap();
+            store.put_batch(&batch(1)).unwrap();
+            store.put_batch(&batch(2)).unwrap();
+        }
+
+        // Cut the last record in half, as a crash mid-append would.
+        let path = dir.0.join(BATCHES_FILE);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.truncate(bytes.len() - 3);
+        fs::write(&path, &bytes).unwrap();
+
+        let store = Store::open(&dir.0).unwrap();
+        assert_eq!(
+            store.batches().unwrap(),
+            vec![batch(1)],
+            "the incomplete record is invisible and the rest survives"
+        );
+    }
+
+    #[test]
+    fn a_complete_but_corrupt_record_is_an_error() {
+        let dir = TempDir::new();
+        {
+            let store = Store::open(&dir.0).unwrap();
+            store.put_batch(&batch(1)).unwrap();
+        }
+
+        let path = dir.0.join(BATCHES_FILE);
+        let mut bytes = fs::read(&path).unwrap();
+        // Flip a payload byte, keeping the record's length intact.
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        let store = Store::open(&dir.0).unwrap();
+        assert!(matches!(store.batches(), Err(StoreError::Decode(_))));
+    }
+
+    #[test]
+    fn the_roots_record_rejects_an_unknown_version() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let mut record = vec![9u8, 9u8];
+        record.extend_from_slice(&[0u8; 64]);
+        fs::write(dir.0.join(ROOTS_FILE), record).unwrap();
+
+        assert!(matches!(store.roots(), Err(StoreError::Decode(_))));
+    }
+}

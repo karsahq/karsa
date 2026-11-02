@@ -609,6 +609,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "store",
  "tokio",
  "tower",
  "tx",
@@ -1017,6 +1018,15 @@ checksum = "7ef958a98b9d5da290cfc78946e9f3e61e1e62a18db0d92cac0b83cc161491a9"
 dependencies = [
  "base64ct",
  "der 0.8.3",
+]
+
+[[package]]
+name = "store"
+version = "0.1.0"
+dependencies = [
+ "crypto",
+ "tx",
+ "validator",
 ]
 
 [[package]]
