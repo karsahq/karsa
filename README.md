@@ -71,24 +71,32 @@ Done:
   proofs let a client holding only the root read one balance without trusting the
   node that served it; odd nodes are promoted rather than duplicated, so two
   account sets cannot share a root.
+- `validator::header`: committed-state headers and the finality certificate that
+  names them. The header id is a domain-separated hash, and the certificate is the
+  existing vote payload over that id — `n` signatures once per **commit**, not once
+  per round, which is what makes it affordable where a per-round certificate was
+  not. `HeaderChain` is the verifier a light client runs: it needs no DAG, no
+  transactions, and no account state.
 - `karsa chain`: order and execute a small chain end to end — sign, batch, name by
-  vertex, commit through the DAG and the pacemaker, then apply — and check the
-  conservation invariant, the determinism of the state root, and a Merkle inclusion
-  proof against that root on every run.
+  vertex, commit through the DAG and the pacemaker, apply, certify one header per
+  committed round, verify the header chain the way a light client would, and check
+  a Merkle inclusion proof against the certified root. The conservation invariant
+  and the determinism of the state root are checked on every run.
 - `karsa node`: the same HTTP pipeline as the V node (decode, policy lookup,
   signature verification, per-sender replay protection) on axum, plus the
   validator schedule: `GET /validators`, `POST /validators/{id}/keys`
   (authorized by an existing active key), and `POST /epoch`.
 - `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
   the numbers are directly comparable.
-- 186 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 193 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
   the DAG direct and indirect commit rules, the deterministic pacemaker, batch
   encoding, the account state machine, Merkle inclusion and malleability
-  properties, in-process HTTP tests, and **byte-for-byte parity checks** against V
-  for the signing payloads and for a complete signed envelope.
+  properties, header finality and replay refusal, in-process HTTP tests, and
+  **byte-for-byte parity checks** against V for the signing payloads and for a
+  complete signed envelope.
 - `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors (the same result as
   the V prototype) and **14/14** NIST SLH-DSA-SHA2-128s sigVer vectors.
 

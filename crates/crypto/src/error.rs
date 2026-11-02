@@ -72,6 +72,8 @@ pub enum CryptoErrorKind {
     MissingReference = 25,
     /// A vertex does not carry the references its round requires.
     InvalidVertex = 26,
+    /// A header does not extend the header this node already trusts.
+    HeaderMismatch = 27,
 }
 
 impl CryptoErrorKind {
@@ -112,6 +114,7 @@ impl CryptoErrorKind {
             Self::MalformedCertificate => "malformed_certificate",
             Self::MissingReference => "missing_reference",
             Self::InvalidVertex => "invalid_vertex",
+            Self::HeaderMismatch => "header_mismatch",
         }
     }
 }
@@ -188,6 +191,7 @@ mod tests {
         assert_eq!(CryptoErrorKind::MalformedCertificate.code(), 24);
         assert_eq!(CryptoErrorKind::MissingReference.code(), 25);
         assert_eq!(CryptoErrorKind::InvalidVertex.code(), 26);
+        assert_eq!(CryptoErrorKind::HeaderMismatch.code(), 27);
     }
 
     #[test]

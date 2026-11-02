@@ -19,6 +19,8 @@ pub const DOMAIN_IBC_CLIENT_V1: &str = "KARSA/IBC/CLIENT/v1";
 pub const DOMAIN_VALIDATOR_KEY_V1: &str = "KARSA/VALIDATOR/KEY/v1";
 /// DAG vertex payload domain: one signature per vertex.
 pub const DOMAIN_VERTEX_V1: &str = "KARSA/DAG/VERTEX/v1";
+/// Committed-state header domain: the object a finality certificate names.
+pub const DOMAIN_HEADER_V1: &str = "KARSA/HEADER/v1";
 
 /// The values a transaction signature authorizes.
 ///
@@ -129,6 +131,31 @@ pub struct VertexSigningFields<'a> {
     pub references: &'a [VertexRefFields<'a>],
 }
 
+/// The committed state a header names.
+///
+/// A header is not signed directly. It is identified by the hash of this payload,
+/// and a finality certificate is a quorum signature over that identifier. The
+/// domain tag is what keeps a header identifier from colliding with a vertex
+/// identifier, so a certificate over one can never be read as a certificate over
+/// the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderFields<'a> {
+    /// Chain identifier.
+    pub chain_id: &'a [u8],
+    /// Epoch the header was produced in.
+    pub epoch: u64,
+    /// Monotone height, starting at 0 for the genesis header.
+    pub height: u64,
+    /// DAG round whose commits this header covers.
+    pub round: u64,
+    /// Merkle root of the account state.
+    pub state_root: &'a [u8],
+    /// Identifier of the previous header, all zero at genesis.
+    pub previous: &'a [u8],
+    /// Cumulative number of transactions applied at this height.
+    pub applied: u64,
+}
+
 /// Prefixes an already-canonical body with a length-prefixed domain tag.
 fn wrap_domain(domain: &str, body: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let mut encoder = Encoder::with_capacity(domain.len() + body.len() + 8);
@@ -232,6 +259,23 @@ pub fn encode_vertex_signing_payload(
         body.put_bytes(reference.digest)?;
     }
     wrap_domain(DOMAIN_VERTEX_V1, body.as_slice())
+}
+
+/// Builds the bytes whose hash identifies a committed-state header.
+///
+/// # Errors
+///
+/// Returns an error only when a field exceeds the encoding limit.
+pub fn encode_header_payload(fields: &HeaderFields<'_>) -> Result<Vec<u8>, CryptoError> {
+    let mut body = Encoder::with_capacity(96 + fields.chain_id.len());
+    body.put_bytes(fields.chain_id)?;
+    body.put_u64(fields.epoch);
+    body.put_u64(fields.height);
+    body.put_u64(fields.round);
+    body.put_bytes(fields.state_root)?;
+    body.put_bytes(fields.previous)?;
+    body.put_u64(fields.applied);
+    wrap_domain(DOMAIN_HEADER_V1, body.as_slice())
 }
 
 #[cfg(test)]

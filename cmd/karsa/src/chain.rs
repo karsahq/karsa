@@ -24,7 +24,8 @@ use tx::batch::Batch;
 use tx::envelope::{PROTOCOL_VERSION_V1, Transaction};
 use tx::policy::{AuthKey, AuthPolicy, AuthPolicyKind, Authorization, KeyStatus};
 use validator::{
-    Dag, NO_EXPIRY, Pacemaker, PacemakerConfig, ValidatorKey, ValidatorRecord, ValidatorSet, Vertex,
+    Certificate, Dag, Header, HeaderChain, NO_EXPIRY, Pacemaker, PacemakerConfig, ValidatorKey,
+    ValidatorRecord, ValidatorSet, Vertex, bitmap_of,
 };
 
 const CHAIN_ID: &[u8] = b"karsa-chain-1";
@@ -142,6 +143,27 @@ fn signed_transaction(
     Ok(transaction)
 }
 
+/// Signs `header` with a quorum of the consensus keys.
+fn certify(consensus: &[Consensus], header: &Header) -> Result<Certificate, Box<dyn Error>> {
+    let quorum = consensus.len() * 2 / 3 + 1;
+    let mut certificate = Certificate {
+        chain_id: header.chain_id.clone(),
+        epoch: header.epoch,
+        round: header.round,
+        vertex_id: header.id()?.to_vec(),
+        validator_set_id: b"karsa-chain-1/epoch-1".to_vec(),
+        signer_bitmap: bitmap_of(consensus.len(), quorum),
+        signatures: Vec::new(),
+    };
+    let payload = certificate.signing_payload()?;
+    certificate.signatures = consensus
+        .iter()
+        .take(quorum)
+        .map(|validator| Ed25519Scheme.sign(&validator.private_key, &payload))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(certificate)
+}
+
 /// One data round, summarised.
 struct RoundReport {
     round: u64,
@@ -160,6 +182,18 @@ struct Report {
     burned: u64,
     root: [u8; 32],
     proof: exec::AccountProof,
+    headers: Vec<HeaderView>,
+    head: Header,
+    signed_headers: usize,
+}
+
+/// One row of the header table.
+struct HeaderView {
+    height: u64,
+    round: u64,
+    applied: u64,
+    signers: usize,
+    state_root: [u8; 32],
 }
 
 fn simulate(validators: usize, data_rounds: u64) -> Result<Report, Box<dyn Error>> {
@@ -246,45 +280,97 @@ fn simulate(validators: usize, data_rounds: u64) -> Result<Report, Box<dyn Error
         pacemaker.tick(&mut dag)?;
     }
 
-    // Execute in commit order. The DAG decides the order; this loop only follows it.
+    // Execute in commit order, one header per committed round. The DAG decides the
+    // order; these loops only follow it.
+    let genesis_header = Header::genesis(CHAIN_ID.to_vec(), EPOCH, state.state_root());
+    let mut chain = HeaderChain::new(set.clone(), genesis_header.clone());
+
     let mut applied = 0usize;
     let mut rejected: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut headers = vec![HeaderView {
+        height: 0,
+        round: 0,
+        applied: 0,
+        signers: 0,
+        state_root: genesis_header.state_root,
+    }];
+    let mut head = genesis_header;
+    let mut signed_headers = 0usize;
+
     let order = dag.order().to_vec();
-    for id in &order {
-        let Some(vertex) = dag.get(id.round, &id.author) else {
-            continue;
-        };
-        let Some(batch) = batches.get(&vertex.payload_hash) else {
-            continue;
-        };
+    let mut cursor = 0usize;
+    while cursor < order.len() {
+        let round = order[cursor].round;
+        let start = cursor;
+        while cursor < order.len() && order[cursor].round == round {
+            cursor += 1;
+        }
 
-        // Authorization happens before execution, so an unsigned or mis-signed
-        // transaction is dropped instead of reaching the state machine.
-        let mut authorized = Vec::with_capacity(batch.len());
-        for transaction in &batch.transactions {
-            let policy = accounts
-                .iter()
-                .find(|account| account.id == transaction.sender)
-                .map(|account| &account.policy);
-            match policy {
-                None => {
-                    *rejected
-                        .entry(RejectReason::UnknownSender.as_str())
-                        .or_insert(0) += 1
+        for id in &order[start..cursor] {
+            let Some(vertex) = dag.get(id.round, &id.author) else {
+                continue;
+            };
+            let Some(batch) = batches.get(&vertex.payload_hash) else {
+                continue;
+            };
+
+            // Authorization happens before execution, so an unsigned or mis-signed
+            // transaction is dropped instead of reaching the state machine.
+            let mut authorized = Vec::with_capacity(batch.len());
+            for transaction in &batch.transactions {
+                let policy = accounts
+                    .iter()
+                    .find(|account| account.id == transaction.sender)
+                    .map(|account| &account.policy);
+                match policy {
+                    None => {
+                        *rejected
+                            .entry(RejectReason::UnknownSender.as_str())
+                            .or_insert(0) += 1
+                    }
+                    Some(policy) if transaction.verify(policy, NOW).is_err() => {
+                        *rejected.entry("unauthorized").or_insert(0) += 1;
+                    }
+                    Some(_) => authorized.push(transaction.clone()),
                 }
-                Some(policy) if transaction.verify(policy, NOW).is_err() => {
-                    *rejected.entry("unauthorized").or_insert(0) += 1;
+            }
+
+            for outcome in state.apply(&Batch::new(authorized)) {
+                match outcome.reason() {
+                    None => applied += 1,
+                    Some(reason) => *rejected.entry(reason.as_str()).or_insert(0) += 1,
                 }
-                Some(_) => authorized.push(transaction.clone()),
             }
         }
 
-        for outcome in state.apply(&Batch::new(authorized)) {
-            match outcome.reason() {
-                None => applied += 1,
-                Some(reason) => *rejected.entry(reason.as_str()).or_insert(0) += 1,
-            }
+        // Round 0 is genesis and is already covered by the genesis header, so it
+        // closes no height of its own.
+        if round == 0 {
+            continue;
         }
+
+        // A quorum signs the state this round produced. From here the root is no
+        // longer a local computation: it is what the chain agreed on.
+        let header = Header {
+            chain_id: CHAIN_ID.to_vec(),
+            epoch: EPOCH,
+            height: head.height + 1,
+            round,
+            state_root: state.state_root(),
+            previous: head.id()?,
+            applied: u64::try_from(applied).unwrap_or(0),
+        };
+        let certificate = certify(&consensus, &header)?;
+        chain.advance(&header, &certificate)?;
+        headers.push(HeaderView {
+            height: header.height,
+            round,
+            applied: header.applied,
+            signers: certificate.signer_count(),
+            state_root: header.state_root,
+        });
+        signed_headers += 1;
+        head = header;
     }
 
     // Each applied transaction burns its whole fee, so nothing leaves the system
@@ -306,6 +392,9 @@ fn simulate(validators: usize, data_rounds: u64) -> Result<Report, Box<dyn Error
         burned,
         root,
         proof,
+        headers,
+        head,
+        signed_headers,
     })
 }
 
@@ -383,6 +472,35 @@ pub fn run(validators: usize, data_rounds: u64) -> Result<(), Box<dyn Error>> {
     println!(
         "  deterministic: {} (two runs, same root)",
         first.root == second.root
+    );
+
+    println!();
+    println!("== Finality: one certified header per committed round ==");
+    println!(
+        "  {}  {}  {}  {}  state root",
+        pad("height", 7),
+        pad("round", 6),
+        pad("applied", 8),
+        pad("signers", 8)
+    );
+    for header in &first.headers {
+        let signers = if header.height == 0 {
+            "-".to_string()
+        } else {
+            format!("{} of {}", header.signers, validators)
+        };
+        println!(
+            "  {}  {}  {}  {}  {}",
+            pad(&header.height.to_string(), 7),
+            pad(&header.round.to_string(), 6),
+            pad(&header.applied.to_string(), 8),
+            pad(&signers, 8),
+            short(&header.state_root)
+        );
+    }
+    println!(
+        "  light client: {} headers verified, head at height {}",
+        first.signed_headers, first.head.height
     );
 
     println!();
