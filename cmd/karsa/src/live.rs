@@ -8,24 +8,26 @@
 //!
 //! - **Framing.** A stream has no message boundaries, so a vertex can arrive in
 //!   two reads. The parser is tested against that; here it runs for real.
-//! - **Out-of-order arrival.** The simulator delivers in a fixed order, so a vertex
-//!   never arrives before the vertices it references. On a socket it does, and the
-//!   DAG rejects it. Those vertices are deferred and retried, and the deferral count
-//!   is printed rather than hidden — it is a property of the transport, not a bug.
-//! - **Backpressure instead of a drop policy.** Each peer has a bounded queue and
-//!   the writer awaits it, so a slow reader slows its sender rather than losing a
-//!   vertex. `--slow-ms` delays one node on purpose: with backpressure, a slow
-//!   validator costs the whole committee throughput. That is the head-of-line
-//!   problem a dissemination design has to answer, and it is cheaper to see it here
-//!   than to reason about it.
+//! - **Out-of-order arrival.** The simulator delivers in a fixed order; a socket
+//!   does not. Insertion is tolerant — the shape rule needs a quorum of distinct
+//!   authors, not every edge — so an early vertex is accepted and the gap only
+//!   surfaces when a walk needs the missing one. That is why repair scans the held
+//!   DAG for dangling references rather than reacting to a rejected insert.
+//! - **A drop policy that cannot lose data.** Each peer has a bounded queue. When
+//!   it is full the frame is dropped and counted, so one slow reader cannot stall
+//!   its sender. Dropping is safe because the reference rule makes the loss
+//!   *visible*: the next round's vertices still name the missing id, so the gap sits
+//!   in the DAG as a dangling edge, and the node asks a peer for exactly that id.
+//!   Nothing is guessed and nothing is lost for good.
 //!
 //! # What it does not measure
 //!
 //! All nodes are in one process on one machine, so the numbers describe the wire
 //! and the runtime, not independent operators. There is no encryption, no
-//! handshake, no retransmission, and no peer discovery: the mesh is fixed by
-//! `--validators`.
+//! handshake, no retransmission timer beyond the want sweep, and no peer discovery:
+//! the mesh is fixed by `--validators`.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,22 +35,29 @@ use std::time::{Duration, Instant};
 
 use crypto::CryptoErrorKind;
 use net::Node;
-use net::wire::{self, Frame};
+use net::wire::{self, Message};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
-use validator::commit_root;
+use validator::{Step, VertexId, commit_root};
 
 use crate::chain;
 
-/// Vertices a node will hold while waiting for the ones they reference.
-const DEFERRED_LIMIT: usize = 4096;
-/// Queue depth per peer, in frames.
-const QUEUE: usize = 4096;
+/// Ids a node will ask for at once. Beyond this the queue is growing faster than
+/// repair can drain it, so the count is reported rather than the memory.
+const WANT_LIMIT: usize = 4096;
+/// How often an unanswered want is repeated.
+const WANT_RETRY: Duration = Duration::from_millis(250);
+/// Attempts before a want is abandoned and counted.
+const WANT_TRIES: u8 = 8;
+/// Control frames a peer may have queued: wants and their answers.
+const CONTROL_QUEUE: usize = 256;
 /// How long to keep retrying a connection before giving up.
 const CONNECT_TRIES: usize = 400;
 /// Tick period: the authoring and pacemaker cadence.
 const TICK: Duration = Duration::from_millis(2);
+/// How often the want sweep runs, in ticks.
+const WANT_SWEEP_TICKS: u32 = 25;
 
 /// How a live run is configured.
 #[derive(Clone)]
@@ -63,8 +72,15 @@ pub struct Config {
     pub slow_ms: u64,
     /// Wall-clock cap on the whole run.
     pub timeout: Duration,
+    /// Frames per peer queue. Small values force drops on purpose, which is the
+    /// only way to exercise the repair path on a fast machine.
+    pub queue: usize,
+    /// Socket send buffer, in bytes. Zero keeps the OS default, which on loopback
+    /// is large enough to absorb a whole run — so forcing a drop needs both a small
+    /// queue and a small buffer.
+    pub send_buffer: usize,
     /// How long to keep the mesh alive after the last node finishes authoring,
-    /// so the final rounds can actually propagate before the run is measured.
+    /// so the final rounds and any repair can land before the run is measured.
     pub drain: Duration,
 }
 
@@ -73,14 +89,18 @@ struct NodeResult {
     index: usize,
     authored: usize,
     received: usize,
-    deferred_max: usize,
+    dropped: u64,
+    wanted: u64,
+    repaired: u64,
+    served: u64,
+    gave_up: u64,
     rejected: usize,
     committed: usize,
     bytes_in: u64,
     bytes_out: u64,
     latencies: Vec<u64>,
     commit_root: [u8; 32],
-    order: Vec<validator::VertexId>,
+    order: Vec<VertexId>,
 }
 
 fn address(port_base: u16, index: usize) -> String {
@@ -93,7 +113,7 @@ fn address(port_base: u16, index: usize) -> String {
 /// Reads frames from one peer and hands them to the node loop.
 async fn read_peer(
     mut stream: TcpStream,
-    frames: mpsc::Sender<Frame>,
+    frames: mpsc::Sender<wire::Frame>,
     bytes_in: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -128,14 +148,25 @@ async fn read_peer(
     }
 }
 
-/// Writes frames to one peer, awaiting the queue so a slow reader applies
-/// backpressure instead of losing data.
+/// Writes frames to one peer from two queues, control first.
+///
+/// One writer, because two tasks writing the same socket would interleave frame
+/// bodies. Control frames (a want, and the vertex sent back for one) go first so a
+/// repair never sits behind a burst of broadcasts in the same queue — that is how a
+/// want ended up dropped and eventually abandoned under load.
 async fn write_peer(
     mut stream: TcpStream,
-    mut outbound: mpsc::Receiver<Vec<u8>>,
+    mut control: mpsc::Receiver<Vec<u8>>,
+    mut data: mpsc::Receiver<Vec<u8>>,
     bytes_out: Arc<AtomicU64>,
 ) {
-    while let Some(bytes) = outbound.recv().await {
+    loop {
+        let bytes = tokio::select! {
+            biased;
+            Some(bytes) = control.recv() => bytes,
+            Some(bytes) = data.recv() => bytes,
+            else => break,
+        };
         if stream.write_all(&bytes).await.is_err() {
             break;
         }
@@ -144,31 +175,31 @@ async fn write_peer(
     let _ = stream.shutdown().await;
 }
 
-/// Retries every deferred vertex after a successful insert.
+/// One peer's two outbound queues.
+struct Link {
+    control: mpsc::Sender<Vec<u8>>,
+    data: mpsc::Sender<Vec<u8>>,
+}
+
+/// Queues one frame for every peer, never waiting.
 ///
-/// Returns how many are still waiting. A vertex whose failure is not
-/// `missing_reference` is a bad vertex, not an early one, so it is dropped and
-/// counted instead of being retried forever.
-fn drain_deferred(node: &mut Node, deferred: &mut Vec<Frame>, rejected: &mut usize) -> usize {
-    let mut progressed = true;
-    while progressed {
-        progressed = false;
-        let mut index = 0;
-        while index < deferred.len() {
-            match node.receive(deferred[index].vertex.clone()) {
-                Ok(()) => {
-                    deferred.swap_remove(index);
-                    progressed = true;
-                }
-                Err(error) if error.kind() == CryptoErrorKind::MissingReference => index += 1,
-                Err(_) => {
-                    deferred.swap_remove(index);
-                    *rejected += 1;
-                }
-            }
+/// Waiting here is what made a slow validator everybody's problem: the node loop
+/// would block on one full queue and stop authoring and answering for every other
+/// peer. Dropping keeps the loop moving, and the want sweep repairs what was
+/// dropped.
+fn broadcast(links: &[Link], control: bool, bytes: &[u8], dropped: &mut u64) {
+    for link in links {
+        let queue = if control { &link.control } else { &link.data };
+        if queue.try_send(bytes.to_vec()).is_err() {
+            *dropped += 1;
         }
     }
-    deferred.len()
+}
+
+/// One outstanding repair request.
+struct Want {
+    at: Instant,
+    tries: u8,
 }
 
 async fn node_task(
@@ -191,7 +222,10 @@ async fn node_task(
 
     let bytes_in = Arc::new(AtomicU64::new(0));
     let bytes_out = Arc::new(AtomicU64::new(0));
-    let (frames_tx, mut frames_rx) = mpsc::channel(QUEUE);
+    // Both directions use the same depth: the inbound channel is what keeps a
+    // reader from acknowledging frames faster than the node loop can judge them,
+    // so tuning only one side would leave the other free to absorb the backlog.
+    let (frames_tx, mut frames_rx) = mpsc::channel(config.queue.max(1));
 
     // Inbound: accept from every peer.
     {
@@ -218,7 +252,7 @@ async fn node_task(
 
     // Outbound: one link per peer, connected with retries because the nodes start
     // together and a listener may not exist yet.
-    let mut outbound: Vec<mpsc::Sender<Vec<u8>>> = Vec::with_capacity(config.validators - 1);
+    let mut outbound: Vec<Link> = Vec::with_capacity(config.validators - 1);
     for peer in 0..config.validators {
         if peer == index {
             continue;
@@ -237,60 +271,84 @@ async fn node_task(
                 }
             }
         };
-        let (out_tx, out_rx) = mpsc::channel(QUEUE);
-        outbound.push(out_tx);
+        let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE);
+        let (data_tx, data_rx) = mpsc::channel(config.queue.max(1));
+        outbound.push(Link {
+            control: control_tx,
+            data: data_tx,
+        });
+        if config.send_buffer > 0 {
+            socket2::SockRef::from(&stream)
+                .set_send_buffer_size(config.send_buffer)
+                .map_err(|error| format!("node {index} cannot size the socket: {error}"))?;
+        }
         let bytes_out = Arc::clone(&bytes_out);
         tokio::spawn(async move {
-            write_peer(stream, out_rx, bytes_out).await;
+            write_peer(stream, control_rx, data_rx, bytes_out).await;
         });
     }
 
-    let mut deferred: Vec<Frame> = Vec::new();
+    let mut wanted: HashMap<VertexId, Want> = HashMap::new();
     let mut latencies: Vec<u64> = Vec::new();
     let mut received = 0usize;
-    let mut deferred_max = 0usize;
     let mut rejected = 0usize;
+    let mut dropped = 0u64;
+    let mut wanted_total = 0u64;
+    let mut repaired = 0u64;
+    let mut served = 0u64;
+    let mut gave_up = 0u64;
+    let mut ticks: u32 = 0;
+    let mut cursor: u64 = 1;
     let mut announced = false;
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let now = || u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
     loop {
         tokio::select! {
             frame = frames_rx.recv() => {
                 let Some(frame) = frame else { break };
                 received += 1;
-                let now = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                latencies.push(now.saturating_sub(frame.sent_at_nanos));
+                let at = now();
+                latencies.push(at.saturating_sub(frame.sent_at_nanos));
                 if config.slow_ms > 0 && index == 1 {
                     tokio::time::sleep(Duration::from_millis(config.slow_ms)).await;
                 }
-                match node.receive(frame.vertex.clone()) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == CryptoErrorKind::MissingReference => {
-                        if deferred.len() < DEFERRED_LIMIT {
-                            deferred.push(frame);
-                        } else {
+                match frame.message {
+                    Message::Want(id) => {
+                        // Answering is a broadcast: the reply is a vertex, and a
+                        // vertex is exactly what the original sender would have
+                        // sent. Peers that already have it ignore the duplicate.
+                        if let Some(vertex) = node.dag().get(id.round, &id.author) {
+                            if let Ok(bytes) = wire::frame(&Message::Vertex(vertex.clone()), now()) {
+                                // A repair answer is control traffic: it must not sit
+                                // behind the broadcast burst it is repairing.
+                                broadcast(&outbound, true, &bytes, &mut dropped);
+                                served += 1;
+                            }
+                        }
+                    }
+                    Message::Vertex(vertex) => {
+                        if let Ok(id) = vertex.id()
+                            && wanted.remove(&id).is_some()
+                        {
+                            repaired += 1;
+                        }
+                        if node.receive(vertex).is_err() {
                             rejected += 1;
                         }
                     }
-                    Err(_) => rejected += 1,
                 }
-                let waiting = drain_deferred(&mut node, &mut deferred, &mut rejected);
-                deferred_max = deferred_max.max(waiting);
             }
             _ = ticker.tick() => {
+                ticks = ticks.wrapping_add(1);
                 if node.round() <= config.rounds {
                     match node.author() {
                         Ok(Some(vertex)) => {
-                            let now = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                            let bytes = wire::frame(&vertex, now).map_err(|error| error.to_string())?;
-                            for queue in &outbound {
-                                // Awaiting is the drop policy: none. A peer that cannot
-                                // keep up slows this node instead of losing a vertex.
-                                if queue.send(bytes.clone()).await.is_err() {
-                                    break;
-                                }
-                            }
+                            let bytes = wire::frame(&Message::Vertex(vertex), now())
+                                .map_err(|error| error.to_string())?;
+                            broadcast(&outbound, false, &bytes, &mut dropped);
                         }
                         Ok(None) => {}
                         Err(error) => return Err(format!("node {index} cannot author: {error}")),
@@ -298,12 +356,15 @@ async fn node_task(
                 }
                 // A commit whose leader history is not fully here yet is a
                 // delivery condition, not a failure: the referenced vertex may
-                // still be in a peer's queue. Leaving the cursor where it is and
-                // retrying on the next tick is what keeps a slow link from
-                // killing a validator.
-                let step = node.commit();
-                match step {
-                    Ok(_) => {}
+                // still be in a peer's queue.
+                match node.commit() {
+                    Ok(step) => {
+                        cursor = match step {
+                            Step::Advanced { cursor, .. }
+                            | Step::Waiting { cursor, .. }
+                            | Step::TimedOut { cursor, .. } => cursor,
+                        };
+                    }
                     Err(error) if error.kind() == CryptoErrorKind::MissingReference => {}
                     Err(error) => {
                         return Err(format!("node {index} cannot commit: {error}"));
@@ -312,6 +373,57 @@ async fn node_task(
                 if !announced && node.round() > config.rounds {
                     announced = true;
                     let _ = ready.send(index).await;
+                }
+
+                // Ask for every dangling reference, then retry whatever is still
+                // outstanding. A gap is visible in the DAG because the next round's
+                // vertices name the vertex that never arrived, so this needs no
+                // signal from the sender and no guess about who owes us what.
+                if ticks % WANT_SWEEP_TICKS == 0 {
+                    let mut gaps = node.dag().missing_references();
+                    // The cursor walk sees gaps the reference scan cannot: a vertex
+                    // nobody held points at is still needed to commit.
+                    if let Some(blocking) = node.dag().missing_history(cursor) {
+                        gaps.push(blocking);
+                    }
+                    for id in gaps {
+                        if wanted.contains_key(&id) {
+                            continue;
+                        }
+                        if wanted.len() >= WANT_LIMIT {
+                            gave_up += 1;
+                            continue;
+                        }
+                        if let Ok(bytes) = wire::frame(&Message::Want(id.clone()), now()) {
+                            broadcast(&outbound, true, &bytes, &mut dropped);
+                            wanted.insert(
+                                id,
+                                Want {
+                                    at: Instant::now(),
+                                    tries: 0,
+                                },
+                            );
+                            wanted_total += 1;
+                        }
+                    }
+                    let retry: Vec<VertexId> = wanted
+                        .iter()
+                        .filter(|(_, want)| want.at.elapsed() >= WANT_RETRY)
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    for id in retry {
+                        let Some(want) = wanted.get_mut(&id) else { continue };
+                        want.at = Instant::now();
+                        if want.tries >= WANT_TRIES {
+                            wanted.remove(&id);
+                            gave_up += 1;
+                            continue;
+                        }
+                        want.tries += 1;
+                        if let Ok(bytes) = wire::frame(&Message::Want(id), now()) {
+                            broadcast(&outbound, true, &bytes, &mut dropped);
+                        }
+                    }
                 }
             }
             _ = shutdown.changed() => break,
@@ -322,7 +434,11 @@ async fn node_task(
         index,
         authored: node.authored(),
         received,
-        deferred_max,
+        dropped,
+        wanted: wanted_total,
+        repaired,
+        served,
+        gave_up,
         rejected,
         committed: node.dag().order().len(),
         bytes_in: bytes_in.load(Ordering::Relaxed),
@@ -411,7 +527,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             }
         }
         // Measured before the drain, so it is the authoring pace rather than the
-        // pace plus a fixed 500 ms wait for the last frames.
+        // pace plus a fixed wait for the last frames.
         let authoring = started.elapsed();
         tokio::time::sleep(config.drain).await;
         let _ = shutdown_tx.send(true);
@@ -463,11 +579,12 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     }
     println!();
     println!(
-        "  {}  {}  {}  {}  {}  {}  {}  {}",
+        "  {}  {}  {}  {}  {}  {}  {}  {}  {}",
         left("node", 7),
         pad("authored", 9),
         pad("received", 9),
-        pad("deferred", 9),
+        pad("dropped", 8),
+        pad("repaired", 9),
         pad("rejected", 9),
         pad("committed", 10),
         pad("in", 10),
@@ -477,18 +594,29 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let mut latencies: Vec<u64> = Vec::new();
     let mut bytes_in = 0u64;
     let mut bytes_out = 0u64;
+    let mut dropped = 0u64;
+    let mut wanted = 0u64;
+    let mut repaired = 0u64;
+    let mut served = 0u64;
+    let mut gave_up = 0u64;
     let mut roots: Vec<[u8; 32]> = Vec::new();
     for result in &results {
         bytes_in += result.bytes_in;
         bytes_out += result.bytes_out;
+        dropped += result.dropped;
+        wanted += result.wanted;
+        repaired += result.repaired;
+        served += result.served;
+        gave_up += result.gave_up;
         roots.push(result.commit_root);
         latencies.extend_from_slice(&result.latencies);
         println!(
-            "  {}  {}  {}  {}  {}  {}  {}  {}",
+            "  {}  {}  {}  {}  {}  {}  {}  {}  {}",
             left(&format!("val-{}", result.index), 7),
             pad(&result.authored.to_string(), 9),
             pad(&result.received.to_string(), 9),
-            pad(&result.deferred_max.to_string(), 9),
+            pad(&result.dropped.to_string(), 8),
+            pad(&result.repaired.to_string(), 9),
             pad(&result.rejected.to_string(), 9),
             pad(&result.committed.to_string(), 10),
             pad(&human(result.bytes_in), 10),
@@ -511,6 +639,10 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         human(bytes_in),
         human(bytes_out),
         results.iter().map(|result| result.received).sum::<usize>()
+    );
+    println!(
+        "  repair            {dropped} frames dropped, {wanted} wants sent, \
+         {repaired} repaired, {served} served, {gave_up} abandoned"
     );
     let agreed = roots.windows(2).all(|pair| pair[0] == pair[1]);
     println!("  same commit root  {agreed}");
@@ -586,16 +718,21 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     }
 
     println!();
-    println!("  Deferred vertices are not lost data: they arrived before the round they");
-    println!("  reference, and the DAG refused them until it could check the rule. Zero");
-    println!("  here means the quorum-sized reference rule absorbed the reordering; a");
-    println!("  non-zero count is a cost a simulator does not have.");
+    if dropped > 0 || wanted > 0 {
+        println!("  Repair is demand-driven. A gap is found by scanning the held DAG for");
+        println!("  references to vertices that never arrived, so the only ids ever");
+        println!("  requested are ones a decision actually needs. Nothing is retransmitted");
+        println!("  blindly, and a want that itself gets dropped is retried a few times");
+        println!("  before it is abandoned and counted.");
+    } else {
+        println!("  Nothing was dropped, so nothing was repaired. Lower --queue to force");
+        println!("  the drop path on a fast machine.");
+    }
     if config.slow_ms > 0 {
         println!();
-        println!("  The slow node is the point of this run: with backpressure and no drop");
-        println!("  policy, its delay propagates to everyone. Payload sharding does not");
-        println!("  help here, because consensus vertices are small and every node needs");
-        println!("  all of them.");
+        println!("  The slow node is the point of this run: its queue fills, frames to it");
+        println!("  are dropped, and the repair sweep fills the gap. Other nodes keep");
+        println!("  authoring at their own pace, which backpressure would not allow.");
     }
 
     if !agreed {

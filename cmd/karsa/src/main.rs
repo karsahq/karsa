@@ -211,6 +211,12 @@ enum Command {
         /// Wall-clock cap on the whole run.
         #[arg(long, default_value_t = 30)]
         timeout_seconds: u64,
+        /// Frames per peer queue. Small values force drops, which exercises repair.
+        #[arg(long, default_value_t = 4096)]
+        queue: usize,
+        /// Socket send buffer in bytes; 0 keeps the OS default.
+        #[arg(long, default_value_t = 0)]
+        send_buffer: usize,
         /// How long the mesh stays up after the last node finishes authoring.
         #[arg(long, default_value_t = 500)]
         drain_ms: u64,
@@ -273,6 +279,8 @@ fn main() -> ExitCode {
             rounds,
             slow_ms,
             timeout_seconds,
+            queue,
+            send_buffer,
             drain_ms,
         } => live::run(live::Config {
             validators,
@@ -280,6 +288,8 @@ fn main() -> ExitCode {
             rounds,
             slow_ms,
             timeout: std::time::Duration::from_secs(timeout_seconds),
+            queue,
+            send_buffer,
             drain: std::time::Duration::from_millis(drain_ms),
         }),
     };

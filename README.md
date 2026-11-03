@@ -310,11 +310,10 @@ Rust port reproduces its measurements.
 14. **A real transport changes the order, not the rules.** On loopback sockets at
     n = 2…20 every committee converged on the same commit root, but delivery order
     is no longer the simulator's: a vertex can arrive before the round it
-    references. The DAG's shape rule absorbs most of that, and the rest is deferred
-    and retried. With a bounded per-peer queue and no drop policy, a slow reader
-    applies backpressure to its sender instead of losing a vertex — which is the
-    head-of-line problem a dissemination design has to answer, and the reason
-    `--slow-ms` exists.
+    references. Insertion tolerates that — the shape rule needs a quorum of distinct
+    authors, not every edge — so a missing neighbour stays invisible until a walk
+    needs it. That is why repair scans the held DAG instead of reacting to a
+    rejected insert, which never happens for this reason.
 15. **Backpressure is a latency cost; it also exposed a convergence bug.** With
     one validator delayed by 5 ms per frame, authoring fell from 5.5–8.7 to
     54.5–57.0 ms/round and p99 rose from 37–50 ms to 0.8–1.0 s, while the commit
@@ -339,6 +338,16 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     of the DAG and not of when data arrived. Reverting only `pacemaker.rs` makes the
     regression test fail with "a deferred indirect commit must not leave history
     behind", which is the check that the test is not passing by accident.
+16. **A drop is safe when the reference rule can see it.** Each peer has a bounded
+    queue and `try_send`, so one slow validator no longer blocks the node loop: at
+    n=4 over 100 rounds with a 2 kB socket buffer and 5 ms/frame on one node, 19–66
+    frames were dropped and 17–28 `Want`s repaired them, with **0 abandoned** and
+    the commit root unchanged. Two things had to be true for that. Repair must be
+    driven by the DAG — dangling references *plus* the vertex blocking the commit
+    walk, because the reference rule needs a quorum and not every edge — and control
+    traffic must not share a queue with broadcasts. With one shared queue, 39 of 84
+    wants were abandoned under the same load; with a separate control queue they
+    were all answered, and authoring fell from 76 to 29 ms/round.
 
 ## Port plan
 

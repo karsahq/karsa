@@ -353,6 +353,74 @@ impl Dag {
         Ok(tally_votes(&self.set, &leader_id, &candidates, &self.schedule)?.len())
     }
 
+    /// The first vertex the history walk from `round`'s leader cannot resolve.
+    ///
+    /// [`Dag::missing_references`] only sees gaps that a *held* vertex names
+    /// directly. The reference rule requires a quorum of previous-round authors, not
+    /// all of them, so a node can miss a vertex that no held vertex points at and
+    /// still have a valid DAG — and then stall, because the commit walk needs it.
+    /// This is the other half of the repair signal: the exact vertex blocking the
+    /// cursor, found by the same walk the commit rule performs.
+    #[must_use]
+    pub fn missing_history(&self, round: u64) -> Option<VertexId> {
+        let leader = self.leader(round)?;
+        let mut seen: HashSet<VertexId> = HashSet::new();
+        let mut stack = vec![leader.id().ok()?];
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            if self.is_pruned(current.round) {
+                continue;
+            }
+            let Some(vertex) = self.vertices.get(&(current.round, current.author.clone())) else {
+                return Some(current);
+            };
+            stack.extend(vertex.references.iter().cloned());
+        }
+        None
+    }
+
+    /// Every reference this node holds that points at a vertex it does not hold.
+    ///
+    /// The reference rule is what makes a dropped frame *visible*: if a vertex
+    /// never arrived, the next round's vertices still name it, so the gap lives in
+    /// the DAG and not only on the wire. This is the repair list, and it is derived
+    /// from what the node holds rather than from a guess about which authors ought
+    /// to have authored.
+    ///
+    /// Note what insertion does *not* do: it accepts a vertex whose referenced
+    /// neighbours are absent, because the shape rule is about a quorum of distinct
+    /// authors, not about holding every edge. The absence only bites when a walk
+    /// needs the missing vertex — a commit, an ancestry check, or an absence proof.
+    /// So repair cannot hang off a rejected insert; it has to scan for dangling
+    /// edges.
+    ///
+    /// References into a pruned round are excluded: they are gone by policy, not by
+    /// delay, and asking for them would never succeed.
+    #[must_use]
+    pub fn missing_references(&self) -> Vec<VertexId> {
+        let mut missing = Vec::new();
+        let mut seen: HashSet<VertexId> = HashSet::new();
+        for vertex in self.vertices.values() {
+            for reference in &vertex.references {
+                if self.is_pruned(reference.round) {
+                    continue;
+                }
+                if self
+                    .vertices
+                    .contains_key(&(reference.round, reference.author.clone()))
+                {
+                    continue;
+                }
+                if seen.insert(reference.clone()) {
+                    missing.push(reference.clone());
+                }
+            }
+        }
+        missing
+    }
+
     /// Collects `id` and its ancestors that are not yet committed, in a
     /// deterministic order.
     fn commit_history(&mut self, id: &VertexId) -> Result<Vec<VertexId>, CryptoError> {
