@@ -180,6 +180,26 @@ impl Genesis {
         Ok(serde_json::from_str(&text)?)
     }
 
+    /// Loads a genesis, writing the template first when the file is missing.
+    ///
+    /// # Errors
+    ///
+    /// [`std::io::Error`] when the directory or file cannot be written, and the
+    /// parse error when an existing file is not this schema.
+    pub fn ensure(path: &Path) -> Result<Self, Box<dyn Error>> {
+        if !path.exists() {
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, EXAMPLE)?;
+            println!("  no genesis at {}; wrote the template", path.display());
+            println!("  it carries placeholder keys: replace them before the chain does anything");
+        }
+        Self::load(path)
+    }
+
     /// Everything wrong with this genesis, as sentences.
     #[must_use]
     pub fn problems(&self) -> Vec<String> {
@@ -395,15 +415,20 @@ pub fn write_example(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub fn run(path: std::path::PathBuf, init: bool) -> Result<(), Box<dyn Error>> {
+pub fn run(
+    home: &crate::home::Home,
+    explicit: Option<std::path::PathBuf>,
+    init: bool,
+) -> Result<(), Box<dyn Error>> {
+    let path = home.file(explicit, "genesis.json");
     if init {
         write_example(&path)?;
         println!("wrote {}", path.display());
         return Ok(());
     }
 
-    let genesis = Genesis::load(&path)?;
-    let problems = genesis.problems();
+    let genesis = Genesis::ensure(&path)?;
+    let mut problems = genesis.problems();
     let hash = genesis.hash()?;
 
     println!("== Genesis: {} ==", path.display());
@@ -425,6 +450,34 @@ pub fn run(path: std::path::PathBuf, init: bool) -> Result<(), Box<dyn Error>> {
         genesis.accounts.len()
     );
     println!("  genesis hash      {}", hex::encode(hash));
+
+    // The node configuration is the other half of the same membership.
+    let node_path = home.node_toml();
+    println!();
+    if node_path.exists() {
+        match crate::config::NodeConfig::load(&node_path) {
+            Ok(config) => {
+                if config.node.chain_id == genesis.chain_id {
+                    println!(
+                        "  node.toml         {} (chain {} matches)",
+                        node_path.display(),
+                        config.node.chain_id
+                    );
+                } else {
+                    problems.push(format!(
+                        "node.toml says chain {} but this genesis is {}",
+                        config.node.chain_id, genesis.chain_id
+                    ));
+                }
+            }
+            Err(error) => problems.push(format!("{error}")),
+        }
+    } else {
+        println!(
+            "  node.toml         {} (missing; `karsa config` writes a template)",
+            node_path.display()
+        );
+    }
     println!();
     println!("  The hash is SHA-256 over the canonical encoding of this data, not over");
     println!("  the file: reformatting or reordering the JSON does not change it, and two");

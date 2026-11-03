@@ -35,6 +35,7 @@ mod dagbench;
 mod dagsim;
 mod demo;
 mod genesis;
+mod home;
 mod live;
 mod loadtest;
 mod migrate;
@@ -66,9 +67,12 @@ struct Cli {
 enum Command {
     /// Run the demo HTTP node until interrupted, optionally from a node.toml.
     Node {
-        /// Configuration file; written with defaults when missing.
+        /// Configuration file; defaults to the one in --home.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Node home directory holding node.toml and genesis.json.
+        #[arg(long)]
+        home: Option<PathBuf>,
     },
     /// Print a signed demo transaction envelope as hex on stdout.
     SampleTx,
@@ -203,18 +207,22 @@ enum Command {
     },
     /// Validate and explain a genesis, or write an example.
     Genesis {
-        /// Path to genesis.json.
-        #[arg(default_value = "genesis.json")]
-        path: std::path::PathBuf,
+        /// Explicit file; defaults to genesis.json in --home.
+        path: Option<std::path::PathBuf>,
+        /// Node home directory holding node.toml and genesis.json.
+        #[arg(long)]
+        home: Option<std::path::PathBuf>,
         /// Write the example instead of reading it.
         #[arg(long)]
         init: bool,
     },
     /// Validate and explain a node configuration, or write an example.
     Config {
-        /// Path to node.toml.
-        #[arg(default_value = "node.toml")]
-        path: std::path::PathBuf,
+        /// Explicit file; defaults to node.toml in --home.
+        path: Option<std::path::PathBuf>,
+        /// Node home directory holding node.toml and genesis.json.
+        #[arg(long)]
+        home: Option<std::path::PathBuf>,
         /// Write the commented example instead of reading it.
         #[arg(long)]
         init: bool,
@@ -266,7 +274,7 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Node { config } => run_node(config),
+        Command::Node { config, home } => run_node(config, home),
         Command::SampleTx => node::print_sample_transaction(),
         Command::RegisterDemo { activation_epoch } => {
             node::print_demo_registration(activation_epoch)
@@ -313,8 +321,8 @@ fn main() -> ExitCode {
         Command::Acvp { file } => acvp::run(&file),
         Command::Dagbench => dagbench::run(),
         Command::Loadtest { count, concurrency } => loadtest::run(count, concurrency),
-        Command::Config { path, init } => config::run(Some(path), init),
-        Command::Genesis { path, init } => genesis::run(path, init),
+        Command::Config { path, home, init } => run_config(home, path, init),
+        Command::Genesis { path, home, init } => run_genesis(home, path, init),
         Command::Live {
             validators,
             port_base,
@@ -355,14 +363,55 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_node(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
-    let listen = match config_path {
-        None => node::DEMO_LISTEN.to_string(),
-        Some(path) => {
+fn run_config(
+    home_path: Option<PathBuf>,
+    path: Option<PathBuf>,
+    init: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let home = home::Home::resolve(home_path)?;
+    config::run(&home, path, init)
+}
+
+fn run_genesis(
+    home_path: Option<PathBuf>,
+    path: Option<PathBuf>,
+    init: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let home = home::Home::resolve(home_path)?;
+    genesis::run(&home, path, init)
+}
+
+fn run_node(
+    config_path: Option<PathBuf>,
+    home_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // A home names both halves of a membership, so it is resolved first; an
+    // explicit --config still wins for a one-off run against a file elsewhere.
+    let home = home::Home::resolve(home_path.clone())?;
+    let listen = match (config_path, home_path) {
+        (None, None) => node::DEMO_LISTEN.to_string(),
+        (explicit, _) => {
+            let path = home.file(explicit, "node.toml");
             // A missing file is written first: a node should not refuse its own
             // first run over a file it can generate.
             let config = crate::config::NodeConfig::ensure(&path)?;
-            let problems = config.problems();
+            let mut problems = config.problems();
+
+            // The other half of the same membership: a node pointed at a genesis
+            // for another chain is not a node of this one.
+            let genesis_path = home.genesis_json();
+            if genesis_path.exists() {
+                let genesis = crate::genesis::Genesis::load(&genesis_path)?;
+                if genesis.chain_id != config.node.chain_id {
+                    problems.push(format!(
+                        "node.chain_id is {} but {} is chain {}",
+                        config.node.chain_id,
+                        genesis_path.display(),
+                        genesis.chain_id
+                    ));
+                }
+            }
+
             if !problems.is_empty() {
                 for problem in &problems {
                     eprintln!("  PROBLEM: {problem}");

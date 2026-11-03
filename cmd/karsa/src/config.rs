@@ -351,19 +351,23 @@ pub fn write_example(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub fn run(path: Option<PathBuf>, init: bool) -> Result<(), Box<dyn Error>> {
+pub fn run(
+    home: &crate::home::Home,
+    explicit: Option<PathBuf>,
+    init: bool,
+) -> Result<(), Box<dyn Error>> {
+    let path = home.file(explicit, "node.toml");
     if init {
-        let target = path.unwrap_or_else(|| PathBuf::from("node.toml"));
-        write_example(&target)?;
-        println!("wrote {}", target.display());
+        write_example(&path)?;
+        println!("wrote {}", path.display());
         return Ok(());
     }
 
-    let path = path.unwrap_or_else(|| PathBuf::from("node.toml"));
     let config = NodeConfig::ensure(&path)?;
-    let problems = config.problems();
+    let mut problems = config.problems();
 
     println!("== Node configuration: {} ==", path.display());
+    println!("  home              {}", home.dir().display());
     println!(
         "  role              {} ({})",
         config.role_label(),
@@ -432,6 +436,43 @@ pub fn run(path: Option<PathBuf>, init: bool) -> Result<(), Box<dyn Error>> {
     println!();
     println!("  Note: retention bounds disk only. Every node still receives and forwards");
     println!("  the whole payload, so per-node egress stays (n-1)/n of the originator total.");
+
+    // Two files describe one membership, so a disagreement between them is worth
+    // catching here rather than at the first transaction that fails to verify.
+    let genesis_path = home.genesis_json();
+    println!();
+    if genesis_path.exists() {
+        match crate::genesis::Genesis::load(&genesis_path) {
+            Ok(genesis) => {
+                let hash = genesis.hash()?;
+                if genesis.chain_id == config.node.chain_id {
+                    println!(
+                        "  genesis           {} (chain {}, hash {})",
+                        genesis_path.display(),
+                        genesis.chain_id,
+                        hex::encode(&hash[..6])
+                    );
+                } else {
+                    println!(
+                        "  genesis MISMATCH  node.toml says chain {}, {} says {}",
+                        config.node.chain_id,
+                        genesis_path.display(),
+                        genesis.chain_id
+                    );
+                    problems.push(format!(
+                        "node.chain_id is {} but the genesis in this home is {}",
+                        config.node.chain_id, genesis.chain_id
+                    ));
+                }
+            }
+            Err(error) => problems.push(format!("{error}")),
+        }
+    } else {
+        println!(
+            "  genesis           {} (missing; `karsa genesis` writes a template)",
+            genesis_path.display()
+        );
+    }
 
     if problems.is_empty() {
         Ok(())

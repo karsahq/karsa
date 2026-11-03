@@ -178,6 +178,12 @@ which are still open.
   sentence. It prints the **genesis hash over the canonical encoding, not over the
   file**, so reformatting the JSON or reordering validators does not change the
   chain's identity, and a field change always does.
+- Home directory: `karsa config`, `karsa genesis`, and `karsa node` all take
+  `--home DIR` (default `$HOME/.karsa`) and read the two files that describe one
+  chain membership from the same place — `node.toml` and `genesis.json` — writing
+  either with defaults when it is missing. Because they are one membership, each
+  command cross-checks the other's chain id and reports a mismatch instead of
+  letting a node join the wrong chain.
 - `karsa config`: per-node settings in a `node.toml`, the way an operator expects.
   Roles (validator, rpc, archive), retention (days and a hard disk cap), snapshot
   cadence, and listen addresses. The file is validated rather than trusted — an
@@ -192,7 +198,7 @@ which are still open.
   key), and `POST /epoch`. With `--config node.toml` it binds to
   `network.rpc_listen` and writes the file with defaults first if it is missing,
   instead of refusing its own first run.
-- 270 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 272 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
