@@ -34,6 +34,7 @@ mod config;
 mod dagbench;
 mod dagsim;
 mod demo;
+mod genesis;
 mod live;
 mod loadtest;
 mod migrate;
@@ -200,6 +201,15 @@ enum Command {
         #[arg(default_value_t = 16)]
         concurrency: usize,
     },
+    /// Validate and explain a genesis, or write an example.
+    Genesis {
+        /// Path to genesis.json.
+        #[arg(default_value = "genesis.json")]
+        path: std::path::PathBuf,
+        /// Write the example instead of reading it.
+        #[arg(long)]
+        init: bool,
+    },
     /// Validate and explain a node configuration, or write an example.
     Config {
         /// Path to node.toml.
@@ -304,6 +314,7 @@ fn main() -> ExitCode {
         Command::Dagbench => dagbench::run(),
         Command::Loadtest { count, concurrency } => loadtest::run(count, concurrency),
         Command::Config { path, init } => config::run(Some(path), init),
+        Command::Genesis { path, init } => genesis::run(path, init),
         Command::Live {
             validators,
             port_base,

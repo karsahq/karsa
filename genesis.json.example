@@ -1,0 +1,35 @@
+{
+  "chain_id": "karsa-1",
+  "protocol_version": 1,
+  "epoch_rounds": 1000,
+  "validators": [
+    {
+      "id": "val-0",
+      "keys": [
+        {
+          "key_id": "val-0-k0",
+          "algorithm": "ed25519",
+          "public_key": "0101010101010101010101010101010101010101010101010101010101010101",
+          "activation_epoch": 0
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "id": "alice",
+      "balance": 1000,
+      "policy": {
+        "kind": "single",
+        "threshold": 0,
+        "keys": [
+          {
+            "key_id": "alice-k0",
+            "algorithm": "ed25519",
+            "public_key": "0202020202020202020202020202020202020202020202020202020202020202"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -15,13 +15,14 @@ not part of this repository.
 | `crates/net/` | Rust: vertex dissemination between nodes, deterministic scheduling, and the wire framing for real sockets |
 | `crates/store/` | Rust: append-only on-disk vertices, batches, and roots |
 | `crates/erasure/` | Rust: Reed-Solomon over GF(2^8) for sharded storage |
-| `cmd/karsa/` | Rust: single CLI with `config`, `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `live`, `dagsim`, `chain`, `net`, `persist`, `audit`, `migrate`, `sigbench`, `sweep`, `shards` |
+| `cmd/karsa/` | Rust: single CLI with `genesis`, `config`, `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `live`, `dagsim`, `chain`, `net`, `persist`, `audit`, `migrate`, `sigbench`, `sweep`, `shards` |
 | `.cargo/config.toml` | sccache as rustc wrapper, mold as linker |
 | `scripts/rust-check.sh` | Rust gate: fmt, clippy, tests |
 | `scripts/acvp-rust.sh` | Downloads the ACVP vectors and runs the checker |
 | `scripts/loadtest-rust.sh` | Starts the node, drives it, prints tx/s |
 | `RUST.md` | Toolchain decisions and crate choices |
 | `node.toml.example` | The node configuration an operator starts from |
+| `genesis.json.example` | The genesis a chain starts from |
 
 The design notes (`docs/architecture.md`, `docs/crypto-registry.md`,
 `docs/consensus-notes.md`, `docs/decisions.md`) are unpublished and git-ignored;
@@ -169,6 +170,14 @@ which are still open.
   persists every vertex and batch through `crates/store`, so the bytes-per-day
   figure is measured from files rather than modelled. `--archives N` adds archive
   nodes: they receive everything, store everything, and never sign.
+- `karsa genesis`: the file every node must agree on, in JSON because it is a
+  generated consensus artifact rather than a hand-edited preference. Validators,
+  their keys, the founding accounts with their policies, and the key-epoch length
+  are all explicit; unknown fields, duplicate ids, unknown algorithms, wrong
+  key lengths, and a threshold above the key count are each refused with a
+  sentence. It prints the **genesis hash over the canonical encoding, not over the
+  file**, so reformatting the JSON or reordering validators does not change the
+  chain's identity, and a field change always does.
 - `karsa config`: per-node settings in a `node.toml`, the way an operator expects.
   Roles (validator, rpc, archive), retention (days and a hard disk cap), snapshot
   cadence, and listen addresses. The file is validated rather than trusted — an
@@ -183,7 +192,7 @@ which are still open.
   key), and `POST /epoch`. With `--config node.toml` it binds to
   `network.rpc_listen` and writes the file with defaults first if it is missing,
   instead of refusing its own first run.
-- 259 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 270 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
