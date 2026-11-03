@@ -380,6 +380,16 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     `data ≈ 2n/3`, so the "32×" in D15 is a ~48-validator figure; at the launch
     sizes of 10 and 30 validators it is 7× and 21×, and a four-node test committee
     only ever gets 3×.
+21. **Pruning plus archive nodes, not sharding, at launch sizes.** A validator that
+    keeps a window of payload, a state snapshot, and every certified header forever
+    needs no repair protocol and no availability layer, and at n=10–30 it is *more*
+    available than one shard per node: any surviving node can serve everything,
+    where sharded data needs a quorum alive. The cost is arithmetic — a month of
+    payload is 437 GB at 1k TPS with 169 B transactions and 9.1 TB with 3.5 kB PQ
+    ones — so the window follows from the disk budget you demand, not from
+    preference. Pruning bounds disk only: per-node egress stays `(n-1)/n` of the
+    originator total, so if bandwidth becomes the constraint the erasure work
+    becomes relevant again. It stays in the tree as a measured result.
 
 ## Build order
 
