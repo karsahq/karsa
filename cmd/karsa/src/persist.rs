@@ -352,7 +352,9 @@ mod tests {
         assert_eq!(replayed.state_root, saved.roots.state_root);
         assert!(
             replayed.applied < saved.applied_total,
-            "the snapshot did work"
+            "the snapshot did work: replayed {} of {} applied transactions",
+            replayed.applied,
+            saved.applied_total
         );
         assert!(
             replayed.vertices < saved.vertices_before,

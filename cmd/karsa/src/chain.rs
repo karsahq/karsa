@@ -41,8 +41,13 @@ pub(crate) struct Consensus {
 }
 
 /// One account: its transfer key and the policy that guards it.
+///
+/// `id` is only a label for logs and fixtures. Everything that must be unique or
+/// that state keys on uses `address`, which the policy derives (D32). Two accounts
+/// with the same policy therefore have the same address, and are one account.
 pub(crate) struct Account {
     pub(crate) id: Vec<u8>,
+    pub(crate) address: [u8; 32],
     pub(crate) private_key: Vec<u8>,
     pub(crate) key_id: Vec<u8>,
     pub(crate) policy: AuthPolicy,
@@ -107,8 +112,10 @@ pub(crate) fn accounts(count: usize) -> Result<Vec<Account>, crypto::CryptoError
                 valid_until: u64::MAX,
             }],
         };
+        let address = policy.address()?;
         accounts.push(Account {
             id: name.as_bytes().to_vec(),
+            address,
             private_key,
             key_id,
             policy,
@@ -128,7 +135,7 @@ fn signed_transaction(
     let mut transaction = Transaction {
         protocol_version: PROTOCOL_VERSION_V1,
         chain_id: chain_id.to_vec(),
-        sender: account.id.clone(),
+        sender: account.address.to_vec(),
         sequence,
         fee: FEE,
         expiration: u64::MAX,
@@ -170,7 +177,7 @@ pub(crate) fn demo_batch(
         transactions.push(signed_transaction(
             &demo_chain_id(),
             sender,
-            &recipient.id,
+            &recipient.address,
             sequence,
             1,
         )?);
@@ -319,7 +326,7 @@ pub(crate) fn simulate(
                     transactions.push(signed_transaction(
                         chain_id,
                         account,
-                        &recipient.id,
+                        &recipient.address,
                         base + offset + 1,
                         amount,
                     )?);
@@ -503,7 +510,7 @@ pub(crate) fn settle(dag: &mut Dag, start_round: u64) -> Result<usize, Box<dyn E
 pub(crate) fn genesis_state(accounts: &[Account]) -> Result<State, exec::ExecError> {
     let mut state = State::new();
     for account in accounts {
-        state.credit(&account.id, GENESIS_BALANCE)?;
+        state.credit(&account.address, GENESIS_BALANCE)?;
     }
     Ok(state)
 }
@@ -522,7 +529,7 @@ pub(crate) fn apply_batch(
     for transaction in &batch.transactions {
         let policy = accounts
             .iter()
-            .find(|account| account.id == transaction.sender)
+            .find(|account| account.address.as_slice() == transaction.sender.as_slice())
             .map(|account| &account.policy);
         match policy {
             None => {
@@ -610,11 +617,21 @@ pub fn run(
     }
 
     println!();
-    println!("  {}  balance", pad("account", 10));
-    for (account, balance) in &first.balances {
+    println!("  {}  {}  balance", pad("account", 10), pad("address", 16));
+    let labels = accounts(validators)?;
+    for (address, balance) in &first.balances {
+        // The state keys on addresses; `id` is only the label that makes this
+        // table readable. An address with no matching account (a recipient the
+        // demo never created) falls back to its hex prefix.
+        let label = labels
+            .iter()
+            .find(|account| account.address.as_slice() == address.as_slice())
+            .map(|account| String::from_utf8_lossy(&account.id).into_owned())
+            .unwrap_or_else(|| hex::encode(&address[..address.len().min(6)]));
         println!(
-            "  {}  {}",
-            pad(&String::from_utf8_lossy(account), 10),
+            "  {}  {}  {}",
+            pad(&label, 10),
+            pad(&hex::encode(&address[..address.len().min(6)]), 16),
             balance
         );
     }

@@ -503,7 +503,7 @@ async fn node_task(
     let mut state = chain::genesis_state(&accounts).map_err(|error| error.to_string())?;
     for account in &accounts {
         state
-            .credit(&account.id, LIVE_BALANCE)
+            .credit(&account.address, LIVE_BALANCE)
             .map_err(|error| error.to_string())?;
     }
     let mut exec_rejected: BTreeMap<&'static str, usize> = BTreeMap::new();
