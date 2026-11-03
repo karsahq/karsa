@@ -28,13 +28,11 @@ the spec they contain is still normative for this code. `decisions.md` records t
 choices that would be expensive to reverse, and says which ones are decided and
 which are still open.
 
-## Rust port
-
-Done:
+## Implementation
 
 - Workspace with `sccache` and `mold` (see `RUST.md`).
 - `crypto`: closed error taxonomy, deterministic codec, algorithm
-  registry with the same frozen IDs and sizes as V, domain-separated payloads.
+  registry with frozen IDs and sizes, domain-separated payloads.
 - `crypto::merkle`: the Merkle tree and leaf commitment shared by the state root
   and the DAG commit root. Two layers of domain separation (structural tags, then a
   caller tag), odd nodes promoted rather than duplicated, and proofs that carry
@@ -162,13 +160,11 @@ Done:
   hold required two fixes: a `missing_reference` during commit is now a retry, not
   a node failure, and an indirect commit no longer mutates history before the
   direct non-vote rule has been ruled out (see design finding 15).
-- `karsa node`: the same HTTP pipeline as the V node (decode, policy lookup,
-  signature verification, per-sender replay protection) on axum, plus the
-  validator schedule: `GET /validators`, `POST /validators/{id}/keys`
-  (authorized by an existing active key), and `POST /epoch`.
-- `karsa dagbench` and `karsa loadtest`: the same measurements as the V tools, so
-  the numbers are directly comparable.
-- 247 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- `karsa node`: an HTTP pipeline (decode, policy lookup, signature verification,
+  per-sender replay protection) on axum, plus the validator schedule:
+  `GET /validators`, `POST /validators/{id}/keys` (authorized by an existing active
+  key), and `POST /epoch`.
+- 250 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
@@ -183,31 +179,28 @@ Done:
   its snapshot, catching a quorum that certified a wrong state root, the
   pacemaker refusing to emit history for an indirect commit it defers, in-process
   HTTP tests, and
-  **byte-for-byte parity checks** against V for the signing payloads and for a
-  complete signed envelope.
-- `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors (the same result as
-  the V prototype) and **14/14** NIST SLH-DSA-SHA2-128s sigVer vectors.
+  **fixed vectors** for the signing payloads and for a complete signed envelope.
+- `karsa acvp` passes **15/15** NIST ML-DSA-65 sigVer vectors and **14/14** NIST
+  SLH-DSA-SHA2-128s sigVer vectors.
 
-Not yet: nothing in the port plan below is missing.
+Nothing in the build order below is missing.
 
 Measured on this machine, one core for the crypto figures:
 
-| Measurement | V | Rust |
-| --- | ---: | ---: |
-| Ed25519 verify | ~63 µs/sig | ~40 µs/sig |
-| ML-DSA-65 verify | ~189 µs/sig | ~193 µs/sig |
-| 100-validator certificate | 331,403 B | 331,403 B (identical) |
-| Certificate verify, ML-DSA-65, n=100 | 18.9 ms | 19.3 ms |
-| Dense vs sparse headers, n=100 | 10.2× / 1.6× | 10.2× / 1.6× |
-| Demo node throughput | ~25–33k tx/s | ~50–57k tx/s |
+| Measurement | Result |
+| --- | ---: |
+| Ed25519 verify | ~40 µs/sig |
+| ML-DSA-65 verify | ~193 µs/sig |
+| 100-validator certificate | 331,403 B |
+| Certificate verify, ML-DSA-65, n=100 | 19.3 ms |
+| Dense vs sparse headers, n=100 | 10.2× / 1.6× |
+| Demo node throughput | ~50–57k tx/s |
 
-The Rust node is roughly twice as fast: axum/tokio spread work across threads and
-`ed25519-dalek` verifies faster than libsodium's Ed25519 here. ML-DSA-65 is the
-same OpenSSL engine, so those numbers match within run-to-run noise.
+Run-to-run noise is ±25%; ratios are stable and single numbers are not.
 
-SLH-DSA-SHA2-128s has no V counterpart. Measured the same way: ~905 µs to verify
-one signature, ~626 ms to sign one, and a 100-validator certificate of 786,103 B
-(projected). It is registered for agility, not as a default.
+SLH-DSA-SHA2-128s, measured the same way: ~905 µs to verify one signature,
+~626 ms to sign one, and a 100-validator certificate of 786,103 B (projected). It
+is registered for agility, not as a default.
 
 Certificates are no longer only a cost model: `karsa certify 10` encodes a real
 certificate and verifies it against the epoch-bound schedule. 771 bytes at 10
@@ -258,8 +251,8 @@ can check either vector set.
 
 ## Design findings
 
-These were established with the V prototype, which has since been removed; the
-Rust port reproduces its measurements.
+Established by measurement on the development machine; the numbers are in the
+tables above.
 
 1. **A crypto-agile registry works.** Algorithm IDs, statuses, canonical
    encodings, domain separation, and a closed error taxonomy are enough to swap
@@ -349,7 +342,7 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     one shared queue, 39 of 84 wants were abandoned while the final root still
     matched, which is precisely the failure a convergence-only test would miss.
 
-## Port plan
+## Build order
 
 | Stage | Crate | State |
 | ----- | ----- | ----- |
@@ -361,6 +354,5 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
 | HTTP node | `karsa node` | done |
 | DAG and throughput benchmarks | `karsa dagbench`, `karsa certify`, `karsa bandwidth`, `karsa loadtest` | done |
 
-The normative spec is `docs/crypto-registry.md` (local, unpublished); the V
-numbers to beat are above. Where the Rust code and the spec disagree, the spec
-wins.
+The normative spec is `docs/crypto-registry.md` (local, unpublished). Where the
+code and the spec disagree, the spec wins.

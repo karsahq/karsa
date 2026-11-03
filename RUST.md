@@ -1,8 +1,7 @@
-# Rust implementation plan
+# Rust implementation notes
 
-Decisions for the next implementation. Nothing here is built yet; this file
-records the toolchain choices and the exact configuration so the scaffold starts
-from a known state.
+Toolchain choices and the configuration the workspace uses. The implementation
+lives in `crates/` and `cmd/`; the normative spec is `docs/crypto-registry.md`.
 
 ## Status on this machine
 
@@ -113,37 +112,38 @@ karsa-new/                 # workspace root
 ├── Cargo.toml
 ├── .cargo/config.toml
 ├── crates/
-│   ├── crypto/      # error, encoding, registry, domain, scheme, ml_dsa
-│   ├── tx/          # envelope, policy
-│   └── validator/   # epoch-bound key schedule
-├── cmd/karsa/       # one CLI: node, sample-tx, demo, acvp, dagbench, loadtest
+│   ├── crypto/      # error, encoding, registry, domain, merkle, scheme, ml_dsa, slh_dsa
+│   ├── tx/          # envelope, policy, batch
+│   ├── exec/        # account state machine, Merkle state root, account proofs
+│   ├── validator/   # key schedule, certificate, vertex, DAG, pacemaker, header
+│   ├── net/         # deterministic dissemination, wire framing
+│   ├── store/       # append-only vertices, batches, shards, headers, snapshot
+│   └── erasure/     # Reed-Solomon GF(2^8)
+├── cmd/karsa/       # one CLI
 └── scripts/{rust-check.sh, acvp-rust.sh, loadtest-rust.sh}
 ```
 
-Status of the first stage:
+Status:
 
 - `crypto` implements the closed error taxonomy, the canonical codec, the
-  algorithm registry (same frozen IDs and sizes as V), domain-separated
-  payloads, and the `SignatureScheme` trait with Ed25519, ML-DSA-65, and
-  SLH-DSA-SHA2-128s implementations.
-- 143 tests pass in the workspace default build (144 with `--all-features`), 30
-  of them in `crypto` alone without PQ backends: RFC 8032 vectors, ML-DSA and
-  SLH-DSA roundtrip and context binding, deterministic signing, key generation,
-  envelope and policy behaviour, validator rotation and quorum-safe counting,
-  validator key registration and epoch advance over HTTP, certificate encoding
-  and quorum rejection, vertex encoding and vote tallying, batch-vs-individual
-  equality, the dissemination model's formulas, in-process HTTP tests, plus
-  byte-for-byte parity checks for the signing payloads and a complete signed
+  algorithm registry, domain-separated payloads, and the `SignatureScheme` trait
+  with Ed25519, ML-DSA-65, and SLH-DSA-SHA2-128s implementations.
+- 250 tests pass in the workspace default build, including RFC 8032 vectors,
+  ML-DSA and SLH-DSA roundtrip and context binding, deterministic signing, key
+  generation, envelope and policy behaviour, validator rotation and quorum-safe
+  counting, validator key registration and epoch advance over HTTP, certificate
+  encoding and quorum rejection, vertex encoding and vote tallying,
+  batch-vs-individual equality, the dissemination model's formulas, in-process
+  HTTP tests, plus fixed vectors for the signing payloads and a complete signed
   envelope.
 - `karsa acvp` matches 15/15 NIST ML-DSA-65 and 14/14 SLH-DSA-SHA2-128s sigVer
   vectors.
-- `karsa node` produces the same transaction id as the V node for the same demo
-  envelope, which is expected because the encoded bytes are identical. It also
-  exposes the validator schedule: registration is authorized by an existing
-  active key, and `POST /epoch` refuses to advance past a schedule that would
-  leave a validator without an active key.
-- `karsa dagbench` reproduces the V certificate sizes exactly (331,403 B at 100
-  validators) and the 10.2× / 1.6× dense-vs-sparse header ratios.
+- `karsa node` produces a stable transaction id for the demo envelope and exposes
+  the validator schedule: registration is authorized by an existing active key,
+  and `POST /epoch` refuses to advance past a schedule that would leave a
+  validator without an active key.
+- `karsa dagbench` measures the certificate at 331,403 B for 100 validators and
+  prints the 10.2× / 1.6× dense-vs-sparse header ratios.
 - `karsa certify` encodes and verifies a real certificate against the schedule:
   batch verification cuts Ed25519 certificate verification by 1.3–2× (2,630 µs
   instead of 4,108 µs at 100 validators), and below-quorum, tampered,
@@ -153,40 +153,38 @@ Status of the first stage:
 - `karsa dagsim` runs the direct and indirect rules on fixed scenarios: a vote
   supermajority commits, an observed non-vote supermajority skips, and a partially
   observed round stays undecided. Insertion enforces the shape rule — a vertex
-  must reference a quorum of distinct previous-round authors — and a referenced
-  vertex that is not held fails with `missing_reference` rather than committing a
-  partial history.
+  must reference a quorum of distinct previous-round authors — but it does *not*
+  require the referenced vertices to be held; a missing neighbour only surfaces
+  when a walk needs it, and the pacemaker then reports a timeout instead of
+  deciding on a partial history.
 - `karsa bandwidth` re-derives the dissemination arithmetic: per-node egress is
   `(n-1)/n` of the originator total for any fanout, so batching and certificate
   size move the number and fanout does not. It also prices three consensus
   metadata styles per round: an `n`-signature certificate (10,000 signatures at
   n=100), and block-per-validator DAGs with one signature each (100), which is
   where a 30–95× metadata difference comes from.
-- `karsa loadtest` measures ~50–57k accepted tx/s on this machine, against
-  ~25–33k for the V node.
-- The V prototype's rule that activation requires an implementation is
-  preserved: `pq-testnet` without at least one of `pq-openssl` or `pq-slh` is a
-  compile error.
+- `karsa loadtest` measures ~50–57k accepted tx/s on this machine.
+- Activation requires an implementation: `pq-testnet` without at least one of
+  `pq-openssl` or `pq-slh` is a compile error.
 
-Port order and the normative spec live in `docs/crypto-registry.md`;
-the measured V numbers to beat are in the root `README.md`.
+The normative spec lives in `docs/crypto-registry.md`; measured numbers are in the
+root `README.md`.
 
 ## Crate choices to evaluate
 
 | Need | Candidate | Note |
 | ---- | --------- | ---- |
 | Ed25519 | `ed25519-dalek` | audited, constant-time, fast; `batch` feature for multi-scalar verification, `curve25519-dalek` used directly to reject a small-order `R`, which the batch equation does not test |
-| ML-DSA-65 | RustCrypto `ml-dsa`, or OpenSSL via `openssl` crate | RustCrypto's is a pre-release and not independently audited; the V prototype used OpenSSL 3.6.5 and passed ACVP sigVer |
+| ML-DSA-65 | RustCrypto `ml-dsa`, or OpenSSL via `openssl` crate | RustCrypto's is a pre-release and not independently audited; OpenSSL 3.5+ passed the ACVP sigVer vectors |
 | SLH-DSA-128s | RustCrypto `slh-dsa` (pure Rust) or OpenSSL 3.5+ EVP | chosen `slh-dsa` 0.2.0-rc.5 so the hash-based fallback needs no system library; also a pre-release, so it still needs an audit |
 | Hashing | `sha2` | matches `SHA-256` in the spec |
-| Encoding | hand-written, as in V | the canonical encoding is normative; do not let `serde` choose bytes |
+| Encoding | hand-written | the canonical encoding is normative; do not let `serde` choose bytes |
 | Benchmarking | `criterion` | plus `dhat` or a counting allocator if allocation matters |
-| HTTP | `axum` or `hyper` | the V node used viltrum; keep the transport at the edge |
+| HTTP | `axum` or `hyper` | keep the transport at the edge |
 | Concurrency | `rayon` for verification, `tokio` for the node | verification is CPU-bound, so `rayon` is the natural fit |
 
 Keep the OpenSSL path as the reference implementation: it is what passed the
-NIST vectors, and a second backend lets the Rust version cross-check itself
-against the V results.
+NIST vectors, and a second backend lets the two cross-check each other.
 
 ## Linker on a machine without clang
 
