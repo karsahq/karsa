@@ -41,6 +41,7 @@ mod loadtest;
 mod migrate;
 mod netrun;
 mod node;
+mod peers;
 mod persist;
 mod shards;
 mod sigbench;
@@ -205,6 +206,18 @@ enum Command {
         #[arg(default_value_t = 16)]
         concurrency: usize,
     },
+    /// List known peers, or add and remove one.
+    Peers {
+        /// Node home directory holding peers.json.
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Add or update a peer, as id@host:port.
+        #[arg(long)]
+        add: Option<String>,
+        /// Remove a peer by id.
+        #[arg(long)]
+        remove: Option<String>,
+    },
     /// Validate and explain a genesis, or write an example.
     Genesis {
         /// Explicit file; defaults to genesis.json in --home.
@@ -322,6 +335,7 @@ fn main() -> ExitCode {
         Command::Dagbench => dagbench::run(),
         Command::Loadtest { count, concurrency } => loadtest::run(count, concurrency),
         Command::Config { path, home, init } => run_config(home, path, init),
+        Command::Peers { home, add, remove } => run_peers(home, add, remove),
         Command::Genesis { path, home, init } => run_genesis(home, path, init),
         Command::Live {
             validators,
@@ -370,6 +384,15 @@ fn run_config(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let home = home::Home::resolve(home_path)?;
     config::run(&home, path, init)
+}
+
+fn run_peers(
+    home_path: Option<PathBuf>,
+    add: Option<String>,
+    remove: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let home = home::Home::resolve(home_path)?;
+    peers::run(&home, add, remove)
 }
 
 fn run_genesis(

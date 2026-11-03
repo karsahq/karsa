@@ -1,5 +1,5 @@
 {
-  "chain_id": "karsa-1",
+  "chain_id": "karsa",
   "protocol_version": 1,
   "epoch_rounds": 1000,
   "validators": [

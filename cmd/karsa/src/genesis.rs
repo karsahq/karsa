@@ -36,7 +36,7 @@ const DOMAIN: &[u8] = b"KARSA/GENESIS/v1";
 
 /// The example written by `karsa genesis --init`.
 const EXAMPLE: &str = r#"{
-  "chain_id": "karsa-1",
+  "chain_id": "karsa",
   "protocol_version": 1,
   "epoch_rounds": 1000,
   "validators": [

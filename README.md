@@ -170,6 +170,12 @@ which are still open.
   persists every vertex and batch through `crates/store`, so the bytes-per-day
   figure is measured from files rather than modelled. `--archives N` adds archive
   nodes: they receive everything, store everything, and never sign.
+- `karsa peers`: the network half, in `peers.json` beside the other two. Genesis says
+  who the validators *are*; an address is operational data that changes when a
+  machine moves, so it never goes in the file every node must agree on. `--add
+  id@host:port` and `--remove id` grow and shrink the list, and the listing marks
+  each entry as a founding validator (present in genesis) or known-only, which is
+  a legitimate state for an RPC or sentry.
 - `karsa genesis`: the file every node must agree on, in JSON because it is a
   generated consensus artifact rather than a hand-edited preference. Validators,
   their keys, the founding accounts with their policies, and the key-epoch length
@@ -198,7 +204,7 @@ which are still open.
   key), and `POST /epoch`. With `--config node.toml` it binds to
   `network.rpc_listen` and writes the file with defaults first if it is missing,
   instead of refusing its own first run.
-- 272 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 278 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
@@ -437,7 +443,7 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     the code instead of a claim about the operator's intentions.
 24. **Chain identity is the genesis hash, and nothing else.** `node.toml` carries
     no chain id at all: every validator loads the same genesis, so a second copy is
-    only a place to typo. The human name (`karsa-1`) lives inside the genesis, where
+    only a place to typo. The human name (`karsa`) lives inside the genesis, where
     it is hashed along with everything else, so renaming a chain is a different
     identity rather than a relabelling. That is the lesson of Ethereum's 2016
     split, where ETH and ETC both kept chain id 1 and transactions replayed across

@@ -67,6 +67,12 @@ impl Home {
         self.dir.join("genesis.json")
     }
 
+    /// `peers.json` inside this home.
+    #[must_use]
+    pub fn peers_json(&self) -> PathBuf {
+        self.dir.join("peers.json")
+    }
+
     /// Picks an explicit file when one was given, else the file inside this home.
     #[must_use]
     pub fn file(&self, explicit: Option<PathBuf>, name: &str) -> PathBuf {
