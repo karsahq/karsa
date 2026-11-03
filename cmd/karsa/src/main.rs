@@ -363,7 +363,14 @@ fn run_node(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Erro
                 )
                 .into());
             }
-            config.network.rpc_listen
+            if !config.rpc.enable {
+                return Err(format!(
+                    "{} has [rpc] enable = false, so there is nothing to serve",
+                    path.display()
+                )
+                .into());
+            }
+            config.rpc.rpc_listen
         }
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()

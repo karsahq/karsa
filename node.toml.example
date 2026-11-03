@@ -16,6 +16,7 @@
 id = "val-0"
 chain_id = "karsa-1"
 data_dir = "/var/lib/karsa"
+listen = "0.0.0.0:26656"
 
 [roles]
 # A validator signs: it authors one vertex per round and votes in consensus.
@@ -25,8 +26,6 @@ validator = true
 # roles: validator + archive signs and keeps everything, while a pure archive
 # (validator = false) never signs.
 archive = false
-# Serve RPC to wallets and indexers. Independent of the two above.
-rpc = false
 
 [storage]
 # Full payload kept for this many days. A validator only needs enough to serve a
@@ -41,6 +40,7 @@ snapshot_interval = 10000
 # Certified headers are what a light client checks; they are small and kept.
 keep_headers = true
 
-[network]
-listen = "0.0.0.0:26656"
+[rpc]
+# Serve RPC to wallets and indexers. Independent of the two above.
+enable = false
 rpc_listen = "127.0.0.1:26657"

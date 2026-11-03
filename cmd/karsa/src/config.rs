@@ -41,6 +41,7 @@ const EXAMPLE: &str = r#"# Karsa node configuration.
 id = "val-0"
 chain_id = "karsa-1"
 data_dir = "/var/lib/karsa"
+listen = "0.0.0.0:26656"
 
 [roles]
 # A validator signs: it authors one vertex per round and votes in consensus.
@@ -50,8 +51,6 @@ validator = true
 # roles: validator + archive signs and keeps everything, while a pure archive
 # (validator = false) never signs.
 archive = false
-# Serve RPC to wallets and indexers. Independent of the two above.
-rpc = false
 
 [storage]
 # Full payload kept for this many days. A validator only needs enough to serve a
@@ -66,8 +65,9 @@ snapshot_interval = 10000
 # Certified headers are what a light client checks; they are small and kept.
 keep_headers = true
 
-[network]
-listen = "0.0.0.0:26656"
+[rpc]
+# Serve RPC to wallets and indexers. Independent of the two above.
+enable = false
 rpc_listen = "127.0.0.1:26657"
 "#;
 
@@ -81,8 +81,8 @@ pub struct NodeConfig {
     pub roles: RolesSection,
     /// What it keeps.
     pub storage: StorageSection,
-    /// Where it listens.
-    pub network: NetworkSection,
+    /// Whether and where it serves RPC.
+    pub rpc: RpcSection,
 }
 
 /// Identity and paths.
@@ -95,6 +95,8 @@ pub struct NodeSection {
     pub chain_id: String,
     /// Where the store lives.
     pub data_dir: PathBuf,
+    /// Peer-to-peer listen address.
+    pub listen: String,
 }
 
 /// What this node does for the network.
@@ -103,8 +105,6 @@ pub struct NodeSection {
 pub struct RolesSection {
     /// Participates in consensus.
     pub validator: bool,
-    /// Serves RPC.
-    pub rpc: bool,
     /// Keeps everything forever; implies no pruning.
     pub archive: bool,
 }
@@ -126,10 +126,10 @@ pub struct StorageSection {
 /// Where this node listens.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct NetworkSection {
-    /// Peer-to-peer listen address.
-    pub listen: String,
-    /// RPC listen address, used when the RPC role is on.
+pub struct RpcSection {
+    /// Serve RPC at all.
+    pub enable: bool,
+    /// RPC listen address, used when `enable` is on.
     pub rpc_listen: String,
 }
 
@@ -140,10 +140,10 @@ impl Default for NodeConfig {
                 id: "val-0".into(),
                 chain_id: "karsa-1".into(),
                 data_dir: PathBuf::from("/var/lib/karsa"),
+                listen: "0.0.0.0:26656".into(),
             },
             roles: RolesSection {
                 validator: true,
-                rpc: false,
                 archive: false,
             },
             storage: StorageSection {
@@ -152,8 +152,8 @@ impl Default for NodeConfig {
                 snapshot_interval: 10_000,
                 keep_headers: true,
             },
-            network: NetworkSection {
-                listen: "0.0.0.0:26656".into(),
+            rpc: RpcSection {
+                enable: false,
                 rpc_listen: "127.0.0.1:26657".into(),
             },
         }
@@ -171,37 +171,39 @@ impl RolesSection {
     pub fn signs(&self) -> bool {
         self.validator
     }
+}
 
+impl NodeConfig {
     /// The role in words, in the order a person would say it.
     #[must_use]
-    pub fn label(&self) -> String {
-        let base = match (self.validator, self.archive) {
+    pub fn role_label(&self) -> String {
+        let base = match (self.roles.validator, self.roles.archive) {
             (true, true) => "validator + archive",
             (true, false) => "validator",
             (false, true) => "archive",
             (false, false) => "none",
         };
-        if self.rpc {
+        if self.rpc.enable {
             format!("{base} + rpc")
         } else {
             base.to_string()
         }
     }
 
-    /// What the role implies, as one clause.
+    /// What the roles imply, as one clause.
     #[must_use]
-    pub fn implies(&self) -> String {
-        let signing = if self.signs() {
+    pub fn role_implies(&self) -> String {
+        let signing = if self.roles.signs() {
             "signs"
         } else {
             "does not sign"
         };
-        let storage = if self.archive {
+        let storage = if self.roles.archive {
             "keeps everything"
         } else {
             "prunes after the retention window"
         };
-        if self.rpc {
+        if self.rpc.enable {
             format!("{signing}, {storage}, serves rpc")
         } else {
             format!("{signing}, {storage}")
@@ -258,19 +260,17 @@ impl NodeConfig {
         if self.node.chain_id.trim().is_empty() {
             problems.push("node.chain_id is empty".to_string());
         }
-        if !self.roles.validator && !self.roles.rpc && !self.roles.archive {
+        if !self.roles.validator && !self.rpc.enable && !self.roles.archive {
             problems.push(
-                "the node has no role: set at least one of validator, archive, or rpc".to_string(),
-            );
-        }
-        if self.roles.archive && self.storage.retain_days != 0 {
-            // An archive that prunes is not an archive; say so rather than let the
-            // retention value quietly win.
-            problems.push(
-                "roles.archive is on, so storage.retain_days must be 0 (an archive keeps \
-                 everything)"
+                "the node has no role: set roles.validator, roles.archive, or rpc.enable"
                     .to_string(),
             );
+        }
+        if std::net::ToSocketAddrs::to_socket_addrs(&self.node.listen).is_err() {
+            problems.push(format!(
+                "node.listen is not an address: {}",
+                self.node.listen
+            ));
         }
         if self.roles.archive {
             if self.storage.retain_days != 0 {
@@ -307,13 +307,15 @@ impl NodeConfig {
                     .to_string(),
             );
         }
-        if self.roles.rpc && self.network.rpc_listen.trim().is_empty() {
-            problems.push("roles.rpc is on but network.rpc_listen is empty".to_string());
+        if self.rpc.enable && self.rpc.rpc_listen.trim().is_empty() {
+            problems.push("rpc.enable is on but rpc.rpc_listen is empty".to_string());
         }
-        if std::net::ToSocketAddrs::to_socket_addrs(&self.network.listen).is_err() {
+        if self.rpc.enable
+            && std::net::ToSocketAddrs::to_socket_addrs(&self.rpc.rpc_listen).is_err()
+        {
             problems.push(format!(
-                "network.listen is not an address: {}",
-                self.network.listen
+                "rpc.rpc_listen is not an address: {}",
+                self.rpc.rpc_listen
             ));
         }
         problems
@@ -364,8 +366,8 @@ pub fn run(path: Option<PathBuf>, init: bool) -> Result<(), Box<dyn Error>> {
     println!("== Node configuration: {} ==", path.display());
     println!(
         "  role              {} ({})",
-        config.roles.label(),
-        config.roles.implies()
+        config.role_label(),
+        config.role_implies()
     );
     println!(
         "  identity          {} on {}",
@@ -374,7 +376,12 @@ pub fn run(path: Option<PathBuf>, init: bool) -> Result<(), Box<dyn Error>> {
     println!("  data directory    {}", config.node.data_dir.display());
     println!(
         "  network           p2p {}  rpc {}",
-        config.network.listen, config.network.rpc_listen
+        config.node.listen,
+        if config.rpc.enable {
+            config.rpc.rpc_listen.as_str()
+        } else {
+            "disabled"
+        }
     );
     println!();
     if config.prunes() {
@@ -465,32 +472,32 @@ mod tests {
     #[test]
     fn roles_are_described_in_words() {
         let mut config = NodeConfig::default();
-        assert_eq!(config.roles.label(), "validator");
+        assert_eq!(config.role_label(), "validator");
         assert!(config.roles.signs());
-        assert!(config.roles.implies().contains("prunes"));
+        assert!(config.role_implies().contains("prunes"));
 
         config.roles.archive = true;
         config.storage.retain_days = 0;
         config.storage.max_disk_gb = 0;
-        assert_eq!(config.roles.label(), "validator + archive");
+        assert_eq!(config.role_label(), "validator + archive");
         assert!(config.roles.signs(), "an archive validator still signs");
-        assert!(config.roles.implies().contains("keeps everything"));
+        assert!(config.role_implies().contains("keeps everything"));
 
         config.roles.validator = false;
-        assert_eq!(config.roles.label(), "archive");
+        assert_eq!(config.role_label(), "archive");
         assert!(!config.roles.signs(), "a pure archive does not sign");
         assert!(config.problems().is_empty(), "{:?}", config.problems());
 
-        config.roles.rpc = true;
-        assert_eq!(config.roles.label(), "archive + rpc");
-        assert!(config.roles.implies().contains("serves rpc"));
+        config.rpc.enable = true;
+        assert_eq!(config.role_label(), "archive + rpc");
+        assert!(config.role_implies().contains("serves rpc"));
     }
 
     #[test]
     fn an_rpc_only_node_prunes_and_does_not_sign() {
         let mut config = NodeConfig::default();
         config.roles.validator = false;
-        config.roles.rpc = true;
+        config.rpc.enable = true;
         assert!(!config.roles.signs());
         assert!(config.prunes());
         assert!(config.problems().is_empty(), "{:?}", config.problems());
@@ -538,14 +545,22 @@ mod tests {
     #[test]
     fn an_rpc_role_needs_somewhere_to_listen() {
         let mut config = NodeConfig::default();
-        config.roles.rpc = true;
-        config.network.rpc_listen = String::new();
+        config.rpc.enable = true;
+        config.rpc.rpc_listen = String::new();
         assert!(
             config
                 .problems()
                 .iter()
                 .any(|problem| problem.contains("rpc_listen"))
         );
+    }
+
+    #[test]
+    fn a_disabled_rpc_section_may_leave_its_address_empty() {
+        let mut config = NodeConfig::default();
+        config.rpc.enable = false;
+        config.rpc.rpc_listen = String::new();
+        assert!(config.problems().is_empty(), "{:?}", config.problems());
     }
 
     #[test]
@@ -558,7 +573,7 @@ mod tests {
     fn a_node_with_no_role_is_refused() {
         let mut config = NodeConfig::default();
         config.roles.validator = false;
-        config.roles.rpc = false;
+        config.rpc.enable = false;
         config.roles.archive = false;
         assert!(
             config
