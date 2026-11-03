@@ -162,7 +162,9 @@ which are still open.
   direct non-vote rule has been ruled out (see design finding 15). With `--txs N`
   each vertex names a real batch of signed transfers and the batch travels on the
   same link, so bytes per transaction are measured rather than modelled (finding
-  17).
+  17). `--execute` applies the committed batches into an account state, so the run
+  ends on a state root rather than on a commit root alone, and it waits for the
+  applied cursor to catch up with the commit cursor before reporting.
 - `karsa node`: an HTTP pipeline (decode, policy lookup, signature verification,
   per-sender replay protection) on axum, plus the validator schedule:
   `GET /validators`, `POST /validators/{id}/keys` (authorized by an existing active
@@ -352,6 +354,15 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     forced vertex drops and repair — because payload waits for a queue slot instead
     of being dropped (D22). The number is per receiving node, so total wire cost is
     that times the committee size.
+18. **Consensus, transport, and execution in one run.** At n=4 with 50 rounds of
+    100 transactions per batch, every node committed 188 vertices and applied
+    **18,800 transactions with 0 rejected**, ending on the same state root
+    (`93b9d04a11bd`) and the same commit root — 1.9 s wall clock, so roughly 10k tx/s
+    per node and 40k across the four, with execution overlapping consensus rather
+    than following it. Getting a number instead of half a number needed two things:
+    funded demo accounts (the default 1,000 runs out and turns the run into a
+    rejection benchmark) and a run that waits for the applied cursor to reach the
+    commit cursor once commits stop arriving.
 
 ## Build order
 

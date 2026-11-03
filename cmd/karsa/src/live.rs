@@ -27,7 +27,7 @@
 //! handshake, no retransmission timer beyond the want sweep, and no peer discovery:
 //! the mesh is fixed by `--validators`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,6 +59,15 @@ const CONNECT_TRIES: usize = 400;
 const TICK: Duration = Duration::from_millis(2);
 /// How often the want sweep runs, in ticks.
 const WANT_SWEEP_TICKS: u32 = 25;
+/// Ticks the commit cursor must stand still before execution is called caught up.
+const QUIET_TICKS: u32 = 50;
+/// Balance each demo account starts with in a live run.
+///
+/// The chain demo funds accounts with a thousand units, which is plenty for a
+/// handful of transactions and far too little for a throughput run: at a hundred
+/// transactions per batch the fee alone exhausts it within a few rounds and the
+/// rest of the run measures rejections instead of execution.
+const LIVE_BALANCE: u64 = 1_000_000_000;
 
 /// How a live run is configured.
 #[derive(Clone)]
@@ -82,6 +91,8 @@ pub struct Config {
     pub send_buffer: usize,
     /// Transactions per authored batch. Zero keeps the data plane empty.
     pub txs: u64,
+    /// Apply committed batches into an account state and print its root.
+    pub execute: bool,
     /// How long to keep the mesh alive after the last node finishes authoring,
     /// so the final rounds and any repair can land before the run is measured.
     pub drain: Duration,
@@ -102,6 +113,9 @@ struct NodeResult {
     txs_received: usize,
     payload_bytes: u64,
     missing_payloads: usize,
+    applied: usize,
+    exec_rejected: usize,
+    state_root: Option<[u8; 32]>,
     rejected: usize,
     committed: usize,
     bytes_in: u64,
@@ -230,6 +244,7 @@ async fn node_task(
     started: Instant,
     mut shutdown: watch::Receiver<bool>,
     ready: mpsc::Sender<usize>,
+    executed: mpsc::Sender<usize>,
 ) -> Result<NodeResult, String> {
     let (set, consensus) =
         chain::consensus_set(config.validators).map_err(|error| error.to_string())?;
@@ -313,6 +328,15 @@ async fn node_task(
 
     let mut wanted: HashMap<VertexId, Want> = HashMap::new();
     let mut batches: HashMap<[u8; 32], Batch> = HashMap::new();
+    let mut state = chain::genesis_state(&accounts).map_err(|error| error.to_string())?;
+    for account in &accounts {
+        state
+            .credit(&account.id, LIVE_BALANCE)
+            .map_err(|error| error.to_string())?;
+    }
+    let mut exec_rejected: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut applied = 0usize;
+    let mut applied_cursor = 0usize;
     let mut payload_bytes = 0u64;
     let mut payloads = 0usize;
     let mut txs_received = 0usize;
@@ -327,6 +351,9 @@ async fn node_task(
     let mut ticks: u32 = 0;
     let mut cursor: u64 = 1;
     let mut announced = false;
+    let mut exec_announced = false;
+    let mut last_order = 0usize;
+    let mut stable_ticks: u32 = 0;
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -425,9 +452,47 @@ async fn node_task(
                         return Err(format!("node {index} cannot commit: {error}"));
                     }
                 }
+                if config.execute {
+                    // Apply in commit order, and stop at the first vertex whose
+                    // batch has not arrived: applying past it would put a later
+                    // transaction before an earlier one.
+                    let order = node.dag().order();
+                    while applied_cursor < order.len() {
+                        let id = &order[applied_cursor];
+                        let Some(vertex) = node.dag().get(id.round, &id.author) else {
+                            break;
+                        };
+                        let Some(batch) = batches.get(&vertex.payload_hash) else {
+                            break;
+                        };
+                        applied +=
+                            chain::apply_batch(&mut state, &accounts, batch, &mut exec_rejected);
+                        applied_cursor += 1;
+                    }
+                }
                 if !announced && node.round() > config.rounds {
                     announced = true;
                     let _ = ready.send(index).await;
+                }
+                // Applying costs real signature verification, so it lags the
+                // commit cursor. Report caught-up only once the commit cursor has
+                // itself stopped moving for a while: early in the run both cursors
+                // are small and "caught up" would be trivially true.
+                let order_len = node.dag().order().len();
+                if order_len == last_order {
+                    stable_ticks = stable_ticks.saturating_add(1);
+                } else {
+                    stable_ticks = 0;
+                    last_order = order_len;
+                }
+                if config.execute
+                    && !exec_announced
+                    && announced
+                    && stable_ticks >= QUIET_TICKS
+                    && applied_cursor >= order_len
+                {
+                    exec_announced = true;
+                    let _ = executed.send(index).await;
                 }
 
                 // Ask for every dangling reference, then retry whatever is still
@@ -503,6 +568,12 @@ async fn node_task(
         }
     }
     let transactions: usize = batches.values().map(Batch::len).sum();
+    let state_root = if config.execute {
+        Some(state.state_root())
+    } else {
+        None
+    };
+    let exec_rejected = exec_rejected.values().sum();
 
     Ok(NodeResult {
         index,
@@ -518,6 +589,9 @@ async fn node_task(
         txs_received,
         payload_bytes,
         missing_payloads,
+        applied,
+        exec_rejected,
+        state_root,
         rejected,
         committed: node.dag().order().len(),
         bytes_in: bytes_in.load(Ordering::Relaxed),
@@ -575,17 +649,20 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         let started = Instant::now();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (ready_tx, mut ready_rx) = mpsc::channel(config.validators);
+        let (executed_tx, mut executed_rx) = mpsc::channel(config.validators);
 
         let mut tasks = Vec::with_capacity(config.validators);
         for index in 0..config.validators {
             let shutdown_rx = shutdown_rx.clone();
             let ready_tx = ready_tx.clone();
+            let executed_tx = executed_tx.clone();
             let config = config.clone();
             tasks.push(tokio::spawn(async move {
-                node_task(index, &config, started, shutdown_rx, ready_tx).await
+                node_task(index, &config, started, shutdown_rx, ready_tx, executed_tx).await
             }));
         }
         drop(ready_tx);
+        drop(executed_tx);
 
         // Every node announces when it has authored its rounds; then the mesh is
         // kept alive for the drain period, because the last rounds are still on
@@ -608,6 +685,22 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         // Measured before the drain, so it is the authoring pace rather than the
         // pace plus a fixed wait for the last frames.
         let authoring = started.elapsed();
+        if config.execute {
+            // Wait for every node's applied cursor to catch up with its commit
+            // cursor; the deadline above still bounds the wait.
+            let mut caught = 0usize;
+            loop {
+                tokio::select! {
+                    Some(_) = executed_rx.recv() => {
+                        caught += 1;
+                        if caught == config.validators {
+                            break;
+                        }
+                    }
+                    _ = &mut deadline => break,
+                }
+            }
+        }
         tokio::time::sleep(config.drain).await;
         let _ = shutdown_tx.send(true);
 
@@ -684,6 +777,9 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let mut payload_txs_received = 0usize;
     let mut payload_wire = 0u64;
     let mut missing_payloads = 0usize;
+    let mut applied = 0usize;
+    let mut exec_rejected = 0usize;
+    let mut state_roots: Vec<[u8; 32]> = Vec::new();
     for result in &results {
         bytes_in += result.bytes_in;
         bytes_out += result.bytes_out;
@@ -697,6 +793,11 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         payload_txs_received += result.txs_received;
         payload_wire += result.payload_bytes;
         missing_payloads += result.missing_payloads;
+        applied += result.applied;
+        exec_rejected += result.exec_rejected;
+        if let Some(root) = result.state_root {
+            state_roots.push(root);
+        }
         roots.push(result.commit_root);
         latencies.extend_from_slice(&result.latencies);
         println!(
@@ -746,6 +847,19 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             human(payload_wire)
         );
         println!("                    {payload_txs} unique transactions held across all nodes");
+    }
+    if let Some(first) = state_roots.first() {
+        let agree = state_roots.iter().all(|root| root == first);
+        println!(
+            "  execution         {applied} tx applied, {exec_rejected} rejected, state root {} \
+             (all nodes agree: {agree})",
+            hex::encode(&first[..6])
+        );
+        if !agree {
+            for (index, root) in state_roots.iter().enumerate() {
+                println!("    val-{index} {}", hex::encode(&root[..6]));
+            }
+        }
     }
     let agreed = roots.windows(2).all(|pair| pair[0] == pair[1]);
     println!("  same commit root  {agreed}");
@@ -845,6 +959,9 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         return Err(
             format!("{missing_payloads} vertices name a batch this node does not hold").into(),
         );
+    }
+    if state_roots.len() > 1 && state_roots.iter().any(|root| *root != state_roots[0]) {
+        return Err("nodes applied the same commits to different state".into());
     }
     Ok(())
 }
