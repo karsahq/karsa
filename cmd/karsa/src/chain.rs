@@ -28,6 +28,7 @@ use tx::policy::{AuthKey, AuthPolicy, AuthPolicyKind, Authorization, KeyStatus};
 use validator::{
     Certificate, CommitProof, Dag, Header, HeaderChain, NO_EXPIRY, Pacemaker, PacemakerConfig,
     Step, ValidatorKey, ValidatorRecord, ValidatorSet, Vertex, bitmap_of, commit_root,
+    validator_address,
 };
 
 const EPOCH: u64 = 1;
@@ -71,18 +72,24 @@ pub(crate) fn consensus_set(
     let mut keys = Vec::with_capacity(count);
     for index in 0..count {
         let (public_key, private_key) = keypair(u8::try_from(index + 1).unwrap_or(1))?;
-        let id = format!("val-{index}").into_bytes();
+        let schedule = vec![ValidatorKey {
+            key_id: format!("val-{index}-k0").into_bytes(),
+            algorithm_id: ALG_ED25519,
+            public_key,
+            activation_epoch: 0,
+            retirement_epoch: NO_EXPIRY,
+        }];
+        // The identity is the genesis schedule, not a label. `key_id` above is
+        // metadata and is excluded from the address.
+        let address = validator_address(&schedule)?;
         validators.push(ValidatorRecord {
-            validator_id: id.clone(),
-            keys: vec![ValidatorKey {
-                key_id: format!("val-{index}-k0").into_bytes(),
-                algorithm_id: ALG_ED25519,
-                public_key,
-                activation_epoch: 0,
-                retirement_epoch: NO_EXPIRY,
-            }],
+            validator_id: address.to_vec(),
+            keys: schedule,
         });
-        keys.push(Consensus { id, private_key });
+        keys.push(Consensus {
+            id: address.to_vec(),
+            private_key,
+        });
     }
     let set = ValidatorSet {
         epoch: EPOCH,
@@ -303,7 +310,7 @@ pub(crate) fn simulate(
         } else {
             (0..validators)
                 .filter_map(|author| {
-                    dag.get(round - 1, format!("val-{author}").as_bytes())
+                    dag.get(round - 1, &consensus[author].id)
                         .and_then(|vertex| vertex.id().ok())
                 })
                 .collect()

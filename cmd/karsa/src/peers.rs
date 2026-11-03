@@ -47,7 +47,7 @@ pub struct Peers {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Peer {
-    /// Validator id, when the peer has one.
+    /// Validator address (Base58Check `K...`), when the peer has one.
     pub id: String,
     /// `host:port` a node can connect to.
     pub address: String,
@@ -169,7 +169,7 @@ pub fn run(
             genesis
                 .validators
                 .iter()
-                .any(|validator| validator.id == id)
+                .any(|validator| validator.address == id)
         })
     };
 
@@ -178,7 +178,9 @@ pub fn run(
     println!();
     if peers.peers.is_empty() {
         println!("  none yet. This node can be reached, but it will not initiate.");
-        println!("  add one:  karsa peers --add val-1@10.0.0.12:26656");
+        println!(
+            "  add one:  karsa peers --add K2omunn2RZQ1xV6SemLxyAoFUEk6PKtV8pUsqJB5vUCusRcHmgN@10.0.0.12:26656"
+        );
     } else {
         println!("  {}  address", left("id", 12));
         for peer in &peers.peers {

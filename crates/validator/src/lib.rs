@@ -5,6 +5,7 @@
 //! migration safe: a new key can be registered while the old one still signs, and
 //! the switch happens at a published epoch rather than by ad hoc node behaviour.
 
+mod address;
 mod certificate;
 mod dag;
 mod header;
@@ -12,6 +13,7 @@ mod pacemaker;
 mod schedule;
 mod vertex;
 
+pub use address::validator_address;
 pub use certificate::{
     CERTIFICATE_VERSION_V1, Certificate, bit_is_set, bitmap_len, bitmap_of, set_bit,
 };

@@ -4,7 +4,7 @@
   "epoch_rounds": 1000,
   "validators": [
     {
-      "id": "val-0",
+      "address": "K2omunn2RZQ1xV6SemLxyAoFUEk6PKtV8pUsqJB5vUCusRcHmgN",
       "keys": [
         {
           "key_id": "val-0-k0",

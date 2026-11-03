@@ -169,6 +169,17 @@ fn address(port_base: u16, index: usize) -> String {
     )
 }
 
+/// Renders a vertex author for a diagnostic line.
+///
+/// The chain runtime authors with 32-byte validator addresses, so this is the same
+/// Base58Check form a person sees elsewhere. A short fixture id falls back to text.
+fn author_label(author: &[u8]) -> String {
+    <[u8; 32]>::try_from(author).map_or_else(
+        |_| String::from_utf8_lossy(author).into_owned(),
+        |bytes| tx::address::encode(&bytes),
+    )
+}
+
 /// A short, readable rendering of a chain id for an error message.
 fn chain_label(chain_id: &[u8]) -> String {
     let prefix = hex::encode(&chain_id[..chain_id.len().min(6)]);
@@ -1423,7 +1434,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
                     println!(
                         "      only val-0: round {} {}",
                         vertex.round,
-                        String::from_utf8_lossy(&vertex.author)
+                        author_label(&vertex.author)
                     );
                 }
                 for vertex in right_only.iter().take(3) {
@@ -1431,7 +1442,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
                         "      only val-{}: round {} {}",
                         result.index,
                         vertex.round,
-                        String::from_utf8_lossy(&vertex.author)
+                        author_label(&vertex.author)
                     );
                 }
                 if let Some(position) = first_order {

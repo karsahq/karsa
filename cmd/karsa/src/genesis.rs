@@ -28,6 +28,7 @@ use crypto::registry::{ALG_ED25519, ALG_ML_DSA_65, ALG_SLH_DSA_SHA2_128S};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tx::policy::{AuthKey, AuthPolicy, AuthPolicyKind, KeyStatus, NO_EXPIRY as POLICY_NO_EXPIRY};
+use validator::{NO_EXPIRY as VALIDATOR_NO_EXPIRY, ValidatorKey, validator_address};
 
 /// The only protocol version this tree implements.
 const PROTOCOL_VERSION: u16 = 1;
@@ -42,7 +43,7 @@ const EXAMPLE: &str = r#"{
   "epoch_rounds": 1000,
   "validators": [
     {
-      "id": "val-0",
+      "address": "K2omunn2RZQ1xV6SemLxyAoFUEk6PKtV8pUsqJB5vUCusRcHmgN",
       "keys": [
         {
           "key_id": "val-0-k0",
@@ -93,10 +94,45 @@ pub struct Genesis {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GenesisValidator {
-    /// Validator id, unique in the committee.
-    pub id: String,
+    /// Base58Check address (`K...`) derived from the genesis key schedule.
+    ///
+    /// Checked against the keys, not trusted. A rotation later adds keys under the
+    /// same address, so votes and history stay attached to one identity.
+    pub address: String,
     /// Keys, at least one active at epoch 0.
     pub keys: Vec<GenesisKey>,
+}
+
+impl GenesisValidator {
+    /// The genesis key schedule in the runtime form.
+    ///
+    /// # Errors
+    ///
+    /// An unknown algorithm or a public key that is not hex.
+    pub fn runtime_keys(&self) -> Result<Vec<ValidatorKey>, Box<dyn Error>> {
+        let mut keys = Vec::with_capacity(self.keys.len());
+        for key in &self.keys {
+            let algorithm_id = algorithm_id(&key.algorithm)
+                .ok_or_else(|| format!("unknown algorithm {}", key.algorithm))?;
+            keys.push(ValidatorKey {
+                key_id: key.key_id.as_bytes().to_vec(),
+                algorithm_id,
+                public_key: hex::decode(&key.public_key)?,
+                activation_epoch: key.activation_epoch,
+                retirement_epoch: VALIDATOR_NO_EXPIRY,
+            });
+        }
+        Ok(keys)
+    }
+
+    /// The validator address the genesis keys derive.
+    ///
+    /// # Errors
+    ///
+    /// Anything [`GenesisValidator::runtime_keys`] reports.
+    pub fn derived_address(&self) -> Result<[u8; 32], Box<dyn Error>> {
+        Ok(validator_address(&self.runtime_keys()?)?)
+    }
 }
 
 /// One consensus key.
@@ -277,36 +313,62 @@ impl Genesis {
             problems.push("there must be at least one validator".to_string());
         }
 
-        let mut validator_ids = HashSet::new();
+        let mut validator_addresses = HashSet::new();
         for validator in &self.validators {
-            if validator.id.trim().is_empty() {
-                problems.push("a validator has an empty id".to_string());
+            let label = if validator.address.is_empty() {
+                "(empty address)".to_string()
+            } else {
+                validator.address.clone()
+            };
+            if validator.address.trim().is_empty() {
+                problems.push("a validator has an empty address".to_string());
             }
-            if !validator_ids.insert(validator.id.as_str()) {
-                problems.push(format!("validator id {} appears twice", validator.id));
-            }
+            let decoded = match tx::address::decode(&validator.address) {
+                Ok(bytes) => {
+                    if !validator_addresses.insert(bytes) {
+                        problems.push(format!("validator address {label} appears twice"));
+                    }
+                    Some(bytes)
+                }
+                Err(error) => {
+                    problems.push(format!("validator {label} is not an address: {error}"));
+                    None
+                }
+            };
             if validator.keys.is_empty() {
-                problems.push(format!("validator {} has no keys", validator.id));
+                problems.push(format!("validator {label} has no keys"));
             }
             let mut key_ids = HashSet::new();
             for key in &validator.keys {
                 if !key_ids.insert(key.key_id.as_str()) {
                     problems.push(format!(
-                        "validator {} has two keys with id {}",
-                        validator.id, key.key_id
+                        "validator {label} has two keys with id {}",
+                        key.key_id
                     ));
                 }
                 problems.extend(check_key(
-                    &format!("validator {} key {}", validator.id, key.key_id),
+                    &format!("validator {label} key {}", key.key_id),
                     &key.algorithm,
                     &key.public_key,
                 ));
             }
             if !validator.keys.iter().any(|key| key.activation_epoch == 0) {
-                problems.push(format!(
-                    "validator {} has no key active at epoch 0",
-                    validator.id
-                ));
+                problems.push(format!("validator {label} has no key active at epoch 0"));
+            }
+            match validator.derived_address() {
+                Ok(derived) => {
+                    if let Some(decoded) = decoded
+                        && decoded != derived
+                    {
+                        problems.push(format!(
+                            "validator {label} does not match its keys; they derive {}",
+                            tx::address::encode(&derived)
+                        ));
+                    }
+                }
+                Err(error) => problems.push(format!(
+                    "validator {label} cannot derive an address: {error}"
+                )),
             }
         }
 
@@ -411,11 +473,19 @@ impl Genesis {
         encoder.put_u16(self.protocol_version);
         encoder.put_u64(self.epoch_rounds);
 
-        let mut validators: Vec<&GenesisValidator> = self.validators.iter().collect();
-        validators.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut validators: Vec<([u8; 32], &GenesisValidator)> = self
+            .validators
+            .iter()
+            .map(
+                |validator| -> Result<([u8; 32], &GenesisValidator), Box<dyn Error>> {
+                    Ok((tx::address::decode(&validator.address)?, validator))
+                },
+            )
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        validators.sort_by_key(|validator| validator.0);
         encoder.put_u32(u32::try_from(validators.len())?);
-        for validator in validators {
-            encoder.put_bytes(validator.id.as_bytes())?;
+        for (address, validator) in validators {
+            encoder.put_bytes(&address)?;
             let mut keys: Vec<&GenesisKey> = validator.keys.iter().collect();
             keys.sort_by(|left, right| left.key_id.cmp(&right.key_id));
             encoder.put_u32(u32::try_from(keys.len())?);
@@ -537,6 +607,9 @@ pub fn run(
         genesis.protocol_version, genesis.epoch_rounds
     );
     println!("  validators        {}", genesis.validators.len());
+    for validator in &genesis.validators {
+        println!("    {}  {} key(s)", validator.address, validator.keys.len());
+    }
     let quorum = genesis.validators.len() * 2 / 3 + 1;
     println!(
         "  quorum            {quorum} of {} (tolerates {} silent)",
@@ -695,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_ids_are_reported() {
+    fn duplicate_validator_addresses_are_reported() {
         let mut genesis = genesis();
         let duplicate = genesis.validators[0].clone();
         genesis.validators.push(duplicate);
@@ -703,7 +776,21 @@ mod tests {
             genesis
                 .problems()
                 .iter()
-                .any(|problem| problem.contains("appears twice"))
+                .any(|problem| problem.contains("validator address")
+                    && problem.contains("appears twice"))
+        );
+    }
+
+    #[test]
+    fn a_validator_address_that_does_not_match_its_keys_is_reported() {
+        let mut genesis = genesis();
+        genesis.validators[0].address = tx::address::encode(&[0u8; 32]);
+        let problems = genesis.problems();
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("does not match its keys")),
+            "{problems:?}"
         );
     }
 
