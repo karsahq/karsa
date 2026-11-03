@@ -33,7 +33,7 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crypto::CryptoErrorKind;
 use erasure::Code;
@@ -61,6 +61,13 @@ const CONTROL_QUEUE: usize = 256;
 const CONNECT_TRIES: usize = 400;
 /// Tick period: the authoring and pacemaker cadence.
 const TICK: Duration = Duration::from_millis(2);
+/// Ticks between persisted clock samples, about one second at the tick cadence.
+///
+/// Age-based retention needs a round-to-time map; a second of resolution is far
+/// more than pruning days of history needs, and one append per second is cheap.
+/// The first sample lands on tick 1 so even a short run leaves an anchor at round
+/// zero instead of a store whose history has no known start.
+const CLOCK_TICKS: u32 = 500;
 /// How often the want sweep runs, in ticks.
 const WANT_SWEEP_TICKS: u32 = 25;
 /// Ticks the commit cursor must stand still before execution is called caught up.
@@ -590,6 +597,13 @@ async fn node_task(
             }
             _ = ticker.tick() => {
                 ticks = ticks.wrapping_add(1);
+                if let Some(store) = &store
+                    && ticks % CLOCK_TICKS == 1
+                {
+                    store
+                        .record_clock(node.round(), unix_now())
+                        .map_err(|error| error.to_string())?;
+                }
                 if node.round() <= config.rounds {
                     let round = node.round();
                     let payload = if config.txs > 0 {
@@ -1020,6 +1034,13 @@ fn percentile(sorted: &[u64], percent: usize) -> u64 {
 
 fn millis(nanos: u64) -> String {
     format!("{:.2} ms", nanos as f64 / 1e6)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {

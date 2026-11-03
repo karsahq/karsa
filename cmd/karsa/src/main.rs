@@ -23,6 +23,7 @@
 //! karsa loadtest [count] [conc]    drive the node and report tx/s
 //! karsa live                       run validator nodes over real loopback sockets
 //! karsa config                     validate and explain a node.toml
+//! karsa prune                      apply a node's retention policy to its store
 //! ```
 
 mod acvp;
@@ -43,6 +44,7 @@ mod netrun;
 mod node;
 mod peers;
 mod persist;
+mod prune;
 mod shards;
 mod sigbench;
 mod sweep;
@@ -288,6 +290,21 @@ enum Command {
         #[arg(long)]
         home: Option<std::path::PathBuf>,
     },
+    /// Apply a node's retention policy to its store.
+    Prune {
+        /// Home directory holding node.toml; defaults to $HOME/.karsa.
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Configuration file; defaults to the one in --home.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Store directory; defaults to node.data_dir from the config.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Report the cutoffs without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -378,6 +395,12 @@ fn main() -> ExitCode {
             drain: std::time::Duration::from_millis(drain_ms),
             home,
         }),
+        Command::Prune {
+            home,
+            config,
+            data_dir,
+            dry_run,
+        } => prune::run(home, config, data_dir, dry_run),
     };
 
     match result {

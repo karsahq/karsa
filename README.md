@@ -199,6 +199,13 @@ which are still open.
   the command prints what the retention setting costs at 10/100/1k/10k TPS for both
   a 169 B and a 3.5 kB transaction, because the number that matters is the disk, not
   the days.
+- `karsa prune`: applies that policy to a store. Both bounds become one round
+  cutoff — "whichever comes first" is the one that leaves less history — and the
+  cutoff never crosses the newest snapshot, because that snapshot is what the tail
+  is replayed onto. A store with no snapshot is left alone rather than made
+  unreplayable. When the cap cannot be met (headers and shards are kept forever, and
+  an unsharded payload is never dropped) the report carries the shortfall instead of
+  claiming the disk fits. `--dry-run` prints the cutoffs without deleting.
 - `karsa node`: an HTTP pipeline (decode, policy lookup, signature verification,
   per-sender replay protection) on axum, plus the validator schedule:
   `GET /validators`, `POST /validators/{id}/keys` (authorized by an existing active

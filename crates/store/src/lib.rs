@@ -41,6 +41,12 @@ const SHARDS_FILE: &str = "shards.log";
 const GENESIS_FILE: &str = "genesis";
 /// The certified header log.
 const HEADERS_FILE: &str = "headers.log";
+/// Rounds seen at a wall-clock time, for age-based retention.
+///
+/// A vertex carries no timestamp: adding one would change every record's shape for
+/// a fact the node can observe once per second instead. This file is that
+/// observation, kept small by trimming it to the retention window on every prune.
+const CLOCK_FILE: &str = "clock";
 /// Version of the roots record.
 const ROOTS_VERSION: u16 = 1;
 
@@ -131,6 +137,63 @@ pub struct PruneReport {
     pub batches_held: usize,
     /// Bytes the two logs shrank by.
     pub bytes_freed: u64,
+    /// Bytes still above the disk cap after pruning, when the cap could not be met.
+    ///
+    /// Non-zero means the store legitimately cannot shrink further: shards and
+    /// headers are kept forever, and a payload no shard backs is never dropped.
+    pub cap_shortfall: u64,
+}
+
+/// How much history a pruning node keeps: a time window and a disk cap, whichever
+/// ends first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retention {
+    /// Days of history. Zero means no time bound.
+    pub days: u32,
+    /// Cap on the whole store directory in bytes. Zero means no size bound.
+    pub max_bytes: u64,
+}
+
+impl Retention {
+    /// Reads the policy as `node.toml` states it: days, and gigabytes (decimal).
+    #[must_use]
+    pub fn from_days_and_gb(days: u32, max_gb: u32) -> Self {
+        Self {
+            days,
+            max_bytes: u64::from(max_gb) * 1_000_000_000,
+        }
+    }
+
+    /// A policy that would delete nothing.
+    #[must_use]
+    pub fn unbounded() -> Self {
+        Self {
+            days: 0,
+            max_bytes: 0,
+        }
+    }
+}
+
+/// What a retention policy decided, before anything was deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPlan {
+    /// Highest round the age window alone would drop.
+    pub age_cutoff: Option<u64>,
+    /// Highest round the disk cap alone would drop.
+    pub size_cutoff: Option<u64>,
+    /// Highest round that will actually be dropped.
+    ///
+    /// The two windows end at different rounds, and "whichever comes first" is the
+    /// one that leaves less history, so this is the larger cutoff. It is clamped to
+    /// [`RetentionPlan::snapshot_round`], and is `None` when there is no snapshot to
+    /// replay from.
+    pub cutoff: Option<u64>,
+    /// Round covered by the newest snapshot, the floor pruning may not cross.
+    pub snapshot_round: Option<u64>,
+    /// Bytes the store occupies now.
+    pub disk_bytes: u64,
+    /// The cap that was applied, if any.
+    pub max_bytes: u64,
 }
 
 /// One erasure-coded shard this node holds for a batch.
@@ -579,6 +642,259 @@ impl Store {
         Ok(report)
     }
 
+    /// Bytes the store occupies, every file in the directory included.
+    ///
+    /// The cap is about a volume, not about one log, so headers, shards, the
+    /// snapshot, and the clock file count. Files that pruning cannot shrink are
+    /// exactly what makes a shortfall possible.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] when the directory cannot be read.
+    pub fn disk_bytes(&self) -> Result<u64, StoreError> {
+        let mut total = 0u64;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+        Ok(total)
+    }
+
+    /// Records that the node's head was at `round` at `unix_seconds`.
+    ///
+    /// Age-based retention needs a round-to-time map, and this is it. The caller
+    /// decides the cadence; once a second is plenty, because pruning days of
+    /// history does not need better resolution than a second. Samples are
+    /// discarded when a later prune drops that part of the log.
+    ///
+    /// A round that goes backwards is ignored rather than recorded: a store that
+    /// is reopened by a fresh demo run would otherwise claim that round 0 happened
+    /// after round 500, which would make the age window prune the wrong tail.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] when the clock file cannot be read or written, and
+    /// [`StoreError::Decode`] when an existing record does not decode.
+    pub fn record_clock(&self, round: u64, unix_seconds: u64) -> Result<(), StoreError> {
+        if let Some((last_round, _)) = self.clock_samples()?.last()
+            && round < *last_round
+        {
+            return Ok(());
+        }
+        let mut payload = [0u8; 16];
+        payload[..8].copy_from_slice(&round.to_le_bytes());
+        payload[8..].copy_from_slice(&unix_seconds.to_le_bytes());
+        append_record(&self.path_of(CLOCK_FILE), &payload)
+    }
+
+    /// Works out what a retention policy would drop, without dropping anything.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] when a log cannot be read, and [`StoreError::Decode`]
+    /// when a record does not decode.
+    pub fn plan(
+        &self,
+        retention: Retention,
+        now_unix: u64,
+        min_shards: usize,
+    ) -> Result<RetentionPlan, StoreError> {
+        let vertices = self.vertices()?;
+        let disk_bytes = self.disk_bytes()?;
+        let age_cutoff = self.age_cutoff(retention.days, now_unix)?;
+        let size_cutoff =
+            self.size_cutoff(&vertices, retention.max_bytes, min_shards, disk_bytes)?;
+        let desired = match (age_cutoff, size_cutoff) {
+            (Some(age), Some(size)) => Some(age.max(size)),
+            (age, size) => age.or(size),
+        };
+        // A snapshot at round S is the state after S: only what is above S has to
+        // be replayed, so dropping above S leaves a hole nothing can fill. With no
+        // snapshot there is no anchor at all, and the safe answer is to prune
+        // nothing rather than to make the store unreplayable.
+        let snapshot_round = self.snapshot()?.map(|snapshot| snapshot.round);
+        let cutoff = match (desired, snapshot_round) {
+            (Some(desired), Some(snapshot)) => Some(desired.min(snapshot)),
+            _ => None,
+        };
+        Ok(RetentionPlan {
+            age_cutoff,
+            size_cutoff,
+            cutoff,
+            snapshot_round,
+            disk_bytes,
+            max_bytes: retention.max_bytes,
+        })
+    }
+
+    /// Applies a retention policy and reports what it removed.
+    ///
+    /// "This many days or this much disk, whichever comes first" is a single
+    /// cutoff: both halves are converted to a round, and the one that leaves less
+    /// history wins. A policy with neither bound does nothing, and so does a store
+    /// with no snapshot: there would be no state to replay the tail onto.
+    ///
+    /// # Errors
+    ///
+    /// Anything [`Store::plan`] or [`Store::prune_below`] reports.
+    pub fn prune(
+        &self,
+        retention: Retention,
+        now_unix: u64,
+        min_shards: usize,
+    ) -> Result<PruneReport, StoreError> {
+        let plan = self.plan(retention, now_unix, min_shards)?;
+        let Some(cutoff) = plan.cutoff else {
+            return Ok(PruneReport::default());
+        };
+        let mut report = self.prune_below(cutoff, min_shards)?;
+        self.trim_clock(cutoff)?;
+        if plan.max_bytes > 0 {
+            report.cap_shortfall = self.disk_bytes()?.saturating_sub(plan.max_bytes);
+        }
+        Ok(report)
+    }
+
+    /// Rounds older than the window, read off the clock file.
+    ///
+    /// With no samples the answer is `None`, not "everything": a store whose age
+    /// is unknown must not be emptied on a guess.
+    fn age_cutoff(&self, days: u32, now_unix: u64) -> Result<Option<u64>, StoreError> {
+        if days == 0 {
+            return Ok(None);
+        }
+        let window = u64::from(days).saturating_mul(86_400);
+        let threshold = now_unix.saturating_sub(window);
+        let mut cutoff = None;
+        for (round, at) in self.clock_samples()? {
+            if at <= threshold {
+                cutoff = Some(round);
+            }
+        }
+        Ok(cutoff)
+    }
+
+    /// The round the disk cap alone requires dropping to, if the cap is exceeded.
+    ///
+    /// Freed bytes are counted with the same rule [`Store::prune_below`] applies: a
+    /// vertex's record goes, and a batch goes only when no kept vertex names it and
+    /// enough shards back it. Counting is one pass over rounds rather than a
+    /// simulation per candidate, because the freed set only grows as the cutoff
+    /// rises.
+    fn size_cutoff(
+        &self,
+        vertices: &[Vertex],
+        max_bytes: u64,
+        min_shards: usize,
+        disk_bytes: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        if max_bytes == 0 || disk_bytes <= max_bytes {
+            return Ok(None);
+        }
+        let need = disk_bytes - max_bytes;
+
+        let mut shard_count: std::collections::HashMap<[u8; 32], usize> =
+            std::collections::HashMap::new();
+        for shard in self.shards()? {
+            *shard_count.entry(shard.digest).or_default() += 1;
+        }
+        let backed =
+            |digest: &[u8; 32]| shard_count.get(digest).copied().unwrap_or(0) >= min_shards;
+
+        let mut batch_sizes: std::collections::HashMap<[u8; 32], u64> =
+            std::collections::HashMap::new();
+        for batch in self.batches()? {
+            let digest = batch.digest()?;
+            batch_sizes.insert(digest, batch.encode()?.len() as u64 + 4);
+        }
+        if vertices.is_empty() {
+            let droppable: u64 = batch_sizes
+                .iter()
+                .filter(|(digest, _)| backed(digest))
+                .map(|(_, size)| *size)
+                .sum();
+            return Ok((droppable > 0).then_some(0));
+        }
+
+        let mut name_counts: std::collections::HashMap<[u8; 32], usize> =
+            std::collections::HashMap::new();
+        let mut records: Vec<(u64, u64, [u8; 32])> = Vec::with_capacity(vertices.len());
+        for vertex in vertices {
+            *name_counts.entry(vertex.payload_hash).or_default() += 1;
+            records.push((
+                vertex.round,
+                vertex.encode()?.len() as u64 + 4,
+                vertex.payload_hash,
+            ));
+        }
+        records.sort_by_key(|(round, _, _)| *round);
+
+        // A batch no vertex names is droppable before any round is considered.
+        let mut freed: u64 = batch_sizes
+            .iter()
+            .filter(|(digest, _)| !name_counts.contains_key(*digest) && backed(digest))
+            .map(|(_, size)| *size)
+            .sum();
+
+        let mut index = 0usize;
+        while index < records.len() {
+            let round = records[index].0;
+            while index < records.len() && records[index].0 == round {
+                let (_, size, digest) = records[index];
+                freed = freed.saturating_add(size);
+                if let Some(count) = name_counts.get_mut(&digest) {
+                    *count -= 1;
+                    if *count == 0
+                        && let Some(batch_size) = batch_sizes.get(&digest)
+                        && backed(&digest)
+                    {
+                        freed = freed.saturating_add(*batch_size);
+                    }
+                }
+                index += 1;
+            }
+            if freed >= need {
+                return Ok(Some(round));
+            }
+        }
+
+        // Even dropping every round does not reach the cap. Prune what can go and
+        // let the caller see the shortfall rather than reporting a lie.
+        Ok(Some(records[records.len() - 1].0))
+    }
+
+    /// Drops clock samples below `cutoff`, keeping the last one that still anchors
+    /// the boundary so a later age window has a reference point.
+    fn trim_clock(&self, cutoff: u64) -> Result<(), StoreError> {
+        let path = self.path_of(CLOCK_FILE);
+        if !path.exists() {
+            return Ok(());
+        }
+        let mut boundary = None;
+        let mut kept = Vec::new();
+        for (round, at) in self.clock_samples()? {
+            if round <= cutoff {
+                boundary = Some((round, at));
+            } else {
+                kept.push((round, at));
+            }
+        }
+        let mut encoded = Vec::with_capacity((kept.len() + 1) * 20);
+        for (round, at) in boundary.into_iter().chain(kept) {
+            encoded.extend_from_slice(&16u32.to_le_bytes());
+            encoded.extend_from_slice(&round.to_le_bytes());
+            encoded.extend_from_slice(&at.to_le_bytes());
+        }
+        rewrite(&path, &encoded)
+    }
+
+    fn clock_samples(&self) -> Result<Vec<(u64, u64)>, StoreError> {
+        read_records(&self.path_of(CLOCK_FILE), clock_record)
+    }
+
     /// Records the chain this directory belongs to.
     ///
     /// Written once, at the first write. A second call with the same hash is a
@@ -749,6 +1065,21 @@ fn append_record(path: &Path, payload: &[u8]) -> Result<(), StoreError> {
     file.write_all(&length.to_le_bytes())?;
     file.write_all(payload)?;
     Ok(())
+}
+
+/// Decodes one `(round, unix seconds)` clock record.
+fn clock_record(bytes: &[u8]) -> Result<(u64, u64), CryptoError> {
+    if bytes.len() != 16 {
+        return Err(CryptoError::new(
+            crypto::CryptoErrorKind::TruncatedInput,
+            format!("clock record is {} bytes, expected 16", bytes.len()),
+        ));
+    }
+    let mut round = [0u8; 8];
+    round.copy_from_slice(&bytes[..8]);
+    let mut at = [0u8; 8];
+    at.copy_from_slice(&bytes[8..]);
+    Ok((u64::from_le_bytes(round), u64::from_le_bytes(at)))
 }
 
 /// Reads length-prefixed records, ignoring a torn tail.
@@ -1158,5 +1489,249 @@ mod tests {
         fs::write(dir.0.join(ROOTS_FILE), record).unwrap();
 
         assert!(matches!(store.roots(), Err(StoreError::Decode(_))));
+    }
+
+    /// Six rounds, each with its own shard so every payload may be dropped, and a
+    /// snapshot at the newest round so the replay anchor covers all of them.
+    fn six_rounds(store: &Store) {
+        for round in 0..6u64 {
+            let payload = batch(round + 1);
+            store.put_batch(&payload).unwrap();
+            let digest = payload.digest().unwrap();
+            store.put_shard(&digest, 0, b"s").unwrap();
+            store.append_vertex(&vertex(round, &payload)).unwrap();
+        }
+        store.put_snapshot(5, b"state").unwrap();
+    }
+
+    #[test]
+    fn age_pruning_drops_rounds_older_than_the_window() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        six_rounds(&store);
+        let day = 86_400u64;
+        for round in 0..6u64 {
+            store.record_clock(round, round * 2 * day + 2).unwrap();
+        }
+
+        // Four days back from day ten lands between the samples for rounds 2 and 3.
+        let now = 10 * day + 1;
+        let policy = Retention {
+            days: 4,
+            max_bytes: 0,
+        };
+        let plan = store.plan(policy, now, 1).unwrap();
+        assert_eq!(plan.age_cutoff, Some(2));
+        assert_eq!(plan.size_cutoff, None);
+        assert_eq!(plan.cutoff, Some(2));
+
+        let report = store.prune(policy, now, 1).unwrap();
+        assert_eq!(
+            report.vertices, 3,
+            "rounds 0, 1, and 2 are older than four days"
+        );
+        let kept: Vec<u64> = store
+            .vertices()
+            .unwrap()
+            .iter()
+            .map(|vertex| vertex.round)
+            .collect();
+        assert_eq!(kept, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn without_clock_samples_age_prunes_nothing() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        six_rounds(&store);
+
+        let policy = Retention {
+            days: 1,
+            max_bytes: 0,
+        };
+        let plan = store.plan(policy, 30 * 86_400, 1).unwrap();
+        assert_eq!(
+            plan.age_cutoff, None,
+            "an unknown age must not empty the store"
+        );
+        assert_eq!(plan.cutoff, None);
+        assert_eq!(store.prune(policy, 30 * 86_400, 1).unwrap().vertices, 0);
+        assert_eq!(store.vertices().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn the_disk_cap_prunes_until_the_store_fits() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        six_rounds(&store);
+
+        let cap = store.disk_bytes().unwrap() / 2;
+        let policy = Retention {
+            days: 0,
+            max_bytes: cap,
+        };
+        let plan = store.plan(policy, 0, 1).unwrap();
+        assert!(plan.disk_bytes > cap);
+        let cutoff = plan
+            .size_cutoff
+            .expect("a cap below the current size must prune");
+        assert!(cutoff < 5, "nonzero shards mean the tail is not the answer");
+
+        let report = store.prune(policy, 0, 1).unwrap();
+        assert_eq!(
+            report.cap_shortfall, 0,
+            "shards are small, so the cap is reachable"
+        );
+        assert!(store.disk_bytes().unwrap() <= cap);
+        assert!(report.vertices > 0);
+        assert!(report.batches_dropped > 0);
+    }
+
+    #[test]
+    fn a_payload_without_a_shard_keeps_the_cap_short() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        // No shards: the batches are the only copy this node knows about.
+        for round in 0..6u64 {
+            let payload = batch(round + 1);
+            store.put_batch(&payload).unwrap();
+            store.append_vertex(&vertex(round, &payload)).unwrap();
+        }
+
+        // A snapshot at the newest round, so the anchor is not what holds this back.
+        store.put_snapshot(5, b"state").unwrap();
+        let cap = store.disk_bytes().unwrap() / 4;
+        let policy = Retention {
+            days: 0,
+            max_bytes: cap,
+        };
+        let report = store.prune(policy, 0, 1).unwrap();
+        assert_eq!(report.batches_dropped, 0, "no shard backs these payloads");
+        assert!(report.batches_held > 0);
+        assert!(report.vertices > 0, "metadata still goes");
+        assert!(
+            report.cap_shortfall > 0,
+            "the store cannot meet a cap the payload alone exceeds"
+        );
+    }
+
+    #[test]
+    fn the_earlier_window_wins_when_both_apply() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        six_rounds(&store);
+        let day = 86_400u64;
+        for round in 0..6u64 {
+            store.record_clock(round, round * 2 * day + 2).unwrap();
+        }
+
+        // Age would drop round 2; half the disk needs a deeper cut.
+        let now = 10 * day + 1;
+        let size_policy = Retention {
+            days: 0,
+            max_bytes: store.disk_bytes().unwrap() / 3,
+        };
+        let size_cutoff = store
+            .plan(size_policy, now, 1)
+            .unwrap()
+            .size_cutoff
+            .unwrap();
+        assert!(
+            size_cutoff > 2,
+            "the size cap must cut deeper than age alone"
+        );
+
+        let policy = Retention {
+            days: 4,
+            max_bytes: size_policy.max_bytes,
+        };
+        assert_eq!(
+            store.plan(policy, now, 1).unwrap().cutoff,
+            Some(size_cutoff)
+        );
+    }
+
+    #[test]
+    fn pruning_keeps_one_anchor_sample_for_the_next_window() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        six_rounds(&store);
+        for round in 0..6u64 {
+            store.record_clock(round, 1_000 + round).unwrap();
+        }
+
+        store.prune_below(2, 1).unwrap();
+        store.trim_clock(2).unwrap();
+        let samples = store.clock_samples().unwrap();
+        assert_eq!(
+            samples,
+            vec![(2, 1_002), (3, 1_003), (4, 1_004), (5, 1_005)]
+        );
+    }
+
+    #[test]
+    fn without_a_snapshot_pruning_would_remove_the_replay_anchor() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        for round in 0..4u64 {
+            let payload = batch(round + 1);
+            store.put_batch(&payload).unwrap();
+            store.append_vertex(&vertex(round, &payload)).unwrap();
+        }
+
+        let policy = Retention {
+            days: 0,
+            max_bytes: 1,
+        };
+        let plan = store.plan(policy, 0, 1).unwrap();
+        assert_eq!(plan.snapshot_round, None);
+        assert_eq!(
+            plan.cutoff, None,
+            "the tail would have nothing to replay onto"
+        );
+        let report = store.prune(policy, 0, 1).unwrap();
+        assert_eq!(report.vertices, 0);
+        assert_eq!(store.vertices().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_snapshot_clamps_the_cutoff_the_policy_asked_for() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        six_rounds(&store);
+        // The newest snapshot covers round 2, so rounds 3..5 must stay even though
+        // the disk cap would happily drop further.
+        store.put_snapshot(2, b"older state").unwrap();
+
+        let policy = Retention {
+            days: 0,
+            max_bytes: 1,
+        };
+        let plan = store.plan(policy, 0, 1).unwrap();
+        assert_eq!(plan.size_cutoff, Some(5));
+        assert_eq!(plan.cutoff, Some(2));
+
+        let report = store.prune(policy, 0, 1).unwrap();
+        assert_eq!(report.vertices, 3);
+        assert!(
+            report.cap_shortfall > 0,
+            "the cap cannot be met above the snapshot"
+        );
+        let kept: Vec<u64> = store
+            .vertices()
+            .unwrap()
+            .iter()
+            .map(|vertex| vertex.round)
+            .collect();
+        assert_eq!(kept, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn a_clock_sample_for_an_earlier_round_is_ignored() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        store.record_clock(500, 1_000).unwrap();
+        store.record_clock(0, 2_000).unwrap();
+        assert_eq!(store.clock_samples().unwrap(), vec![(500, 1_000)]);
     }
 }
