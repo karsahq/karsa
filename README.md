@@ -340,14 +340,14 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     behind", which is the check that the test is not passing by accident.
 16. **A drop is safe when the reference rule can see it.** Each peer has a bounded
     queue and `try_send`, so one slow validator no longer blocks the node loop: at
-    n=4 over 100 rounds with a 2 kB socket buffer and 5 ms/frame on one node, 19–66
-    frames were dropped and 17–28 `Want`s repaired them, with **0 abandoned** and
-    the commit root unchanged. Two things had to be true for that. Repair must be
-    driven by the DAG — dangling references *plus* the vertex blocking the commit
-    walk, because the reference rule needs a quorum and not every edge — and control
-    traffic must not share a queue with broadcasts. With one shared queue, 39 of 84
-    wants were abandoned under the same load; with a separate control queue they
-    were all answered, and authoring fell from 76 to 29 ms/round.
+    n=4 over 100 rounds with a 2 kB socket buffer and 5 ms/frame on one node, 19
+    frames were dropped and 28 `Want`s repaired them — **0 abandoned**, commit root
+    unchanged, authoring at 29 ms/round. Two things had to be true for that. Repair
+    must be driven by the DAG — dangling references *plus* the vertex blocking the
+    commit walk, because the reference rule needs a quorum and not every edge — and
+    control traffic must not share a queue with broadcasts. Under the same load with
+    one shared queue, 39 of 84 wants were abandoned while the final root still
+    matched, which is precisely the failure a convergence-only test would miss.
 
 ## Port plan
 
