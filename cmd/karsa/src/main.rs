@@ -397,19 +397,12 @@ fn run_node(
             let config = crate::config::NodeConfig::ensure(&path)?;
             let mut problems = config.problems();
 
-            // The other half of the same membership: a node pointed at a genesis
-            // for another chain is not a node of this one.
+            // The other half of the same membership: a genesis in this home must at
+            // least parse and validate before the node serves anything.
             let genesis_path = home.genesis_json();
             if genesis_path.exists() {
                 let genesis = crate::genesis::Genesis::load(&genesis_path)?;
-                if genesis.chain_id != config.node.chain_id {
-                    problems.push(format!(
-                        "node.chain_id is {} but {} is chain {}",
-                        config.node.chain_id,
-                        genesis_path.display(),
-                        genesis.chain_id
-                    ));
-                }
+                problems.extend(genesis.problems());
             }
 
             if !problems.is_empty() {

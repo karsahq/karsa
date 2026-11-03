@@ -181,9 +181,9 @@ which are still open.
 - Home directory: `karsa config`, `karsa genesis`, and `karsa node` all take
   `--home DIR` (default `$HOME/.karsa`) and read the two files that describe one
   chain membership from the same place — `node.toml` and `genesis.json` — writing
-  either with defaults when it is missing. Because they are one membership, each
-  command cross-checks the other's chain id and reports a mismatch instead of
-  letting a node join the wrong chain.
+  either with defaults when it is missing. The node keeps **no chain identity of
+  its own**: the genesis beside it is the only one, so there is nothing to drift
+  from it.
 - `karsa config`: per-node settings in a `node.toml`, the way an operator expects.
   Roles (validator, rpc, archive), retention (days and a hard disk cap), snapshot
   cadence, and listen addresses. The file is validated rather than trusted — an
@@ -435,6 +435,17 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     a validator (186 B per transaction in a 20-transaction run, identical with and
     without archives). That is what makes "the archive keeps history" a property of
     the code instead of a claim about the operator's intentions.
+24. **Chain identity is the genesis hash, and nothing else.** `node.toml` carries
+    no chain id at all: every validator loads the same genesis, so a second copy is
+    only a place to typo. The human name (`karsa-1`) lives inside the genesis, where
+    it is hashed along with everything else, so renaming a chain is a different
+    identity rather than a relabelling. That is the lesson of Ethereum's 2016
+    split, where ETH and ETC both kept chain id 1 and transactions replayed across
+    them until EIP-155; a hash cannot collide that way. The cost is size — 32 bytes
+    in the signing domain instead of a short string — which is ~19 B on a 169 B
+    transaction and noise on a 3.5 kB one. Not yet wired: the transaction and vertex
+    payloads still use compiled constants, and there is no peer handshake to compare
+    hashes with.
 
 ## Build order
 

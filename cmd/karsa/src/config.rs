@@ -39,7 +39,6 @@ const EXAMPLE: &str = r#"# Karsa node configuration.
 
 [node]
 id = "val-0"
-chain_id = "karsa-1"
 data_dir = "/var/lib/karsa"
 listen = "0.0.0.0:26656"
 
@@ -91,8 +90,6 @@ pub struct NodeConfig {
 pub struct NodeSection {
     /// Validator id, unique in the committee.
     pub id: String,
-    /// Chain this node belongs to.
-    pub chain_id: String,
     /// Where the store lives.
     pub data_dir: PathBuf,
     /// Peer-to-peer listen address.
@@ -138,7 +135,6 @@ impl Default for NodeConfig {
         Self {
             node: NodeSection {
                 id: "val-0".into(),
-                chain_id: "karsa-1".into(),
                 data_dir: PathBuf::from("/var/lib/karsa"),
                 listen: "0.0.0.0:26656".into(),
             },
@@ -257,9 +253,6 @@ impl NodeConfig {
         if self.node.id.trim().is_empty() {
             problems.push("node.id is empty".to_string());
         }
-        if self.node.chain_id.trim().is_empty() {
-            problems.push("node.chain_id is empty".to_string());
-        }
         if !self.roles.validator && !self.rpc.enable && !self.roles.archive {
             problems.push(
                 "the node has no role: set roles.validator, roles.archive, or rpc.enable"
@@ -373,10 +366,7 @@ pub fn run(
         config.role_label(),
         config.role_implies()
     );
-    println!(
-        "  identity          {} on {}",
-        config.node.id, config.node.chain_id
-    );
+    println!("  identity          {}", config.node.id);
     println!("  data directory    {}", config.node.data_dir.display());
     println!(
         "  network           p2p {}  rpc {}",
@@ -437,33 +427,22 @@ pub fn run(
     println!("  Note: retention bounds disk only. Every node still receives and forwards");
     println!("  the whole payload, so per-node egress stays (n-1)/n of the originator total.");
 
-    // Two files describe one membership, so a disagreement between them is worth
-    // catching here rather than at the first transaction that fails to verify.
+    // The genesis is the other half of this membership, and the only thing that
+    // says which chain this home belongs to. Reporting its hash here is the point:
+    // the node stores no chain identifier of its own to drift from it.
     let genesis_path = home.genesis_json();
     println!();
     if genesis_path.exists() {
         match crate::genesis::Genesis::load(&genesis_path) {
             Ok(genesis) => {
                 let hash = genesis.hash()?;
-                if genesis.chain_id == config.node.chain_id {
-                    println!(
-                        "  genesis           {} (chain {}, hash {})",
-                        genesis_path.display(),
-                        genesis.chain_id,
-                        hex::encode(&hash[..6])
-                    );
-                } else {
-                    println!(
-                        "  genesis MISMATCH  node.toml says chain {}, {} says {}",
-                        config.node.chain_id,
-                        genesis_path.display(),
-                        genesis.chain_id
-                    );
-                    problems.push(format!(
-                        "node.chain_id is {} but the genesis in this home is {}",
-                        config.node.chain_id, genesis.chain_id
-                    ));
-                }
+                println!(
+                    "  genesis           {} (chain {}, hash {})",
+                    genesis_path.display(),
+                    genesis.chain_id,
+                    hex::encode(&hash[..6])
+                );
+                problems.extend(genesis.problems());
             }
             Err(error) => problems.push(format!("{error}")),
         }

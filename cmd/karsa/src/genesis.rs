@@ -451,24 +451,21 @@ pub fn run(
     );
     println!("  genesis hash      {}", hex::encode(hash));
 
-    // The node configuration is the other half of the same membership.
+    // The node configuration is the other half of the same membership. It carries
+    // no chain identifier of its own: this genesis is the only thing that says
+    // which chain the home belongs to, so there is nothing to disagree with.
     let node_path = home.node_toml();
     println!();
     if node_path.exists() {
         match crate::config::NodeConfig::load(&node_path) {
             Ok(config) => {
-                if config.node.chain_id == genesis.chain_id {
-                    println!(
-                        "  node.toml         {} (chain {} matches)",
-                        node_path.display(),
-                        config.node.chain_id
-                    );
-                } else {
-                    problems.push(format!(
-                        "node.toml says chain {} but this genesis is {}",
-                        config.node.chain_id, genesis.chain_id
-                    ));
-                }
+                println!(
+                    "  node.toml         {} ({} · {})",
+                    node_path.display(),
+                    config.node.id,
+                    config.role_label()
+                );
+                problems.extend(config.problems());
             }
             Err(error) => problems.push(format!("{error}")),
         }
