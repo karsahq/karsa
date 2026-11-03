@@ -164,7 +164,9 @@ which are still open.
   same link, so bytes per transaction are measured rather than modelled (finding
   17). `--execute` applies the committed batches into an account state, so the run
   ends on a state root rather than on a commit root alone, and it waits for the
-  applied cursor to catch up with the commit cursor before reporting.
+  applied cursor to catch up with the commit cursor before reporting. `--store DIR`
+  persists every vertex and batch through `crates/store`, so the bytes-per-day
+  figure is measured from files rather than modelled.
 - `karsa node`: an HTTP pipeline (decode, policy lookup, signature verification,
   per-sender replay protection) on axum, plus the validator schedule:
   `GET /validators`, `POST /validators/{id}/keys` (authorized by an existing active
@@ -363,6 +365,14 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     funded demo accounts (the default 1,000 runs out and turns the run into a
     rejection benchmark) and a run that waits for the applied cursor to reach the
     commit cursor once commits stop arriving.
+19. **Storage overhead is ~2%, so the payload is the only lever.** Writing a live
+    run through `crates/store` puts 172 B on disk per transaction against 169 B on
+    the wire: record headers and duplicate suppression cost 1.8%. Vertices are 1.9%
+    of stored bytes (67.9 kB against 3.44 MB of batches at 100 transactions per
+    batch). That is D12 measured rather than argued — the append-only format is not
+    where storage goes, so the transaction itself is. At 1k TPS this shape costs
+    ~14.9 GB/day per node; the 302 GB/day in D15 is the same arithmetic on a 3.5 kB
+    hybrid transaction, twenty times larger.
 
 ## Build order
 

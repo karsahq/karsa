@@ -29,6 +29,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -36,6 +37,7 @@ use std::time::{Duration, Instant};
 use crypto::CryptoErrorKind;
 use net::Node;
 use net::wire::{self, Message};
+use store::Store;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
@@ -93,6 +95,9 @@ pub struct Config {
     pub txs: u64,
     /// Apply committed batches into an account state and print its root.
     pub execute: bool,
+    /// Directory to persist into, one subdirectory per node. Empty keeps everything
+    /// in memory, which makes every on-disk figure a model instead of a measurement.
+    pub store: PathBuf,
     /// How long to keep the mesh alive after the last node finishes authoring,
     /// so the final rounds and any repair can land before the run is measured.
     pub drain: Duration,
@@ -116,6 +121,7 @@ struct NodeResult {
     applied: usize,
     exec_rejected: usize,
     state_root: Option<[u8; 32]>,
+    disk_bytes: u64,
     rejected: usize,
     committed: usize,
     bytes_in: u64,
@@ -253,6 +259,14 @@ async fn node_task(
         .ok_or("no consensus key for this node")?;
     let mut node = Node::new(set, identity.id.clone(), identity.private_key.clone());
     let accounts = chain::accounts(config.validators).map_err(|error| error.to_string())?;
+    let store = if config.store.as_os_str().is_empty() {
+        None
+    } else {
+        Some(
+            Store::open(config.store.join(format!("val-{index}")))
+                .map_err(|error| error.to_string())?,
+        )
+    };
 
     let listener = TcpListener::bind(address(config.port_base, index))
         .await
@@ -389,15 +403,31 @@ async fn node_task(
                         {
                             repaired += 1;
                         }
-                        if node.receive(vertex).is_err() {
-                            rejected += 1;
+                        // Only a vertex this node did not already hold is new, so a
+                        // repaired or duplicated frame is not written twice.
+                        let known = node.dag().get(vertex.round, &vertex.author).is_some();
+                        match node.receive(vertex.clone()) {
+                            Ok(()) => {
+                                if !known && let Some(store) = &store {
+                                    store
+                                        .append_vertex(&vertex)
+                                        .map_err(|error| error.to_string())?;
+                                }
+                            }
+                            Err(_) => rejected += 1,
                         }
                     }
                     Message::Payload(batch) => {
                         if let Ok(digest) = batch.digest() {
                             payload_bytes += frame.len as u64;
                             txs_received += batch.len();
-                            if batches.insert(digest, batch).is_none() {
+                            if let std::collections::hash_map::Entry::Vacant(slot) =
+                                batches.entry(digest)
+                            {
+                                if let Some(store) = &store {
+                                    store.put_batch(&batch).map_err(|error| error.to_string())?;
+                                }
+                                slot.insert(batch);
                                 payloads += 1;
                             }
                         }
@@ -422,6 +452,12 @@ async fn node_task(
                     };
                     match node.author_with(digest) {
                         Ok(Some(vertex)) => {
+                            if let Some(store) = &store {
+                                store.append_vertex(&vertex).map_err(|error| error.to_string())?;
+                                if let Some(batch) = &payload {
+                                    store.put_batch(batch).map_err(|error| error.to_string())?;
+                                }
+                            }
                             let bytes = wire::frame(&Message::Vertex(vertex), now())
                                 .map_err(|error| error.to_string())?;
                             broadcast(&outbound, false, &bytes, &mut dropped);
@@ -592,6 +628,9 @@ async fn node_task(
         applied,
         exec_rejected,
         state_root,
+        disk_bytes: store
+            .as_ref()
+            .map_or(0, |store| directory_bytes(store.path())),
         rejected,
         committed: node.dag().order().len(),
         bytes_in: bytes_in.load(Ordering::Relaxed),
@@ -600,6 +639,22 @@ async fn node_task(
         commit_root: commit_root(node.dag().order()),
         order: node.dag().order().to_vec(),
     })
+}
+
+/// Total bytes of the files directly inside a store directory.
+///
+/// This is what the node actually wrote, record headers included, so it is the
+/// number a disk budget should use rather than a model of one.
+fn directory_bytes(path: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum()
 }
 
 fn pad(value: &str, width: usize) -> String {
@@ -779,6 +834,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let mut missing_payloads = 0usize;
     let mut applied = 0usize;
     let mut exec_rejected = 0usize;
+    let mut disk_bytes = 0u64;
     let mut state_roots: Vec<[u8; 32]> = Vec::new();
     for result in &results {
         bytes_in += result.bytes_in;
@@ -795,6 +851,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         missing_payloads += result.missing_payloads;
         applied += result.applied;
         exec_rejected += result.exec_rejected;
+        disk_bytes += result.disk_bytes;
         if let Some(root) = result.state_root {
             state_roots.push(root);
         }
@@ -847,6 +904,21 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             human(payload_wire)
         );
         println!("                    {payload_txs} unique transactions held across all nodes");
+    }
+    if disk_bytes > 0 {
+        let per_tx = if payload_txs == 0 {
+            0.0
+        } else {
+            disk_bytes as f64 / payload_txs as f64
+        };
+        // At 1k TPS the same record shape costs this much per day.
+        let per_day = per_tx * 1_000.0 * 86_400.0 / 1e9;
+        println!(
+            "  storage           {} on disk across nodes, {per_tx:.0} B per transaction \
+             (~{per_day:.1} GB/day at 1k TPS)",
+            human(disk_bytes)
+        );
+        println!("                    vertices and batches only: no shards, no pruning here");
     }
     if let Some(first) = state_roots.first() {
         let agree = state_roots.iter().all(|root| root == first);

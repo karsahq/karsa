@@ -223,6 +223,9 @@ enum Command {
         /// Apply committed batches into an account state and compare the roots.
         #[arg(long)]
         execute: bool,
+        /// Persist vertices and batches here, one subdirectory per node.
+        #[arg(long, default_value = "")]
+        store: std::path::PathBuf,
         /// How long the mesh stays up after the last node finishes authoring.
         #[arg(long, default_value_t = 500)]
         drain_ms: u64,
@@ -289,6 +292,7 @@ fn main() -> ExitCode {
             send_buffer,
             txs,
             execute,
+            store,
             drain_ms,
         } => live::run(live::Config {
             validators,
@@ -300,6 +304,7 @@ fn main() -> ExitCode {
             send_buffer,
             txs,
             execute,
+            store,
             drain: std::time::Duration::from_millis(drain_ms),
         }),
     };
