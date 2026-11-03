@@ -25,6 +25,15 @@ use serde::{Deserialize, Serialize};
 /// The example written by `karsa config --init`.
 const EXAMPLE: &str = r#"# Karsa node configuration.
 #
+# Generated on first run when the path is missing. Edit it freely: an existing file
+# is never overwritten, and a file with problems stops the node before it writes.
+#
+# Roles compose:
+#   validator             signs: authors one vertex per round and votes
+#   archive               keeps every vertex and batch forever, does not sign
+#   validator + archive   signs and keeps everything
+#   rpc                   serves wallets and indexers, independent of the two above
+#
 # Every validator runs its own copy: retention and roles are local decisions with
 # local costs, not chain constants.
 
@@ -439,6 +448,18 @@ mod tests {
         assert!(config.problems().is_empty(), "{:?}", config.problems());
         assert!(config.prunes());
         assert!(config.roles.validator);
+    }
+
+    #[test]
+    fn the_committed_example_matches_the_generated_one() {
+        // The file at the repository root is what an operator copies. It is
+        // generated from the same constant, so this test is what stops the two from
+        // drifting apart after an edit to one of them.
+        let committed = include_str!("../../../node.toml.example");
+        assert_eq!(
+            committed, EXAMPLE,
+            "node.toml.example is stale: regenerate it with `karsa config node.toml.example --init`"
+        );
     }
 
     #[test]

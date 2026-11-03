@@ -21,6 +21,7 @@ not part of this repository.
 | `scripts/acvp-rust.sh` | Downloads the ACVP vectors and runs the checker |
 | `scripts/loadtest-rust.sh` | Starts the node, drives it, prints tx/s |
 | `RUST.md` | Toolchain decisions and crate choices |
+| `node.toml.example` | The node configuration an operator starts from |
 
 The design notes (`docs/architecture.md`, `docs/crypto-registry.md`,
 `docs/consensus-notes.md`, `docs/decisions.md`) are unpublished and git-ignored;
