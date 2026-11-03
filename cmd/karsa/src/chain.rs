@@ -40,13 +40,13 @@ pub(crate) struct Consensus {
     pub(crate) private_key: Vec<u8>,
 }
 
-/// One account: its transfer key and the policy that guards it.
+/// One account: its address, transfer key, and the policy that guards it.
 ///
-/// `id` is only a label for logs and fixtures. Everything that must be unique or
-/// that state keys on uses `address`, which the policy derives (D32). Two accounts
-/// with the same policy therefore have the same address, and are one account.
+/// There is no separate id. The address the policy derives (D32) is both the
+/// identity and the state key, so there is nothing that can disagree with it. Two
+/// accounts with the same policy therefore have the same address, and are one
+/// account.
 pub(crate) struct Account {
-    pub(crate) id: Vec<u8>,
     pub(crate) address: [u8; 32],
     pub(crate) private_key: Vec<u8>,
     pub(crate) key_id: Vec<u8>,
@@ -92,12 +92,12 @@ pub(crate) fn consensus_set(
 }
 
 pub(crate) fn accounts(count: usize) -> Result<Vec<Account>, crypto::CryptoError> {
-    const NAMES: [&str; 4] = ["alice", "bob", "carol", "dave"];
     let mut accounts = Vec::with_capacity(count);
     for index in 0..count {
         let (public_key, private_key) = keypair(u8::try_from(index + 101).unwrap_or(101))?;
-        let name = NAMES.get(index).copied().unwrap_or("account");
-        let key_id = format!("{name}-k0").into_bytes();
+        // The label is cosmetic and excluded from the address; keep it derived
+        // from the index so the fixture does not imply an identity that is not one.
+        let key_id = format!("acct-{index}-k0").into_bytes();
         let policy = AuthPolicy {
             kind: AuthPolicyKind::Single,
             threshold: 0,
@@ -114,7 +114,6 @@ pub(crate) fn accounts(count: usize) -> Result<Vec<Account>, crypto::CryptoError
         };
         let address = policy.address()?;
         accounts.push(Account {
-            id: name.as_bytes().to_vec(),
             address,
             private_key,
             key_id,
@@ -617,23 +616,11 @@ pub fn run(
     }
 
     println!();
-    println!("  {}  {}  balance", pad("account", 10), pad("address", 16));
-    let labels = accounts(validators)?;
+    println!("  {}  balance", pad("address", 64));
     for (address, balance) in &first.balances {
-        // The state keys on addresses; `id` is only the label that makes this
-        // table readable. An address with no matching account (a recipient the
-        // demo never created) falls back to its hex prefix.
-        let label = labels
-            .iter()
-            .find(|account| account.address.as_slice() == address.as_slice())
-            .map(|account| String::from_utf8_lossy(&account.id).into_owned())
-            .unwrap_or_else(|| hex::encode(&address[..address.len().min(6)]));
-        println!(
-            "  {}  {}  {}",
-            pad(&label, 10),
-            pad(&hex::encode(&address[..address.len().min(6)]), 16),
-            balance
-        );
+        // The full address, not a prefix: this is the value a person copies into
+        // an explorer, and truncating it would make the table pretty and useless.
+        println!("  {}  {}", hex::encode(address), balance);
     }
 
     let circulating: u64 = first.balances.values().sum();

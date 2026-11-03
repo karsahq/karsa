@@ -17,7 +17,7 @@
   ],
   "accounts": [
     {
-      "id": "alice",
+      "address": "e94f1b9f07298aa1f80d6208597150b177b2cdadd98cafd4bd32515be6301a50",
       "balance": 1000,
       "policy": {
         "kind": "single",

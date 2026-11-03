@@ -27,6 +27,7 @@ use crypto::encoding::Encoder;
 use crypto::registry::{ALG_ED25519, ALG_ML_DSA_65, ALG_SLH_DSA_SHA2_128S};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tx::policy::{AuthKey, AuthPolicy, AuthPolicyKind, KeyStatus, NO_EXPIRY as POLICY_NO_EXPIRY};
 
 /// The only protocol version this tree implements.
 const PROTOCOL_VERSION: u16 = 1;
@@ -54,7 +55,7 @@ const EXAMPLE: &str = r#"{
   ],
   "accounts": [
     {
-      "id": "alice",
+      "address": "e94f1b9f07298aa1f80d6208597150b177b2cdadd98cafd4bd32515be6301a50",
       "balance": 1000,
       "policy": {
         "kind": "single",
@@ -116,12 +117,67 @@ pub struct GenesisKey {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GenesisAccount {
-    /// Account id.
-    pub id: String,
+    /// Lowercase hex of the 32 bytes the policy derives.
+    ///
+    /// Written out rather than left implicit so an operator can copy it into an
+    /// explorer. It is checked against the policy, not trusted: a value that does
+    /// not match is refused, because a genesis where the address and the keys
+    /// disagree would make every reader pick one of them.
+    pub address: String,
     /// Starting balance, in the chain's smallest unit.
     pub balance: u64,
     /// What authorizes a transaction from this account.
     pub policy: GenesisPolicy,
+}
+
+impl GenesisAccount {
+    /// The policy in the runtime form execution uses.
+    ///
+    /// # Errors
+    ///
+    /// An unknown policy kind, a threshold that does not fit the runtime's width,
+    /// an unknown algorithm, or a public key that is not hex.
+    pub fn runtime_policy(&self) -> Result<AuthPolicy, Box<dyn Error>> {
+        let kind = match self.policy.kind.as_str() {
+            "single" => AuthPolicyKind::Single,
+            "all" => AuthPolicyKind::All,
+            "threshold" => AuthPolicyKind::Threshold,
+            other => return Err(format!("unknown policy kind {other}").into()),
+        };
+        let threshold = u16::try_from(self.policy.threshold)
+            .map_err(|_| format!("threshold {} does not fit a u16", self.policy.threshold))?;
+        let mut keys = Vec::with_capacity(self.policy.keys.len());
+        for key in &self.policy.keys {
+            let algorithm_id = algorithm_id(&key.algorithm)
+                .ok_or_else(|| format!("unknown algorithm {}", key.algorithm))?;
+            keys.push(AuthKey {
+                key_id: key.key_id.as_bytes().to_vec(),
+                algorithm_id,
+                public_key: hex::decode(&key.public_key)?,
+                // Genesis lists no weights; one each keeps a threshold equal to a
+                // key count, which is what the file's threshold field means here.
+                weight: 1,
+                status: KeyStatus::Active,
+                valid_from: 0,
+                valid_until: POLICY_NO_EXPIRY,
+            });
+        }
+        Ok(AuthPolicy {
+            kind,
+            threshold,
+            policy_nonce: 1,
+            keys,
+        })
+    }
+
+    /// The address this account's policy derives.
+    ///
+    /// # Errors
+    ///
+    /// Anything [`GenesisAccount::runtime_policy`] reports.
+    pub fn derived_address(&self) -> Result<[u8; 32], Box<dyn Error>> {
+        Ok(self.runtime_policy()?.address()?)
+    }
 }
 
 /// The authorization policy attached to a genesis account.
@@ -253,53 +309,85 @@ impl Genesis {
             }
         }
 
-        let mut account_ids = HashSet::new();
+        let mut account_addresses = HashSet::new();
         for account in &self.accounts {
-            if account.id.trim().is_empty() {
-                problems.push("an account has an empty id".to_string());
+            let label = if account.address.is_empty() {
+                "(empty address)".to_string()
+            } else {
+                account.address.clone()
+            };
+            if account.address.trim().is_empty() {
+                problems.push("an account has an empty address".to_string());
             }
-            if !account_ids.insert(account.id.as_str()) {
-                problems.push(format!("account id {} appears twice", account.id));
+            match hex::decode(&account.address) {
+                Ok(bytes) if bytes.len() == 32 => {}
+                Ok(bytes) => problems.push(format!(
+                    "account {label} is {} bytes, an address is 32",
+                    bytes.len()
+                )),
+                Err(error) => problems.push(format!("account {label} is not hex: {error}")),
+            }
+            if account.address != account.address.to_lowercase() {
+                problems.push(format!("account {label} is not lowercase hex"));
+            }
+            if !account_addresses.insert(account.address.as_str()) {
+                problems.push(format!("account address {label} appears twice"));
             }
             match account.policy.kind.as_str() {
                 "single" | "all" => {}
                 "threshold" => {
                     if account.policy.threshold == 0 {
                         problems.push(format!(
-                            "account {} has a threshold policy with threshold 0",
-                            account.id
+                            "account {label} has a threshold policy with threshold 0"
                         ));
                     }
                     if account.policy.threshold > account.policy.keys.len() as u64 {
                         problems.push(format!(
-                            "account {} needs {} keys but the policy lists {}",
-                            account.id,
+                            "account {label} needs {} keys but the policy lists {}",
                             account.policy.threshold,
                             account.policy.keys.len()
                         ));
                     }
                 }
-                other => problems.push(format!(
-                    "account {} has unknown policy kind {other}",
-                    account.id
-                )),
+                other => {
+                    problems.push(format!("account {label} has unknown policy kind {other}"));
+                }
+            }
+            if account.policy.threshold > u64::from(u16::MAX) {
+                problems.push(format!(
+                    "account {label} threshold {} does not fit a u16",
+                    account.policy.threshold
+                ));
             }
             if account.policy.keys.is_empty() {
-                problems.push(format!("account {} has no policy keys", account.id));
+                problems.push(format!("account {label} has no policy keys"));
             }
             let mut key_ids = HashSet::new();
             for key in &account.policy.keys {
                 if !key_ids.insert(key.key_id.as_str()) {
                     problems.push(format!(
-                        "account {} has two keys with id {}",
-                        account.id, key.key_id
+                        "account {label} has two keys with id {}",
+                        key.key_id
                     ));
                 }
                 problems.extend(check_key(
-                    &format!("account {} key {}", account.id, key.key_id),
+                    &format!("account {label} key {}", key.key_id),
                     &key.algorithm,
                     &key.public_key,
                 ));
+            }
+            match account.derived_address() {
+                Ok(derived) => {
+                    if account.address.to_lowercase() != hex::encode(derived) {
+                        problems.push(format!(
+                            "account {label} does not match its policy; the policy derives {}",
+                            hex::encode(derived)
+                        ));
+                    }
+                }
+                Err(error) => {
+                    problems.push(format!("account {label} cannot derive an address: {error}"))
+                }
             }
         }
         problems
@@ -338,11 +426,21 @@ impl Genesis {
             }
         }
 
-        let mut accounts: Vec<&GenesisAccount> = self.accounts.iter().collect();
-        accounts.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut accounts: Vec<(Vec<u8>, &GenesisAccount)> = self
+            .accounts
+            .iter()
+            .map(
+                |account| -> Result<(Vec<u8>, &GenesisAccount), Box<dyn Error>> {
+                    Ok((hex::decode(&account.address)?, account))
+                },
+            )
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        // Sort by the decoded bytes, not the text: case and leading zeros are not
+        // supposed to exist, but the hash must not depend on them if they do.
+        accounts.sort_by(|left, right| left.0.cmp(&right.0));
         encoder.put_u32(u32::try_from(accounts.len())?);
-        for account in accounts {
-            encoder.put_bytes(account.id.as_bytes())?;
+        for (address, account) in accounts {
+            encoder.put_bytes(&address)?;
             encoder.put_u64(account.balance);
             encoder.put_u16(policy_id(&account.policy.kind));
             encoder.put_u64(account.policy.threshold);
@@ -449,6 +547,9 @@ pub fn run(
         "  accounts          {} holding {supply} in total",
         genesis.accounts.len()
     );
+    for account in &genesis.accounts {
+        println!("    {}  {}", account.address, account.balance);
+    }
     println!("  genesis hash      {}", hex::encode(hash));
 
     // The node configuration is the other half of the same membership. It carries
@@ -548,6 +649,32 @@ mod tests {
                 .problems()
                 .iter()
                 .any(|problem| problem.contains("keys are 32"))
+        );
+    }
+
+    #[test]
+    fn duplicate_addresses_are_reported() {
+        let mut genesis = genesis();
+        let duplicate = genesis.accounts[0].clone();
+        genesis.accounts.push(duplicate);
+        assert!(
+            genesis
+                .problems()
+                .iter()
+                .any(|problem| problem.contains("address") && problem.contains("appears twice"))
+        );
+    }
+
+    #[test]
+    fn an_address_that_does_not_match_its_policy_is_reported() {
+        let mut genesis = genesis();
+        genesis.accounts[0].address = hex::encode([0u8; 32]);
+        let problems = genesis.problems();
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("does not match its policy")),
+            "{problems:?}"
         );
     }
 
