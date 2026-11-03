@@ -39,6 +39,7 @@ use net::wire::{self, Message};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
+use tx::batch::Batch;
 use validator::{Step, VertexId, commit_root};
 
 use crate::chain;
@@ -79,6 +80,8 @@ pub struct Config {
     /// is large enough to absorb a whole run — so forcing a drop needs both a small
     /// queue and a small buffer.
     pub send_buffer: usize,
+    /// Transactions per authored batch. Zero keeps the data plane empty.
+    pub txs: u64,
     /// How long to keep the mesh alive after the last node finishes authoring,
     /// so the final rounds and any repair can land before the run is measured.
     pub drain: Duration,
@@ -94,6 +97,11 @@ struct NodeResult {
     repaired: u64,
     served: u64,
     gave_up: u64,
+    payloads: usize,
+    transactions: usize,
+    txs_received: usize,
+    payload_bytes: u64,
+    missing_payloads: usize,
     rejected: usize,
     committed: usize,
     bytes_in: u64,
@@ -196,6 +204,20 @@ fn broadcast(links: &[Link], control: bool, bytes: &[u8], dropped: &mut u64) {
     }
 }
 
+/// Queues payload on the data plane, awaiting a slot.
+///
+/// Payload is large and every node has to execute it, so it blocks rather than
+/// drops: losing a batch costs more than slowing down for it. The wait is for a
+/// queue slot, not for delivery, but it is real — a peer that cannot keep up now
+/// costs the sender throughput, which is the trade D22 recorded.
+async fn broadcast_payload(links: &[Link], bytes: &[u8]) {
+    for link in links {
+        if link.data.send(bytes.to_vec()).await.is_err() {
+            break;
+        }
+    }
+}
+
 /// One outstanding repair request.
 struct Want {
     at: Instant,
@@ -215,6 +237,7 @@ async fn node_task(
         .get(index)
         .ok_or("no consensus key for this node")?;
     let mut node = Node::new(set, identity.id.clone(), identity.private_key.clone());
+    let accounts = chain::accounts(config.validators).map_err(|error| error.to_string())?;
 
     let listener = TcpListener::bind(address(config.port_base, index))
         .await
@@ -289,6 +312,10 @@ async fn node_task(
     }
 
     let mut wanted: HashMap<VertexId, Want> = HashMap::new();
+    let mut batches: HashMap<[u8; 32], Batch> = HashMap::new();
+    let mut payload_bytes = 0u64;
+    let mut payloads = 0usize;
+    let mut txs_received = 0usize;
     let mut latencies: Vec<u64> = Vec::new();
     let mut received = 0usize;
     let mut rejected = 0usize;
@@ -339,16 +366,44 @@ async fn node_task(
                             rejected += 1;
                         }
                     }
+                    Message::Payload(batch) => {
+                        if let Ok(digest) = batch.digest() {
+                            payload_bytes += frame.len as u64;
+                            txs_received += batch.len();
+                            if batches.insert(digest, batch).is_none() {
+                                payloads += 1;
+                            }
+                        }
+                    }
                 }
             }
             _ = ticker.tick() => {
                 ticks = ticks.wrapping_add(1);
                 if node.round() <= config.rounds {
-                    match node.author() {
+                    let round = node.round();
+                    let payload = if config.txs > 0 {
+                        Some(
+                            chain::demo_batch(&accounts, index, round, config.txs)
+                                .map_err(|error| error.to_string())?,
+                        )
+                    } else {
+                        None
+                    };
+                    let digest = match &payload {
+                        Some(batch) => batch.digest().map_err(|error| error.to_string())?,
+                        None => [0u8; 32],
+                    };
+                    match node.author_with(digest) {
                         Ok(Some(vertex)) => {
                             let bytes = wire::frame(&Message::Vertex(vertex), now())
                                 .map_err(|error| error.to_string())?;
                             broadcast(&outbound, false, &bytes, &mut dropped);
+                            if let Some(batch) = payload {
+                                let frame = wire::frame(&Message::Payload(batch.clone()), now())
+                                    .map_err(|error| error.to_string())?;
+                                batches.insert(digest, batch);
+                                broadcast_payload(&outbound, &frame).await;
+                            }
                         }
                         Ok(None) => {}
                         Err(error) => return Err(format!("node {index} cannot author: {error}")),
@@ -430,6 +485,25 @@ async fn node_task(
         }
     }
 
+    // A vertex names a batch, so a payload that never arrived is visible without
+    // trusting the sender's accounting.
+    let mut missing_payloads = 0usize;
+    if config.txs > 0 {
+        let dag = node.dag();
+        let highest = dag.highest_round().unwrap_or(0);
+        for round in 0..=highest {
+            for validator in &dag.set().validators {
+                if let Some(vertex) = dag.get(round, &validator.validator_id)
+                    && vertex.payload_hash != [0u8; 32]
+                    && !batches.contains_key(&vertex.payload_hash)
+                {
+                    missing_payloads += 1;
+                }
+            }
+        }
+    }
+    let transactions: usize = batches.values().map(Batch::len).sum();
+
     Ok(NodeResult {
         index,
         authored: node.authored(),
@@ -439,6 +513,11 @@ async fn node_task(
         repaired,
         served,
         gave_up,
+        payloads,
+        transactions,
+        txs_received,
+        payload_bytes,
+        missing_payloads,
         rejected,
         committed: node.dag().order().len(),
         bytes_in: bytes_in.load(Ordering::Relaxed),
@@ -600,6 +679,11 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let mut served = 0u64;
     let mut gave_up = 0u64;
     let mut roots: Vec<[u8; 32]> = Vec::new();
+    let mut payload_batches = 0usize;
+    let mut payload_txs = 0usize;
+    let mut payload_txs_received = 0usize;
+    let mut payload_wire = 0u64;
+    let mut missing_payloads = 0usize;
     for result in &results {
         bytes_in += result.bytes_in;
         bytes_out += result.bytes_out;
@@ -608,6 +692,11 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         repaired += result.repaired;
         served += result.served;
         gave_up += result.gave_up;
+        payload_batches += result.payloads;
+        payload_txs += result.transactions;
+        payload_txs_received += result.txs_received;
+        payload_wire += result.payload_bytes;
+        missing_payloads += result.missing_payloads;
         roots.push(result.commit_root);
         latencies.extend_from_slice(&result.latencies);
         println!(
@@ -644,6 +733,20 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         "  repair            {dropped} frames dropped, {wanted} wants sent, \
          {repaired} repaired, {served} served, {gave_up} abandoned"
     );
+    if config.txs > 0 {
+        let per_tx = if payload_txs_received == 0 {
+            0.0
+        } else {
+            payload_wire as f64 / payload_txs_received as f64
+        };
+        println!(
+            "  data plane        {payload_batches} batches, {payload_txs_received} transaction \
+             deliveries, {per_tx:.0} B/tx received, {} on the wire, {missing_payloads} named but \
+             missing",
+            human(payload_wire)
+        );
+        println!("                    {payload_txs} unique transactions held across all nodes");
+    }
     let agreed = roots.windows(2).all(|pair| pair[0] == pair[1]);
     println!("  same commit root  {agreed}");
     if !agreed {
@@ -737,6 +840,11 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
 
     if !agreed {
         return Err("nodes did not converge on the same commit root".into());
+    }
+    if missing_payloads > 0 {
+        return Err(
+            format!("{missing_payloads} vertices name a batch this node does not hold").into(),
+        );
     }
     Ok(())
 }

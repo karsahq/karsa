@@ -145,6 +145,32 @@ fn signed_transaction(
     Ok(transaction)
 }
 
+/// A deterministic batch of transfers, for a transport that needs real payload.
+///
+/// Sequences are derived from the round so two rounds never reuse one. Nothing
+/// here is executed: this exists so a vertex can name a batch that actually
+/// exists and travels on the wire, which is what makes the measured bytes per
+/// transaction a measurement rather than a model.
+pub(crate) fn demo_batch(
+    accounts: &[Account],
+    author: usize,
+    round: u64,
+    count: u64,
+) -> Result<Batch, Box<dyn Error>> {
+    if accounts.len() < 2 {
+        return Err("a batch needs at least two accounts".into());
+    }
+    let sender = &accounts[author % accounts.len()];
+    let recipient = &accounts[(author + 1) % accounts.len()];
+    let capacity = usize::try_from(count).unwrap_or(0);
+    let mut transactions = Vec::with_capacity(capacity);
+    for offset in 0..count {
+        let sequence = round.saturating_mul(count).saturating_add(offset) + 1;
+        transactions.push(signed_transaction(sender, &recipient.id, sequence, 1)?);
+    }
+    Ok(Batch::new(transactions))
+}
+
 /// Signs `header` with a quorum of the consensus keys.
 pub(crate) fn certify(
     consensus: &[Consensus],

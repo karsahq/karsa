@@ -146,10 +146,24 @@ impl Node {
     /// check is the same one `Dag::insert` performs, done before signing so this
     /// node never produces a vertex it would reject itself.
     ///
+    /// The vertex names no payload: this node only orders.
+    ///
     /// # Errors
     ///
     /// Propagates signing and DAG insertion errors.
     pub fn author(&mut self) -> Result<Option<Vertex>, CryptoError> {
+        self.author_with([0u8; 32])
+    }
+
+    /// Authors this round's vertex, naming the batch it orders.
+    ///
+    /// `payload_hash` is part of the signed payload, so it has to be known before
+    /// signing — a node cannot add a batch to a vertex it already signed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates signing and DAG insertion errors.
+    pub fn author_with(&mut self, payload_hash: [u8; 32]) -> Result<Option<Vertex>, CryptoError> {
         let round = self.round;
         let references = if round == 0 {
             Vec::new()
@@ -179,8 +193,8 @@ impl Node {
             epoch: EPOCH,
             round,
             author: self.id.clone(),
-            // Ordering only: batches are a separate data plane.
-            payload_hash: [0u8; 32],
+            // Ordering only unless the caller names a batch.
+            payload_hash,
             references,
             signature: Vec::new(),
         };

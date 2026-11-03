@@ -8,6 +8,7 @@ description = "Karsa deterministic vertex dissemination between validator nodes"
 
 [dependencies]
 crypto = { path = "../crypto" }
+tx = { path = "../tx" }
 validator = { path = "../validator" }
 
 [lints]

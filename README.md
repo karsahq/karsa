@@ -159,12 +159,15 @@ which are still open.
   identical and the deferral count stays at zero. Getting that last sentence to
   hold required two fixes: a `missing_reference` during commit is now a retry, not
   a node failure, and an indirect commit no longer mutates history before the
-  direct non-vote rule has been ruled out (see design finding 15).
+  direct non-vote rule has been ruled out (see design finding 15). With `--txs N`
+  each vertex names a real batch of signed transfers and the batch travels on the
+  same link, so bytes per transaction are measured rather than modelled (finding
+  17).
 - `karsa node`: an HTTP pipeline (decode, policy lookup, signature verification,
   per-sender replay protection) on axum, plus the validator schedule:
   `GET /validators`, `POST /validators/{id}/keys` (authorized by an existing active
   key), and `POST /epoch`.
-- 250 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 251 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
@@ -341,6 +344,14 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     control traffic must not share a queue with broadcasts. Under the same load with
     one shared queue, 39 of 84 wants were abandoned while the final root still
     matched, which is precisely the failure a convergence-only test would miss.
+17. **Bytes per transaction are measured, not modelled.** `karsa live --txs 8`
+    signs a batch of transfers per round, names it in the vertex, and sends the
+    batch along the same link. At n=4 a node received 171 B per transaction: about
+    120 B of envelope, the rest batch and frame overhead. 3,968 unique transactions
+    were carried with **0 named batches missing**, including a run where a slow node
+    forced vertex drops and repair — because payload waits for a queue slot instead
+    of being dropped (D22). The number is per receiving node, so total wire cost is
+    that times the committee size.
 
 ## Build order
 

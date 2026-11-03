@@ -217,6 +217,9 @@ enum Command {
         /// Socket send buffer in bytes; 0 keeps the OS default.
         #[arg(long, default_value_t = 0)]
         send_buffer: usize,
+        /// Transactions per authored batch. Zero keeps the data plane empty.
+        #[arg(long, default_value_t = 0)]
+        txs: u64,
         /// How long the mesh stays up after the last node finishes authoring.
         #[arg(long, default_value_t = 500)]
         drain_ms: u64,
@@ -281,6 +284,7 @@ fn main() -> ExitCode {
             timeout_seconds,
             queue,
             send_buffer,
+            txs,
             drain_ms,
         } => live::run(live::Config {
             validators,
@@ -290,6 +294,7 @@ fn main() -> ExitCode {
             timeout: std::time::Duration::from_secs(timeout_seconds),
             queue,
             send_buffer,
+            txs,
             drain: std::time::Duration::from_millis(drain_ms),
         }),
     };

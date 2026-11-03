@@ -13,6 +13,7 @@
 //!
 //! - [`Message::Vertex`] is the broadcast.
 //! - [`Message::Want`] asks a peer for one vertex by id.
+//! - [`Message::Payload`] carries the batch a vertex names, on the data plane.
 //!
 //! The second kind is what makes a bounded queue safe. A peer that cannot keep up
 //! may have a frame dropped, and a dropped vertex is never "lost" to the protocol:
@@ -27,6 +28,7 @@
 
 use crypto::encoding::{Decoder, Encoder};
 use crypto::{CryptoError, CryptoErrorKind};
+use tx::batch::Batch;
 use validator::{Vertex, VertexId};
 
 /// Largest body this parser will accept.
@@ -41,6 +43,7 @@ const HEADER: usize = 4 + 8 + 1;
 
 const KIND_VERTEX: u8 = 1;
 const KIND_WANT: u8 = 2;
+const KIND_PAYLOAD: u8 = 3;
 
 /// What a frame carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +52,8 @@ pub enum Message {
     Vertex(Vertex),
     /// A request for one vertex, named by id.
     Want(VertexId),
+    /// A batch a vertex names, sent on the data plane.
+    Payload(Batch),
 }
 
 /// One decoded frame.
@@ -56,6 +61,8 @@ pub enum Message {
 pub struct Frame {
     /// Nanoseconds since the sender's mesh started, as the sender saw them.
     pub sent_at_nanos: u64,
+    /// Bytes this frame occupied on the wire, length prefix included.
+    pub len: usize,
     /// What the frame carries.
     pub message: Message,
 }
@@ -101,6 +108,7 @@ pub fn frame(message: &Message, sent_at_nanos: u64) -> Result<Vec<u8>, CryptoErr
     let (kind, payload) = match message {
         Message::Vertex(vertex) => (KIND_VERTEX, vertex.encode()?),
         Message::Want(id) => (KIND_WANT, encode_id(id)?),
+        Message::Payload(batch) => (KIND_PAYLOAD, batch.encode()?),
     };
     let length = u32::try_from(8 + 1 + payload.len()).map_err(|_| {
         CryptoError::new(
@@ -155,11 +163,13 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
     let message = match kind {
         KIND_VERTEX => Message::Vertex(Vertex::decode(payload)?),
         KIND_WANT => Message::Want(decode_id(&mut Decoder::new(payload))?),
+        KIND_PAYLOAD => Message::Payload(Batch::decode(payload)?),
         other => return Err(invalid(format!("unknown frame kind {other}"))),
     };
     buffer.drain(..total);
     Ok(Some(Frame {
         sent_at_nanos: u64::from_le_bytes(sent_at_nanos),
+        len: total,
         message,
     }))
 }
@@ -211,6 +221,24 @@ mod tests {
         let mut buffer = frame(&Message::Want(want(7)), 11).unwrap();
         let frame = take_frame(&mut buffer).unwrap().unwrap();
         assert_eq!(frame.message, Message::Want(want(7)));
+    }
+
+    #[test]
+    fn a_payload_frame_round_trips() {
+        let batch = tx::batch::Batch::new(vec![tx::envelope::Transaction {
+            protocol_version: tx::envelope::PROTOCOL_VERSION_V1,
+            chain_id: b"karsa-wire-1".to_vec(),
+            sender: b"alice".to_vec(),
+            sequence: 1,
+            fee: 1,
+            expiration: 100,
+            policy_version: 1,
+            payload: vec![1, 2, 3],
+            authorization: Vec::new(),
+        }]);
+        let mut buffer = frame(&Message::Payload(batch.clone()), 5).unwrap();
+        let frame = take_frame(&mut buffer).unwrap().unwrap();
+        assert_eq!(frame.message, Message::Payload(batch));
     }
 
     #[test]
