@@ -31,48 +31,23 @@ use tx::policy::{AuthKey, AuthPolicy, AuthPolicyKind, KeyStatus, NO_EXPIRY as PO
 use validator::{NO_EXPIRY as VALIDATOR_NO_EXPIRY, ValidatorKey, validator_address};
 
 /// The only protocol version this tree implements.
-const PROTOCOL_VERSION: u16 = 1;
+pub(crate) const PROTOCOL_VERSION: u16 = 1;
 
 /// Domain tag mixed into the genesis hash.
 const DOMAIN: &[u8] = b"KARSA/GENESIS/v1";
 
-/// The example written by `karsa genesis --init`.
-const EXAMPLE: &str = r#"{
-  "chain_id": "karsa",
-  "protocol_version": 1,
-  "epoch_rounds": 1000,
-  "validators": [
-    {
-      "address": "K2omunn2RZQ1xV6SemLxyAoFUEk6PKtV8pUsqJB5vUCusRcHmgN",
-      "keys": [
-        {
-          "key_id": "val-0-k0",
-          "algorithm": "ed25519",
-          "public_key": "0101010101010101010101010101010101010101010101010101010101010101",
-          "activation_epoch": 0
-        }
-      ]
-    }
-  ],
-  "accounts": [
-    {
-      "address": "K4aFUZMDDimgetMW8Vm3QsKAKCZ8jLGGziZ7bndkskcAYmLuVPx",
-      "balance": 1000,
-      "policy": {
-        "kind": "single",
-        "threshold": 0,
-        "keys": [
-          {
-            "key_id": "alice-k0",
-            "algorithm": "ed25519",
-            "public_key": "0202020202020202020202020202020202020202020202020202020202020202"
-          }
-        ]
-      }
-    }
-  ]
+/// The genesis written on a fresh home: a four-validator, four-account devnet.
+///
+/// Generated from the same deterministic seeds as the demo keys, so the file and
+/// `keys.json` always agree. It is a devnet, not a template to deploy: the seeds
+/// are in the source.
+///
+/// # Errors
+///
+/// Propagates the demo membership generation.
+pub(crate) fn example() -> Result<Genesis, Box<dyn Error>> {
+    Ok(crate::keys::demo_genesis()?.0)
 }
-"#;
 
 /// The whole file.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -286,9 +261,13 @@ impl Genesis {
             {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(path, EXAMPLE)?;
-            println!("  no genesis at {}; wrote the template", path.display());
-            println!("  it carries placeholder keys: replace them before the chain does anything");
+            let text = serde_json::to_string_pretty(&example()?)?;
+            std::fs::write(path, format!("{text}\n"))?;
+            println!(
+                "  no genesis at {}; wrote a four-validator devnet",
+                path.display()
+            );
+            println!("  its keys are the demo keys in keys.json; replace both before a real chain");
         }
         Self::load(path)
     }
@@ -580,7 +559,8 @@ pub fn write_example(path: &Path) -> Result<(), Box<dyn Error>> {
     if path.exists() {
         return Err(format!("{} already exists; not overwriting", path.display()).into());
     }
-    std::fs::write(path, EXAMPLE)?;
+    let text = serde_json::to_string_pretty(&example()?)?;
+    std::fs::write(path, format!("{text}\n"))?;
     Ok(())
 }
 
@@ -590,14 +570,21 @@ pub fn run(
     init: bool,
 ) -> Result<(), Box<dyn Error>> {
     let path = home.file(explicit, "genesis.json");
+    let keys_path = home.keys_json();
     if init {
+        if keys_path.exists() {
+            return Err(format!("{} already exists; not overwriting", keys_path.display()).into());
+        }
         write_example(&path)?;
-        println!("wrote {}", path.display());
+        crate::keys::demo_genesis()?.1.save(&keys_path)?;
+        println!("wrote {} and {}", path.display(), keys_path.display());
         return Ok(());
     }
 
     let genesis = Genesis::ensure(&path)?;
+    let keys = crate::keys::Keys::ensure(&keys_path)?;
     let mut problems = genesis.problems();
+    problems.extend(keys.problems(&genesis));
     let hash = genesis.hash()?;
 
     println!("== Genesis: {} ==", path.display());
@@ -671,9 +658,7 @@ mod tests {
     use super::*;
 
     fn genesis() -> Genesis {
-        // The example's keys are placeholders, but of the right length for their
-        // algorithm, so the committed file validates as it stands.
-        serde_json::from_str(EXAMPLE).unwrap()
+        example().unwrap()
     }
 
     #[test]
@@ -685,8 +670,12 @@ mod tests {
     #[test]
     fn the_committed_example_matches_the_generated_one() {
         let committed = include_str!("../../../genesis.json.example");
+        let generated = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&example().unwrap()).unwrap()
+        );
         assert_eq!(
-            committed, EXAMPLE,
+            committed, generated,
             "genesis.json.example is stale: regenerate it with `karsa genesis --init`"
         );
     }
@@ -821,7 +810,9 @@ mod tests {
 
     #[test]
     fn an_unknown_field_is_rejected_rather_than_ignored() {
-        let text = EXAMPLE.replace("\"epoch_rounds\": 1000", "\"epoch_roundz\": 1000");
+        let text = serde_json::to_string(&genesis())
+            .unwrap()
+            .replace("\"epoch_rounds\":1000", "\"epoch_roundz\":1000");
         assert!(serde_json::from_str::<Genesis>(&text).is_err());
     }
 }

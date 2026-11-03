@@ -185,12 +185,19 @@ which are still open.
   sentence. It prints the **genesis hash over the canonical encoding, not over the
   file**, so reformatting the JSON or reordering validators does not change the
   chain's identity, and a field change always does.
-- Home directory: `karsa config`, `karsa genesis`, and `karsa node` all take
-  `--home DIR` (default `$HOME/.karsa`) and read the two files that describe one
-  chain membership from the same place — `node.toml` and `genesis.json` — writing
-  either with defaults when it is missing. The node keeps **no chain identity of
-  its own**: the genesis beside it is the only one, so there is nothing to drift
-  from it.
+- Home directory: `karsa config`, `karsa genesis`, `karsa node`, `karsa chain`,
+  and `karsa live` all take `--home DIR` (default `$HOME/.karsa`) and read the
+  files that describe one chain membership from the same place — `node.toml`,
+  `genesis.json`, `keys.json`, and `peers.json` — writing any missing one with a
+  documented default. The private half lives in `keys.json` (`0600`, never hashed)
+  and is validated against the genesis public keys: an address the genesis does not
+  list, a key id the policy does not have, or a public half that disagrees with its
+  seed is refused before a signature exists. A fresh home is a four-validator,
+  four-account devnet; `genesis.json` and `keys.json` are generated together from
+  the demo seeds, so `karsa chain 4 --rounds 4 --home DIR` and `karsa live
+  --validators 4 --home DIR` run without extra setup. The node keeps **no chain
+  identity of its own**: the genesis beside it is the only one, so there is nothing
+  to drift from it.
 - `karsa config`: per-node settings in a `node.toml`, the way an operator expects.
   Roles (validator, rpc, archive), retention (days and a hard disk cap), snapshot
   cadence, and listen addresses. The file is validated rather than trusted — an

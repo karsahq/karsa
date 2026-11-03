@@ -23,6 +23,10 @@ use exec::{RejectReason, State};
 use sha2::{Digest, Sha256};
 use tx::address;
 use tx::batch::Batch;
+
+use crate::genesis::{Genesis, GenesisAccount, GenesisValidator};
+use crate::home::Home;
+use crate::keys::{Keys, decode_ed25519};
 use tx::envelope::{PROTOCOL_VERSION_V1, Transaction};
 use tx::policy::{AuthKey, AuthPolicy, AuthPolicyKind, Authorization, KeyStatus};
 use validator::{
@@ -34,9 +38,10 @@ use validator::{
 const EPOCH: u64 = 1;
 const NOW: u64 = 1_000;
 const FEE: u64 = 1;
-const GENESIS_BALANCE: u64 = 1_000;
+pub(crate) const GENESIS_BALANCE: u64 = 1_000;
 
 /// One validator's consensus key.
+#[derive(Clone)]
 pub(crate) struct Consensus {
     pub(crate) id: Vec<u8>,
     pub(crate) private_key: Vec<u8>,
@@ -48,11 +53,14 @@ pub(crate) struct Consensus {
 /// identity and the state key, so there is nothing that can disagree with it. Two
 /// accounts with the same policy therefore have the same address, and are one
 /// account.
+#[derive(Clone)]
 pub(crate) struct Account {
     pub(crate) address: [u8; 32],
     pub(crate) private_key: Vec<u8>,
     pub(crate) key_id: Vec<u8>,
     pub(crate) policy: AuthPolicy,
+    /// Opening balance. A genesis account states this; the demo uses a constant.
+    pub(crate) balance: u64,
 }
 
 /// A deterministic Ed25519 keypair from a single seed byte.
@@ -126,6 +134,7 @@ pub(crate) fn accounts(count: usize) -> Result<Vec<Account>, crypto::CryptoError
             private_key,
             key_id,
             policy,
+            balance: GENESIS_BALANCE,
         });
     }
     Ok(accounts)
@@ -232,6 +241,9 @@ pub(crate) struct Report {
     pub(crate) rejected: BTreeMap<&'static str, usize>,
     pub(crate) balances: BTreeMap<Vec<u8>, u64>,
     pub(crate) burned: u64,
+    /// Sum of the opening balances, so conservation is checked against the state
+    /// the chain actually started from rather than a compiled constant.
+    pub(crate) genesis_total: u64,
     pub(crate) root: [u8; 32],
     pub(crate) proof: exec::AccountProof,
     pub(crate) headers: Vec<HeaderView>,
@@ -287,15 +299,149 @@ pub(crate) fn demo_chain_id() -> Vec<u8> {
     Sha256::digest(b"KARSA/GENESIS/v1/demo").to_vec()
 }
 
+/// The committee and accounts one run acts for.
+///
+/// Without a home this is the deterministic demo. With one it is the genesis and
+/// the keys beside it, which is what makes `--home` an actual chain membership
+/// rather than a different chain id over the same fixtures.
+#[derive(Clone)]
+pub(crate) struct Membership {
+    pub(crate) set: ValidatorSet,
+    pub(crate) consensus: Vec<Consensus>,
+    pub(crate) accounts: Vec<Account>,
+}
+
+/// Builds the membership for `validators`, from a home when one is given.
+///
+/// A home without `genesis.json` gets the four-validator devnet, and a matching
+/// `keys.json`, exactly as a first `karsa node` writes `node.toml`. Missing files
+/// are generated once; existing ones are validated, never repaired.
+///
+/// # Errors
+///
+/// A genesis or keystore that does not parse, fails validation, disagrees with the
+/// other, or does not have the requested validator count.
+pub(crate) fn membership(
+    validators: usize,
+    home: Option<&Home>,
+) -> Result<Membership, Box<dyn Error>> {
+    let Some(home) = home else {
+        let (set, consensus) = consensus_set(validators)?;
+        return Ok(Membership {
+            set,
+            consensus,
+            accounts: accounts(validators)?,
+        });
+    };
+    let genesis = Genesis::ensure(&home.genesis_json())?;
+    let keys = Keys::ensure(&home.keys_json())?;
+    membership_from(&genesis, &keys, validators)
+}
+
+fn membership_from(
+    genesis: &Genesis,
+    keys: &Keys,
+    validators: usize,
+) -> Result<Membership, Box<dyn Error>> {
+    let problems = genesis.problems();
+    if !problems.is_empty() {
+        return Err(format!("genesis has problems: {}", problems.join("; ")).into());
+    }
+    let key_problems = keys.problems(genesis);
+    if !key_problems.is_empty() {
+        return Err(format!("keys.json has problems: {}", key_problems.join("; ")).into());
+    }
+    if genesis.validators.len() != validators {
+        return Err(format!(
+            "genesis has {} validators, --validators is {validators}",
+            genesis.validators.len()
+        )
+        .into());
+    }
+
+    // The genesis hash sorts by address, so the runtime must too. A file written
+    // with its entries in another order would otherwise elect a different leader
+    // while hashing to the same chain id.
+    let mut ordered: Vec<&GenesisValidator> = genesis.validators.iter().collect();
+    ordered.sort_by_key(|validator| address::decode(&validator.address).unwrap_or([0u8; 32]));
+    let mut records = Vec::with_capacity(ordered.len());
+    let mut consensus = Vec::with_capacity(ordered.len());
+    for validator in &ordered {
+        let address = address::decode(&validator.address)?;
+        let entry = keys
+            .validator_key(&validator.address)
+            .ok_or_else(|| format!("no private key for validator {}", validator.address))?;
+        let private_key = decode_ed25519(&entry.private_key)
+            .map_err(|error| format!("key {}: {error}", entry.key_id))?;
+        records.push(ValidatorRecord {
+            validator_id: address.to_vec(),
+            keys: validator.runtime_keys()?,
+        });
+        consensus.push(Consensus {
+            id: address.to_vec(),
+            private_key,
+        });
+    }
+    let set = ValidatorSet {
+        epoch: EPOCH,
+        validators: records,
+    };
+    set.validate()?;
+
+    let mut ordered: Vec<&GenesisAccount> = genesis.accounts.iter().collect();
+    ordered.sort_by_key(|account| address::decode(&account.address).unwrap_or([0u8; 32]));
+    let mut runtime = Vec::with_capacity(ordered.len());
+    for account in ordered {
+        let address = address::decode(&account.address)?;
+        let policy = account.runtime_policy()?;
+        let entry = keys
+            .account_key(&account.address)
+            .ok_or_else(|| format!("no private key for account {}", account.address))?;
+        let private_key = decode_ed25519(&entry.private_key)
+            .map_err(|error| format!("key {}: {error}", entry.key_id))?;
+        let key_id = entry.key_id.as_bytes().to_vec();
+        if !policy.keys.iter().any(|key| key.key_id == key_id) {
+            return Err(format!(
+                "account {} policy has no key {}",
+                account.address, entry.key_id
+            )
+            .into());
+        }
+        runtime.push(Account {
+            address,
+            private_key,
+            key_id,
+            policy,
+            balance: account.balance,
+        });
+    }
+
+    Ok(Membership {
+        set,
+        consensus,
+        accounts: runtime,
+    })
+}
+
 pub(crate) fn simulate(
     chain_id: &[u8],
     validators: usize,
     data_rounds: u64,
 ) -> Result<Simulation, Box<dyn Error>> {
-    let (set, consensus) = consensus_set(validators)?;
-    let accounts = accounts(validators)?;
+    let membership = membership(validators, None)?;
+    simulate_with(chain_id, &membership, data_rounds)
+}
 
-    let mut state = genesis_state(&accounts)?;
+fn simulate_with(
+    chain_id: &[u8],
+    membership: &Membership,
+    data_rounds: u64,
+) -> Result<Simulation, Box<dyn Error>> {
+    let set = membership.set.clone();
+    let consensus = membership.consensus.as_slice();
+    let accounts = membership.accounts.as_slice();
+
+    let mut state = genesis_state(accounts)?;
 
     let mut dag = Dag::new(set.clone());
     let mut batches: HashMap<[u8; 32], Batch> = HashMap::new();
@@ -308,7 +454,7 @@ pub(crate) fn simulate(
         let references: Vec<validator::VertexId> = if round == 0 {
             Vec::new()
         } else {
-            (0..validators)
+            (0..consensus.len())
                 .filter_map(|author| {
                     dag.get(round - 1, &consensus[author].id)
                         .and_then(|vertex| vertex.id().ok())
@@ -415,7 +561,7 @@ pub(crate) fn simulate(
                 continue;
             };
 
-            applied += apply_batch(&mut state, &accounts, batch, &mut rejected);
+            applied += apply_batch(&mut state, accounts, batch, &mut rejected);
         }
 
         // Round 0 is genesis and is already covered by the genesis header, so it
@@ -439,7 +585,7 @@ pub(crate) fn simulate(
             previous: head.id()?,
             applied: u64::try_from(applied).unwrap_or(0),
         };
-        let certificate = certify(&consensus, &header)?;
+        let certificate = certify(consensus, &header)?;
         chain.advance(&header, &certificate)?;
         certified.push((header.clone(), certificate.clone()));
         headers.push(HeaderView {
@@ -472,6 +618,7 @@ pub(crate) fn simulate(
         .proof(&first_account)
         .ok_or("the state has no account to prove")?;
 
+    let genesis_total = accounts.iter().map(|account| account.balance).sum();
     let report = Report {
         rounds,
         committed_vertices: order.len(),
@@ -479,6 +626,7 @@ pub(crate) fn simulate(
         rejected,
         balances: state.balances().clone(),
         burned,
+        genesis_total,
         root,
         proof,
         headers,
@@ -517,7 +665,7 @@ pub(crate) fn settle(dag: &mut Dag, start_round: u64) -> Result<usize, Box<dyn E
 pub(crate) fn genesis_state(accounts: &[Account]) -> Result<State, exec::ExecError> {
     let mut state = State::new();
     for account in accounts {
-        state.credit(&account.address, GENESIS_BALANCE)?;
+        state.credit(&account.address, account.balance)?;
     }
     Ok(state)
 }
@@ -581,9 +729,12 @@ pub fn run(
         return Err("--rounds must be at least 1".into());
     }
 
+    // Build the membership first: with a home it writes the devnet genesis and
+    // keys when they are missing, and the chain id is that genesis's hash.
+    let committee = membership(validators, home)?;
     let chain_id = chain_id(home)?;
-    let first = simulate(&chain_id, validators, data_rounds)?;
-    let second = simulate(&chain_id, validators, data_rounds)?.report;
+    let first = simulate_with(&chain_id, &committee, data_rounds)?;
+    let second = simulate_with(&chain_id, &committee, data_rounds)?.report;
     let first = first.report;
 
     println!("== Karsa chain: order, then execute ==");
@@ -594,8 +745,9 @@ pub fn run(
     );
     println!("  validators:   {validators}");
     println!(
-        "  accounts:     {:?}, genesis balance {GENESIS_BALANCE}",
-        first.balances.len()
+        "  accounts:     {} holding {} at genesis",
+        first.balances.len(),
+        first.genesis_total
     );
     println!("  data rounds:  {data_rounds} plus genesis and two empty rounds");
     println!();
@@ -634,7 +786,7 @@ pub fn run(
     }
 
     let circulating: u64 = first.balances.values().sum();
-    let genesis_total = GENESIS_BALANCE * u64::try_from(first.balances.len()).unwrap_or(0);
+    let genesis_total = first.genesis_total;
     println!();
     println!("  state root:  {}", hex::encode(first.root));
     println!(

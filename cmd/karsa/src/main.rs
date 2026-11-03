@@ -37,6 +37,7 @@ mod dagsim;
 mod demo;
 mod genesis;
 mod home;
+mod keys;
 mod live;
 mod loadtest;
 mod migrate;

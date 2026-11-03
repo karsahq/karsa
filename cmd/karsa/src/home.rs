@@ -73,6 +73,15 @@ impl Home {
         self.dir.join("peers.json")
     }
 
+    /// `keys.json` inside this home.
+    ///
+    /// Private keys sit beside the public membership they belong to, in the same
+    /// directory, but are written `0600` and never hashed.
+    #[must_use]
+    pub fn keys_json(&self) -> PathBuf {
+        self.dir.join("keys.json")
+    }
+
     /// Picks an explicit file when one was given, else the file inside this home.
     #[must_use]
     pub fn file(&self, explicit: Option<PathBuf>, name: &str) -> PathBuf {

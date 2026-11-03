@@ -361,22 +361,30 @@ struct Want {
     tries: u8,
 }
 
+/// The two progress channels a node reports on.
+///
+/// Grouped so the task signature stays about the node rather than about plumbing.
+struct Notify {
+    ready: mpsc::Sender<usize>,
+    executed: mpsc::Sender<usize>,
+}
+
 async fn node_task(
     index: usize,
     config: &Config,
+    committee: chain::Membership,
     chain_id: Vec<u8>,
     started: Instant,
     mut shutdown: watch::Receiver<bool>,
-    ready: mpsc::Sender<usize>,
-    executed: mpsc::Sender<usize>,
+    notify: Notify,
 ) -> Result<NodeResult, String> {
-    let (set, consensus) =
-        chain::consensus_set(config.validators).map_err(|error| error.to_string())?;
+    let set = committee.set.clone();
     // One shard per node: `data` of `n` reconstruct, so the code tolerates
     // `n - data` missing nodes and each node holds `payload / data`.
     let coding =
         Code::new(set.quorum_size(), config.validators).map_err(|error| error.to_string())?;
-    let identity = consensus
+    let identity = committee
+        .consensus
         .get(index)
         .ok_or("no consensus key for this node")?;
     let mut node = Node::with_chain_id(
@@ -385,7 +393,7 @@ async fn node_task(
         identity.private_key.clone(),
         chain_id.clone(),
     );
-    let accounts = chain::accounts(config.validators).map_err(|error| error.to_string())?;
+    let accounts = committee.accounts.clone();
     let store = if config.store.as_os_str().is_empty() {
         None
     } else {
@@ -689,7 +697,7 @@ async fn node_task(
                 }
                 if !announced && node.round() > config.rounds {
                     announced = true;
-                    let _ = ready.send(index).await;
+                    let _ = notify.ready.send(index).await;
                 }
                 // Applying costs real signature verification, so it lags the
                 // commit cursor. Report caught-up only once the commit cursor has
@@ -712,7 +720,7 @@ async fn node_task(
                     && execution_caught_up
                 {
                     exec_announced = true;
-                    let _ = executed.send(index).await;
+                    let _ = notify.executed.send(index).await;
                 }
 
                 // Ask for every dangling reference, then retry whatever is still
@@ -1064,13 +1072,18 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     }
 
     // The genesis hash is the chain identity vertices are signed over (D29). An
-    // explicit home supplies it; without one the demo identity every other command
-    // uses keeps this run self-contained and does not depend on `~/.karsa`.
-    let chain_id = match config.home.clone() {
-        Some(path) => {
-            let home = crate::home::Home::resolve(Some(path))?;
-            chain::chain_id(Some(&home))?
-        }
+    // explicit home supplies it; without one the demo identity keeps this run
+    // self-contained and does not depend on `~/.karsa`. Membership first: with a
+    // home it ensures the genesis and keys exist, so the chain id read below is the
+    // hash of the same genesis the committee came from.
+    let home = config
+        .home
+        .clone()
+        .map(|path| crate::home::Home::resolve(Some(path)))
+        .transpose()?;
+    let committee = chain::membership(config.validators, home.as_ref())?;
+    let chain_id = match &home {
+        Some(home) => chain::chain_id(Some(home))?,
         None => chain::demo_chain_id(),
     };
 
@@ -1090,16 +1103,20 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             let ready_tx = ready_tx.clone();
             let executed_tx = executed_tx.clone();
             let config = config.clone();
+            let committee = committee.clone();
             let chain_id = chain_id.clone();
             tasks.push(tokio::spawn(async move {
                 node_task(
                     index,
                     &config,
+                    committee,
                     chain_id,
                     started,
                     shutdown_rx,
-                    ready_tx,
-                    executed_tx,
+                    Notify {
+                        ready: ready_tx,
+                        executed: executed_tx,
+                    },
                 )
                 .await
             }));

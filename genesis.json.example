@@ -4,12 +4,45 @@
   "epoch_rounds": 1000,
   "validators": [
     {
-      "address": "K2omunn2RZQ1xV6SemLxyAoFUEk6PKtV8pUsqJB5vUCusRcHmgN",
+      "address": "K2qG83wrJgn8QMuDwTkdMmPk5JPuDLHaEU33AyHTY1qL41zZVNw",
       "keys": [
         {
           "key_id": "val-0-k0",
           "algorithm": "ed25519",
-          "public_key": "0101010101010101010101010101010101010101010101010101010101010101",
+          "public_key": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+          "activation_epoch": 0
+        }
+      ]
+    },
+    {
+      "address": "K4e5rA97NwjksFXciZD9rQgHgPN17pvLPLqYRXiMVria9d66xjs",
+      "keys": [
+        {
+          "key_id": "val-1-k0",
+          "algorithm": "ed25519",
+          "public_key": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+          "activation_epoch": 0
+        }
+      ]
+    },
+    {
+      "address": "K2sfJhNEijr3Q97BYE1n9vvggwWvGR4N7117AtmGgdEnU8Eosq3",
+      "keys": [
+        {
+          "key_id": "val-2-k0",
+          "algorithm": "ed25519",
+          "public_key": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+          "activation_epoch": 0
+        }
+      ]
+    },
+    {
+      "address": "K3HUgwfmCi5KhuK1khUUWCRPaNRwrdxW5S9rDBvRoyFacg8t75K",
+      "keys": [
+        {
+          "key_id": "val-3-k0",
+          "algorithm": "ed25519",
+          "public_key": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
           "activation_epoch": 0
         }
       ]
@@ -17,16 +50,61 @@
   ],
   "accounts": [
     {
-      "address": "K4aFUZMDDimgetMW8Vm3QsKAKCZ8jLGGziZ7bndkskcAYmLuVPx",
+      "address": "K3npKrm2cRinwoudDmcKM8r4ZRrd5pVF8bFDo2137E2pxLLcZa3",
       "balance": 1000,
       "policy": {
         "kind": "single",
         "threshold": 0,
         "keys": [
           {
-            "key_id": "alice-k0",
+            "key_id": "acct-0-k0",
             "algorithm": "ed25519",
-            "public_key": "0202020202020202020202020202020202020202020202020202020202020202"
+            "public_key": "d62f016a1efd1e4fdf793eb42cd84471e1ba9f0cf04d1287b5cc71f616287cb8"
+          }
+        ]
+      }
+    },
+    {
+      "address": "K4XFvWr5LNqpQTo9pGTfYVFp8sWrTn47wUycDMbb3bRxmFm1qD6",
+      "balance": 1000,
+      "policy": {
+        "kind": "single",
+        "threshold": 0,
+        "keys": [
+          {
+            "key_id": "acct-1-k0",
+            "algorithm": "ed25519",
+            "public_key": "34b4d9043156cb6dcf0beb0a2949b7559c940d2bcb6dbe8c53a9b30278e3a746"
+          }
+        ]
+      }
+    },
+    {
+      "address": "K2phnVzwHP4F4h91k5eeEUzA8AUcU2oJjsCxDLwZ1qcwcNZzokV",
+      "balance": 1000,
+      "policy": {
+        "kind": "single",
+        "threshold": 0,
+        "keys": [
+          {
+            "key_id": "acct-2-k0",
+            "algorithm": "ed25519",
+            "public_key": "12a41592c8b7c17d4059e7b29b61e8ff96c7415f2f803348f2f017e05b9ea1da"
+          }
+        ]
+      }
+    },
+    {
+      "address": "K3PCQW2QALVz9GaPg9TNB5HJC8VjyHyDxJyG9KMeYQHp4juHKSL",
+      "balance": 1000,
+      "policy": {
+        "kind": "single",
+        "threshold": 0,
+        "keys": [
+          {
+            "key_id": "acct-3-k0",
+            "algorithm": "ed25519",
+            "public_key": "54b0d81d0fa7d00e4a7d600dfaba6f2b22035b22fe335e17edf5f9aa5bb05074"
           }
         ]
       }
