@@ -15,7 +15,7 @@ not part of this repository.
 | `crates/net/` | Rust: vertex dissemination between nodes, deterministic scheduling, and the wire framing for real sockets |
 | `crates/store/` | Rust: append-only on-disk vertices, batches, and roots |
 | `crates/erasure/` | Rust: Reed-Solomon over GF(2^8) for sharded storage |
-| `cmd/karsa/` | Rust: single CLI with `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `live`, `dagsim`, `chain`, `net`, `persist`, `audit`, `migrate`, `sigbench`, `sweep`, `shards` |
+| `cmd/karsa/` | Rust: single CLI with `config`, `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `live`, `dagsim`, `chain`, `net`, `persist`, `audit`, `migrate`, `sigbench`, `sweep`, `shards` |
 | `.cargo/config.toml` | sccache as rustc wrapper, mold as linker |
 | `scripts/rust-check.sh` | Rust gate: fmt, clippy, tests |
 | `scripts/acvp-rust.sh` | Downloads the ACVP vectors and runs the checker |
@@ -167,11 +167,19 @@ which are still open.
   applied cursor to catch up with the commit cursor before reporting. `--store DIR`
   persists every vertex and batch through `crates/store`, so the bytes-per-day
   figure is measured from files rather than modelled.
+- `karsa config`: per-node settings in a `node.toml`, the way an operator expects.
+  Roles (validator, rpc, archive), retention (days and a hard disk cap), snapshot
+  cadence, and listen addresses. The file is validated rather than trusted — an
+  archive node that also prunes, a pruning node with zero retention, a node with no
+  role, or an RPC role with no address are all refused with a sentence each — and
+  the command prints what the retention setting costs at 10/100/1k/10k TPS for both
+  a 169 B and a 3.5 kB transaction, because the number that matters is the disk, not
+  the days.
 - `karsa node`: an HTTP pipeline (decode, policy lookup, signature verification,
   per-sender replay protection) on axum, plus the validator schedule:
   `GET /validators`, `POST /validators/{id}/keys` (authorized by an existing active
   key), and `POST /epoch`.
-- 251 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 257 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
@@ -390,6 +398,14 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     preference. Pruning bounds disk only: per-node egress stays `(n-1)/n` of the
     originator total, so if bandwidth becomes the constraint the erasure work
     becomes relevant again. It stays in the tree as a measured result.
+22. **Retention is a local decision, so it is a file.** Two validators running the
+    same chain do not have to keep the same history: `node.toml` carries the roles
+    (validator, rpc, archive), the retention window, a hard disk cap, and the
+    snapshot cadence. The cap is the part that matters operationally — retention is
+    "this many days **or** this much disk", because a burst is charged in full: one
+    hour at 10k TPS is 36 million transactions, which at 3.5 kB is more than a quiet
+    month. A config that would delete everything, or an archive node that also
+    prunes, is refused before the node starts writing.
 
 ## Build order
 

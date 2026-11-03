@@ -22,6 +22,7 @@
 //! karsa dagbench                   measure DAG certificate and header cost
 //! karsa loadtest [count] [conc]    drive the node and report tx/s
 //! karsa live                       run validator nodes over real loopback sockets
+//! karsa config                     validate and explain a node.toml
 //! ```
 
 mod acvp;
@@ -29,6 +30,7 @@ mod audit;
 mod bandwidth;
 mod certify;
 mod chain;
+mod config;
 mod dagbench;
 mod dagsim;
 mod demo;
@@ -194,6 +196,15 @@ enum Command {
         #[arg(default_value_t = 16)]
         concurrency: usize,
     },
+    /// Validate and explain a node configuration, or write an example.
+    Config {
+        /// Path to node.toml.
+        #[arg(default_value = "node.toml")]
+        path: std::path::PathBuf,
+        /// Write the commented example instead of reading it.
+        #[arg(long)]
+        init: bool,
+    },
     /// Run validator nodes over real loopback sockets and measure what crosses them.
     Live {
         /// Validators in the committee.
@@ -285,6 +296,7 @@ fn main() -> ExitCode {
         Command::Acvp { file } => acvp::run(&file),
         Command::Dagbench => dagbench::run(),
         Command::Loadtest { count, concurrency } => loadtest::run(count, concurrency),
+        Command::Config { path, init } => config::run(Some(path), init),
         Command::Live {
             validators,
             port_base,
