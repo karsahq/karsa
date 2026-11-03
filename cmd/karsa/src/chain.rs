@@ -21,6 +21,7 @@ use crypto::registry::ALG_ED25519;
 use crypto::scheme::Ed25519Scheme;
 use exec::{RejectReason, State};
 use sha2::{Digest, Sha256};
+use tx::address;
 use tx::batch::Batch;
 use tx::envelope::{PROTOCOL_VERSION_V1, Transaction};
 use tx::policy::{AuthKey, AuthPolicy, AuthPolicyKind, Authorization, KeyStatus};
@@ -616,11 +617,13 @@ pub fn run(
     }
 
     println!();
-    println!("  {}  balance", pad("address", 64));
-    for (address, balance) in &first.balances {
+    println!("  {}  balance", pad("address", 51));
+    for (key, balance) in &first.balances {
         // The full address, not a prefix: this is the value a person copies into
         // an explorer, and truncating it would make the table pretty and useless.
-        println!("  {}  {}", hex::encode(address), balance);
+        let text = <[u8; 32]>::try_from(key.as_slice())
+            .map_or_else(|_| hex::encode(key), |bytes| address::encode(&bytes));
+        println!("  {text}  {balance}");
     }
 
     let circulating: u64 = first.balances.values().sum();

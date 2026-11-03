@@ -55,7 +55,7 @@ const EXAMPLE: &str = r#"{
   ],
   "accounts": [
     {
-      "address": "e94f1b9f07298aa1f80d6208597150b177b2cdadd98cafd4bd32515be6301a50",
+      "address": "K4aFUZMDDimgetMW8Vm3QsKAKCZ8jLGGziZ7bndkskcAYmLuVPx",
       "balance": 1000,
       "policy": {
         "kind": "single",
@@ -117,12 +117,13 @@ pub struct GenesisKey {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GenesisAccount {
-    /// Lowercase hex of the 32 bytes the policy derives.
+    /// Base58Check address (`K...`) of the 32 bytes the policy derives.
     ///
     /// Written out rather than left implicit so an operator can copy it into an
     /// explorer. It is checked against the policy, not trusted: a value that does
     /// not match is refused, because a genesis where the address and the keys
-    /// disagree would make every reader pick one of them.
+    /// disagree would make every reader pick one of them. The text encoding is
+    /// display only; the identity is still the 32 bytes it decodes to.
     pub address: String,
     /// Starting balance, in the chain's smallest unit.
     pub balance: u64,
@@ -319,20 +320,18 @@ impl Genesis {
             if account.address.trim().is_empty() {
                 problems.push("an account has an empty address".to_string());
             }
-            match hex::decode(&account.address) {
-                Ok(bytes) if bytes.len() == 32 => {}
-                Ok(bytes) => problems.push(format!(
-                    "account {label} is {} bytes, an address is 32",
-                    bytes.len()
-                )),
-                Err(error) => problems.push(format!("account {label} is not hex: {error}")),
-            }
-            if account.address != account.address.to_lowercase() {
-                problems.push(format!("account {label} is not lowercase hex"));
-            }
-            if !account_addresses.insert(account.address.as_str()) {
-                problems.push(format!("account address {label} appears twice"));
-            }
+            let decoded = match tx::address::decode(&account.address) {
+                Ok(bytes) => {
+                    if !account_addresses.insert(bytes) {
+                        problems.push(format!("account address {label} appears twice"));
+                    }
+                    Some(bytes)
+                }
+                Err(error) => {
+                    problems.push(format!("account {label} is not an address: {error}"));
+                    None
+                }
+            };
             match account.policy.kind.as_str() {
                 "single" | "all" => {}
                 "threshold" => {
@@ -378,10 +377,12 @@ impl Genesis {
             }
             match account.derived_address() {
                 Ok(derived) => {
-                    if account.address.to_lowercase() != hex::encode(derived) {
+                    if let Some(decoded) = decoded
+                        && decoded != derived
+                    {
                         problems.push(format!(
                             "account {label} does not match its policy; the policy derives {}",
-                            hex::encode(derived)
+                            tx::address::encode(&derived)
                         ));
                     }
                 }
@@ -426,18 +427,18 @@ impl Genesis {
             }
         }
 
-        let mut accounts: Vec<(Vec<u8>, &GenesisAccount)> = self
+        let mut accounts: Vec<([u8; 32], &GenesisAccount)> = self
             .accounts
             .iter()
             .map(
-                |account| -> Result<(Vec<u8>, &GenesisAccount), Box<dyn Error>> {
-                    Ok((hex::decode(&account.address)?, account))
+                |account| -> Result<([u8; 32], &GenesisAccount), Box<dyn Error>> {
+                    Ok((tx::address::decode(&account.address)?, account))
                 },
             )
             .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-        // Sort by the decoded bytes, not the text: case and leading zeros are not
-        // supposed to exist, but the hash must not depend on them if they do.
-        accounts.sort_by(|left, right| left.0.cmp(&right.0));
+        // Sort by the decoded bytes, not the text: case is a display choice and
+        // must not be able to change the chain's identity.
+        accounts.sort_by_key(|left| left.0);
         encoder.put_u32(u32::try_from(accounts.len())?);
         for (address, account) in accounts {
             encoder.put_bytes(&address)?;
@@ -668,13 +669,28 @@ mod tests {
     #[test]
     fn an_address_that_does_not_match_its_policy_is_reported() {
         let mut genesis = genesis();
-        genesis.accounts[0].address = hex::encode([0u8; 32]);
+        genesis.accounts[0].address = tx::address::encode(&[0u8; 32]);
         let problems = genesis.problems();
         assert!(
             problems
                 .iter()
                 .any(|problem| problem.contains("does not match its policy")),
             "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn an_address_with_a_bad_checksum_is_reported() {
+        let mut genesis = genesis();
+        let mut characters: Vec<char> = genesis.accounts[0].address.chars().collect();
+        let last = characters.len() - 1;
+        characters[last] = if characters[last] == 'q' { 'p' } else { 'q' };
+        genesis.accounts[0].address = characters.into_iter().collect();
+        assert!(
+            genesis
+                .problems()
+                .iter()
+                .any(|problem| problem.contains("checksum"))
         );
     }
 
