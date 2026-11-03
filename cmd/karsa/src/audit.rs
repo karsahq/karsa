@@ -345,7 +345,7 @@ mod tests {
 
     fn write_store(dir: &TempDir, keep_history: bool) -> Store {
         let store = Store::open(&dir.0).unwrap();
-        let simulation = chain::simulate(4, 4).unwrap();
+        let simulation = chain::simulate(&chain::demo_chain_id(), 4, 4).unwrap();
         let accounts = chain::accounts(4).unwrap();
         crate::persist::save(&store, &simulation, 2, &accounts, 4, keep_history).unwrap();
         store

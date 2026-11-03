@@ -211,7 +211,7 @@ pub fn run(
 
     let store = Store::open(&path)?;
     let saved = {
-        let simulation = chain::simulate(validators, rounds)?;
+        let simulation = chain::simulate(&chain::demo_chain_id(), validators, rounds)?;
         let accounts = chain::accounts(validators)?;
         let prune_round = (rounds / 2).max(1);
         save(
@@ -323,7 +323,7 @@ mod tests {
         let accounts = chain::accounts(4).unwrap();
 
         let saved = {
-            let simulation = chain::simulate(4, 4).unwrap();
+            let simulation = chain::simulate(&chain::demo_chain_id(), 4, 4).unwrap();
             save(&store, &simulation, 2, &accounts, 4, false).unwrap()
         };
         let replayed = replay(&store, 4).unwrap();
@@ -346,7 +346,7 @@ mod tests {
         let accounts = chain::accounts(4).unwrap();
 
         let saved = {
-            let simulation = chain::simulate(4, 2).unwrap();
+            let simulation = chain::simulate(&chain::demo_chain_id(), 4, 2).unwrap();
             save(&store, &simulation, 0, &accounts, 4, false).unwrap()
         };
         assert_eq!(
@@ -367,7 +367,7 @@ mod tests {
         let accounts = chain::accounts(4).unwrap();
 
         let saved = {
-            let simulation = chain::simulate(4, 6).unwrap();
+            let simulation = chain::simulate(&chain::demo_chain_id(), 4, 6).unwrap();
             save(&store, &simulation, 3, &accounts, 4, false).unwrap()
         };
         assert!(

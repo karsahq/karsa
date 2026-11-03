@@ -103,6 +103,9 @@ enum Command {
         /// Rounds that carry transactions.
         #[arg(long, default_value_t = 4)]
         rounds: u64,
+        /// Node home directory; its genesis decides the chain id.
+        #[arg(long)]
+        home: Option<PathBuf>,
     },
     /// Erasure-code a batch payload and reconstruct it after losing shards.
     Shards,
@@ -294,7 +297,11 @@ fn main() -> ExitCode {
         }
         Command::Certify { validators } => certify::run(validators),
         Command::Dagsim { validators } => dagsim::run(validators),
-        Command::Chain { validators, rounds } => chain::run(validators, rounds),
+        Command::Chain {
+            validators,
+            rounds,
+            home,
+        } => run_chain(home, validators, rounds),
         Command::Net {
             validators,
             jitter,
@@ -384,6 +391,15 @@ fn run_config(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let home = home::Home::resolve(home_path)?;
     config::run(&home, path, init)
+}
+
+fn run_chain(
+    home_path: Option<PathBuf>,
+    validators: usize,
+    rounds: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let home = home::Home::resolve(home_path)?;
+    chain::run(validators, rounds, Some(&home))
 }
 
 fn run_peers(

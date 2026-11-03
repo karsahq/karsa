@@ -20,6 +20,7 @@ use std::error::Error;
 use crypto::registry::ALG_ED25519;
 use crypto::scheme::Ed25519Scheme;
 use exec::{RejectReason, State};
+use sha2::{Digest, Sha256};
 use tx::batch::Batch;
 use tx::envelope::{PROTOCOL_VERSION_V1, Transaction};
 use tx::policy::{AuthKey, AuthPolicy, AuthPolicyKind, Authorization, KeyStatus};
@@ -28,7 +29,6 @@ use validator::{
     Step, ValidatorKey, ValidatorRecord, ValidatorSet, Vertex, bitmap_of, commit_root,
 };
 
-const CHAIN_ID: &[u8] = b"karsa-chain-1";
 const EPOCH: u64 = 1;
 const NOW: u64 = 1_000;
 const FEE: u64 = 1;
@@ -119,6 +119,7 @@ pub(crate) fn accounts(count: usize) -> Result<Vec<Account>, crypto::CryptoError
 
 /// Builds and signs one transaction.
 fn signed_transaction(
+    chain_id: &[u8],
     account: &Account,
     recipient: &[u8],
     sequence: u64,
@@ -126,7 +127,7 @@ fn signed_transaction(
 ) -> Result<Transaction, Box<dyn Error>> {
     let mut transaction = Transaction {
         protocol_version: PROTOCOL_VERSION_V1,
-        chain_id: CHAIN_ID.to_vec(),
+        chain_id: chain_id.to_vec(),
         sender: account.id.clone(),
         sequence,
         fee: FEE,
@@ -166,7 +167,13 @@ pub(crate) fn demo_batch(
     let mut transactions = Vec::with_capacity(capacity);
     for offset in 0..count {
         let sequence = round.saturating_mul(count).saturating_add(offset) + 1;
-        transactions.push(signed_transaction(sender, &recipient.id, sequence, 1)?);
+        transactions.push(signed_transaction(
+            &demo_chain_id(),
+            sender,
+            &recipient.id,
+            sequence,
+            1,
+        )?);
     }
     Ok(Batch::new(transactions))
 }
@@ -241,7 +248,36 @@ pub(crate) struct Simulation {
     pub(crate) certified: Vec<(Header, Certificate)>,
 }
 
-pub(crate) fn simulate(validators: usize, data_rounds: u64) -> Result<Simulation, Box<dyn Error>> {
+/// The chain id a run binds its signatures to.
+///
+/// With a genesis beside the node, this is that genesis's hash: 32 bytes that no
+/// other chain shares by accident, which is what makes a signature unusable
+/// anywhere else. Without one it is a fixed demo value of the same shape, so the
+/// code paths do not differ in the thing that matters.
+///
+/// # Errors
+///
+/// Propagates a genesis that cannot be read, hashed, or parsed.
+pub(crate) fn chain_id(home: Option<&crate::home::Home>) -> Result<Vec<u8>, Box<dyn Error>> {
+    if let Some(path) = home.map(crate::home::Home::genesis_json)
+        && path.exists()
+    {
+        return Ok(crate::genesis::Genesis::load(&path)?.hash()?.to_vec());
+    }
+    Ok(Sha256::digest(b"KARSA/GENESIS/v1/demo").to_vec())
+}
+
+/// The chain id when no genesis is supplied.
+#[must_use]
+pub(crate) fn demo_chain_id() -> Vec<u8> {
+    Sha256::digest(b"KARSA/GENESIS/v1/demo").to_vec()
+}
+
+pub(crate) fn simulate(
+    chain_id: &[u8],
+    validators: usize,
+    data_rounds: u64,
+) -> Result<Simulation, Box<dyn Error>> {
     let (set, consensus) = consensus_set(validators)?;
     let accounts = accounts(validators)?;
 
@@ -281,6 +317,7 @@ pub(crate) fn simulate(validators: usize, data_rounds: u64) -> Result<Simulation
                 let mut transactions = Vec::new();
                 for offset in 0..2u64 {
                     transactions.push(signed_transaction(
+                        chain_id,
                         account,
                         &recipient.id,
                         base + offset + 1,
@@ -295,7 +332,7 @@ pub(crate) fn simulate(validators: usize, data_rounds: u64) -> Result<Simulation
             batches.insert(digest, batch);
 
             let mut vertex = Vertex {
-                chain_id: CHAIN_ID.to_vec(),
+                chain_id: chain_id.to_vec(),
                 epoch: EPOCH,
                 round,
                 author: validator.id.clone(),
@@ -325,7 +362,7 @@ pub(crate) fn simulate(validators: usize, data_rounds: u64) -> Result<Simulation
     // Execute in commit order, one header per committed round. The DAG decides the
     // order; these loops only follow it.
     let genesis_header = Header::genesis(
-        CHAIN_ID.to_vec(),
+        chain_id.to_vec(),
         EPOCH,
         state.state_root(),
         commit_root(&[]),
@@ -379,7 +416,7 @@ pub(crate) fn simulate(validators: usize, data_rounds: u64) -> Result<Simulation
         // verifiable against this header and not only against the final one.
         let prefix = &order[..cursor];
         let header = Header {
-            chain_id: CHAIN_ID.to_vec(),
+            chain_id: chain_id.to_vec(),
             epoch: EPOCH,
             height: head.height + 1,
             round,
@@ -518,7 +555,11 @@ fn short(digest: &[u8; 32]) -> String {
     hex::encode(&digest[..6])
 }
 
-pub fn run(validators: usize, data_rounds: u64) -> Result<(), Box<dyn Error>> {
+pub fn run(
+    validators: usize,
+    data_rounds: u64,
+    home: Option<&crate::home::Home>,
+) -> Result<(), Box<dyn Error>> {
     if validators < 4 {
         return Err("--validators must be at least 4 so that a quorum is not everyone".into());
     }
@@ -526,12 +567,17 @@ pub fn run(validators: usize, data_rounds: u64) -> Result<(), Box<dyn Error>> {
         return Err("--rounds must be at least 1".into());
     }
 
-    let first = simulate(validators, data_rounds)?;
-    let second = simulate(validators, data_rounds)?.report;
+    let chain_id = chain_id(home)?;
+    let first = simulate(&chain_id, validators, data_rounds)?;
+    let second = simulate(&chain_id, validators, data_rounds)?.report;
     let first = first.report;
 
     println!("== Karsa chain: order, then execute ==");
-    println!("  chain:        {}", String::from_utf8_lossy(CHAIN_ID));
+    println!(
+        "  chain id:     {} ({} bytes)",
+        hex::encode(&chain_id[..8]),
+        chain_id.len()
+    );
     println!("  validators:   {validators}");
     println!(
         "  accounts:     {:?}, genesis balance {GENESIS_BALANCE}",
