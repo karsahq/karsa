@@ -238,6 +238,9 @@ enum Command {
         /// Apply committed batches into an account state and compare the roots.
         #[arg(long)]
         execute: bool,
+        /// Extra archive nodes: they store everything and never sign.
+        #[arg(long, default_value_t = 0)]
+        archives: usize,
         /// Persist vertices and batches here, one subdirectory per node.
         #[arg(long, default_value = "")]
         store: std::path::PathBuf,
@@ -311,6 +314,7 @@ fn main() -> ExitCode {
             send_buffer,
             txs,
             execute,
+            archives,
             store,
             shard,
             drain_ms,
@@ -324,6 +328,7 @@ fn main() -> ExitCode {
             send_buffer,
             txs,
             execute,
+            archives,
             store,
             shard,
             drain: std::time::Duration::from_millis(drain_ms),

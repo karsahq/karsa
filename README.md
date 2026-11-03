@@ -166,7 +166,8 @@ which are still open.
   ends on a state root rather than on a commit root alone, and it waits for the
   applied cursor to catch up with the commit cursor before reporting. `--store DIR`
   persists every vertex and batch through `crates/store`, so the bytes-per-day
-  figure is measured from files rather than modelled.
+  figure is measured from files rather than modelled. `--archives N` adds archive
+  nodes: they receive everything, store everything, and never sign.
 - `karsa config`: per-node settings in a `node.toml`, the way an operator expects.
   Roles (validator, rpc, archive), retention (days and a hard disk cap), snapshot
   cadence, and listen addresses. The file is validated rather than trusted — an
@@ -181,7 +182,7 @@ which are still open.
   key), and `POST /epoch`. With `--config node.toml` it binds to
   `network.rpc_listen` and writes the file with defaults first if it is missing,
   instead of refusing its own first run.
-- 257 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 259 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
@@ -410,6 +411,14 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     prunes, is refused before the node starts writing. A node started without a
     file writes one with its comments intact rather than refusing its own first
     run, and an existing file is never overwritten or silently corrected.
+23. **Roles are a model, not a comment.** `node.toml` states validator, archive,
+    and rpc, and the three compose: a validator signs and prunes, an archive keeps
+    everything and signs nothing, and validator + archive does both. `karsa live
+    --archives 2` runs the rule rather than describing it — the archive rows show
+    `authored 0`, `out 0 B`, `committed 0`, while holding the same bytes on disk as
+    a validator (186 B per transaction in a 20-transaction run, identical with and
+    without archives). That is what makes "the archive keeps history" a property of
+    the code instead of a claim about the operator's intentions.
 
 ## Build order
 

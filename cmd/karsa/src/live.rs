@@ -27,7 +27,7 @@
 //! handshake, no retransmission timer beyond the want sweep, and no peer discovery:
 //! the mesh is fixed by `--validators`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -94,6 +94,12 @@ pub struct Config {
     pub send_buffer: usize,
     /// Transactions per authored batch. Zero keeps the data plane empty.
     pub txs: u64,
+    /// Extra nodes that store everything and never sign.
+    ///
+    /// An archive is a role, not a bigger validator: it receives and keeps every
+    /// vertex and batch, and produces no vertex of its own. Its presence also makes
+    /// the role rule executable rather than a comment in a config file.
+    pub archives: usize,
     /// Apply committed batches into an account state and print its root.
     pub execute: bool,
     /// Directory to persist into, one subdirectory per node. Empty keeps everything
@@ -113,6 +119,7 @@ pub struct Config {
 /// What one node saw.
 struct NodeResult {
     index: usize,
+    signs: bool,
     authored: usize,
     received: usize,
     dropped: u64,
@@ -314,9 +321,12 @@ async fn node_task(
     }
 
     // Outbound: one link per peer, connected with retries because the nodes start
-    // together and a listener may not exist yet.
-    let mut outbound: Vec<Link> = Vec::with_capacity(config.validators - 1);
-    for peer in 0..config.validators {
+    // together and a listener may not exist yet. Archives are peers too: what makes
+    // an archive an archive is that validators send it everything, not that it
+    // participates.
+    let total = config.validators + config.archives;
+    let mut outbound: Vec<Link> = Vec::with_capacity(total.saturating_sub(1));
+    for peer in 0..total {
         if peer == index {
             continue;
         }
@@ -626,6 +636,7 @@ async fn node_task(
 
     Ok(NodeResult {
         index,
+        signs: true,
         authored: node.authored(),
         received,
         dropped,
@@ -651,6 +662,131 @@ async fn node_task(
         latencies,
         commit_root: commit_root(node.dag().order()),
         order: node.dag().order().to_vec(),
+    })
+}
+
+/// One archive node: it accepts, stores, and never signs.
+///
+/// It keeps no DAG and sends nothing, because both are consensus work. What it
+/// keeps is the payload every validator broadcasts, which is what makes history
+/// outlive the validators' retention window. Duplicate frames are ignored by id, so
+/// a repair or a retransmission does not inflate what it holds.
+async fn archive_task(
+    index: usize,
+    config: &Config,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<NodeResult, String> {
+    let store = if config.store.as_os_str().is_empty() {
+        None
+    } else {
+        Some(
+            Store::open(config.store.join(format!("arc-{index}")))
+                .map_err(|error| error.to_string())?,
+        )
+    };
+
+    let listener = TcpListener::bind(address(config.port_base, index))
+        .await
+        .map_err(|error| format!("archive {index} cannot listen: {error}"))?;
+
+    let bytes_in = Arc::new(AtomicU64::new(0));
+    let (frames_tx, mut frames_rx) = mpsc::channel(config.queue.max(1));
+    {
+        let frames_tx = frames_tx.clone();
+        let bytes_in = Arc::clone(&bytes_in);
+        let mut shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { return };
+                        let frames_tx = frames_tx.clone();
+                        let bytes_in = Arc::clone(&bytes_in);
+                        let shutdown = shutdown.clone();
+                        tokio::spawn(async move {
+                            read_peer(stream, frames_tx, bytes_in, shutdown).await;
+                        });
+                    }
+                    _ = shutdown.changed() => return,
+                }
+            }
+        });
+    }
+
+    let mut vertices: HashSet<VertexId> = HashSet::new();
+    let mut batches: HashSet<[u8; 32]> = HashSet::new();
+    let mut received = 0usize;
+    let mut payloads = 0usize;
+    let mut txs = 0usize;
+    let mut payload_bytes = 0u64;
+    let mut rejected = 0usize;
+
+    loop {
+        tokio::select! {
+            frame = frames_rx.recv() => {
+                let Some(frame) = frame else { break };
+                received += 1;
+                match frame.message {
+                    Message::Vertex(vertex) => match vertex.id() {
+                        Ok(id) => {
+                            if vertices.insert(id.clone())
+                                && let Some(store) = &store
+                            {
+                                store
+                                    .append_vertex(&vertex)
+                                    .map_err(|error| error.to_string())?;
+                            }
+                        }
+                        Err(_) => rejected += 1,
+                    },
+                    Message::Payload(batch) => {
+                        payload_bytes += frame.len as u64;
+                        if let Ok(digest) = batch.digest()
+                            && batches.insert(digest)
+                        {
+                            txs += batch.len();
+                            payloads += 1;
+                            if let Some(store) = &store {
+                                store.put_batch(&batch).map_err(|error| error.to_string())?;
+                            }
+                        }
+                    }
+                    // An archive decides nothing, so a want is not addressed to it.
+                    Message::Want(_) => {}
+                }
+            }
+            _ = shutdown.changed() => break,
+        }
+    }
+
+    Ok(NodeResult {
+        index,
+        signs: false,
+        authored: 0,
+        received,
+        dropped: 0,
+        wanted: 0,
+        repaired: 0,
+        served: 0,
+        gave_up: 0,
+        payloads,
+        transactions: txs,
+        txs_received: txs,
+        payload_bytes,
+        missing_payloads: 0,
+        applied: 0,
+        exec_rejected: 0,
+        state_root: None,
+        disk_bytes: store
+            .as_ref()
+            .map_or(0, |store| directory_bytes(store.path())),
+        rejected,
+        committed: 0,
+        bytes_in: bytes_in.load(Ordering::Relaxed),
+        bytes_out: 0,
+        latencies: Vec::new(),
+        commit_root: [0u8; 32],
+        order: Vec::new(),
     })
 }
 
@@ -733,7 +869,8 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     if config.validators < 2 {
         return Err("a live run needs at least two nodes".into());
     }
-    if config.validators > 64 {
+    let total = config.validators + config.archives;
+    if total > 64 {
         return Err("at most 64 nodes: this is a loopback mesh, not a network".into());
     }
 
@@ -747,7 +884,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         let (ready_tx, mut ready_rx) = mpsc::channel(config.validators);
         let (executed_tx, mut executed_rx) = mpsc::channel(config.validators);
 
-        let mut tasks = Vec::with_capacity(config.validators);
+        let mut tasks = Vec::with_capacity(total);
         for index in 0..config.validators {
             let shutdown_rx = shutdown_rx.clone();
             let ready_tx = ready_tx.clone();
@@ -755,6 +892,16 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             let config = config.clone();
             tasks.push(tokio::spawn(async move {
                 node_task(index, &config, started, shutdown_rx, ready_tx, executed_tx).await
+            }));
+        }
+        // Archives are peers of the mesh with no consensus role: they accept what
+        // validators broadcast and keep it.
+        for offset in 0..config.archives {
+            let index = config.validators + offset;
+            let shutdown_rx = shutdown_rx.clone();
+            let config = config.clone();
+            tasks.push(tokio::spawn(async move {
+                archive_task(index, &config, shutdown_rx).await
             }));
         }
         drop(ready_tx);
@@ -819,10 +966,15 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
 
     println!("== Live sockets between validator nodes ==");
     println!(
-        "  {} nodes on 127.0.0.1:{}..={}, full mesh, {} rounds each{}",
+        "  {} validators{} on 127.0.0.1:{}..={}, full mesh, {} rounds each{}",
         config.validators,
+        if config.archives > 0 {
+            format!(" plus {} archives", config.archives)
+        } else {
+            String::new()
+        },
         config.port_base,
-        u32::from(config.port_base) + u32::try_from(config.validators - 1).unwrap_or(0),
+        u32::from(config.port_base) + u32::try_from(total - 1).unwrap_or(0),
         config.rounds,
         if config.slow_ms > 0 {
             format!(", node 1 slowed by {} ms per frame", config.slow_ms)
@@ -876,6 +1028,9 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let mut applied = 0usize;
     let mut exec_rejected = 0usize;
     let mut disk_bytes = 0u64;
+    let mut disk_bytes_archives = 0u64;
+    let mut archive_txs = 0usize;
+    let mut validator_txs = 0usize;
     let mut state_roots: Vec<[u8; 32]> = Vec::new();
     for result in &results {
         bytes_in += result.bytes_in;
@@ -892,15 +1047,30 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         missing_payloads += result.missing_payloads;
         applied += result.applied;
         exec_rejected += result.exec_rejected;
-        disk_bytes += result.disk_bytes;
+        if result.signs {
+            disk_bytes += result.disk_bytes;
+            validator_txs += result.transactions;
+        } else {
+            disk_bytes_archives += result.disk_bytes;
+            archive_txs += result.transactions;
+        }
         if let Some(root) = result.state_root {
             state_roots.push(root);
         }
-        roots.push(result.commit_root);
-        latencies.extend_from_slice(&result.latencies);
+        if result.signs {
+            roots.push(result.commit_root);
+            latencies.extend_from_slice(&result.latencies);
+        }
         println!(
             "  {}  {}  {}  {}  {}  {}  {}  {}  {}",
-            left(&format!("val-{}", result.index), 7),
+            left(
+                &format!(
+                    "{}-{}",
+                    if result.signs { "val" } else { "arc" },
+                    result.index
+                ),
+                7
+            ),
             pad(&result.authored.to_string(), 9),
             pad(&result.received.to_string(), 9),
             pad(&result.dropped.to_string(), 8),
@@ -947,10 +1117,10 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         println!("                    {payload_txs} unique transactions held across all nodes");
     }
     if disk_bytes > 0 {
-        let per_tx = if payload_txs == 0 {
+        let per_tx = if validator_txs == 0 {
             0.0
         } else {
-            disk_bytes as f64 / payload_txs as f64
+            disk_bytes as f64 / validator_txs as f64
         };
         // At 1k TPS the same record shape costs this much per day.
         let per_day = per_tx * 1_000.0 * 86_400.0 / 1e9;
@@ -961,11 +1131,22 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             String::from(" (full replication)")
         };
         println!(
-            "  storage           {} on disk across nodes, {per_tx:.0} B per transaction \
+            "  storage           {} on disk for validators, {per_tx:.0} B per transaction \
              (~{per_day:.1} GB/day at 1k TPS){coding}",
             human(disk_bytes)
         );
         println!("                    vertices and batches only: no snapshot, no pruning here");
+        if disk_bytes_archives > 0 {
+            let per_tx_archive = if archive_txs == 0 {
+                0.0
+            } else {
+                disk_bytes_archives as f64 / archive_txs as f64
+            };
+            println!(
+                "  archives          {} on disk, {per_tx_archive:.0} B per transaction, kept in full",
+                human(disk_bytes_archives)
+            );
+        }
     }
     if config.shard && !config.store.as_os_str().is_empty() {
         // Coverage is the property that matters for model B: every batch must be

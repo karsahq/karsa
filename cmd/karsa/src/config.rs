@@ -34,12 +34,15 @@ chain_id = "karsa-1"
 data_dir = "/var/lib/karsa"
 
 [roles]
-# Whether this node participates in consensus.
+# A validator signs: it authors one vertex per round and votes in consensus.
+# Set false for a node that only stores and serves; it signs nothing.
 validator = true
-# Serve RPC to wallets and indexers. An RPC node without pruning is an archive.
-rpc = false
-# Keep every vertex and batch forever. Overrides retention below.
+# An archive keeps every vertex and batch forever. It composes with the other
+# roles: validator + archive signs and keeps everything, while a pure archive
+# (validator = false) never signs.
 archive = false
+# Serve RPC to wallets and indexers. Independent of the two above.
+rpc = false
 
 [storage]
 # Full payload kept for this many days. A validator only needs enough to serve a
@@ -148,6 +151,55 @@ impl Default for NodeConfig {
     }
 }
 
+impl RolesSection {
+    /// Whether this node signs, which is exactly whether it is a validator.
+    ///
+    /// An archive that does not validate still receives and stores everything and
+    /// still checks every signature it sees; it just never produces one. Keeping
+    /// the two separate is what lets a node serve history without holding a
+    /// consensus key at all.
+    #[must_use]
+    pub fn signs(&self) -> bool {
+        self.validator
+    }
+
+    /// The role in words, in the order a person would say it.
+    #[must_use]
+    pub fn label(&self) -> String {
+        let base = match (self.validator, self.archive) {
+            (true, true) => "validator + archive",
+            (true, false) => "validator",
+            (false, true) => "archive",
+            (false, false) => "none",
+        };
+        if self.rpc {
+            format!("{base} + rpc")
+        } else {
+            base.to_string()
+        }
+    }
+
+    /// What the role implies, as one clause.
+    #[must_use]
+    pub fn implies(&self) -> String {
+        let signing = if self.signs() {
+            "signs"
+        } else {
+            "does not sign"
+        };
+        let storage = if self.archive {
+            "keeps everything"
+        } else {
+            "prunes after the retention window"
+        };
+        if self.rpc {
+            format!("{signing}, {storage}, serves rpc")
+        } else {
+            format!("{signing}, {storage}")
+        }
+    }
+}
+
 impl NodeConfig {
     /// Reads a configuration file.
     ///
@@ -199,7 +251,16 @@ impl NodeConfig {
         }
         if !self.roles.validator && !self.roles.rpc && !self.roles.archive {
             problems.push(
-                "the node has no role: set at least one of validator, rpc, or archive".to_string(),
+                "the node has no role: set at least one of validator, archive, or rpc".to_string(),
+            );
+        }
+        if self.roles.archive && self.storage.retain_days != 0 {
+            // An archive that prunes is not an archive; say so rather than let the
+            // retention value quietly win.
+            problems.push(
+                "roles.archive is on, so storage.retain_days must be 0 (an archive keeps \
+                 everything)"
+                    .to_string(),
             );
         }
         if self.roles.archive {
@@ -293,14 +354,15 @@ pub fn run(path: Option<PathBuf>, init: bool) -> Result<(), Box<dyn Error>> {
 
     println!("== Node configuration: {} ==", path.display());
     println!(
+        "  role              {} ({})",
+        config.roles.label(),
+        config.roles.implies()
+    );
+    println!(
         "  identity          {} on {}",
         config.node.id, config.node.chain_id
     );
     println!("  data directory    {}", config.node.data_dir.display());
-    println!(
-        "  roles             validator={} rpc={} archive={}",
-        config.roles.validator, config.roles.rpc, config.roles.archive
-    );
     println!(
         "  network           p2p {}  rpc {}",
         config.network.listen, config.network.rpc_listen
@@ -377,6 +439,40 @@ mod tests {
         assert!(config.problems().is_empty(), "{:?}", config.problems());
         assert!(config.prunes());
         assert!(config.roles.validator);
+    }
+
+    #[test]
+    fn roles_are_described_in_words() {
+        let mut config = NodeConfig::default();
+        assert_eq!(config.roles.label(), "validator");
+        assert!(config.roles.signs());
+        assert!(config.roles.implies().contains("prunes"));
+
+        config.roles.archive = true;
+        config.storage.retain_days = 0;
+        config.storage.max_disk_gb = 0;
+        assert_eq!(config.roles.label(), "validator + archive");
+        assert!(config.roles.signs(), "an archive validator still signs");
+        assert!(config.roles.implies().contains("keeps everything"));
+
+        config.roles.validator = false;
+        assert_eq!(config.roles.label(), "archive");
+        assert!(!config.roles.signs(), "a pure archive does not sign");
+        assert!(config.problems().is_empty(), "{:?}", config.problems());
+
+        config.roles.rpc = true;
+        assert_eq!(config.roles.label(), "archive + rpc");
+        assert!(config.roles.implies().contains("serves rpc"));
+    }
+
+    #[test]
+    fn an_rpc_only_node_prunes_and_does_not_sign() {
+        let mut config = NodeConfig::default();
+        config.roles.validator = false;
+        config.roles.rpc = true;
+        assert!(!config.roles.signs());
+        assert!(config.prunes());
+        assert!(config.problems().is_empty(), "{:?}", config.problems());
     }
 
     #[test]
