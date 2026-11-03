@@ -95,6 +95,7 @@ pub(crate) fn save(
     accounts: &[chain::Account],
     validators: usize,
     keep_history: bool,
+    chain_id: &[u8],
 ) -> Result<Saved, Box<dyn Error>> {
     let highest = simulation.dag.highest_round().unwrap_or(0);
     let mut vertices_before = 0usize;
@@ -106,6 +107,12 @@ pub(crate) fn save(
             }
         }
     }
+    // The directory now remembers which chain it belongs to, so opening it against
+    // another genesis is refused instead of silently producing a different root.
+    if let Ok(hash) = <[u8; 32]>::try_from(chain_id) {
+        store.bind_genesis(&hash)?;
+    }
+
     let mut batches_before = 0usize;
     let code = Code::new(validators - validators / 3, validators)?;
     for batch in simulation.batches.values() {
@@ -153,7 +160,10 @@ pub(crate) fn save(
 }
 
 /// Rebuilds the chain from a snapshot plus the retained tail.
-fn replay(store: &Store, validators: usize) -> Result<Replayed, Box<dyn Error>> {
+fn replay(store: &Store, validators: usize, chain_id: &[u8]) -> Result<Replayed, Box<dyn Error>> {
+    if let Ok(hash) = <[u8; 32]>::try_from(chain_id) {
+        store.require_genesis(&hash)?;
+    }
     let snapshot = store
         .snapshot()?
         .ok_or("the store has no snapshot; nothing to replay from")?;
@@ -210,8 +220,9 @@ pub fn run(
     }
 
     let store = Store::open(&path)?;
+    let chain_id = chain::demo_chain_id();
     let saved = {
-        let simulation = chain::simulate(&chain::demo_chain_id(), validators, rounds)?;
+        let simulation = chain::simulate(&chain_id, validators, rounds)?;
         let accounts = chain::accounts(validators)?;
         let prune_round = (rounds / 2).max(1);
         save(
@@ -221,10 +232,11 @@ pub fn run(
             &accounts,
             validators,
             keep_history,
+            &chain_id,
         )?
         // The simulation is dropped here: everything below reads from disk only.
     };
-    let replayed = replay(&store, validators)?;
+    let replayed = replay(&store, validators, &chain_id)?;
     let stored = store.roots()?;
 
     println!("== Persistence: save, prune, drop, reopen, replay ==");
@@ -324,9 +336,18 @@ mod tests {
 
         let saved = {
             let simulation = chain::simulate(&chain::demo_chain_id(), 4, 4).unwrap();
-            save(&store, &simulation, 2, &accounts, 4, false).unwrap()
+            save(
+                &store,
+                &simulation,
+                2,
+                &accounts,
+                4,
+                false,
+                &chain::demo_chain_id(),
+            )
+            .unwrap()
         };
-        let replayed = replay(&store, 4).unwrap();
+        let replayed = replay(&store, 4, &chain::demo_chain_id()).unwrap();
 
         assert_eq!(replayed.state_root, saved.roots.state_root);
         assert!(
@@ -347,7 +368,16 @@ mod tests {
 
         let saved = {
             let simulation = chain::simulate(&chain::demo_chain_id(), 4, 2).unwrap();
-            save(&store, &simulation, 0, &accounts, 4, false).unwrap()
+            save(
+                &store,
+                &simulation,
+                0,
+                &accounts,
+                4,
+                false,
+                &chain::demo_chain_id(),
+            )
+            .unwrap()
         };
         assert_eq!(
             saved.report.vertices, 4,
@@ -368,7 +398,16 @@ mod tests {
 
         let saved = {
             let simulation = chain::simulate(&chain::demo_chain_id(), 4, 6).unwrap();
-            save(&store, &simulation, 3, &accounts, 4, false).unwrap()
+            save(
+                &store,
+                &simulation,
+                3,
+                &accounts,
+                4,
+                false,
+                &chain::demo_chain_id(),
+            )
+            .unwrap()
         };
         assert!(
             saved.report.batches_dropped > 0,

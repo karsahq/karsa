@@ -109,7 +109,8 @@ which are still open.
   nothing in the retained tail names it **and** a shard of it is already on disk.
   A node holding no shards keeps every payload, and the report says so.
   `karsa persist` saves, prunes, drops the simulation, reopens, replays, and fails
-  unless the state root comes back identical.
+  unless the state root comes back identical. It also records the chain the
+  directory belongs to, and refuses to open against another genesis.
 - `erasure`: Reed-Solomon over GF(2^8), non-systematic Vandermonde, any `data` of
   `total` shards reconstruct. `karsa shards` shows the storage it buys (302 GB/day
   down to 9.45 at 1k TPS), the CPU it costs (~36 MB/s scalar, 10% of a core at 1k
@@ -449,11 +450,12 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     split, where ETH and ETC both kept chain id 1 and transactions replayed across
     them until EIP-155; a hash cannot collide that way. The cost is size — 32 bytes
     in the signing domain instead of a short string — which is ~19 B on a 169 B
-    transaction and noise on a 3.5 kB one. Wired for `karsa chain`: the command
-    reads the genesis in `--home`, uses its hash as the chain id, and the simulated
-    transactions, vertices, and headers all sign over it — rename the chain in the
-    genesis and the chain id changes with it. Still to do: `net` keeps its own
-    constant, and no store refuses a genesis hash it was not written under.
+    transaction and noise on a 3.5 kB one. Wired end to end: `karsa chain` signs
+    over the genesis hash in `--home`, `net`/`live` sign over the same id the other
+    commands use, and a store records the chain it was written under — opening a
+    directory against another genesis is refused with `store belongs to chain …`
+    rather than producing a different root. Still to do: a peer handshake that
+    compares hashes between nodes.
 
 ## Build order
 

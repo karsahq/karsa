@@ -85,6 +85,7 @@ fn keypair(seed: u8) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
 pub struct Node {
     id: Vec<u8>,
     private_key: Vec<u8>,
+    chain_id: Vec<u8>,
     round: u64,
     dag: Dag,
     pacemaker: Pacemaker,
@@ -92,12 +93,30 @@ pub struct Node {
 }
 
 impl Node {
-    /// Creates a node that will author for `id`, which must be in `set`.
+    /// Creates a node that will author for `id`, which must be in `set`, signing
+    /// over the crate's demo chain id.
     #[must_use]
     pub fn new(set: ValidatorSet, id: Vec<u8>, private_key: Vec<u8>) -> Self {
+        Self::with_chain_id(set, id, private_key, CHAIN_ID.to_vec())
+    }
+
+    /// Creates a node that signs over `chain_id`.
+    ///
+    /// The chain id is part of the vertex signing payload, so a node given another
+    /// chain's id produces vertices that chain's nodes would accept — which is why
+    /// callers that know the genesis pass its hash here instead of relying on the
+    /// default.
+    #[must_use]
+    pub fn with_chain_id(
+        set: ValidatorSet,
+        id: Vec<u8>,
+        private_key: Vec<u8>,
+        chain_id: Vec<u8>,
+    ) -> Self {
         Self {
             id,
             private_key,
+            chain_id,
             round: 0,
             dag: Dag::new(set),
             pacemaker: Pacemaker::new(PacemakerConfig::default(), 1),
@@ -189,7 +208,7 @@ impl Node {
         }
 
         let mut vertex = Vertex {
-            chain_id: CHAIN_ID.to_vec(),
+            chain_id: self.chain_id.clone(),
             epoch: EPOCH,
             round,
             author: self.id.clone(),

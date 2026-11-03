@@ -275,7 +275,12 @@ async fn node_task(
     let identity = consensus
         .get(index)
         .ok_or("no consensus key for this node")?;
-    let mut node = Node::new(set, identity.id.clone(), identity.private_key.clone());
+    let mut node = Node::with_chain_id(
+        set,
+        identity.id.clone(),
+        identity.private_key.clone(),
+        chain::demo_chain_id(),
+    );
     let accounts = chain::accounts(config.validators).map_err(|error| error.to_string())?;
     let store = if config.store.as_os_str().is_empty() {
         None

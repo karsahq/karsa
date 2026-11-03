@@ -276,8 +276,8 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         archives: usize,
         /// Persist vertices and batches here, one subdirectory per node.
-        #[arg(long, default_value = "")]
-        store: std::path::PathBuf,
+        #[arg(long)]
+        store: Option<std::path::PathBuf>,
         /// Store one erasure shard per batch instead of the whole payload.
         #[arg(long)]
         shard: bool,
@@ -369,7 +369,7 @@ fn main() -> ExitCode {
             txs,
             execute,
             archives,
-            store,
+            store: store.unwrap_or_default(),
             shard,
             drain: std::time::Duration::from_millis(drain_ms),
         }),

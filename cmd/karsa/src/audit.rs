@@ -347,7 +347,16 @@ mod tests {
         let store = Store::open(&dir.0).unwrap();
         let simulation = chain::simulate(&chain::demo_chain_id(), 4, 4).unwrap();
         let accounts = chain::accounts(4).unwrap();
-        crate::persist::save(&store, &simulation, 2, &accounts, 4, keep_history).unwrap();
+        crate::persist::save(
+            &store,
+            &simulation,
+            2,
+            &accounts,
+            4,
+            keep_history,
+            &chain::demo_chain_id(),
+        )
+        .unwrap();
         store
     }
 

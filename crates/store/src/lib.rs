@@ -37,6 +37,8 @@ const BATCHES_FILE: &str = "batches.log";
 const SNAPSHOT_FILE: &str = "snapshot";
 /// The erasure-coded shard log.
 const SHARDS_FILE: &str = "shards.log";
+/// The chain this directory belongs to.
+const GENESIS_FILE: &str = "genesis";
 /// The certified header log.
 const HEADERS_FILE: &str = "headers.log";
 /// Version of the roots record.
@@ -49,6 +51,18 @@ pub enum StoreError {
     Io(std::io::Error),
     /// A complete record did not decode.
     Decode(CryptoError),
+    /// The directory belongs to a different chain than the one being run.
+    ChainMismatch {
+        /// Chain the store was written under.
+        stored: [u8; 32],
+        /// Chain the caller is running.
+        expected: [u8; 32],
+    },
+}
+
+/// First bytes of a hash, for a message a person reads.
+fn short(hash: &[u8; 32]) -> String {
+    hash[..6].iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 impl std::fmt::Display for StoreError {
@@ -56,6 +70,12 @@ impl std::fmt::Display for StoreError {
         match self {
             Self::Io(error) => write!(f, "store io: {error}"),
             Self::Decode(error) => write!(f, "store decode: {error}"),
+            Self::ChainMismatch { stored, expected } => write!(
+                f,
+                "store belongs to chain {}, not {}",
+                short(stored),
+                short(expected)
+            ),
         }
     }
 }
@@ -65,6 +85,7 @@ impl std::error::Error for StoreError {
         match self {
             Self::Io(error) => Some(error),
             Self::Decode(error) => Some(error),
+            Self::ChainMismatch { .. } => None,
         }
     }
 }
@@ -558,6 +579,73 @@ impl Store {
         Ok(report)
     }
 
+    /// Records the chain this directory belongs to.
+    ///
+    /// Written once, at the first write. A second call with the same hash is a
+    /// no-op; a different one is refused, because the alternative is reinterpreting
+    /// what is already on disk as another chain's data, which is the one mistake a
+    /// store cannot recover from.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ChainMismatch`] when the directory is already bound to another
+    /// chain, and [`StoreError::Io`] when the record cannot be written.
+    pub fn bind_genesis(&self, hash: &[u8; 32]) -> Result<(), StoreError> {
+        match self.genesis()? {
+            Some(stored) if stored == *hash => Ok(()),
+            Some(stored) => Err(StoreError::ChainMismatch {
+                stored,
+                expected: *hash,
+            }),
+            None => {
+                fs::write(self.path_of(GENESIS_FILE), hash)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// The chain recorded in this directory, if one was ever written.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] when the file cannot be read, and
+    /// [`StoreError::Decode`] when it is not a 32-byte hash.
+    pub fn genesis(&self) -> Result<Option<[u8; 32]>, StoreError> {
+        let path = self.path_of(GENESIS_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path)?;
+        if bytes.len() != 32 {
+            return Err(StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::TruncatedInput,
+                "genesis record is not 32 bytes",
+            )));
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&bytes);
+        Ok(Some(hash))
+    }
+
+    /// Refuses a directory that belongs to another chain.
+    ///
+    /// A store with no recorded chain is accepted: directories written before this
+    /// existed, and a first write, are both legitimate. Only a positive disagreement
+    /// is an error.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ChainMismatch`] when the recorded chain differs.
+    pub fn require_genesis(&self, hash: &[u8; 32]) -> Result<(), StoreError> {
+        match self.genesis()? {
+            Some(stored) if stored != *hash => Err(StoreError::ChainMismatch {
+                stored,
+                expected: *hash,
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// Reads the last reported roots, if any were ever written.
     ///
     /// # Errors
@@ -1010,6 +1098,55 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
 
         assert!(matches!(store.headers(), Err(StoreError::Decode(_))));
+    }
+
+    #[test]
+    fn a_store_remembers_which_chain_it_belongs_to() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        assert_eq!(store.genesis().unwrap(), None, "a fresh store is unbound");
+
+        let chain = [7u8; 32];
+        store.bind_genesis(&chain).unwrap();
+        assert_eq!(store.genesis().unwrap(), Some(chain));
+
+        // Binding again to the same chain is harmless, and survives reopening.
+        store.bind_genesis(&chain).unwrap();
+        let reopened = Store::open(&dir.0).unwrap();
+        reopened.require_genesis(&chain).unwrap();
+    }
+
+    #[test]
+    fn a_store_refuses_another_chain() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        store.bind_genesis(&[1u8; 32]).unwrap();
+
+        assert!(matches!(
+            store.bind_genesis(&[2u8; 32]),
+            Err(StoreError::ChainMismatch { .. })
+        ));
+        assert!(matches!(
+            store.require_genesis(&[2u8; 32]),
+            Err(StoreError::ChainMismatch { .. })
+        ));
+        // The original binding is untouched by the refusals.
+        assert_eq!(store.genesis().unwrap(), Some([1u8; 32]));
+    }
+
+    #[test]
+    fn an_unbound_store_is_accepted_by_require_genesis() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        store.require_genesis(&[9u8; 32]).unwrap();
+    }
+
+    #[test]
+    fn a_truncated_genesis_record_is_an_error() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        fs::write(dir.0.join(GENESIS_FILE), [0u8; 20]).unwrap();
+        assert!(matches!(store.genesis(), Err(StoreError::Decode(_))));
     }
 
     #[test]
