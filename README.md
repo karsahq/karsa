@@ -373,6 +373,13 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     where storage goes, so the transaction itself is. At 1k TPS this shape costs
     ~14.9 GB/day per node; the 302 GB/day in D15 is the same arithmetic on a 3.5 kB
     hybrid transaction, twenty times larger.
+20. **The storage saving is the committee size, not a constant.** With `--shard`
+    each node keeps one erasure shard sized by the committee (`data = quorum`,
+    `total = n`): 172 → 60 B/tx on disk at n=4, a 2.9× cut, with all 204 batches
+    covered by at least three shards across the four nodes. The multiplier is
+    `data ≈ 2n/3`, so the "32×" in D15 is a ~48-validator figure; at the launch
+    sizes of 10 and 30 validators it is 7× and 21×, and a four-node test committee
+    only ever gets 3×.
 
 ## Build order
 

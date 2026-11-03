@@ -226,6 +226,9 @@ enum Command {
         /// Persist vertices and batches here, one subdirectory per node.
         #[arg(long, default_value = "")]
         store: std::path::PathBuf,
+        /// Store one erasure shard per batch instead of the whole payload.
+        #[arg(long)]
+        shard: bool,
         /// How long the mesh stays up after the last node finishes authoring.
         #[arg(long, default_value_t = 500)]
         drain_ms: u64,
@@ -293,6 +296,7 @@ fn main() -> ExitCode {
             txs,
             execute,
             store,
+            shard,
             drain_ms,
         } => live::run(live::Config {
             validators,
@@ -305,6 +309,7 @@ fn main() -> ExitCode {
             txs,
             execute,
             store,
+            shard,
             drain: std::time::Duration::from_millis(drain_ms),
         }),
     };

@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crypto::CryptoErrorKind;
+use erasure::Code;
 use net::Node;
 use net::wire::{self, Message};
 use store::Store;
@@ -98,6 +99,12 @@ pub struct Config {
     /// Directory to persist into, one subdirectory per node. Empty keeps everything
     /// in memory, which makes every on-disk figure a model instead of a measurement.
     pub store: PathBuf,
+    /// Store one erasure shard per batch instead of the whole payload.
+    ///
+    /// The code is sized from the committee: `data` shards reconstruct, `n` shards
+    /// exist, so one shard per node gives tolerance `n - data` and a per-node
+    /// storage of `payload / data`.
+    pub shard: bool,
     /// How long to keep the mesh alive after the last node finishes authoring,
     /// so the final rounds and any repair can land before the run is measured.
     pub drain: Duration,
@@ -254,6 +261,10 @@ async fn node_task(
 ) -> Result<NodeResult, String> {
     let (set, consensus) =
         chain::consensus_set(config.validators).map_err(|error| error.to_string())?;
+    // One shard per node: `data` of `n` reconstruct, so the code tolerates
+    // `n - data` missing nodes and each node holds `payload / data`.
+    let coding =
+        Code::new(set.quorum_size(), config.validators).map_err(|error| error.to_string())?;
     let identity = consensus
         .get(index)
         .ok_or("no consensus key for this node")?;
@@ -425,7 +436,7 @@ async fn node_task(
                                 batches.entry(digest)
                             {
                                 if let Some(store) = &store {
-                                    store.put_batch(&batch).map_err(|error| error.to_string())?;
+                                    put_payload(store, &coding, index, &batch, config.shard)?;
                                 }
                                 slot.insert(batch);
                                 payloads += 1;
@@ -453,9 +464,11 @@ async fn node_task(
                     match node.author_with(digest) {
                         Ok(Some(vertex)) => {
                             if let Some(store) = &store {
-                                store.append_vertex(&vertex).map_err(|error| error.to_string())?;
+                                store
+                                    .append_vertex(&vertex)
+                                    .map_err(|error| error.to_string())?;
                                 if let Some(batch) = &payload {
-                                    store.put_batch(batch).map_err(|error| error.to_string())?;
+                                    put_payload(store, &coding, index, batch, config.shard)?;
                                 }
                             }
                             let bytes = wire::frame(&Message::Vertex(vertex), now())
@@ -655,6 +668,34 @@ fn directory_bytes(path: &std::path::Path) -> u64 {
         .filter(|meta| meta.is_file())
         .map(|meta| meta.len())
         .sum()
+}
+
+/// Writes one batch to a store, whole or as this node's erasure shard.
+///
+/// The shard is the same size for every node (`payload / data`), so one directory
+/// per node is the whole distribution scheme — which is model B without a data-
+/// availability protocol around it.
+fn put_payload(
+    store: &Store,
+    coding: &Code,
+    index: usize,
+    batch: &Batch,
+    shard: bool,
+) -> Result<(), String> {
+    if !shard {
+        return store.put_batch(batch).map_err(|error| error.to_string());
+    }
+    let payload = batch.encode().map_err(|error| error.to_string())?;
+    let encoded = coding.encode(&payload).map_err(|error| error.to_string())?;
+    let piece = encoded
+        .shards
+        .get(index)
+        .ok_or("shard index is outside the code")?;
+    let digest = batch.digest().map_err(|error| error.to_string())?;
+    let slot = u16::try_from(index).map_err(|_| "shard index does not fit u16")?;
+    store
+        .put_shard(&digest, slot, piece)
+        .map_err(|error| error.to_string())
 }
 
 fn pad(value: &str, width: usize) -> String {
@@ -913,12 +954,36 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         };
         // At 1k TPS the same record shape costs this much per day.
         let per_day = per_tx * 1_000.0 * 86_400.0 / 1e9;
+        let coding = if config.shard {
+            let quorum = chain::consensus_set(config.validators)?.0.quorum_size();
+            format!(" (one shard per node, {quorum}/{})", config.validators)
+        } else {
+            String::from(" (full replication)")
+        };
         println!(
             "  storage           {} on disk across nodes, {per_tx:.0} B per transaction \
-             (~{per_day:.1} GB/day at 1k TPS)",
+             (~{per_day:.1} GB/day at 1k TPS){coding}",
             human(disk_bytes)
         );
-        println!("                    vertices and batches only: no shards, no pruning here");
+        println!("                    vertices and batches only: no snapshot, no pruning here");
+    }
+    if config.shard && !config.store.as_os_str().is_empty() {
+        // Coverage is the property that matters for model B: every batch must be
+        // reconstructible from shards held across the committee.
+        let quorum = chain::consensus_set(config.validators)?.0.quorum_size();
+        let mut coverage: HashMap<[u8; 32], usize> = HashMap::new();
+        for index in 0..config.validators {
+            let store = Store::open(config.store.join(format!("val-{index}")))?;
+            for shard in store.shards()? {
+                *coverage.entry(shard.digest).or_default() += 1;
+            }
+        }
+        let total = coverage.len();
+        let sufficient = coverage.values().filter(|count| **count >= quorum).count();
+        println!(
+            "  shards            {sufficient} of {total} batches have at least {quorum} shards \
+             across the committee"
+        );
     }
     if let Some(first) = state_roots.first() {
         let agree = state_roots.iter().all(|root| root == first);
