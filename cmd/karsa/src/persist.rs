@@ -160,7 +160,12 @@ pub(crate) fn save(
 }
 
 /// Rebuilds the chain from a snapshot plus the retained tail.
-fn replay(store: &Store, validators: usize, chain_id: &[u8]) -> Result<Replayed, Box<dyn Error>> {
+fn replay(
+    store: &Store,
+    set: validator::ValidatorSet,
+    accounts: &[chain::Account],
+    chain_id: &[u8],
+) -> Result<Replayed, Box<dyn Error>> {
     if let Ok(hash) = <[u8; 32]>::try_from(chain_id) {
         store.require_genesis(&hash)?;
     }
@@ -169,7 +174,6 @@ fn replay(store: &Store, validators: usize, chain_id: &[u8]) -> Result<Replayed,
         .ok_or("the store has no snapshot; nothing to replay from")?;
     let mut state = State::decode(&snapshot.state)?;
 
-    let (set, _consensus) = chain::consensus_set(validators)?;
     let mut dag = Dag::new(set);
     dag.set_floor(snapshot.round);
 
@@ -185,7 +189,6 @@ fn replay(store: &Store, validators: usize, chain_id: &[u8]) -> Result<Replayed,
         batches.insert(batch.digest()?, batch);
     }
 
-    let accounts = chain::accounts(validators)?;
     let mut rejected: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut applied = 0usize;
     let order: Vec<VertexId> = dag.order().to_vec();
@@ -196,7 +199,7 @@ fn replay(store: &Store, validators: usize, chain_id: &[u8]) -> Result<Replayed,
         let Some(batch) = batches.get(&vertex.payload_hash) else {
             continue;
         };
-        applied += chain::apply_batch(&mut state, &accounts, batch, &mut rejected);
+        applied += chain::apply_batch(&mut state, accounts, batch, &mut rejected);
     }
 
     Ok(Replayed {
@@ -214,29 +217,33 @@ pub fn run(
     validators: usize,
     rounds: u64,
     keep_history: bool,
+    home: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     if validators < 4 {
         return Err("validators must be at least 4 so that a quorum is not everyone".into());
     }
 
+    let home = home
+        .map(|path| crate::home::Home::resolve(Some(path)))
+        .transpose()?;
+    let committee = chain::membership(validators, home.as_ref())?;
     let store = Store::open(&path)?;
-    let chain_id = chain::demo_chain_id();
+    let chain_id = chain::chain_id(home.as_ref())?;
     let saved = {
-        let simulation = chain::simulate(&chain_id, validators, rounds)?;
-        let accounts = chain::accounts(validators)?;
+        let simulation = chain::simulate_with(&chain_id, &committee, rounds)?;
         let prune_round = (rounds / 2).max(1);
         save(
             &store,
             &simulation,
             prune_round,
-            &accounts,
-            validators,
+            &committee.accounts,
+            committee.consensus.len(),
             keep_history,
             &chain_id,
         )?
         // The simulation is dropped here: everything below reads from disk only.
     };
-    let replayed = replay(&store, validators, &chain_id)?;
+    let replayed = replay(&store, committee.set, &committee.accounts, &chain_id)?;
     let stored = store.roots()?;
 
     println!("== Persistence: save, prune, drop, reopen, replay ==");
@@ -347,7 +354,8 @@ mod tests {
             )
             .unwrap()
         };
-        let replayed = replay(&store, 4, &chain::demo_chain_id()).unwrap();
+        let (set, _) = chain::consensus_set(4).unwrap();
+        let replayed = replay(&store, set, &accounts, &chain::demo_chain_id()).unwrap();
 
         assert_eq!(replayed.state_root, saved.roots.state_root);
         assert!(

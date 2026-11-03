@@ -194,10 +194,12 @@ which are still open.
   list, a key id the policy does not have, or a public half that disagrees with its
   seed is refused before a signature exists. A fresh home is a four-validator,
   four-account devnet; `genesis.json` and `keys.json` are generated together from
-  the demo seeds, so `karsa chain 4 --rounds 4 --home DIR` and `karsa live
-  --validators 4 --home DIR` run without extra setup. The node keeps **no chain
-  identity of its own**: the genesis beside it is the only one, so there is nothing
-  to drift from it.
+  the demo seeds, so `karsa chain 4 --rounds 4 --home DIR`, `karsa live
+  --validators 4 --home DIR`, `karsa persist --home DIR 4 --rounds 4`, and `karsa
+  audit --home DIR` run without extra setup. A store remembers the genesis it was
+  written under; auditing it with another home is refused by that binding before
+  any signature work. The node keeps **no chain identity of its own**: the genesis
+  beside it is the only one, so there is nothing to drift from it.
 - `karsa config`: per-node settings in a `node.toml`, the way an operator expects.
   Roles (validator, rpc, archive), retention (days and a hard disk cap), snapshot
   cadence, and listen addresses. The file is validated rather than trusted — an

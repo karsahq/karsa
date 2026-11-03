@@ -423,6 +423,8 @@ fn membership_from(
     })
 }
 
+/// The demo membership, kept for tests and the commands that predate `--home`.
+#[cfg(test)]
 pub(crate) fn simulate(
     chain_id: &[u8],
     validators: usize,
@@ -432,7 +434,7 @@ pub(crate) fn simulate(
     simulate_with(chain_id, &membership, data_rounds)
 }
 
-fn simulate_with(
+pub(crate) fn simulate_with(
     chain_id: &[u8],
     membership: &Membership,
     data_rounds: u64,

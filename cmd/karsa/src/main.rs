@@ -156,6 +156,9 @@ enum Command {
         /// Keep every vertex and payload so that `karsa audit` can re-derive the chain.
         #[arg(long)]
         keep_history: bool,
+        /// Home directory whose genesis and keys the run uses; absent keeps the demo.
+        #[arg(long)]
+        home: Option<PathBuf>,
     },
     /// Re-derive the certified state root from the stored data, and say where
     /// trust begins.
@@ -166,6 +169,9 @@ enum Command {
         /// Validators in the committee the chain was produced by.
         #[arg(default_value_t = 4)]
         validators: usize,
+        /// Home directory whose genesis and keys the audit uses; absent keeps the demo.
+        #[arg(long)]
+        home: Option<PathBuf>,
     },
     /// Exchange vertices between validator nodes and check convergence.
     Net {
@@ -350,8 +356,13 @@ fn main() -> ExitCode {
             validators,
             rounds,
             keep_history,
-        } => persist::run(path, validators, rounds, keep_history),
-        Command::Audit { path, validators } => audit::run(path, validators),
+            home,
+        } => persist::run(path, validators, rounds, keep_history, home),
+        Command::Audit {
+            path,
+            validators,
+            home,
+        } => audit::run(path, validators, home),
         Command::Bandwidth {
             validators,
             tps,

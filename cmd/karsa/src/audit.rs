@@ -61,12 +61,23 @@ fn left(value: &str, width: usize) -> String {
     format!("{value:<width$}")
 }
 
-pub fn run(path: PathBuf, validators: usize) -> Result<(), Box<dyn Error>> {
+pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     if validators < 4 {
         return Err("validators must be at least 4 so that a quorum is not everyone".into());
     }
 
+    let home = home
+        .map(|path| crate::home::Home::resolve(Some(path)))
+        .transpose()?;
+    let committee = chain::membership(validators, home.as_ref())?;
+
     let store = Store::open(&path)?;
+    // Refuse a store written for another chain before spending a header chain's
+    // worth of signature checks to discover it.
+    let chain_id = chain::chain_id(home.as_ref())?;
+    if let Ok(hash) = <[u8; 32]>::try_from(chain_id.as_slice()) {
+        store.require_genesis(&hash)?;
+    }
     let certified: Vec<CertifiedHeader> = store.headers()?;
     let Some(first) = certified.first() else {
         return Err(
@@ -76,8 +87,8 @@ pub fn run(path: PathBuf, validators: usize) -> Result<(), Box<dyn Error>> {
         );
     };
 
-    let (set, _consensus) = chain::consensus_set(validators)?;
-    let accounts = chain::accounts(validators)?;
+    let set = committee.set.clone();
+    let accounts = committee.accounts.clone();
     let genesis = Header::genesis(
         first.header.chain_id.clone(),
         first.header.epoch,
@@ -364,20 +375,20 @@ mod tests {
     fn a_full_history_store_is_re_derived_from_genesis() {
         let dir = TempDir::new();
         write_store(&dir, true);
-        assert!(run(dir.0.clone(), 4).is_ok());
+        assert!(run(dir.0.clone(), 4, None).is_ok());
     }
 
     #[test]
     fn a_pruned_store_audits_only_above_its_snapshot() {
         let dir = TempDir::new();
         write_store(&dir, false);
-        assert!(run(dir.0.clone(), 4).is_ok());
+        assert!(run(dir.0.clone(), 4, None).is_ok());
     }
 
     #[test]
     fn an_empty_store_has_nothing_to_audit() {
         let dir = TempDir::new();
-        assert!(run(dir.0.clone(), 4).is_err());
+        assert!(run(dir.0.clone(), 4, None).is_err());
     }
 
     #[test]
@@ -402,7 +413,7 @@ mod tests {
         let certificate = chain::certify(&consensus, &forged).unwrap();
         store.put_header(&forged, &certificate).unwrap();
 
-        let error = run(dir.0.clone(), 4).unwrap_err().to_string();
+        let error = run(dir.0.clone(), 4, None).unwrap_err().to_string();
         assert!(
             error.contains("reproduce"),
             "the audit must fail on the roots, not on the certificate: {error}"
