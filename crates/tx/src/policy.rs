@@ -5,11 +5,32 @@
 //! a classical and a post-quantum key authorizes with the weakest component and
 //! must not be described as hybrid protection.
 
+use crypto::encoding::Encoder;
 use crypto::scheme::verify_signature;
 use crypto::{CryptoError, CryptoErrorKind};
+use sha2::{Digest, Sha256};
 
 /// Sentinel for a key that never expires.
 pub const NO_EXPIRY: u64 = u64::MAX;
+
+/// Domain separator for account addresses.
+///
+/// The policy encoding is also a plausible input elsewhere; hashing it under its own
+/// domain means an address can never be confused with a hash of the same bytes used
+/// for another purpose.
+const ADDRESS_DOMAIN: &[u8] = b"KARSA/ADDRESS/v1";
+
+/// Stable identifier for a policy shape, used in the address preimage.
+///
+/// The numbers are part of the wire contract: changing one changes every address
+/// derived from that shape.
+fn kind_id(kind: AuthPolicyKind) -> u16 {
+    match kind {
+        AuthPolicyKind::Single => 1,
+        AuthPolicyKind::All => 2,
+        AuthPolicyKind::Threshold => 3,
+    }
+}
 
 /// The policy shape, mirroring `SINGLE` / `AND` / `THRESHOLD` in the spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +241,52 @@ impl AuthPolicy {
 
         Ok(used)
     }
+
+    /// The account address this policy creates: 32 bytes of SHA-256.
+    ///
+    /// The address is a commitment to the *authorization structure at creation*:
+    /// policy shape, threshold, and every key's algorithm, public key, and weight,
+    /// with keys sorted so their order in the file does not matter. It deliberately
+    /// excludes the things that are labels or mutable state — `key_id`, status,
+    /// validity window, and `policy_nonce` — because rotating a key or changing a
+    /// label must not move an account's balance to a new address. The consequence is
+    /// stated plainly: after a rotation the address is no longer recomputable from
+    /// the current policy, only from the policy the account was created with.
+    ///
+    /// `key_id` is excluded for the same reason it is a label: two policies with the
+    /// same authorization power are the same account, whatever the keys are called.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoErrorKind::FieldTooLong`] when a public key does not fit the encoder's
+    /// length prefix, which a registry-sized key never does.
+    pub fn address(&self) -> Result<[u8; 32], CryptoError> {
+        let mut encoder = Encoder::with_capacity(ADDRESS_DOMAIN.len() + 8 + self.keys.len() * 40);
+        // `put_raw`: the domain is a constant, not a length-prefixed field.
+        encoder.put_raw(ADDRESS_DOMAIN);
+        encoder.put_u16(kind_id(self.kind));
+        encoder.put_u16(self.threshold);
+
+        let mut keys: Vec<&AuthKey> = self.keys.iter().collect();
+        keys.sort_by(|left, right| {
+            left.algorithm_id
+                .cmp(&right.algorithm_id)
+                .then_with(|| left.public_key.cmp(&right.public_key))
+        });
+        encoder.put_u32(u32::try_from(keys.len()).map_err(|_| {
+            CryptoError::new(
+                CryptoErrorKind::FieldTooLong,
+                "policy has more keys than a u32 can count",
+            )
+        })?);
+        for key in keys {
+            encoder.put_u16(key.algorithm_id);
+            encoder.put_u16(key.weight);
+            encoder.put_bytes(&key.public_key)?;
+        }
+
+        Ok(Sha256::digest(encoder.as_slice()).into())
+    }
 }
 
 #[cfg(test)]
@@ -257,6 +324,97 @@ mod tests {
             policy_nonce: 1,
             keys,
         }
+    }
+
+    #[test]
+    fn the_address_encoding_is_stable() {
+        // A golden vector. If this moves, every address keyed by the old bytes moves
+        // with it, so a change here needs a migration, not a test update.
+        let policy = policy(
+            AuthPolicyKind::Single,
+            vec![active_key(b"alice-k0", vec![2u8; 32])],
+        );
+        let hex: String = policy
+            .address()
+            .unwrap()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            hex,
+            "e94f1b9f07298aa1f80d6208597150b177b2cdadd98cafd4bd32515be6301a50"
+        );
+    }
+
+    #[test]
+    fn key_order_does_not_change_the_address() {
+        let (first, _) = Ed25519Scheme::generate_keypair().unwrap();
+        let (second, _) = Ed25519Scheme::generate_keypair().unwrap();
+        let left = policy(
+            AuthPolicyKind::All,
+            vec![
+                active_key(b"k1", first.to_vec()),
+                active_key(b"k2", second.to_vec()),
+            ],
+        );
+        let right = policy(
+            AuthPolicyKind::All,
+            vec![
+                active_key(b"k2", second.to_vec()),
+                active_key(b"k1", first.to_vec()),
+            ],
+        );
+        assert_eq!(left.address().unwrap(), right.address().unwrap());
+    }
+
+    #[test]
+    fn labels_and_mutable_state_do_not_move_the_address() {
+        let (public_key, _) = Ed25519Scheme::generate_keypair().unwrap();
+        let original = policy(
+            AuthPolicyKind::Single,
+            vec![active_key(b"k1", public_key.to_vec())],
+        );
+        let mut rotated = original.clone();
+        rotated.policy_nonce = 99;
+        rotated.keys[0].key_id = b"renamed".to_vec();
+        rotated.keys[0].status = KeyStatus::Retired;
+        rotated.keys[0].valid_from = 10;
+        rotated.keys[0].valid_until = 500;
+        assert_eq!(
+            original.address().unwrap(),
+            rotated.address().unwrap(),
+            "rotation must not move the balance to a new address"
+        );
+    }
+
+    #[test]
+    fn changing_what_authorizes_changes_the_address() {
+        let (public_key, _) = Ed25519Scheme::generate_keypair().unwrap();
+        let (other_key, _) = Ed25519Scheme::generate_keypair().unwrap();
+        let base = policy(
+            AuthPolicyKind::Single,
+            vec![active_key(b"k1", public_key.to_vec())],
+        );
+        let address = base.address().unwrap();
+
+        let mut different_key = base.clone();
+        different_key.keys[0].public_key = other_key.to_vec();
+        assert_ne!(address, different_key.address().unwrap());
+
+        let mut different_weight = base.clone();
+        different_weight.keys[0].weight = 7;
+        assert_ne!(address, different_weight.address().unwrap());
+
+        let mut different_kind = base.clone();
+        different_kind.kind = AuthPolicyKind::All;
+        assert_ne!(address, different_kind.address().unwrap());
+
+        let mut different_threshold = policy(
+            AuthPolicyKind::Threshold,
+            vec![active_key(b"k1", public_key.to_vec())],
+        );
+        different_threshold.threshold = 1;
+        assert_ne!(address, different_threshold.address().unwrap());
     }
 
     #[test]
