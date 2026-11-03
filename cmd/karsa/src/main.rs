@@ -284,6 +284,9 @@ enum Command {
         /// How long the mesh stays up after the last node finishes authoring.
         #[arg(long, default_value_t = 500)]
         drain_ms: u64,
+        /// Home directory whose genesis sets the chain identity; absent keeps the demo one.
+        #[arg(long)]
+        home: Option<std::path::PathBuf>,
     },
 }
 
@@ -358,6 +361,7 @@ fn main() -> ExitCode {
             store,
             shard,
             drain_ms,
+            home,
         } => live::run(live::Config {
             validators,
             port_base,
@@ -372,6 +376,7 @@ fn main() -> ExitCode {
             store: store.unwrap_or_default(),
             shard,
             drain: std::time::Duration::from_millis(drain_ms),
+            home,
         }),
     };
 

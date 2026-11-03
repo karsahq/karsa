@@ -9,13 +9,19 @@
 //! u32 body length || u64 sent-at nanos || u8 kind || payload
 //! ```
 //!
-//! Two kinds share a link:
+//! Four kinds share a link:
 //!
+//! - [`Message::Hello`] is the first frame on a link and names the chain.
 //! - [`Message::Vertex`] is the broadcast.
 //! - [`Message::Want`] asks a peer for one vertex by id.
 //! - [`Message::Payload`] carries the batch a vertex names, on the data plane.
 //!
-//! The second kind is what makes a bounded queue safe. A peer that cannot keep up
+//! The hello exists because a vertex is only meaningful on one chain: the chain id
+//! is part of what a validator signs, so a peer on another genesis would produce
+//! vertices this node can only reject. Exchanging the identity first turns that
+//! from per-frame waste into one refused connection.
+//!
+//! [`Message::Want`] is what makes a bounded queue safe. A peer that cannot keep up
 //! may have a frame dropped, and a dropped vertex is never "lost" to the protocol:
 //! the reference rule makes it *visible* — the next round's vertices name it, the
 //! receiver cannot check the shape rule, and it asks for exactly that id. Repair is
@@ -44,10 +50,40 @@ const HEADER: usize = 4 + 8 + 1;
 const KIND_VERTEX: u8 = 1;
 const KIND_WANT: u8 = 2;
 const KIND_PAYLOAD: u8 = 3;
+const KIND_HELLO: u8 = 4;
+
+/// The framing and message layout this build speaks.
+///
+/// A peer that answers with another number is not necessarily hostile; it may be a
+/// different build. The link is closed rather than parsed optimistically, because
+/// the next frame kind could mean something else there.
+pub const WIRE_PROTOCOL: u16 = 1;
+
+/// The first frame on every link: which chain the sender is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hello {
+    /// Framing version the sender speaks.
+    pub protocol: u16,
+    /// The sender's genesis hash, which is the chain's identity.
+    pub chain_id: Vec<u8>,
+}
+
+impl Hello {
+    /// A hello for `chain_id` speaking [`WIRE_PROTOCOL`].
+    #[must_use]
+    pub fn new(chain_id: Vec<u8>) -> Self {
+        Self {
+            protocol: WIRE_PROTOCOL,
+            chain_id,
+        }
+    }
+}
 
 /// What a frame carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
+    /// The opening frame, naming the chain.
+    Hello(Hello),
     /// A broadcast vertex.
     Vertex(Vertex),
     /// A request for one vertex, named by id.
@@ -106,6 +142,12 @@ fn decode_id(decoder: &mut Decoder<'_>) -> Result<VertexId, CryptoError> {
 /// body does not fit the length field.
 pub fn frame(message: &Message, sent_at_nanos: u64) -> Result<Vec<u8>, CryptoError> {
     let (kind, payload) = match message {
+        Message::Hello(hello) => {
+            let mut encoder = Encoder::with_capacity(2 + 4 + hello.chain_id.len());
+            encoder.put_u16(hello.protocol);
+            encoder.put_bytes(&hello.chain_id)?;
+            (KIND_HELLO, encoder.finish())
+        }
         Message::Vertex(vertex) => (KIND_VERTEX, vertex.encode()?),
         Message::Want(id) => (KIND_WANT, encode_id(id)?),
         Message::Payload(batch) => (KIND_PAYLOAD, batch.encode()?),
@@ -161,6 +203,13 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
     let kind = buffer[12];
     let payload = &buffer[HEADER..total];
     let message = match kind {
+        KIND_HELLO => {
+            let mut decoder = Decoder::new(payload);
+            let protocol = decoder.read_u16()?;
+            let chain_id = decoder.read_bytes()?.to_vec();
+            decoder.finish()?;
+            Message::Hello(Hello { protocol, chain_id })
+        }
         KIND_VERTEX => Message::Vertex(Vertex::decode(payload)?),
         KIND_WANT => Message::Want(decode_id(&mut Decoder::new(payload))?),
         KIND_PAYLOAD => Message::Payload(Batch::decode(payload)?),
@@ -197,6 +246,37 @@ mod tests {
             author: b"val-2".to_vec(),
             digest: [round as u8; 32],
         }
+    }
+
+    #[test]
+    fn a_hello_names_the_chain_and_the_protocol() {
+        let hello = Hello::new(vec![7u8; 32]);
+        let mut buffer = frame(&Message::Hello(hello.clone()), 1).unwrap();
+        let frame = take_frame(&mut buffer).unwrap().unwrap();
+        assert_eq!(frame.message, Message::Hello(hello));
+        assert_eq!(frame.sent_at_nanos, 1);
+    }
+
+    #[test]
+    fn a_hello_with_trailing_bytes_is_refused_rather_than_guessed() {
+        let mut payload = Vec::new();
+        let mut encoder = Encoder::with_capacity(64);
+        encoder.put_u16(WIRE_PROTOCOL);
+        encoder.put_bytes(&[3u8; 32]).unwrap();
+        payload.extend_from_slice(encoder.as_slice());
+        payload.push(0xff);
+
+        let body = 8 + 1 + payload.len();
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&u32::try_from(body).unwrap().to_le_bytes());
+        buffer.extend_from_slice(&0u64.to_le_bytes());
+        buffer.push(KIND_HELLO);
+        buffer.extend_from_slice(&payload);
+
+        assert!(matches!(
+            take_frame(&mut buffer),
+            Err(error) if error.kind() == CryptoErrorKind::TrailingBytes
+        ));
     }
 
     #[test]

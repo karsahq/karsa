@@ -24,8 +24,9 @@
 //!
 //! All nodes are in one process on one machine, so the numbers describe the wire
 //! and the runtime, not independent operators. There is no encryption, no
-//! handshake, no retransmission timer beyond the want sweep, and no peer discovery:
-//! the mesh is fixed by `--validators`.
+//! retransmission timer beyond the want sweep, and no peer discovery: the mesh is
+//! fixed by `--validators`. A link opens with a hello naming the chain, so two
+//! genesis hashes never get as far as exchanging a vertex.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -71,6 +72,8 @@ const QUIET_TICKS: u32 = 50;
 /// transactions per batch the fee alone exhausts it within a few rounds and the
 /// rest of the run measures rejections instead of execution.
 const LIVE_BALANCE: u64 = 1_000_000_000;
+/// How long a peer gets to state its chain identity before the link is closed.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How a live run is configured.
 #[derive(Clone)]
@@ -114,6 +117,13 @@ pub struct Config {
     /// How long to keep the mesh alive after the last node finishes authoring,
     /// so the final rounds and any repair can land before the run is measured.
     pub drain: Duration,
+    /// Home directory whose genesis fixes the chain identity.
+    ///
+    /// The mesh here is still the demo committee, so this does not change who
+    /// validates; it changes what the nodes sign over and which chain their hello
+    /// announces. Two runs with different genesis hashes refuse each other's links.
+    /// `None` keeps the demo identity every other command uses without a home.
+    pub home: Option<PathBuf>,
 }
 
 /// What one node saw.
@@ -152,16 +162,105 @@ fn address(port_base: u16, index: usize) -> String {
     )
 }
 
+/// A short, readable rendering of a chain id for an error message.
+fn chain_label(chain_id: &[u8]) -> String {
+    let prefix = hex::encode(&chain_id[..chain_id.len().min(6)]);
+    if chain_id.len() > 6 {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+/// Decides whether a peer's hello describes this chain.
+fn check_hello(chain_id: &[u8], hello: &wire::Hello) -> Result<(), String> {
+    if hello.protocol != wire::WIRE_PROTOCOL {
+        return Err(format!(
+            "peer speaks wire protocol {}, this build speaks {}",
+            hello.protocol,
+            wire::WIRE_PROTOCOL
+        ));
+    }
+    if hello.chain_id != chain_id {
+        return Err(format!(
+            "peer is on chain {}, this node is on {}",
+            chain_label(&hello.chain_id),
+            chain_label(chain_id)
+        ));
+    }
+    Ok(())
+}
+
+/// Exchanges chain identity before any data frame crosses the link.
+///
+/// Both sides write first and then read, so neither waits for the other to speak.
+/// The genesis hash is the chain's identity (D29); a peer that reports another one
+/// is a different chain, and the link is closed before a single vertex is parsed.
+/// Bytes that arrived behind the hello stay in `buffer` for [`read_peer`], because a
+/// stream has no message boundaries and dropping them would lose the first frame.
+async fn handshake(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+    chain_id: &[u8],
+) -> Result<(), String> {
+    let hello = wire::frame(&Message::Hello(wire::Hello::new(chain_id.to_vec())), 0)
+        .map_err(|error| format!("cannot encode the hello: {error}"))?;
+    stream
+        .write_all(&hello)
+        .await
+        .map_err(|error| format!("cannot send the hello: {error}"))?;
+
+    let mut chunk = vec![0u8; 4096];
+    loop {
+        // The first frame on the link has to be the hello; anything else means a
+        // peer that skipped the identity check, so there is nothing to buffer for.
+        if let Some(frame) = wire::take_frame(buffer)
+            .map_err(|error| format!("unreadable frame during the handshake: {error}"))?
+        {
+            return match frame.message {
+                Message::Hello(hello) => check_hello(chain_id, &hello),
+                _ => Err("peer sent data before its hello".to_string()),
+            };
+        }
+        let read = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|error| format!("cannot read the hello: {error}"))?;
+        if read == 0 {
+            return Err("peer closed the link during the handshake".to_string());
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+}
+
 /// Reads frames from one peer and hands them to the node loop.
+///
+/// `buffer` is what the handshake already read: a frame that arrived in the same
+/// segment as the hello is parsed here instead of being thrown away.
 async fn read_peer(
     mut stream: TcpStream,
+    mut buffer: Vec<u8>,
     frames: mpsc::Sender<wire::Frame>,
     bytes_in: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
+        // Drain whatever is already buffered before waiting for more bytes.
+        loop {
+            match wire::take_frame(&mut buffer) {
+                Ok(Some(frame)) => {
+                    if frames.send(frame).await.is_err() {
+                        return;
+                    }
+                }
+                // Not yet: more bytes are on the way.
+                Ok(None) => break,
+                // A peer that sends an unparseable frame is disconnected
+                // rather than trusted to resynchronise.
+                Err(_) => return,
+            }
+        }
         tokio::select! {
             read = stream.read(&mut chunk) => {
                 let Ok(read) = read else { break };
@@ -170,20 +269,6 @@ async fn read_peer(
                 }
                 buffer.extend_from_slice(&chunk[..read]);
                 bytes_in.fetch_add(read as u64, Ordering::Relaxed);
-                loop {
-                    match wire::take_frame(&mut buffer) {
-                        Ok(Some(frame)) => {
-                            if frames.send(frame).await.is_err() {
-                                return;
-                            }
-                        }
-                        // Not yet: more bytes are on the way.
-                        Ok(None) => break,
-                        // A peer that sends an unparseable frame is disconnected
-                        // rather than trusted to resynchronise.
-                        Err(_) => return,
-                    }
-                }
             }
             _ = shutdown.changed() => break,
         }
@@ -261,6 +346,7 @@ struct Want {
 async fn node_task(
     index: usize,
     config: &Config,
+    chain_id: Vec<u8>,
     started: Instant,
     mut shutdown: watch::Receiver<bool>,
     ready: mpsc::Sender<usize>,
@@ -279,7 +365,7 @@ async fn node_task(
         set,
         identity.id.clone(),
         identity.private_key.clone(),
-        chain::demo_chain_id(),
+        chain_id.clone(),
     );
     let accounts = chain::accounts(config.validators).map_err(|error| error.to_string())?;
     let store = if config.store.as_os_str().is_empty() {
@@ -307,16 +393,37 @@ async fn node_task(
         let frames_tx = frames_tx.clone();
         let bytes_in = Arc::clone(&bytes_in);
         let mut shutdown = shutdown.clone();
+        let chain_id = chain_id.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
-                        let Ok((stream, _)) = accepted else { return };
+                        let Ok((mut stream, _)) = accepted else { return };
                         let frames_tx = frames_tx.clone();
                         let bytes_in = Arc::clone(&bytes_in);
                         let shutdown = shutdown.clone();
+                        let chain_id = chain_id.clone();
                         tokio::spawn(async move {
-                            read_peer(stream, frames_tx, bytes_in, shutdown).await;
+                            // The chain identity is settled before any frame is
+                            // parsed: a vertex from another chain is not a vertex
+                            // this node can ever accept.
+                            let mut buffer = Vec::new();
+                            match tokio::time::timeout(
+                                HANDSHAKE_TIMEOUT,
+                                handshake(&mut stream, &mut buffer, &chain_id),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {
+                                    read_peer(stream, buffer, frames_tx, bytes_in, shutdown).await;
+                                }
+                                Ok(Err(error)) => {
+                                    eprintln!("node {index} refused an inbound peer: {error}");
+                                }
+                                Err(_) => {
+                                    eprintln!("node {index} timed out an inbound handshake");
+                                }
+                            }
                         });
                     }
                     _ = shutdown.changed() => return,
@@ -337,7 +444,7 @@ async fn node_task(
         }
         let target = address(config.port_base, peer);
         let mut attempt = 0usize;
-        let stream = loop {
+        let mut stream = loop {
             match TcpStream::connect(&target).await {
                 Ok(stream) => break stream,
                 Err(error) => {
@@ -349,6 +456,24 @@ async fn node_task(
                 }
             }
         };
+        // The outbound socket carries data one way; the only frame ever read on
+        // it is the peer's hello. Anything behind that hello is dropped, which is
+        // why the buffer is not handed on.
+        let mut trailing = Vec::new();
+        match tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake(&mut stream, &mut trailing, &chain_id),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(format!("node {index} refused {target}: {error}"));
+            }
+            Err(_) => {
+                return Err(format!("node {index} handshake with {target} timed out"));
+            }
+        }
         let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE);
         let (data_tx, data_rx) = mpsc::channel(config.queue.max(1));
         outbound.push(Link {
@@ -410,6 +535,9 @@ async fn node_task(
                     tokio::time::sleep(Duration::from_millis(config.slow_ms)).await;
                 }
                 match frame.message {
+                    // The handshake consumes the hello before this loop starts; a
+                    // second one is a peer breaking the protocol.
+                    Message::Hello(_) => rejected += 1,
                     Message::Want(id) => {
                         // Answering is a broadcast: the reply is a vertex, and a
                         // vertex is exactly what the original sender would have
@@ -549,11 +677,14 @@ async fn node_task(
                     stable_ticks = 0;
                     last_order = order_len;
                 }
+                // With no transactions there is no batch to apply, so an empty
+                // `batches` map is not a gap this node is waiting on.
+                let execution_caught_up = applied_cursor >= order_len || config.txs == 0;
                 if config.execute
                     && !exec_announced
                     && announced
                     && stable_ticks >= QUIET_TICKS
-                    && applied_cursor >= order_len
+                    && execution_caught_up
                 {
                     exec_announced = true;
                     let _ = executed.send(index).await;
@@ -679,6 +810,7 @@ async fn node_task(
 async fn archive_task(
     index: usize,
     config: &Config,
+    chain_id: Vec<u8>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<NodeResult, String> {
     let store = if config.store.as_os_str().is_empty() {
@@ -700,16 +832,34 @@ async fn archive_task(
         let frames_tx = frames_tx.clone();
         let bytes_in = Arc::clone(&bytes_in);
         let mut shutdown = shutdown.clone();
+        let chain_id = chain_id.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
-                        let Ok((stream, _)) = accepted else { return };
+                        let Ok((mut stream, _)) = accepted else { return };
                         let frames_tx = frames_tx.clone();
                         let bytes_in = Arc::clone(&bytes_in);
                         let shutdown = shutdown.clone();
+                        let chain_id = chain_id.clone();
                         tokio::spawn(async move {
-                            read_peer(stream, frames_tx, bytes_in, shutdown).await;
+                            let mut buffer = Vec::new();
+                            match tokio::time::timeout(
+                                HANDSHAKE_TIMEOUT,
+                                handshake(&mut stream, &mut buffer, &chain_id),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {
+                                    read_peer(stream, buffer, frames_tx, bytes_in, shutdown).await;
+                                }
+                                Ok(Err(error)) => {
+                                    eprintln!("archive {index} refused a peer: {error}");
+                                }
+                                Err(_) => {
+                                    eprintln!("archive {index} timed out a handshake");
+                                }
+                            }
                         });
                     }
                     _ = shutdown.changed() => return,
@@ -758,6 +908,8 @@ async fn archive_task(
                     }
                     // An archive decides nothing, so a want is not addressed to it.
                     Message::Want(_) => {}
+                    // The accept side consumes the hello before the loop starts.
+                    Message::Hello(_) => rejected += 1,
                 }
             }
             _ = shutdown.changed() => break,
@@ -879,6 +1031,17 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         return Err("at most 64 nodes: this is a loopback mesh, not a network".into());
     }
 
+    // The genesis hash is the chain identity vertices are signed over (D29). An
+    // explicit home supplies it; without one the demo identity every other command
+    // uses keeps this run self-contained and does not depend on `~/.karsa`.
+    let chain_id = match config.home.clone() {
+        Some(path) => {
+            let home = crate::home::Home::resolve(Some(path))?;
+            chain::chain_id(Some(&home))?
+        }
+        None => chain::demo_chain_id(),
+    };
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -895,8 +1058,18 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             let ready_tx = ready_tx.clone();
             let executed_tx = executed_tx.clone();
             let config = config.clone();
+            let chain_id = chain_id.clone();
             tasks.push(tokio::spawn(async move {
-                node_task(index, &config, started, shutdown_rx, ready_tx, executed_tx).await
+                node_task(
+                    index,
+                    &config,
+                    chain_id,
+                    started,
+                    shutdown_rx,
+                    ready_tx,
+                    executed_tx,
+                )
+                .await
             }));
         }
         // Archives are peers of the mesh with no consensus role: they accept what
@@ -905,8 +1078,9 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             let index = config.validators + offset;
             let shutdown_rx = shutdown_rx.clone();
             let config = config.clone();
+            let chain_id = chain_id.clone();
             tasks.push(tokio::spawn(async move {
-                archive_task(index, &config, shutdown_rx).await
+                archive_task(index, &config, chain_id, shutdown_rx).await
             }));
         }
         drop(ready_tx);
@@ -970,6 +1144,10 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     }
 
     println!("== Live sockets between validator nodes ==");
+    println!(
+        "  chain {}: every link opens with it, and a peer on another hash is refused",
+        chain_label(&chain_id)
+    );
     println!(
         "  {} validators{} on 127.0.0.1:{}..={}, full mesh, {} rounds each{}",
         config.validators,
@@ -1287,4 +1465,74 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         return Err("nodes applied the same commits to different state".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two connected sockets, the way a node pair sees them.
+    async fn linked_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[test]
+    fn another_wire_protocol_is_refused() {
+        let hello = wire::Hello {
+            protocol: wire::WIRE_PROTOCOL + 1,
+            chain_id: b"chain-a".to_vec(),
+        };
+        let error = check_hello(b"chain-a", &hello).unwrap_err();
+        assert!(error.contains("wire protocol"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn peers_on_the_same_chain_complete_the_handshake_from_both_sides() {
+        let (mut client, mut server) = linked_pair().await;
+        let mut client_buffer = Vec::new();
+        let mut server_buffer = Vec::new();
+        let (client_result, server_result) = tokio::join!(
+            handshake(&mut client, &mut client_buffer, b"chain-a"),
+            handshake(&mut server, &mut server_buffer, b"chain-a"),
+        );
+        client_result.unwrap();
+        server_result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_peer_on_another_chain_is_refused_by_both_sides() {
+        let (mut client, mut server) = linked_pair().await;
+        let mut client_buffer = Vec::new();
+        let mut server_buffer = Vec::new();
+        let (client_result, server_result) = tokio::join!(
+            handshake(&mut client, &mut client_buffer, b"chain-a"),
+            handshake(&mut server, &mut server_buffer, b"chain-b"),
+        );
+        let client_error = client_result.unwrap_err();
+        let server_error = server_result.unwrap_err();
+        assert!(client_error.contains("peer is on chain"), "{client_error}");
+        assert!(server_error.contains("peer is on chain"), "{server_error}");
+    }
+
+    #[tokio::test]
+    async fn a_frame_sent_before_the_hello_is_refused_even_if_it_parses() {
+        let (mut client, mut server) = linked_pair().await;
+        let want = VertexId {
+            round: 3,
+            author: b"val-0".to_vec(),
+            digest: [1u8; 32],
+        };
+        let bytes = wire::frame(&Message::Want(want), 0).unwrap();
+        client.write_all(&bytes).await.unwrap();
+
+        let mut buffer = Vec::new();
+        let error = handshake(&mut server, &mut buffer, b"chain-a")
+            .await
+            .unwrap_err();
+        assert_eq!(error, "peer sent data before its hello");
+    }
 }
