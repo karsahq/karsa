@@ -178,7 +178,9 @@ which are still open.
 - `karsa node`: an HTTP pipeline (decode, policy lookup, signature verification,
   per-sender replay protection) on axum, plus the validator schedule:
   `GET /validators`, `POST /validators/{id}/keys` (authorized by an existing active
-  key), and `POST /epoch`.
+  key), and `POST /epoch`. With `--config node.toml` it binds to
+  `network.rpc_listen` and writes the file with defaults first if it is missing,
+  instead of refusing its own first run.
 - 257 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
@@ -405,7 +407,9 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     "this many days **or** this much disk", because a burst is charged in full: one
     hour at 10k TPS is 36 million transactions, which at 3.5 kB is more than a quiet
     month. A config that would delete everything, or an archive node that also
-    prunes, is refused before the node starts writing.
+    prunes, is refused before the node starts writing. A node started without a
+    file writes one with its comments intact rather than refusing its own first
+    run, and an existing file is never overwritten or silently corrected.
 
 ## Build order
 

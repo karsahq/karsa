@@ -63,8 +63,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the demo HTTP node until interrupted.
-    Node,
+    /// Run the demo HTTP node until interrupted, optionally from a node.toml.
+    Node {
+        /// Configuration file; written with defaults when missing.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Print a signed demo transaction envelope as hex on stdout.
     SampleTx,
     /// Print the signed key registration body for the demo validator.
@@ -249,7 +253,7 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Node => run_node(),
+        Command::Node { config } => run_node(config),
         Command::SampleTx => node::print_sample_transaction(),
         Command::RegisterDemo { activation_epoch } => {
             node::print_demo_registration(activation_epoch)
@@ -335,9 +339,30 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_node() -> Result<(), Box<dyn std::error::Error>> {
+fn run_node(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let listen = match config_path {
+        None => node::DEMO_LISTEN.to_string(),
+        Some(path) => {
+            // A missing file is written first: a node should not refuse its own
+            // first run over a file it can generate.
+            let config = crate::config::NodeConfig::ensure(&path)?;
+            let problems = config.problems();
+            if !problems.is_empty() {
+                for problem in &problems {
+                    eprintln!("  PROBLEM: {problem}");
+                }
+                return Err(format!(
+                    "{} configuration problem(s) in {}",
+                    problems.len(),
+                    path.display()
+                )
+                .into());
+            }
+            config.network.rpc_listen
+        }
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(node::serve())
+    runtime.block_on(node::serve(&listen))
 }

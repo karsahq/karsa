@@ -32,7 +32,7 @@ use validator::{
 const DEMO_CHAIN_ID: &[u8] = b"karsa-demo-1";
 const DEMO_ACCOUNT: &[u8] = b"acct_alice";
 const DEMO_KEY_ID: &[u8] = b"alice-1";
-const DEMO_LISTEN: &str = "127.0.0.1:8099";
+pub const DEMO_LISTEN: &str = "127.0.0.1:8099";
 
 /// The single genesis validator and its first consensus key.
 const DEMO_VALIDATOR: &[u8] = b"val-1";
@@ -771,12 +771,13 @@ fn build_router(state: Shared) -> Router {
 ///
 /// # Errors
 ///
-/// Returns an error when the listener cannot bind or the server fails.
-pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
+/// Returns an error when the listen address is not valid, the listener cannot
+/// bind, or the server fails.
+pub async fn serve(listen: &str) -> Result<(), Box<dyn std::error::Error>> {
     let state: Shared = Arc::new(Mutex::new(NodeState::demo()));
     let app = build_router(state);
     println!("karsa demo node (rust)");
-    println!("  listen:         http://{DEMO_LISTEN}");
+    println!("  listen:         http://{listen}");
     println!("  ml-dsa enabled: {}", registry::ml_dsa_enabled());
     println!("  slh-dsa enabled: {}", registry::slh_dsa_enabled());
     println!("  validators:     1 at epoch 0");
@@ -784,7 +785,7 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     println!("  sample tx:      karsa sample-tx");
     println!("  rotate a key:   karsa register-demo 1  # prints the signed body");
 
-    let listener = tokio::net::TcpListener::bind(DEMO_LISTEN).await?;
+    let listener = tokio::net::TcpListener::bind(listen).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }

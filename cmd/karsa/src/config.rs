@@ -160,6 +160,29 @@ impl NodeConfig {
         Ok(toml::from_str(&text)?)
     }
 
+    /// Loads a configuration, writing the default file first when it is missing.
+    ///
+    /// A node that refuses to start because a file it could have written itself is
+    /// missing is a bad first run. The file is created once, with its comments
+    /// intact, and then treated like any other: validated, never silently repaired.
+    ///
+    /// # Errors
+    ///
+    /// [`std::io::Error`] when the directory or file cannot be written, and the
+    /// parse error when an existing file is not this schema.
+    pub fn ensure(path: &Path) -> Result<Self, Box<dyn Error>> {
+        if !path.exists() {
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, EXAMPLE)?;
+            println!("  no configuration at {}; wrote defaults", path.display());
+        }
+        Self::load(path)
+    }
+
     /// Everything wrong with this configuration, as sentences.
     ///
     /// Empty means usable. This returns problems rather than failing on the first
@@ -265,7 +288,7 @@ pub fn run(path: Option<PathBuf>, init: bool) -> Result<(), Box<dyn Error>> {
     }
 
     let path = path.unwrap_or_else(|| PathBuf::from("node.toml"));
-    let config = NodeConfig::load(&path)?;
+    let config = NodeConfig::ensure(&path)?;
     let problems = config.problems();
 
     println!("== Node configuration: {} ==", path.display());
