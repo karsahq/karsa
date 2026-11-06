@@ -1,7 +1,7 @@
 {
   "chain_id": "karsa",
   "protocol_version": 1,
-  "epoch_rounds": 1000,
+  "epoch_rounds": 26000,
   "validators": [
     {
       "address": "K2qG83wrJgn8QMuDwTkdMmPk5JPuDLHaEU33AyHTY1qL41zZVNw",

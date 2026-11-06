@@ -387,8 +387,9 @@ async fn node_task(
         .consensus
         .get(index)
         .ok_or("no consensus key for this node")?;
-    let mut node = Node::with_chain_id(
+    let mut node = Node::with_chain_id_and_epoch_length(
         set,
+        committee.epoch_rounds,
         identity.id.clone(),
         identity.private_key.clone(),
         chain_id.clone(),

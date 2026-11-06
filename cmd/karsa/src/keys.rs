@@ -314,7 +314,7 @@ pub(crate) fn demo_genesis() -> Result<(Genesis, Keys), Box<dyn Error>> {
         Genesis {
             chain_id: "karsa".into(),
             protocol_version: PROTOCOL_VERSION,
-            epoch_rounds: 1_000,
+            epoch_rounds: crate::genesis::DEMO_EPOCH_ROUNDS,
             validators: genesis_validators,
             accounts: genesis_accounts,
         },

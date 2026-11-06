@@ -33,6 +33,14 @@ use validator::{NO_EXPIRY as VALIDATOR_NO_EXPIRY, ValidatorKey, validator_addres
 /// The only protocol version this tree implements.
 pub(crate) const PROTOCOL_VERSION: u16 = 1;
 
+/// Rounds per key epoch in the generated devnet.
+///
+/// At the measured 2.3 ms/round of a four-validator local run this is about one
+/// minute. It is deliberately not a production value: a production genesis starts
+/// from 86,400 (24 hours at one second per round) and is calibrated against the
+/// round time the network actually measures.
+pub(crate) const DEMO_EPOCH_ROUNDS: u64 = 26_000;
+
 /// Domain tag mixed into the genesis hash.
 const DOMAIN: &[u8] = b"KARSA/GENESIS/v1";
 
@@ -58,6 +66,10 @@ pub struct Genesis {
     /// Wire format this genesis is valid for.
     pub protocol_version: u16,
     /// Commits between key epochs.
+    ///
+    /// The generated devnet uses [`DEMO_EPOCH_ROUNDS`]. A production chain starts
+    /// from 86,400 (24 hours at one second per round) and calibrates against its
+    /// measured round time, because a round is logical, not a wall-clock slot.
     pub epoch_rounds: u64,
     /// The initial committee.
     pub validators: Vec<GenesisValidator>,
@@ -550,17 +562,31 @@ fn check_key(where_: &str, algorithm: &str, public_key: &str) -> Vec<String> {
     problems
 }
 
-/// Writes the example, refusing to overwrite.
+/// Writes `genesis`, refusing to overwrite.
 ///
 /// # Errors
 ///
 /// [`std::io::Error`] when the file exists or cannot be written.
-pub fn write_example(path: &Path) -> Result<(), Box<dyn Error>> {
+fn write(path: &Path, genesis: &Genesis) -> Result<(), Box<dyn Error>> {
     if path.exists() {
         return Err(format!("{} already exists; not overwriting", path.display()).into());
     }
-    let text = serde_json::to_string_pretty(&example()?)?;
+    let text = serde_json::to_string_pretty(genesis)?;
     std::fs::write(path, format!("{text}\n"))?;
+    Ok(())
+}
+
+/// Applies an optional epoch length to a generated genesis.
+fn apply_epoch_rounds(
+    genesis: &mut Genesis,
+    epoch_rounds: Option<u64>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(rounds) = epoch_rounds {
+        if rounds == 0 {
+            return Err("--epoch-rounds must be at least 1".into());
+        }
+        genesis.epoch_rounds = rounds;
+    }
     Ok(())
 }
 
@@ -568,6 +594,7 @@ pub fn run(
     home: &crate::home::Home,
     explicit: Option<std::path::PathBuf>,
     init: bool,
+    epoch_rounds: Option<u64>,
 ) -> Result<(), Box<dyn Error>> {
     let path = home.file(explicit, "genesis.json");
     let keys_path = home.keys_json();
@@ -575,10 +602,15 @@ pub fn run(
         if keys_path.exists() {
             return Err(format!("{} already exists; not overwriting", keys_path.display()).into());
         }
-        write_example(&path)?;
-        crate::keys::demo_genesis()?.1.save(&keys_path)?;
+        let (mut genesis, keys) = crate::keys::demo_genesis()?;
+        apply_epoch_rounds(&mut genesis, epoch_rounds)?;
+        write(&path, &genesis)?;
+        keys.save(&keys_path)?;
         println!("wrote {} and {}", path.display(), keys_path.display());
         return Ok(());
+    }
+    if epoch_rounds.is_some() {
+        return Err("--epoch-rounds only applies with --init".into());
     }
 
     let genesis = Genesis::ensure(&path)?;
@@ -665,6 +697,24 @@ mod tests {
     fn the_example_is_well_formed_and_valid() {
         let genesis = genesis();
         assert!(genesis.problems().is_empty(), "{:?}", genesis.problems());
+    }
+
+    #[test]
+    fn a_generated_genesis_can_carry_a_production_epoch_length() {
+        let mut genesis = genesis();
+        apply_epoch_rounds(&mut genesis, Some(86_400)).unwrap();
+
+        assert_eq!(genesis.epoch_rounds, 86_400);
+        assert!(genesis.problems().is_empty(), "{:?}", genesis.problems());
+    }
+
+    #[test]
+    fn a_zero_epoch_length_is_refused_before_writing() {
+        let mut genesis = genesis();
+        let before = genesis.epoch_rounds;
+
+        assert!(apply_epoch_rounds(&mut genesis, Some(0)).is_err());
+        assert_eq!(genesis.epoch_rounds, before);
     }
 
     #[test]
@@ -812,7 +862,7 @@ mod tests {
     fn an_unknown_field_is_rejected_rather_than_ignored() {
         let text = serde_json::to_string(&genesis())
             .unwrap()
-            .replace("\"epoch_rounds\":1000", "\"epoch_roundz\":1000");
+            .replace("\"epoch_rounds\":26000", "\"epoch_roundz\":26000");
         assert!(serde_json::from_str::<Genesis>(&text).is_err());
     }
 }

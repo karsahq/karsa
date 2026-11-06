@@ -255,6 +255,7 @@ pub(crate) struct Report {
 /// One row of the header table.
 pub(crate) struct HeaderView {
     height: u64,
+    epoch: u64,
     round: u64,
     applied: u64,
     signers: usize,
@@ -309,6 +310,7 @@ pub(crate) struct Membership {
     pub(crate) set: ValidatorSet,
     pub(crate) consensus: Vec<Consensus>,
     pub(crate) accounts: Vec<Account>,
+    pub(crate) epoch_rounds: u64,
 }
 
 /// Builds the membership for `validators`, from a home when one is given.
@@ -331,6 +333,7 @@ pub(crate) fn membership(
             set,
             consensus,
             accounts: accounts(validators)?,
+            epoch_rounds: crate::genesis::DEMO_EPOCH_ROUNDS,
         });
     };
     let genesis = Genesis::ensure(&home.genesis_json())?;
@@ -420,6 +423,7 @@ fn membership_from(
         set,
         consensus,
         accounts: runtime,
+        epoch_rounds: genesis.epoch_rounds,
     })
 }
 
@@ -445,7 +449,7 @@ pub(crate) fn simulate_with(
 
     let mut state = genesis_state(accounts)?;
 
-    let mut dag = Dag::new(set.clone());
+    let mut dag = Dag::with_epoch_length(set.clone(), membership.epoch_rounds);
     let mut batches: HashMap<[u8; 32], Batch> = HashMap::new();
     let mut rounds = Vec::new();
 
@@ -495,7 +499,7 @@ pub(crate) fn simulate_with(
 
             let mut vertex = Vertex {
                 chain_id: chain_id.to_vec(),
-                epoch: EPOCH,
+                epoch: dag.epoch_of(round),
                 round,
                 author: validator.id.clone(),
                 payload_hash: digest,
@@ -525,16 +529,18 @@ pub(crate) fn simulate_with(
     // order; these loops only follow it.
     let genesis_header = Header::genesis(
         chain_id.to_vec(),
-        EPOCH,
+        dag.epoch_of(0),
         state.state_root(),
         commit_root(&[]),
     );
-    let mut chain = HeaderChain::new(set.clone(), genesis_header.clone());
+    let mut chain =
+        HeaderChain::with_schedule(set.clone(), genesis_header.clone(), dag.epoch_schedule());
 
     let mut applied = 0usize;
     let mut rejected: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut headers = vec![HeaderView {
         height: 0,
+        epoch: genesis_header.epoch,
         round: 0,
         applied: 0,
         signers: 0,
@@ -579,7 +585,7 @@ pub(crate) fn simulate_with(
         let prefix = &order[..cursor];
         let header = Header {
             chain_id: chain_id.to_vec(),
-            epoch: EPOCH,
+            epoch: dag.epoch_of(round),
             height: head.height + 1,
             round,
             state_root: state.state_root(),
@@ -592,6 +598,7 @@ pub(crate) fn simulate_with(
         certified.push((header.clone(), certificate.clone()));
         headers.push(HeaderView {
             height: header.height,
+            epoch: header.epoch,
             round,
             applied: header.applied,
             signers: certificate.signer_count(),
@@ -804,8 +811,9 @@ pub fn run(
     println!();
     println!("== Finality: one certified header per committed round ==");
     println!(
-        "  {}  {}  {}  {}  {}  dag root",
+        "  {}  {}  {}  {}  {}  {}  dag root",
         pad("height", 7),
+        pad("epoch", 6),
         pad("round", 6),
         pad("applied", 8),
         pad("signers", 8),
@@ -818,8 +826,9 @@ pub fn run(
             format!("{} of {}", header.signers, validators)
         };
         println!(
-            "  {}  {}  {}  {}  {}  {}",
+            "  {}  {}  {}  {}  {}  {}  {}",
             pad(&header.height.to_string(), 7),
+            pad(&header.epoch.to_string(), 6),
             pad(&header.round.to_string(), 6),
             pad(&header.applied.to_string(), 8),
             pad(&signers, 8),
@@ -882,4 +891,33 @@ pub fn run(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn certified_headers_cross_an_epoch_boundary() {
+        let (set, consensus) = consensus_set(4).unwrap();
+        let committee = Membership {
+            set,
+            consensus,
+            accounts: accounts(4).unwrap(),
+            epoch_rounds: 2,
+        };
+
+        let simulation = simulate_with(&demo_chain_id(), &committee, 4).unwrap();
+        let epochs: Vec<u64> = simulation
+            .certified
+            .iter()
+            .map(|(header, _)| header.epoch)
+            .collect();
+
+        assert!(
+            epochs.windows(2).any(|pair| pair[1] > pair[0]),
+            "expected a certified header in a later epoch, got {epochs:?}"
+        );
+        assert!(!simulation.report.headers.is_empty());
+    }
 }

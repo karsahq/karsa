@@ -237,6 +237,9 @@ enum Command {
         /// Node home directory holding node.toml and genesis.json.
         #[arg(long)]
         home: Option<std::path::PathBuf>,
+        /// Rounds per key epoch when --init writes a new genesis.
+        #[arg(long)]
+        epoch_rounds: Option<u64>,
         /// Write the example instead of reading it.
         #[arg(long)]
         init: bool,
@@ -375,7 +378,12 @@ fn main() -> ExitCode {
         Command::Loadtest { count, concurrency } => loadtest::run(count, concurrency),
         Command::Config { path, home, init } => run_config(home, path, init),
         Command::Peers { home, add, remove } => run_peers(home, add, remove),
-        Command::Genesis { path, home, init } => run_genesis(home, path, init),
+        Command::Genesis {
+            path,
+            home,
+            init,
+            epoch_rounds,
+        } => run_genesis(home, path, init, epoch_rounds),
         Command::Live {
             validators,
             port_base,
@@ -455,9 +463,10 @@ fn run_genesis(
     home_path: Option<PathBuf>,
     path: Option<PathBuf>,
     init: bool,
+    epoch_rounds: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let home = home::Home::resolve(home_path)?;
-    genesis::run(&home, path, init)
+    genesis::run(&home, path, init, epoch_rounds)
 }
 
 fn run_node(

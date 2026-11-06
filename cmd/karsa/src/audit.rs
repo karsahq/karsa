@@ -34,7 +34,7 @@ use std::path::PathBuf;
 
 use exec::State;
 use store::{CertifiedHeader, Store};
-use validator::{Dag, Header, HeaderChain, VertexId, commit_root};
+use validator::{Dag, EpochSchedule, Header, HeaderChain, VertexId, commit_root};
 
 use crate::chain;
 
@@ -99,7 +99,8 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
     // Every height must extend the one before it and carry a quorum. This needs no
     // payload, so it is checked over the *whole* header chain even when the store
     // has been pruned.
-    let mut verifier = HeaderChain::new(set.clone(), genesis.clone());
+    let schedule = EpochSchedule::advancing(set.epoch, committee.epoch_rounds);
+    let mut verifier = HeaderChain::with_schedule(set.clone(), genesis.clone(), schedule);
     for entry in &certified {
         verifier.advance(&entry.header, &entry.certificate)?;
     }
@@ -150,7 +151,7 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
         }
     }
 
-    let mut dag = Dag::new(set);
+    let mut dag = Dag::with_epoch_length(set, committee.epoch_rounds);
     if let Some(round) = floor {
         dag.set_floor(round);
     }

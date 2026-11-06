@@ -82,10 +82,14 @@ which are still open.
   account sets cannot share a root.
 - `validator::EpochSchedule`: maps rounds to epochs as a pure function of the
   round, which is what lets a key rotation cross a boundary without a restart.
-  `karsa migrate` runs it end to end. PQ is registered but not active: the default
-  chain is classical, and switching a validator to ML-DSA is a change to one
-  `ValidatorKey`. Overlapping keys are not supported yet — a vertex carries one
-  signature.
+  `karsa migrate`, `karsa chain`, and `karsa live` run it end to end, and the
+  header chain now verifies across the boundary instead of refusing a new epoch.
+  The generated devnet uses 26,000 rounds (about a minute at the measured local
+  round time); a production genesis starts from 86,400 (24 hours at one second
+  per round) and is calibrated against measured round time. PQ is registered but
+  not active: the default chain is classical, and switching a validator to ML-DSA
+  is a change to one `ValidatorKey`. Overlapping keys are not supported yet — a
+  vertex carries one signature.
 - `validator::header`: committed-state headers and the finality certificate that
   names them. The header id is a domain-separated hash, and the certificate is the
   existing vote payload over that id — `n` signatures once per **commit**, not once
@@ -180,7 +184,9 @@ which are still open.
 - `karsa genesis`: the file every node must agree on, in JSON because it is a
   generated consensus artifact rather than a hand-edited preference. Validators,
   their keys, the founding accounts with their policies, and the key-epoch length
-  are all explicit; unknown fields, duplicate ids, unknown algorithms, wrong
+  are all explicit; `--init --epoch-rounds 86400` writes a genesis whose key
+  epoch is 24 hours at one second per round, while the generated devnet keeps
+  its short default. Unknown fields, duplicate ids, unknown algorithms, wrong
   key lengths, and a threshold above the key count are each refused with a
   sentence. It prints the **genesis hash over the canonical encoding, not over the
   file**, so reformatting the JSON or reordering validators does not change the

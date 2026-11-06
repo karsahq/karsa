@@ -113,12 +113,30 @@ impl Node {
         private_key: Vec<u8>,
         chain_id: Vec<u8>,
     ) -> Self {
+        Self::with_chain_id_and_epoch_length(set, 0, id, private_key, chain_id)
+    }
+
+    /// Creates a node that signs over `chain_id` and resolves keys through an
+    /// epoch schedule of `epoch_rounds` rounds.
+    ///
+    /// A zero length keeps the whole DAG in one epoch, which is the behaviour of
+    /// [`Node::with_chain_id`] and the simulator. A non-zero length makes the
+    /// vertex's epoch a function of its round, so a scheduled key rotation is
+    /// accepted at the boundary instead of after a restart.
+    #[must_use]
+    pub fn with_chain_id_and_epoch_length(
+        set: ValidatorSet,
+        epoch_rounds: u64,
+        id: Vec<u8>,
+        private_key: Vec<u8>,
+        chain_id: Vec<u8>,
+    ) -> Self {
         Self {
             id,
             private_key,
             chain_id,
             round: 0,
-            dag: Dag::new(set),
+            dag: Dag::with_epoch_length(set, epoch_rounds),
             pacemaker: Pacemaker::new(PacemakerConfig::default(), 1),
             authored: 0,
         }
@@ -209,7 +227,7 @@ impl Node {
 
         let mut vertex = Vertex {
             chain_id: self.chain_id.clone(),
-            epoch: EPOCH,
+            epoch: self.dag.epoch_of(round),
             round,
             author: self.id.clone(),
             // Ordering only unless the caller names a batch.

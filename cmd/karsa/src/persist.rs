@@ -163,6 +163,7 @@ pub(crate) fn save(
 fn replay(
     store: &Store,
     set: validator::ValidatorSet,
+    epoch_rounds: u64,
     accounts: &[chain::Account],
     chain_id: &[u8],
 ) -> Result<Replayed, Box<dyn Error>> {
@@ -174,7 +175,7 @@ fn replay(
         .ok_or("the store has no snapshot; nothing to replay from")?;
     let mut state = State::decode(&snapshot.state)?;
 
-    let mut dag = Dag::new(set);
+    let mut dag = Dag::with_epoch_length(set, epoch_rounds);
     dag.set_floor(snapshot.round);
 
     let vertices = store.vertices()?;
@@ -243,7 +244,13 @@ pub fn run(
         )?
         // The simulation is dropped here: everything below reads from disk only.
     };
-    let replayed = replay(&store, committee.set, &committee.accounts, &chain_id)?;
+    let replayed = replay(
+        &store,
+        committee.set,
+        committee.epoch_rounds,
+        &committee.accounts,
+        &chain_id,
+    )?;
     let stored = store.roots()?;
 
     println!("== Persistence: save, prune, drop, reopen, replay ==");
@@ -355,7 +362,14 @@ mod tests {
             .unwrap()
         };
         let (set, _) = chain::consensus_set(4).unwrap();
-        let replayed = replay(&store, set, &accounts, &chain::demo_chain_id()).unwrap();
+        let replayed = replay(
+            &store,
+            set,
+            crate::genesis::DEMO_EPOCH_ROUNDS,
+            &accounts,
+            &chain::demo_chain_id(),
+        )
+        .unwrap();
 
         assert_eq!(replayed.state_root, saved.roots.state_root);
         assert!(

@@ -23,7 +23,7 @@ use crypto::{CryptoError, CryptoErrorKind};
 use sha2::{Digest, Sha256};
 
 use crate::certificate::Certificate;
-use crate::schedule::ValidatorSet;
+use crate::schedule::{EpochSchedule, ValidatorSet};
 
 /// Canonical header encoding version.
 pub const HEADER_VERSION_V1: u16 = 1;
@@ -173,14 +173,37 @@ impl Header {
 #[derive(Debug, Clone)]
 pub struct HeaderChain {
     set: ValidatorSet,
+    schedule: EpochSchedule,
     head: Header,
 }
 
 impl HeaderChain {
     /// Starts a verifier from a trusted header.
+    ///
+    /// Every round is treated as belonging to the genesis epoch. Use
+    /// [`HeaderChain::with_schedule`] when the chain rotates keys across epochs.
     #[must_use]
     pub fn new(set: ValidatorSet, genesis: Header) -> Self {
-        Self { set, head: genesis }
+        let schedule = EpochSchedule::single(genesis.epoch);
+        Self {
+            set,
+            schedule,
+            head: genesis,
+        }
+    }
+
+    /// Starts a verifier whose epoch for a round is derived from `schedule`.
+    ///
+    /// The schedule is the same pure function of the round the DAG uses, so a
+    /// header at a round in a new epoch is accepted exactly when its epoch is the
+    /// one that round belongs to.
+    #[must_use]
+    pub fn with_schedule(set: ValidatorSet, genesis: Header, schedule: EpochSchedule) -> Self {
+        Self {
+            set,
+            schedule,
+            head: genesis,
+        }
     }
 
     /// The header currently trusted.
@@ -193,6 +216,12 @@ impl HeaderChain {
     #[must_use]
     pub fn set(&self) -> &ValidatorSet {
         &self.set
+    }
+
+    /// The round-to-epoch mapping this verifier checks against.
+    #[must_use]
+    pub fn schedule(&self) -> EpochSchedule {
+        self.schedule
     }
 
     /// Accepts `header` when it extends the trusted head and `certificate` names it.
@@ -214,10 +243,17 @@ impl HeaderChain {
         if header.chain_id != self.head.chain_id {
             return Err(header_mismatch("header is for another chain"));
         }
-        if header.epoch != self.head.epoch {
+        if header.round <= self.head.round {
             return Err(header_mismatch(format!(
-                "header epoch {} is not the trusted epoch {}",
-                header.epoch, self.head.epoch
+                "header round {} does not advance past {}",
+                header.round, self.head.round
+            )));
+        }
+        let expected = self.schedule.epoch_of(header.round);
+        if header.epoch != expected {
+            return Err(header_mismatch(format!(
+                "header epoch {} does not match round {}'s epoch {}",
+                header.epoch, header.round, expected
             )));
         }
         if header.height != self.head.height.saturating_add(1) {
@@ -426,5 +462,38 @@ mod tests {
         let error = chain.advance(&first, &first_certificate).unwrap_err();
         assert_eq!(error.kind(), CryptoErrorKind::HeaderMismatch);
         assert_eq!(chain.head().height, 1);
+    }
+
+    #[test]
+    fn a_header_advances_into_the_epoch_its_round_belongs_to() {
+        let fixture = fixture();
+        let genesis = fixture.genesis();
+        let schedule = EpochSchedule::advancing(EPOCH, 1);
+        let mut chain = HeaderChain::with_schedule(fixture.set.clone(), genesis.clone(), schedule);
+
+        let mut header = fixture.next(&genesis, 8);
+        header.epoch = schedule.epoch_of(header.round);
+        let certificate = fixture.certify(&header, 3);
+
+        chain.advance(&header, &certificate).unwrap();
+        assert_eq!(chain.head().epoch, EPOCH + 1);
+        assert_eq!(chain.schedule(), schedule);
+    }
+
+    #[test]
+    fn a_header_epoch_that_does_not_match_its_round_is_refused() {
+        let fixture = fixture();
+        let genesis = fixture.genesis();
+        let schedule = EpochSchedule::advancing(EPOCH, 1);
+        let mut chain = HeaderChain::with_schedule(fixture.set.clone(), genesis.clone(), schedule);
+
+        let mut header = fixture.next(&genesis, 8);
+        // Round 1 belongs to EPOCH + 1 under this schedule, not EPOCH.
+        header.epoch = EPOCH;
+        let certificate = fixture.certify(&header, 3);
+
+        let error = chain.advance(&header, &certificate).unwrap_err();
+        assert_eq!(error.kind(), CryptoErrorKind::HeaderMismatch);
+        assert_eq!(chain.head().height, 0);
     }
 }
