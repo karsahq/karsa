@@ -520,24 +520,28 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
 26. **One process per validator is a scheduler boundary, not a throughput lever.**
     `--node-index` puts one validator in each process, which removes the shared
     runtime but not the work: every validator still executes every committed batch.
-    On 4 validators, 1,000 tx per batch, `--execute --pre-sign`, 20 rounds (84,000
-    chain-unique transactions), median of 3 on the AMD Ryzen 7 6800U (8 cores / 16
-    threads), one process with 4 verifier threads authored 74.7k tx/s; four
-    processes with four workers and one verifier thread authored 20.3k tx/s. That
-    20.3k is configuration, not a verdict on the boundary: the same four processes
-    with four verifier threads authored 40.6k tx/s, and one 4,000 tx/batch run with
-    4 threads reached 103.8k against an 88.4k single-process median. So the residue
-    at 1,000 tx/batch is batch-size and thread-budget dependent, not a fixed penalty.
+    On the AMD Ryzen 7 6800U (8 cores / 16 threads), 4 validators, 20 rounds,
+    `--execute --pre-sign`, median of 3 on an idle machine, the single-process
+    control authored 76.4k tx/s at 1,000 tx/batch with 4 verifier threads and 88.2k
+    at 4,000; one process per validator with 4 verifier threads per process authored
+    70.9k and 78.3k — 93% and 89% of the control. One verifier thread per process
+    authored 29.4k and 37.7k, while the single-process control at one thread
+    authored 35.9k and 41.1k. Across the whole matrix one process per validator
+    stayed at 82–93% of the single-process control and never above it. Verifier
+    threads are a 2.1–2.4× lever; the process boundary is not. Batch 1,000 → 4,000
+    adds 10–16% at 4 threads and 14–28% at one.
     Without `--execute`, four processes finish 21 rounds in 146–159 ms with delivery
-    p50 5–9 ms and p99 ≤ 23 ms, so the sockets are healthy; `verify tx` is 89–94% of
-    the named stages. On the Intel i7-4790K (4 cores / 8 threads), the same 1,000
-    tx/batch configuration with one verifier thread per process was 49.3k against
-    46.9k in one process at 4 verifier threads, which points at the thread budget
-    rather than the boundary itself. Adding validators does not add unique
-    throughput: 10 validators with one worker each authored 23.4k tx/s aggregate and
-    each node applied about 20.1k tx/s, which is the per-node verification ceiling.
-    The levers are batch verification (finding 25), verifier threads, and batch
-    size; the process boundary is how those are measured, not a lever of its own.
+    p50 5–9 ms and p99 ≤ 23 ms, so the sockets are healthy; with execution, delivery
+    p50 rises to 27–142 ms at 1,000 tx/batch and 198–508 ms at 4,000, depending on
+    verifier threads, because `apply_batch_timed` runs inline in the node loop.
+    `verify tx` is 89–94% of the named stages. Adding validators does not add unique
+    throughput: 10 validators with one worker each authored 24.7k tx/s aggregate and
+    each node applied about 22.1k tx/s — the per-node verification ceiling. The
+    levers are batch verification (finding 25), verifier threads, and batch size;
+    the process boundary is how those are measured, not a lever of its own. Numbers
+    must name the verifier-thread count and the load: a first session measured 20.3k
+    and 40.6k and one 103.8k run; the idle matrix supersedes those and rejects the
+    103.8k as an outlier.
 27. **Finality is 125–225 ms p50 submit → certified, with a ~1.6 ms commit →
     certificate gap.** On 4 validators over `mpsc` links with injected one-way
     delay and 0–5 ms jitter, 100 samples, 3 runs (median), at 25 ms one-way delay:
@@ -547,8 +551,8 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     at 50 ms. All 100 samples finalized on every node and certified on the submitter
     in all six runs; order, state, and header agreement held with 0 conflicts
     (433/437/437 commits at 25 ms and 423/420/425 at 50 ms). This is preliminary:
-    four validators on loopback with injected delay, not a WAN, not under load, not
-    a large committee. The comparison to Sui (~400–700 ms) and IOTA (seconds) is
+    four validators on loopback with injected delay, not a WAN, not an idle machine,
+    not a large committee. The comparison to Sui (~400–700 ms) and IOTA (seconds) is
     submit → certified, not block time.
 
 ## Build order
