@@ -238,6 +238,74 @@ impl Pacemaker {
         })
     }
 
+    /// Takes one decision and returns, instead of draining every one available.
+    ///
+    /// [`Pacemaker::tick`] is the normal driver: it keeps deciding while it can, and
+    /// a caller that only observes the cursor sees the end state of that batch.
+    /// A caller that materializes an artifact per decision — one header per commit,
+    /// for example — needs the boundaries, so this stops after the first commit or
+    /// skip. An anchor or a stall returns without moving the cursor and therefore
+    /// without deciding anything.
+    ///
+    /// Calling this repeatedly produces the same decision sequence as calling
+    /// [`Pacemaker::tick`] once, because both run the same [`Advance`] rules in the
+    /// same order; only the reporting granularity differs.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the commit rules' errors, as [`Pacemaker::tick`] does.
+    pub fn tick_one(&mut self, dag: &mut Dag) -> Result<Step, CryptoError> {
+        if let Some(highest) = dag.highest_round() {
+            self.observed = self.observed.max(highest);
+        }
+
+        let from = self.cursor;
+        let step = match self.advance_once(dag)? {
+            Advance::Commit => Step::Advanced {
+                from,
+                cursor: self.cursor,
+                commits: 1,
+                skips: 0,
+                anchors: 0,
+            },
+            Advance::Skip => Step::Advanced {
+                from,
+                cursor: self.cursor,
+                commits: 0,
+                skips: 1,
+                anchors: 0,
+            },
+            Advance::Anchor => Step::Advanced {
+                from,
+                cursor: self.cursor,
+                commits: 0,
+                skips: 0,
+                anchors: 1,
+            },
+            Advance::Stalled => {
+                self.ticks_waited = self.ticks_waited.saturating_add(1);
+                if self.ticks_waited >= self.config.timeout_ticks {
+                    self.ticks_waited = 0;
+                    self.timeouts += 1;
+                    Step::TimedOut {
+                        cursor: self.cursor,
+                        observed: self.observed,
+                        timeouts: self.timeouts,
+                    }
+                } else {
+                    Step::Waiting {
+                        cursor: self.cursor,
+                        waited: self.ticks_waited,
+                    }
+                }
+            }
+        };
+        if matches!(step, Step::Advanced { .. }) {
+            self.ticks_waited = 0;
+        }
+        Ok(step)
+    }
+
     /// Makes at most one decision.
     fn advance_once(&mut self, dag: &mut Dag) -> Result<Advance, CryptoError> {
         let round = self.cursor;
@@ -589,6 +657,29 @@ mod tests {
             }
         );
         assert!(fixture.dag.skipped().is_empty());
+    }
+
+    #[test]
+    fn tick_one_exposes_each_decision_boundary() {
+        let mut fixture = chain(8, &[]);
+        let mut pacemaker = pacemaker(3);
+        let mut decided = Vec::new();
+
+        loop {
+            match pacemaker.tick_one(&mut fixture.dag).unwrap() {
+                Step::Advanced {
+                    from,
+                    commits: 1,
+                    anchors: 0,
+                    ..
+                } => decided.push(from),
+                Step::Advanced { anchors: 1, .. } => break,
+                Step::Waiting { .. } | Step::TimedOut { .. } => break,
+                other => panic!("unexpected step {other:?}"),
+            }
+        }
+
+        assert_eq!(decided, (1..=7).collect::<Vec<_>>());
     }
 
     #[test]

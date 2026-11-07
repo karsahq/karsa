@@ -628,7 +628,7 @@ async fn node_task(
                     let round = node.round();
                     let payload = if config.txs > 0 {
                         Some(
-                            chain::demo_batch(&accounts, index, round, config.txs)
+                            chain::demo_batch(&chain_id, &accounts, index, round, config.txs)
                                 .map_err(|error| error.to_string())?,
                         )
                     } else {

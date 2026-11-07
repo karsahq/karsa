@@ -262,6 +262,19 @@ impl Node {
     pub fn commit(&mut self) -> Result<Step, CryptoError> {
         self.pacemaker.tick(&mut self.dag)
     }
+
+    /// Takes one decision rather than every decision available in a tick.
+    ///
+    /// A caller that records one artifact per commit needs the boundaries that
+    /// [`Node::commit`] collapses into a single [`Step`]. The decision sequence is
+    /// the same; only the reporting granularity differs.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the commit rules' errors.
+    pub fn commit_once(&mut self) -> Result<Step, CryptoError> {
+        self.pacemaker.tick_one(&mut self.dag)
+    }
 }
 
 /// The identity of one held vertex: round, author, and digest.

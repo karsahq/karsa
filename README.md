@@ -15,7 +15,7 @@ not part of this repository.
 | `crates/net/` | Rust: vertex dissemination between nodes, deterministic scheduling, and the wire framing for real sockets |
 | `crates/store/` | Rust: append-only on-disk vertices, batches, and roots |
 | `crates/erasure/` | Rust: Reed-Solomon over GF(2^8) for sharded storage |
-| `cmd/karsa/` | Rust: single CLI with `genesis`, `config`, `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `live`, `dagsim`, `chain`, `net`, `persist`, `audit`, `migrate`, `sigbench`, `sweep`, `shards` |
+| `cmd/karsa/` | Rust: single CLI with `genesis`, `config`, `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `live`, `finality`, `dagsim`, `chain`, `net`, `persist`, `audit`, `migrate`, `sigbench`, `sweep`, `shards` |
 | `.cargo/config.toml` | sccache as rustc wrapper, mold as linker |
 | `scripts/rust-check.sh` | Rust gate: fmt, clippy, tests |
 | `scripts/acvp-rust.sh` | Downloads the ACVP vectors and runs the checker |
@@ -175,6 +175,18 @@ which are still open.
   persists every vertex and batch through `crates/store`, so the bytes-per-day
   figure is measured from files rather than modelled. `--archives N` adds archive
   nodes: they receive everything, store everything, and never sign.
+- `karsa finality`: the client-side metric `live` cannot produce. A closed-loop
+  client submits a signed batch to validator 0; a vertex names it, the same
+  pacemaker decides it, and the commit is written into a header that the
+  certificate keys sign. The mesh runs over `mpsc` links with an injected one-way
+  delay and jitter, so the same code can be measured at loopback and at a delay
+  comparable to a wide-area network. It reports submit → commit and submit →
+  certified header as p50/p95/p99, the commit → certificate gap, and rounds to
+  finality as a separate protocol metric: a leader vertex finalizes in one round,
+  a non-leader in two, and wall-clock latency is a multiple of the one-way delay
+  because a round is an out-and-back. Headers are built one decision at a time
+  (`Node::commit_once`), so every node signs the same prefix header regardless of
+  how many decisions one tick happened to contain.
 - `karsa peers`: the network half, in `peers.json` beside the other two. Genesis says
   who the validators *are*; an address is operational data that changes when a
   machine moves, so it never goes in the file every node must agree on. `--add

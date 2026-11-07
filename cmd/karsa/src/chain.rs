@@ -175,7 +175,11 @@ fn signed_transaction(
 /// here is executed: this exists so a vertex can name a batch that actually
 /// exists and travels on the wire, which is what makes the measured bytes per
 /// transaction a measurement rather than a model.
+///
+/// `chain_id` is the chain the transactions authorize against, not the identity
+/// of the run's fixture: a node on another genesis would reject them.
 pub(crate) fn demo_batch(
+    chain_id: &[u8],
     accounts: &[Account],
     author: usize,
     round: u64,
@@ -191,7 +195,7 @@ pub(crate) fn demo_batch(
     for offset in 0..count {
         let sequence = round.saturating_mul(count).saturating_add(offset) + 1;
         transactions.push(signed_transaction(
-            &demo_chain_id(),
+            chain_id,
             sender,
             &recipient.address,
             sequence,
