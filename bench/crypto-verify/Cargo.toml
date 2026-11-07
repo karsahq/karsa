@@ -1,0 +1,17 @@
+[package]
+name = "crypto-verify-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Local measurement target, deliberately outside the workspace so the BLS
+# dependency never enters the default build or the validation gate.
+[workspace]
+
+[dependencies]
+# `no-threads` is required for a fair comparison: with the default feature blst
+# runs its own thread pool inside one verify call, which would silently turn a
+# "single-thread" number into an all-core number.
+blst = { version = "0.3.17", features = ["no-threads"] }
+crypto = { path = "../../crates/crypto" }
+validator = { path = "../../crates/validator" }
