@@ -131,6 +131,27 @@ pub struct Config {
     /// announces. Two runs with different genesis hashes refuse each other's links.
     /// `None` keeps the demo identity every other command uses without a home.
     pub home: Option<PathBuf>,
+    /// Print where the node's wall time went, one line per stage.
+    pub profile: bool,
+    /// Sign every batch before the measured window instead of inside the node loop.
+    ///
+    /// A real client signs before submitting; generating the batch in the validator
+    /// would otherwise charge chain throughput for client work.
+    pub pre_sign: bool,
+    /// Threads used to verify one batch. One keeps the serial path.
+    pub verify_threads: usize,
+}
+
+/// Wall time spent in the stages the live loop can name.
+#[derive(Default, Clone, Copy)]
+struct Profile {
+    sign: Duration,
+    author: Duration,
+    commit: Duration,
+    verify: Duration,
+    state: Duration,
+    frame: Duration,
+    store: Duration,
 }
 
 /// What one node saw.
@@ -160,6 +181,7 @@ struct NodeResult {
     latencies: Vec<u64>,
     commit_root: [u8; 32],
     order: Vec<VertexId>,
+    profile: Profile,
 }
 
 fn address(port_base: u16, index: usize) -> String {
@@ -369,15 +391,26 @@ struct Notify {
     executed: mpsc::Sender<usize>,
 }
 
+/// What a validator task needs at startup, grouped so the task signature stays
+/// about the node rather than about plumbing.
+struct Start {
+    started: Instant,
+    prebuilt: Option<Vec<Option<Batch>>>,
+}
+
 async fn node_task(
     index: usize,
     config: &Config,
     committee: chain::Membership,
     chain_id: Vec<u8>,
-    started: Instant,
+    start: Start,
     mut shutdown: watch::Receiver<bool>,
     notify: Notify,
 ) -> Result<NodeResult, String> {
+    let Start {
+        started,
+        mut prebuilt,
+    } = start;
     let set = committee.set.clone();
     // One shard per node: `data` of `n` reconstruct, so the code tolerates
     // `n - data` missing nodes and each node holds `payload / data`.
@@ -543,6 +576,7 @@ async fn node_task(
     let mut ticks: u32 = 0;
     let mut cursor: u64 = 1;
     let mut announced = false;
+    let mut profile = Profile::default();
     let mut exec_announced = false;
     let mut last_order = 0usize;
     let mut stable_ticks: u32 = 0;
@@ -626,46 +660,85 @@ async fn node_task(
                 }
                 if node.round() <= config.rounds {
                     let round = node.round();
-                    let payload = if config.txs > 0 {
-                        Some(
-                            chain::demo_batch(&chain_id, &accounts, index, round, config.txs)
-                                .map_err(|error| error.to_string())?,
-                        )
-                    } else {
+                    let slot = usize::try_from(round).unwrap_or(usize::MAX);
+                    let mut sign = Duration::ZERO;
+                    let payload = if config.txs == 0 {
                         None
+                    } else if let Some(queue) = prebuilt.as_mut() {
+                        match queue.get_mut(slot).and_then(Option::take) {
+                            Some(batch) => Some(batch),
+                            None => {
+                                return Err(format!(
+                                    "node {index} has no prebuilt batch for round {round}"
+                                ));
+                            }
+                        }
+                    } else {
+                        let sign_start = Instant::now();
+                        let batch = chain::demo_batch(
+                            &chain_id,
+                            &accounts,
+                            index,
+                            round,
+                            config.txs,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        sign = sign_start.elapsed();
+                        Some(batch)
                     };
+                    profile.sign += sign;
                     let digest = match &payload {
                         Some(batch) => batch.digest().map_err(|error| error.to_string())?,
                         None => [0u8; 32],
                     };
-                    match node.author_with(digest) {
+                    let author_start = Instant::now();
+                    let author = node.author_with(digest);
+                    profile.author += author_start.elapsed();
+                    match author {
                         Ok(Some(vertex)) => {
                             if let Some(store) = &store {
+                                let store_start = Instant::now();
                                 store
                                     .append_vertex(&vertex)
                                     .map_err(|error| error.to_string())?;
                                 if let Some(batch) = &payload {
                                     put_payload(store, &coding, index, batch, config.shard)?;
                                 }
+                                profile.store += store_start.elapsed();
                             }
+                            let frame_start = Instant::now();
                             let bytes = wire::frame(&Message::Vertex(vertex), now())
                                 .map_err(|error| error.to_string())?;
+                            profile.frame += frame_start.elapsed();
                             broadcast(&outbound, false, &bytes, &mut dropped);
                             if let Some(batch) = payload {
+                                let frame_start = Instant::now();
                                 let frame = wire::frame(&Message::Payload(batch.clone()), now())
                                     .map_err(|error| error.to_string())?;
+                                profile.frame += frame_start.elapsed();
                                 batches.insert(digest, batch);
                                 broadcast_payload(&outbound, &frame).await;
                             }
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            // The batch was not consumed, so put it back for the
+                            // next tick instead of signing it again.
+                            if let (Some(queue), Some(batch)) = (prebuilt.as_mut(), payload)
+                                && slot < queue.len()
+                            {
+                                queue[slot] = Some(batch);
+                            }
+                        }
                         Err(error) => return Err(format!("node {index} cannot author: {error}")),
                     }
                 }
                 // A commit whose leader history is not fully here yet is a
                 // delivery condition, not a failure: the referenced vertex may
                 // still be in a peer's queue.
-                match node.commit() {
+                let commit_start = Instant::now();
+                let step = node.commit();
+                profile.commit += commit_start.elapsed();
+                match step {
                     Ok(step) => {
                         cursor = match step {
                             Step::Advanced { cursor, .. }
@@ -691,8 +764,17 @@ async fn node_task(
                         let Some(batch) = batches.get(&vertex.payload_hash) else {
                             break;
                         };
-                        applied +=
-                            chain::apply_batch(&mut state, &accounts, batch, &mut exec_rejected);
+                        let mut timing = chain::ApplyTiming::default();
+                        applied += chain::apply_batch_timed(
+                            &mut state,
+                            &accounts,
+                            batch,
+                            &mut exec_rejected,
+                            &mut timing,
+                            config.verify_threads,
+                        );
+                        profile.verify += timing.verify;
+                        profile.state += timing.state;
                         applied_cursor += 1;
                     }
                 }
@@ -832,6 +914,7 @@ async fn node_task(
         latencies,
         commit_root: commit_root(node.dag().order()),
         order: node.dag().order().to_vec(),
+        profile,
     })
 }
 
@@ -978,6 +1061,7 @@ async fn archive_task(
         latencies: Vec::new(),
         commit_root: [0u8; 32],
         order: Vec::new(),
+        profile: Profile::default(),
     })
 }
 
@@ -1088,6 +1172,29 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         None => chain::demo_chain_id(),
     };
 
+    let mut prebuilt: Vec<Vec<Option<Batch>>> = if config.pre_sign && config.txs > 0 {
+        let rounds = usize::try_from(config.rounds)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let mut all = Vec::with_capacity(config.validators);
+        for index in 0..config.validators {
+            let mut batches = Vec::with_capacity(rounds);
+            for round in 0..=config.rounds {
+                batches.push(Some(chain::demo_batch(
+                    &chain_id,
+                    &committee.accounts,
+                    index,
+                    round,
+                    config.txs,
+                )?));
+            }
+            all.push(batches);
+        }
+        all
+    } else {
+        Vec::new()
+    };
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -1106,13 +1213,18 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             let config = config.clone();
             let committee = committee.clone();
             let chain_id = chain_id.clone();
+            let prebuilt = if prebuilt.is_empty() {
+                None
+            } else {
+                Some(std::mem::take(&mut prebuilt[index]))
+            };
             tasks.push(tokio::spawn(async move {
                 node_task(
                     index,
                     &config,
                     committee,
                     chain_id,
-                    started,
+                    Start { started, prebuilt },
                     shutdown_rx,
                     Notify {
                         ready: ready_tx,
@@ -1483,6 +1595,59 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+    }
+
+    if config.profile {
+        let mut profile = Profile::default();
+        let mut nodes = 0usize;
+        for result in &results {
+            if !result.signs {
+                continue;
+            }
+            profile.sign += result.profile.sign;
+            profile.author += result.profile.author;
+            profile.commit += result.profile.commit;
+            profile.verify += result.profile.verify;
+            profile.state += result.profile.state;
+            profile.frame += result.profile.frame;
+            profile.store += result.profile.store;
+            nodes += 1;
+        }
+        let nodes = nodes.max(1) as f64;
+        let total = profile.sign
+            + profile.author
+            + profile.commit
+            + profile.verify
+            + profile.state
+            + profile.frame
+            + profile.store;
+        let ms = |duration: Duration| duration.as_secs_f64() * 1e3 / nodes;
+        let pct = |duration: Duration| {
+            if total.is_zero() {
+                0.0
+            } else {
+                duration.as_secs_f64() / total.as_secs_f64() * 100.0
+            }
+        };
+        println!();
+        println!("  profile           average per validator, share of named stages");
+        for (name, duration) in [
+            ("sign batch", profile.sign),
+            ("author vertex", profile.author),
+            ("commit tick", profile.commit),
+            ("verify tx", profile.verify),
+            ("apply state", profile.state),
+            ("frame payload", profile.frame),
+            ("store write", profile.store),
+        ] {
+            println!(
+                "    {:<16} {:>9.2} ms  {:>5.1}%",
+                name,
+                ms(duration),
+                pct(duration)
+            );
+        }
+        println!("    {:<16} {:>9.2} ms", "named total", ms(total));
     }
 
     println!();

@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
+use std::time::{Duration, Instant};
 
 use crypto::registry::ALG_ED25519;
 use crypto::scheme::Ed25519Scheme;
@@ -683,6 +684,15 @@ pub(crate) fn genesis_state(accounts: &[Account]) -> Result<State, exec::ExecErr
     Ok(state)
 }
 
+/// Time spent in the two halves of [`apply_batch`], for the live profile.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct ApplyTiming {
+    /// Policy lookup and signature verification.
+    pub verify: Duration,
+    /// State transitions after authorization.
+    pub state: Duration,
+}
+
 /// Authorizes one transaction, then applies the authorized ones to `state`.
 ///
 /// Shared by the simulator and the replay path: authorization is part of
@@ -693,25 +703,79 @@ pub(crate) fn apply_batch(
     batch: &Batch,
     rejected: &mut BTreeMap<&'static str, usize>,
 ) -> usize {
-    let mut authorized = Vec::with_capacity(batch.len());
-    for transaction in &batch.transactions {
+    apply_batch_timed(
+        state,
+        accounts,
+        batch,
+        rejected,
+        &mut ApplyTiming::default(),
+        1,
+    )
+}
+
+/// One chunk of authorization work, in input order.
+fn authorize_chunk(
+    transactions: &[Transaction],
+    accounts: &[Account],
+) -> (Vec<Transaction>, Vec<(&'static str, usize)>) {
+    let mut authorized = Vec::with_capacity(transactions.len());
+    let mut rejected: Vec<(&'static str, usize)> = Vec::new();
+    for transaction in transactions {
         let policy = accounts
             .iter()
             .find(|account| account.address.as_slice() == transaction.sender.as_slice())
             .map(|account| &account.policy);
         match policy {
-            None => {
-                *rejected
-                    .entry(RejectReason::UnknownSender.as_str())
-                    .or_insert(0) += 1
-            }
+            None => rejected.push((RejectReason::UnknownSender.as_str(), 1)),
             Some(policy) if transaction.verify(policy, NOW).is_err() => {
-                *rejected.entry("unauthorized").or_insert(0) += 1;
+                rejected.push(("unauthorized", 1));
             }
             Some(_) => authorized.push(transaction.clone()),
         }
     }
+    (authorized, rejected)
+}
 
+/// [`apply_batch`], reporting how long authorization and state application took.
+pub(crate) fn apply_batch_timed(
+    state: &mut State,
+    accounts: &[Account],
+    batch: &Batch,
+    rejected: &mut BTreeMap<&'static str, usize>,
+    timing: &mut ApplyTiming,
+    threads: usize,
+) -> usize {
+    let verify_start = Instant::now();
+    let mut authorized = Vec::with_capacity(batch.len());
+    let mut chunk_rejected: Vec<(&'static str, usize)> = Vec::new();
+    if threads <= 1 || batch.len() < 64 {
+        let (chunk, rejected) = authorize_chunk(&batch.transactions, accounts);
+        authorized = chunk;
+        chunk_rejected = rejected;
+    } else {
+        let chunk_size = batch.len().div_ceil(threads).max(1);
+        let chunks = std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .transactions
+                .chunks(chunk_size)
+                .map(|slice| scope.spawn(move || authorize_chunk(slice, accounts)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("a verification thread panicked"))
+                .collect::<Vec<_>>()
+        });
+        for (chunk, rejected) in chunks {
+            authorized.extend(chunk);
+            chunk_rejected.extend(rejected);
+        }
+    }
+    for (reason, count) in chunk_rejected {
+        *rejected.entry(reason).or_insert(0) += count;
+    }
+    timing.verify += verify_start.elapsed();
+
+    let state_start = Instant::now();
     let mut applied = 0usize;
     for outcome in state.apply(&Batch::new(authorized)) {
         match outcome.reason() {
@@ -719,6 +783,7 @@ pub(crate) fn apply_batch(
             Some(reason) => *rejected.entry(reason.as_str()).or_insert(0) += 1,
         }
     }
+    timing.state += state_start.elapsed();
     applied
 }
 
@@ -923,5 +988,30 @@ mod tests {
             "expected a certified header in a later epoch, got {epochs:?}"
         );
         assert!(!simulation.report.headers.is_empty());
+    }
+
+    #[test]
+    fn parallel_authorization_matches_the_serial_path() {
+        let accounts = accounts(4).unwrap();
+        let batch = demo_batch(&demo_chain_id(), &accounts, 0, 0, 100).unwrap();
+
+        let mut serial_state = genesis_state(&accounts).unwrap();
+        let mut serial_rejected = BTreeMap::new();
+        let serial = apply_batch(&mut serial_state, &accounts, &batch, &mut serial_rejected);
+
+        let mut parallel_state = genesis_state(&accounts).unwrap();
+        let mut parallel_rejected = BTreeMap::new();
+        let parallel = apply_batch_timed(
+            &mut parallel_state,
+            &accounts,
+            &batch,
+            &mut parallel_rejected,
+            &mut ApplyTiming::default(),
+            4,
+        );
+
+        assert_eq!(serial, parallel);
+        assert_eq!(serial_rejected, parallel_rejected);
+        assert_eq!(serial_state.state_root(), parallel_state.state_root());
     }
 }

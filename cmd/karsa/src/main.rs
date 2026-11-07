@@ -300,6 +300,15 @@ enum Command {
         /// Home directory whose genesis sets the chain identity; absent keeps the demo one.
         #[arg(long)]
         home: Option<std::path::PathBuf>,
+        /// Print the time spent in each stage of the node loop.
+        #[arg(long)]
+        profile: bool,
+        /// Sign every batch before the measured window instead of in the node loop.
+        #[arg(long)]
+        pre_sign: bool,
+        /// Threads used to verify one batch. One keeps the serial path.
+        #[arg(long, default_value_t = 1)]
+        verify_threads: usize,
     },
     /// Measure client submit to certified header over a delayed validator mesh.
     Finality {
@@ -441,6 +450,9 @@ fn main() -> ExitCode {
             shard,
             drain_ms,
             home,
+            profile,
+            pre_sign,
+            verify_threads,
         } => live::run(live::Config {
             validators,
             port_base,
@@ -456,6 +468,9 @@ fn main() -> ExitCode {
             shard,
             drain: std::time::Duration::from_millis(drain_ms),
             home,
+            profile,
+            pre_sign,
+            verify_threads,
         }),
         Command::Prune {
             home,
