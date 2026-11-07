@@ -245,6 +245,20 @@ impl State {
             .collect()
     }
 
+    /// Applies transactions in the given order, returning one outcome per
+    /// transaction.
+    ///
+    /// This is [`State::apply`] for a caller that selected a subsequence of a
+    /// batch without cloning it. The order is the execution order; sequence numbers
+    /// and balances depend on it.
+    #[must_use]
+    pub fn apply_refs(&mut self, transactions: &[&Transaction]) -> Vec<Outcome> {
+        transactions
+            .iter()
+            .map(|transaction| self.apply_one(transaction))
+            .collect()
+    }
+
     fn apply_one(&mut self, transaction: &Transaction) -> Outcome {
         let Ok(transfer) = Transfer::decode(&transaction.payload) else {
             return Outcome::Rejected(RejectReason::MalformedPayload);

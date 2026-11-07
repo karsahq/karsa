@@ -18,8 +18,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::time::{Duration, Instant};
 
+use crypto::encoding::MAX_FIELD_LEN;
 use crypto::registry::ALG_ED25519;
-use crypto::scheme::Ed25519Scheme;
+use crypto::scheme::{Ed25519BatchEntry, Ed25519Scheme, verify_ed25519_batch};
 use exec::{RejectReason, State};
 use sha2::{Digest, Sha256};
 use tx::address;
@@ -713,24 +714,115 @@ pub(crate) fn apply_batch(
     )
 }
 
+/// One transaction whose signature can join a batch verification.
+struct BatchCandidate<'a> {
+    index: usize,
+    policy: &'a AuthPolicy,
+    public_key: &'a [u8],
+    message: Vec<u8>,
+    signature: &'a [u8],
+}
+
+/// Returns the batch-verifiable form of `transaction`, when the account policy is
+/// the common single-authorization Ed25519 shape and every cheap check already
+/// passes.
+///
+/// Anything else returns `None` and takes the canonical per-transaction path, so
+/// the fast path can only accept a transaction that path would also accept.
+fn batch_candidate<'a>(
+    index: usize,
+    transaction: &'a Transaction,
+    policy: &'a AuthPolicy,
+) -> Option<BatchCandidate<'a>> {
+    if policy.kind != AuthPolicyKind::Single || transaction.authorization.len() != 1 {
+        return None;
+    }
+    let authorization = &transaction.authorization[0];
+    if authorization.algorithm_id != ALG_ED25519 {
+        return None;
+    }
+    let key = policy.keys.iter().find(|key| {
+        key.key_id.as_slice() == authorization.key_id.as_slice()
+            && key.algorithm_id == ALG_ED25519
+            && key.is_usable(NOW)
+    })?;
+    let message = transaction.signing_payload().ok()?;
+    // The canonical path refuses a message above the encoding limit before it
+    // reaches the signature; the batch entry must not accept one it would reject.
+    if message.len() > MAX_FIELD_LEN {
+        return None;
+    }
+    Some(BatchCandidate {
+        index,
+        policy,
+        public_key: &key.public_key,
+        message,
+        signature: &authorization.signature,
+    })
+}
+
 /// One chunk of authorization work, in input order.
-fn authorize_chunk(
-    transactions: &[Transaction],
-    accounts: &[Account],
-) -> (Vec<Transaction>, Vec<(&'static str, usize)>) {
-    let mut authorized = Vec::with_capacity(transactions.len());
+fn authorize_chunk<'a>(
+    transactions: &'a [Transaction],
+    accounts: &'a [Account],
+) -> (Vec<&'a Transaction>, Vec<(&'static str, usize)>) {
+    let mut accepted = vec![false; transactions.len()];
     let mut rejected: Vec<(&'static str, usize)> = Vec::new();
-    for transaction in transactions {
+    let mut candidates: Vec<BatchCandidate<'a>> = Vec::new();
+
+    for (index, transaction) in transactions.iter().enumerate() {
         let policy = accounts
             .iter()
             .find(|account| account.address.as_slice() == transaction.sender.as_slice())
             .map(|account| &account.policy);
         match policy {
             None => rejected.push((RejectReason::UnknownSender.as_str(), 1)),
-            Some(policy) if transaction.verify(policy, NOW).is_err() => {
-                rejected.push(("unauthorized", 1));
+            Some(policy) => match batch_candidate(index, transaction, policy) {
+                Some(candidate) => candidates.push(candidate),
+                None => {
+                    if transaction.verify(policy, NOW).is_ok() {
+                        accepted[index] = true;
+                    } else {
+                        rejected.push(("unauthorized", 1));
+                    }
+                }
+            },
+        }
+    }
+
+    if !candidates.is_empty() {
+        let entries: Vec<Ed25519BatchEntry<'_>> = candidates
+            .iter()
+            .map(|candidate| Ed25519BatchEntry {
+                public_key: candidate.public_key,
+                message: &candidate.message,
+                signature: candidate.signature,
+            })
+            .collect();
+        if verify_ed25519_batch(&entries).is_ok() {
+            for candidate in &candidates {
+                accepted[candidate.index] = true;
             }
-            Some(_) => authorized.push(transaction.clone()),
+        } else {
+            // The batch equation cannot attribute a failure, so re-check the
+            // candidates one by one to keep the rejection count and reason exact.
+            for candidate in &candidates {
+                if transactions[candidate.index]
+                    .verify(candidate.policy, NOW)
+                    .is_ok()
+                {
+                    accepted[candidate.index] = true;
+                } else {
+                    rejected.push(("unauthorized", 1));
+                }
+            }
+        }
+    }
+
+    let mut authorized = Vec::with_capacity(transactions.len());
+    for (index, transaction) in transactions.iter().enumerate() {
+        if accepted[index] {
+            authorized.push(transaction);
         }
     }
     (authorized, rejected)
@@ -746,7 +838,7 @@ pub(crate) fn apply_batch_timed(
     threads: usize,
 ) -> usize {
     let verify_start = Instant::now();
-    let mut authorized = Vec::with_capacity(batch.len());
+    let mut authorized: Vec<&Transaction> = Vec::with_capacity(batch.len());
     let mut chunk_rejected: Vec<(&'static str, usize)> = Vec::new();
     if threads <= 1 || batch.len() < 64 {
         let (chunk, rejected) = authorize_chunk(&batch.transactions, accounts);
@@ -777,7 +869,7 @@ pub(crate) fn apply_batch_timed(
 
     let state_start = Instant::now();
     let mut applied = 0usize;
-    for outcome in state.apply(&Batch::new(authorized)) {
+    for outcome in state.apply_refs(&authorized) {
         match outcome.reason() {
             None => applied += 1,
             Some(reason) => *rejected.entry(reason.as_str()).or_insert(0) += 1,
@@ -1013,5 +1105,35 @@ mod tests {
         assert_eq!(serial, parallel);
         assert_eq!(serial_rejected, parallel_rejected);
         assert_eq!(serial_state.state_root(), parallel_state.state_root());
+    }
+
+    #[test]
+    fn batch_authorization_matches_the_single_transaction_path() {
+        let accounts = accounts(4).unwrap();
+        let mut batch = demo_batch(&demo_chain_id(), &accounts, 0, 0, 100).unwrap();
+        let tampered = batch.len() / 2;
+        batch.transactions[tampered].authorization[0].signature[0] ^= 0x01;
+
+        let expected: Vec<&Transaction> = batch
+            .transactions
+            .iter()
+            .filter(|transaction| {
+                let Some(policy) = accounts
+                    .iter()
+                    .find(|account| account.address.as_slice() == transaction.sender.as_slice())
+                    .map(|account| &account.policy)
+                else {
+                    return false;
+                };
+                transaction.verify(policy, NOW).is_ok()
+            })
+            .collect();
+        let (actual, rejected) = authorize_chunk(&batch.transactions, &accounts);
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            rejected.iter().map(|(_, count)| *count).sum::<usize>(),
+            batch.len() - expected.len()
+        );
     }
 }
