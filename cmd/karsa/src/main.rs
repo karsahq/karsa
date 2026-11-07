@@ -288,6 +288,13 @@ enum Command {
         /// Extra archive nodes: they store everything and never sign.
         #[arg(long, default_value_t = 0)]
         archives: usize,
+        /// Run exactly this validator in this process, one process per validator.
+        ///
+        /// Requires `--archives 0`: an archive has no consensus role, and this mode
+        /// exists to put each signing node in its own process instead of sharing one
+        /// runtime. Every process must be given the same committee and port base.
+        #[arg(long)]
+        node_index: Option<usize>,
         /// Persist vertices and batches here, one subdirectory per node.
         #[arg(long)]
         store: Option<std::path::PathBuf>,
@@ -446,6 +453,7 @@ fn main() -> ExitCode {
             txs,
             execute,
             archives,
+            node_index,
             store,
             shard,
             drain_ms,
@@ -464,6 +472,7 @@ fn main() -> ExitCode {
             txs,
             execute,
             archives,
+            node_index,
             store: store.unwrap_or_default(),
             shard,
             drain: std::time::Duration::from_millis(drain_ms),

@@ -22,8 +22,10 @@
 //!
 //! # What it does not measure
 //!
-//! All nodes are in one process on one machine, so the numbers describe the wire
-//! and the runtime, not independent operators. There is no encryption, no
+//! The default mesh puts all nodes in one process on one machine, so the numbers
+//! describe the wire and the runtime, not independent operators. `--node-index`
+//! moves one validator into each process, which adds a real scheduler boundary
+//! but still leaves every node on the same machine. There is no encryption, no
 //! retransmission timer beyond the want sweep, and no peer discovery: the mesh is
 //! fixed by `--validators`. A link opens with a hello naming the chain, so two
 //! genesis hashes never get as far as exchanging a vertex.
@@ -110,6 +112,13 @@ pub struct Config {
     /// vertex and batch, and produces no vertex of its own. Its presence also makes
     /// the role rule executable rather than a comment in a config file.
     pub archives: usize,
+    /// Run exactly this validator in this process instead of the whole committee.
+    ///
+    /// `None` keeps the single-process mesh, where every node shares one runtime.
+    /// `Some(index)` makes this process one validator: it binds `port_base + index`,
+    /// advertises the same chain identity, and serves peers until `timeout` expires
+    /// rather than stopping at a local drain.
+    pub node_index: Option<usize>,
     /// Apply committed batches into an account state and print its root.
     pub execute: bool,
     /// Directory to persist into, one subdirectory per node. Empty keeps everything
@@ -159,6 +168,9 @@ struct NodeResult {
     index: usize,
     signs: bool,
     authored: usize,
+    first_author_ms: Option<u64>,
+    last_author_ms: Option<u64>,
+    complete: bool,
     received: usize,
     dropped: u64,
     wanted: u64,
@@ -576,6 +588,8 @@ async fn node_task(
     let mut ticks: u32 = 0;
     let mut cursor: u64 = 1;
     let mut announced = false;
+    let mut first_author_ms: Option<u64> = None;
+    let mut last_author_ms: Option<u64> = None;
     let mut profile = Profile::default();
     let mut exec_announced = false;
     let mut last_order = 0usize;
@@ -583,7 +597,19 @@ async fn node_task(
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let now = || u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    // A single-process mesh shares one clock, so a frame's local timestamp is
+    // enough. One process per validator does not: each process has its own
+    // `Instant` epoch, and subtracting two epochs would measure nothing. Node
+    // mode therefore stamps frames on the Unix clock, which every process on
+    // this machine shares.
+    let absolute_clock = config.node_index.is_some();
+    let now = move || {
+        if absolute_clock {
+            unix_nanos()
+        } else {
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        }
+    };
 
     loop {
         tokio::select! {
@@ -696,6 +722,9 @@ async fn node_task(
                     profile.author += author_start.elapsed();
                     match author {
                         Ok(Some(vertex)) => {
+                            let authored_at = unix_millis();
+                            first_author_ms.get_or_insert(authored_at);
+                            last_author_ms = Some(authored_at);
                             if let Some(store) = &store {
                                 let store_start = Instant::now();
                                 store
@@ -890,6 +919,9 @@ async fn node_task(
         index,
         signs: true,
         authored: node.authored(),
+        first_author_ms,
+        last_author_ms,
+        complete: node.round() > config.rounds,
         received,
         dropped,
         wanted: wanted_total,
@@ -1037,6 +1069,9 @@ async fn archive_task(
         index,
         signs: false,
         authored: 0,
+        first_author_ms: None,
+        last_author_ms: None,
+        complete: false,
         received,
         dropped: 0,
         wanted: 0,
@@ -1147,6 +1182,228 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn unix_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Runs one validator in this process and prints a machine-readable result line.
+///
+/// The committee is still `config.validators` wide, but this process owns exactly
+/// one member. Authoring stops after `config.rounds`; the process then keeps serving
+/// peers until `config.timeout` expires, so no listener closes while a slower peer
+/// is still committing.
+fn run_one_node(
+    runtime: tokio::runtime::Runtime,
+    config: Config,
+    index: usize,
+    committee: chain::Membership,
+    chain_id: Vec<u8>,
+    mut prebuilt: Vec<Vec<Option<Batch>>>,
+) -> Result<(), Box<dyn Error>> {
+    let validators = config.validators;
+    let rounds = config.rounds;
+    let txs = config.txs;
+    let timeout = config.timeout;
+    let execute = config.execute;
+    let show_profile = config.profile;
+    let prebuilt = prebuilt.pop();
+    let port = u32::from(config.port_base) + u32::try_from(index).unwrap_or(0);
+    let lifetime = millis(u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX));
+
+    println!("== Live node {index} of {validators} (one process per validator) ==");
+    println!(
+        "  listening on 127.0.0.1:{port}, {} rounds each, lifetime {lifetime}",
+        rounds
+    );
+
+    let (result, authoring): (NodeResult, Option<Duration>) = runtime.block_on(async move {
+        let started = Instant::now();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (ready_tx, mut ready_rx) = mpsc::channel(1);
+        let (executed_tx, mut executed_rx) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            node_task(
+                index,
+                &config,
+                committee,
+                chain_id,
+                Start { started, prebuilt },
+                shutdown_rx,
+                Notify {
+                    ready: ready_tx,
+                    executed: executed_tx,
+                },
+            )
+            .await
+        });
+
+        let mut authoring = None;
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        tokio::select! {
+            _ = ready_rx.recv() => {
+                authoring = Some(started.elapsed());
+            }
+            _ = &mut deadline => {}
+        }
+        if execute {
+            tokio::select! {
+                _ = executed_rx.recv() => {}
+                _ = &mut deadline => {}
+            }
+        }
+        // Stay on the wire until the shared lifetime ends. An early finisher that
+        // closed its listener would strand the peers still authoring.
+        (&mut deadline).await;
+        let _ = shutdown_tx.send(true);
+        let result = match task.await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => return Err(error.into()),
+            Err(error) => return Err(format!("node {index} failed: {error}").into()),
+        };
+        Ok::<_, Box<dyn Error>>((result, authoring))
+    })?;
+
+    println!();
+    println!(
+        "  node val-{index}: authored {}, committed {}, applied {} tx, rejected {}",
+        result.authored, result.committed, result.applied, result.exec_rejected
+    );
+    if let Some(authoring) = authoring {
+        println!(
+            "  finished          authoring after {} (including startup)",
+            millis(u64::try_from(authoring.as_nanos()).unwrap_or(u64::MAX))
+        );
+    }
+    match (result.first_author_ms, result.last_author_ms) {
+        (Some(first), Some(last)) => {
+            let span = last.saturating_sub(first);
+            let seconds = span as f64 / 1e3;
+            let rounds_per_second = if seconds > 0.0 {
+                result.authored as f64 / seconds
+            } else {
+                0.0
+            };
+            println!(
+                "  authoring window  {span} ms for {} authored rounds ({rounds_per_second:.1} rounds/s), \
+                 first vertex {first} ms, last {last} ms (unix)",
+                result.authored
+            );
+        }
+        _ => println!("  authoring window  no vertex was authored"),
+    }
+    let mut latencies = result.latencies.clone();
+    latencies.sort_unstable();
+    println!(
+        "  delivery latency  p50 {}  p90 {}  p99 {}  max {}  ({} frames received here)",
+        millis(percentile(&latencies, 50)),
+        millis(percentile(&latencies, 90)),
+        millis(percentile(&latencies, 99)),
+        millis(percentile(&latencies, 100)),
+        latencies.len()
+    );
+    if result.disk_bytes > 0 {
+        let per_tx = if result.transactions == 0 {
+            0.0
+        } else {
+            result.disk_bytes as f64 / result.transactions as f64
+        };
+        println!(
+            "  storage           {} on disk for this validator, {per_tx:.0} B per transaction held",
+            human(result.disk_bytes)
+        );
+    }
+    if show_profile {
+        let total = result.profile.sign
+            + result.profile.author
+            + result.profile.commit
+            + result.profile.verify
+            + result.profile.state
+            + result.profile.frame
+            + result.profile.store;
+        let ms = |duration: Duration| duration.as_secs_f64() * 1e3;
+        let pct = |duration: Duration| {
+            if total.is_zero() {
+                0.0
+            } else {
+                duration.as_secs_f64() / total.as_secs_f64() * 100.0
+            }
+        };
+        println!();
+        println!("  profile           this validator, share of named stages");
+        for (name, duration) in [
+            ("sign batch", result.profile.sign),
+            ("author vertex", result.profile.author),
+            ("commit tick", result.profile.commit),
+            ("verify tx", result.profile.verify),
+            ("apply state", result.profile.state),
+            ("frame payload", result.profile.frame),
+            ("store write", result.profile.store),
+        ] {
+            println!(
+                "    {:<16} {:>9.2} ms  {:>5.1}%",
+                name,
+                ms(duration),
+                pct(duration)
+            );
+        }
+        println!("    {:<16} {:>9.2} ms", "named total", ms(total));
+    }
+    let state_root = match &result.state_root {
+        Some(root) => hex::encode(root),
+        None => String::from("-"),
+    };
+    println!(
+        "  result node={index} validators={validators} rounds={rounds} txs={txs} \
+         complete={} authored={} committed={} applied_tx={} rejected={} missing_payloads={} \
+         first_author_ms={} last_author_ms={} commit_root={} state_root={state_root} \
+         disk_bytes={}",
+        u8::from(result.complete),
+        result.authored,
+        result.committed,
+        result.applied,
+        result.exec_rejected,
+        result.missing_payloads,
+        result
+            .first_author_ms
+            .map_or_else(|| String::from("-"), |value| value.to_string()),
+        result
+            .last_author_ms
+            .map_or_else(|| String::from("-"), |value| value.to_string()),
+        hex::encode(result.commit_root),
+        result.disk_bytes,
+    );
+
+    if !result.complete {
+        return Err(format!("node {index} did not finish authoring within {lifetime}").into());
+    }
+    if result.missing_payloads > 0 {
+        return Err(format!(
+            "node {index} names {} batches it does not hold",
+            result.missing_payloads
+        )
+        .into());
+    }
+    if execute && txs > 0 && result.applied < result.committed {
+        return Err(format!(
+            "node {index} applied {} of {} committed batches before the lifetime ended",
+            result.applied, result.committed
+        )
+        .into());
+    }
+    Ok(())
+}
+
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     if config.validators < 2 {
         return Err("a live run needs at least two nodes".into());
@@ -1154,6 +1411,18 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let total = config.validators + config.archives;
     if total > 64 {
         return Err("at most 64 nodes: this is a loopback mesh, not a network".into());
+    }
+    if let Some(index) = config.node_index {
+        if index >= config.validators {
+            return Err(format!(
+                "--node-index {index} is outside 0..{} validators",
+                config.validators
+            )
+            .into());
+        }
+        if config.archives > 0 {
+            return Err("--node-index runs one validator per process; --archives must be 0".into());
+        }
     }
 
     // The genesis hash is the chain identity vertices are signed over (D29). An
@@ -1176,8 +1445,12 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         let rounds = usize::try_from(config.rounds)
             .unwrap_or(usize::MAX)
             .saturating_add(1);
-        let mut all = Vec::with_capacity(config.validators);
-        for index in 0..config.validators {
+        let indices: Vec<usize> = match config.node_index {
+            Some(index) => vec![index],
+            None => (0..config.validators).collect(),
+        };
+        let mut all = Vec::with_capacity(indices.len());
+        for index in indices {
             let mut batches = Vec::with_capacity(rounds);
             for round in 0..=config.rounds {
                 batches.push(Some(chain::demo_batch(
@@ -1198,6 +1471,10 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+
+    if let Some(index) = config.node_index {
+        return run_one_node(runtime, config, index, committee, chain_id, prebuilt);
+    }
 
     let results = runtime.block_on(async {
         let started = Instant::now();
@@ -1341,6 +1618,34 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             config.rounds + 1,
             authoring.as_secs_f64() * 1e3 / (config.rounds + 1) as f64
         );
+    }
+    // The same first-vertex-to-last-vertex window the one-process-per-validator
+    // report uses, so the two modes can be compared without one charging the
+    // last round's commit and apply to the other's numerator.
+    let first_author = results
+        .iter()
+        .filter(|result| result.signs)
+        .filter_map(|result| result.first_author_ms)
+        .min();
+    let last_author = results
+        .iter()
+        .filter(|result| result.signs)
+        .filter_map(|result| result.last_author_ms)
+        .max();
+    if let (Some(first), Some(last)) = (first_author, last_author) {
+        let span = last.saturating_sub(first);
+        let authored_txs: u64 = results
+            .iter()
+            .filter(|result| result.signs)
+            .map(|result| result.authored as u64 * config.txs)
+            .sum();
+        if span > 0 && authored_txs > 0 {
+            let tps = authored_txs as f64 * 1e3 / span as f64;
+            println!(
+                "  authoring window: {span} ms for {authored_txs} authored transactions \
+                 ({tps:.0} tx/s, first vertex to last, all nodes)"
+            );
+        }
     }
     println!();
     println!(
@@ -1749,5 +2054,42 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error, "peer sent data before its hello");
+    }
+
+    fn node_mode_config(validators: usize, node_index: Option<usize>) -> Config {
+        Config {
+            validators,
+            port_base: 0,
+            rounds: 0,
+            slow_ms: 0,
+            timeout: Duration::from_secs(1),
+            queue: 1,
+            send_buffer: 0,
+            txs: 0,
+            archives: 0,
+            node_index,
+            execute: false,
+            store: PathBuf::new(),
+            shard: false,
+            drain: Duration::ZERO,
+            home: None,
+            profile: false,
+            pre_sign: false,
+            verify_threads: 1,
+        }
+    }
+
+    #[test]
+    fn one_process_per_validator_refuses_archives() {
+        let mut config = node_mode_config(2, Some(0));
+        config.archives = 1;
+        let error = run(config).unwrap_err().to_string();
+        assert!(error.contains("--archives must be 0"), "{error}");
+    }
+
+    #[test]
+    fn one_process_per_validator_refuses_an_index_outside_the_committee() {
+        let error = run(node_mode_config(2, Some(2))).unwrap_err().to_string();
+        assert!(error.contains("outside 0..2"), "{error}");
     }
 }
