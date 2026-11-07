@@ -433,7 +433,10 @@ impl Dag {
     /// Propagates [`tally_votes`].
     pub fn can_still_anchor(&self, round: u64) -> Result<bool, CryptoError> {
         let Some(leader) = self.leader(round) else {
-            return Ok(false);
+            // The leader's vertex is missing, not disproved. It may still arrive,
+            // and a held vote already names its id, so the conservative answer is
+            // "possible": the caller keeps waiting instead of passing the round.
+            return Ok(true);
         };
         let leader_id = leader.id()?;
         let candidates: Vec<Vertex> = self
@@ -1375,6 +1378,54 @@ mod tests {
                 .dag
                 .history_contains_author(&anchor, LEADER_ROUND + 9, b"val-0")
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_missing_leader_may_still_anchor() {
+        let mut fixture = fixture(4);
+        fixture.full_round(0, &[]).unwrap();
+        let genesis = fixture.ids(0);
+        let leader = fixture.leader_index(LEADER_ROUND);
+
+        // The leader's vertex is signed but deliberately not inserted.
+        let missing_id = vertex(&fixture, leader, LEADER_ROUND, genesis.clone())
+            .id()
+            .unwrap();
+        for author in 0..4 {
+            if author == leader {
+                continue;
+            }
+            let vertex = vertex(&fixture, author, LEADER_ROUND, genesis.clone());
+            fixture.dag.insert(vertex).unwrap();
+        }
+
+        // Round-2 votes reference the missing leader by id, so a quorum for round 1
+        // is still possible even though this node does not hold the leader's vertex.
+        let mut references = fixture.ids(LEADER_ROUND);
+        references.push(missing_id);
+        fixture.full_round(LEADER_ROUND + 1, &references).unwrap();
+
+        assert!(
+            fixture.dag.can_still_anchor(LEADER_ROUND).unwrap(),
+            "a missing leader with held votes can still anchor"
+        );
+    }
+
+    #[test]
+    fn an_impossible_quorum_cannot_anchor() {
+        let mut fixture = bootstrapped(4);
+        // Two held round-2 vertices that do not vote for the round-1 leader. Two
+        // votes are missing, so even if both arrive, three voters cannot exist.
+        let without_leader = fixture.ids_without_leader(LEADER_ROUND);
+        for author in 0..2 {
+            let vertex = vertex(&fixture, author, LEADER_ROUND + 1, without_leader.clone());
+            fixture.dag.insert(vertex).unwrap();
+        }
+
+        assert!(
+            !fixture.dag.can_still_anchor(LEADER_ROUND).unwrap(),
+            "two held non-votes plus two missing votes cannot reach three"
         );
     }
 }
