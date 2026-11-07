@@ -174,7 +174,14 @@ which are still open.
   applied cursor to catch up with the commit cursor before reporting. `--store DIR`
   persists every vertex and batch through `crates/store`, so the bytes-per-day
   figure is measured from files rather than modelled. `--archives N` adds archive
-  nodes: they receive everything, store everything, and never sign.
+  nodes: they receive everything, store everything, and never sign. `--profile`
+  prints the time each validator spent per named stage of the node loop — sign
+  batch, author vertex, commit tick, verify tx, apply state, frame payload, store
+  write — as a share of the named total. `--pre-sign` (with `--txs`) signs every
+  batch before the measured window, so client signing is not charged to chain
+  throughput. `--verify-threads N` (with `--execute`) splits one batch across N
+  verifier threads; the default 1 keeps the serial path, and batches under 64
+  transactions stay serial either way.
 - `karsa finality`: the client-side metric `live` cannot produce. A closed-loop
   client submits a signed batch to validator 0; a vertex names it, the same
   pacemaker decides it, and the commit is written into a header that the
