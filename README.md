@@ -181,7 +181,14 @@ which are still open.
   batch before the measured window, so client signing is not charged to chain
   throughput. `--verify-threads N` (with `--execute`) splits one batch across N
   verifier threads; the default 1 keeps the serial path, and batches under 64
-  transactions stay serial either way.
+  transactions stay serial either way. `--node-index N` instead runs exactly one
+  validator in this process: it binds `port_base + N`, requires `--archives 0`, and
+  treats `--timeout` as a shared lifetime, so the process keeps serving peers after
+  its own rounds are authored. `scripts/live-multiprocess.sh` starts the committee,
+  divides the logical CPUs between processes, compares every process's commit and
+  state roots, and reports throughput over the union authoring window; set
+  `VERIFY_THREADS` explicitly, because its default of 1 is not a fair per-process
+  configuration on a 16-thread machine (finding 26).
 - `karsa finality`: the client-side metric `live` cannot produce. A closed-loop
   client submits a signed batch to validator 0; a vertex names it, the same
   pacemaker decides it, and the commit is written into a header that the
@@ -510,6 +517,39 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     oversubscribe. Verification is still 94% of the named stages, so the next lever
     is cheaper per-transaction work or fewer nodes doing it, not overlapping it with
     the 6% that remains.
+26. **One process per validator is a scheduler boundary, not a throughput lever.**
+    `--node-index` puts one validator in each process, which removes the shared
+    runtime but not the work: every validator still executes every committed batch.
+    On 4 validators, 1,000 tx per batch, `--execute --pre-sign`, 20 rounds (84,000
+    chain-unique transactions), median of 3 on the AMD Ryzen 7 6800U (8 cores / 16
+    threads), one process with 4 verifier threads authored 74.7k tx/s; four
+    processes with four workers and one verifier thread authored 20.3k tx/s. That
+    20.3k is configuration, not a verdict on the boundary: the same four processes
+    with four verifier threads authored 40.6k tx/s, and one 4,000 tx/batch run with
+    4 threads reached 103.8k against an 88.4k single-process median. So the residue
+    at 1,000 tx/batch is batch-size and thread-budget dependent, not a fixed penalty.
+    Without `--execute`, four processes finish 21 rounds in 146–159 ms with delivery
+    p50 5–9 ms and p99 ≤ 23 ms, so the sockets are healthy; `verify tx` is 89–94% of
+    the named stages. On the Intel i7-4790K (4 cores / 8 threads), the same 1,000
+    tx/batch configuration with one verifier thread per process was 49.3k against
+    46.9k in one process at 4 verifier threads, which points at the thread budget
+    rather than the boundary itself. Adding validators does not add unique
+    throughput: 10 validators with one worker each authored 23.4k tx/s aggregate and
+    each node applied about 20.1k tx/s, which is the per-node verification ceiling.
+    The levers are batch verification (finding 25), verifier threads, and batch
+    size; the process boundary is how those are measured, not a lever of its own.
+27. **Finality is 125–225 ms p50 submit → certified, with a ~1.6 ms commit →
+    certificate gap.** On 4 validators over `mpsc` links with injected one-way
+    delay and 0–5 ms jitter, 100 samples, 3 runs (median), at 25 ms one-way delay:
+    submit → certified p50 125.6 ms, p95 189.9, p99 219.5; at 50 ms: p50 224.6,
+    p95 339.6, p99 390.7. Commit → certificate is p50 1.6 ms at both delays, and
+    rounds to finality are p50 2 / p95 3 / p99 4 at 25 ms and p50 2 / p95 3 / p99 3
+    at 50 ms. All 100 samples finalized on every node and certified on the submitter
+    in all six runs; order, state, and header agreement held with 0 conflicts
+    (433/437/437 commits at 25 ms and 423/420/425 at 50 ms). This is preliminary:
+    four validators on loopback with injected delay, not a WAN, not under load, not
+    a large committee. The comparison to Sui (~400–700 ms) and IOTA (seconds) is
+    submit → certified, not block time.
 
 ## Build order
 
