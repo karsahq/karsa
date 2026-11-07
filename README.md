@@ -497,6 +497,19 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     directory against another genesis is refused with `store belongs to chain …`
     rather than producing a different root. Still to do: a peer handshake that
     compares hashes between nodes.
+25. **Batch verification moves the execution bottleneck, and the best thread count
+    moves with it.** Authorization now batch-verifies the single-authorization
+    Ed25519 cases with one `verify_ed25519_batch` per verifier chunk and applies
+    the authorized transactions by reference instead of cloning them; if the batch
+    equation fails it falls back to the per-transaction path, so a bad signature is
+    still attributed to its own transaction. On 4 validators, 1,000 tx per batch,
+    `--execute --pre-sign`, 20 rounds (84,000 chain-unique transactions), median of
+    3 on the same 8C/16T machine: 36.3k tx/s before at 8 verifier threads, 64.9k
+    after. After batching, 4 threads gave 73.5k, 8 gave 64.9k, and 16 gave 61.9k —
+    four nodes × four threads fill the 16 hardware threads exactly, while 8 and 16
+    oversubscribe. Verification is still 94% of the named stages, so the next lever
+    is cheaper per-transaction work or fewer nodes doing it, not overlapping it with
+    the 6% that remains.
 
 ## Build order
 
