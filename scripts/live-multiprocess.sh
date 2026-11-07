@@ -17,8 +17,6 @@ ROUNDS=${2:-20}
 TXS=${3:-1000}
 PORT_BASE=${4:-7100}
 TIMEOUT=${5:-20}
-# How many threads one batch of signatures is verified on inside each process.
-VERIFY_THREADS=${VERIFY_THREADS:-1}
 # One process per validator shares the machine, so divide the logical CPUs
 # between them. A real deployment gives each validator its own machine; this
 # keeps the benchmark from oversubscribing one. Override with WORKERS=N.
@@ -30,6 +28,10 @@ WORKERS=${WORKERS:-$(( (CPUS + VALIDATORS - 1) / VALIDATORS ))}
 if [ "$WORKERS" -lt 1 ]; then
     WORKERS=1
 fi
+# Verifier threads are the throughput lever, not the process boundary: default
+# one per CPU slice the process got, and let VERIFY_THREADS override it. A value
+# of 1 still reproduces the old serial-per-process configuration.
+VERIFY_THREADS=${VERIFY_THREADS:-$WORKERS}
 BIN=${BIN:-target/release/karsa}
 OUT=${OUT:-/tmp/karsa-live-multiprocess}
 

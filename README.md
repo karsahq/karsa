@@ -186,9 +186,10 @@ which are still open.
   treats `--timeout` as a shared lifetime, so the process keeps serving peers after
   its own rounds are authored. `scripts/live-multiprocess.sh` starts the committee,
   divides the logical CPUs between processes, compares every process's commit and
-  state roots, and reports throughput over the union authoring window; set
-  `VERIFY_THREADS` explicitly, because its default of 1 is not a fair per-process
-  configuration on a 16-thread machine (finding 26).
+  state roots, and reports throughput over the union authoring window. Its
+  `VERIFY_THREADS` default follows the per-process CPU slice, because verifier
+  threads are the leverage, not the process boundary (finding 26); set
+  `VERIFY_THREADS=1` only to reproduce the old serial configuration.
 - `karsa finality`: the client-side metric `live` cannot produce. A closed-loop
   client submits a signed batch to validator 0; a vertex names it, the same
   pacemaker decides it, and the commit is written into a header that the
