@@ -530,7 +530,14 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     authored 35.9k and 41.1k. Across the whole matrix one process per validator
     stayed at 82–93% of the single-process control and never above it. Verifier
     threads are a 2.1–2.4× lever; the process boundary is not. Batch 1,000 → 4,000
-    adds 10–16% at 4 threads and 14–28% at one.
+    adds 10–16% at 4 threads and 14–28% at one. Batch size stops at 4,096
+    transactions (`MAX_BATCH_TRANSACTIONS`), so the 1,000 → 4,000 gain is the end of
+    that lever. A second session put four workers per process at 64.3k and one
+    worker at 62.1k against a 68.9k single-process control in the same session —
+    93% and 90%, a 3.5% difference — so worker count does not move the ratio. The
+    absolute TPS in that session was 18–22% below the earlier idle matrix for both
+    modes; the ratio, not the absolute number, is the stable result, and ratios
+    need a same-session control.
     Without `--execute`, four processes finish 21 rounds in 146–159 ms with delivery
     p50 5–9 ms and p99 ≤ 23 ms, so the sockets are healthy; with execution, delivery
     p50 rises to 27–142 ms at 1,000 tx/batch and 198–508 ms at 4,000, depending on
@@ -543,18 +550,20 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     must name the verifier-thread count and the load: a first session measured 20.3k
     and 40.6k and one 103.8k run; the idle matrix supersedes those and rejects the
     103.8k as an outlier.
-27. **Finality is 125–225 ms p50 submit → certified, with a ~1.6 ms commit →
+27. **Finality is 124–224 ms p50 submit → certified, with a ~1.1–1.3 ms commit →
     certificate gap.** On 4 validators over `mpsc` links with injected one-way
     delay and 0–5 ms jitter, 100 samples, 3 runs (median), at 25 ms one-way delay:
-    submit → certified p50 125.6 ms, p95 189.9, p99 219.5; at 50 ms: p50 224.6,
-    p95 339.6, p99 390.7. Commit → certificate is p50 1.6 ms at both delays, and
-    rounds to finality are p50 2 / p95 3 / p99 4 at 25 ms and p50 2 / p95 3 / p99 3
-    at 50 ms. All 100 samples finalized on every node and certified on the submitter
-    in all six runs; order, state, and header agreement held with 0 conflicts
-    (433/437/437 commits at 25 ms and 423/420/425 at 50 ms). This is preliminary:
-    four validators on loopback with injected delay, not a WAN, not an idle machine,
-    not a large committee. The comparison to Sui (~400–700 ms) and IOTA (seconds) is
-    submit → certified, not block time.
+    submit → certified p50 124.1 ms, p95 210.7, p99 218.4, max 242.3; at 50 ms:
+    p50 224.3, p95 339.5, p99 394.6, max 446.2. Commit → certificate is p50 1.1 ms
+    at 25 ms and 1.3 ms at 50 ms; rounds to finality are p50 2 / p95 3 / p99 3 /
+    max 3 at both delays. All 100 samples finalized on every node and certified on
+    the submitter in all six runs; order, state, and header agreement held with 0
+    conflicts (435/440/436 commits at 25 ms and 413/420/421 at 50 ms). Across
+    sessions with load 0.75–4.8, p50 did not move (125.6 → 124.1 ms and 224.6 →
+    224.3 ms), so the earlier numbers were within noise; tail latencies vary run to
+    run. This is measured on four validators on loopback with injected delay, not a
+    WAN and not a large committee. The comparison to Sui (~400–700 ms) and IOTA
+    (seconds) is submit → certified, not block time.
 
 ## Build order
 
