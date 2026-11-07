@@ -571,6 +571,33 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     run. This is measured on four validators on loopback with injected delay, not a
     WAN and not a large committee. The comparison to Sui (~400–700 ms) and IOTA
     (seconds) is submit → certified, not block time.
+28. **Committee size moves the finality tail more than the median.** On the same
+    in-process `mpsc` mesh, 4 → 10 validators with injected one-way delay and
+    0–5 ms jitter, 100 samples, 1 tx/batch, 3 runs (median), against a same-session
+    4-validator control: at 25 ms one-way, submit → certified p50 moved
+    124.7 → 136.8 ms (+9.7%), p95 192.3 → 240.3 (+25.0%), p99 231.9 → 262.6
+    (+13.2%); at 50 ms, p50 225.2 → 235.5 (+4.6%), p95 340.6 → 430.7 (+26.4%),
+    p99 392.0 → 487.2 (+24.3%). Commit → certificate moved 1.65 → 2.86 ms p50 and
+    4.50 → 18.27 p95 at 25 ms, and 2.16 → 3.08 / 4.36 → 19.67 at 50 ms — a 4–5×
+    tail. Rounds to finality stayed p50 2 / p95 3 at both delays (p99 4 at n=10),
+    leader p50 1, non-leader p50 2. All six n=10 runs finalized 100 of 100 samples
+    on every node and certified them on the submitter; order, state, and header
+    agreement held with 0 conflicts (1,170/1,119/1,109 commits at 25 ms and
+    1,096/1,061/1,078 at 50 ms). Two end-of-run artifacts are not failures: at
+    25 ms run 1 three nodes ended one header ahead (106/117 vs 105/116), and at
+    25 ms run 2 nine nodes had 102 headers but 99 certified; all samples still
+    finalized. The control stayed within 10% of the earlier n=4 baseline (124.7
+    vs 124.1 ms p50 at 25 ms; 225.2 vs 224.3 at 50 ms), so the comparison is
+    same-session. Both steps carry the tail: submit → commit p95 rose 17.7% and
+    20.9% while commit → certificate p95 rose 4.0–4.5×, from 4.5/4.4 ms to
+    18.3/19.7 ms, so the certificate step's relative growth is the largest but
+    contributes only 14–15 ms of the 48/90 ms submit → certified p95 increase.
+    Rounds do not change, so the median moves 5–10% and the tail 13–26%; this run
+    does not separate quorum-signature collection, certificate verification, and
+    scheduling of ten in-process tasks, so the mechanism remains an
+    interpretation. Still one process on one 16-thread machine, 1 tx/batch,
+    injected delay, n=10 — not a WAN, not one process per validator, and not a
+    committee above 10.
 
 ## Build order
 
