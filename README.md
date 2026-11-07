@@ -549,7 +549,14 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     the process boundary is how those are measured, not a lever of its own. Numbers
     must name the verifier-thread count and the load: a first session measured 20.3k
     and 40.6k and one 103.8k run; the idle matrix supersedes those and rejects the
-    103.8k as an outlier.
+    103.8k as an outlier. The chain spends n× the verification work for one unique
+    stream. On the 4C/8T desktop, four validators at 46.9k tx/s each verify 187.5k
+    tx/s in total, about twice the machine's raw serial Ed25519 ceiling of 91.7k
+    tx/s at eight threads; batch verification is that ~2× factor and it is already
+    on, and the curve25519 SIMD backend is selected automatically on x86-64. The
+    next lever is therefore not a cheaper verifier but fewer validators verifying
+    every transaction — threshold, BLS, or probabilistic verification — which
+    changes the trust model and is a protocol decision, not a tuning knob.
 27. **Finality is 124–224 ms p50 submit → certified, with a ~1.1–1.3 ms commit →
     certificate gap.** On 4 validators over `mpsc` links with injected one-way
     delay and 0–5 ms jitter, 100 samples, 3 runs (median), at 25 ms one-way delay:
