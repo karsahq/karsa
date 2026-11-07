@@ -571,33 +571,38 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     run. This is measured on four validators on loopback with injected delay, not a
     WAN and not a large committee. The comparison to Sui (~400–700 ms) and IOTA
     (seconds) is submit → certified, not block time.
-28. **Committee size moves the finality tail more than the median.** On the same
-    in-process `mpsc` mesh, 4 → 10 validators with injected one-way delay and
-    0–5 ms jitter, 100 samples, 1 tx/batch, 3 runs (median), against a same-session
-    4-validator control: at 25 ms one-way, submit → certified p50 moved
-    124.7 → 136.8 ms (+9.7%), p95 192.3 → 240.3 (+25.0%), p99 231.9 → 262.6
-    (+13.2%); at 50 ms, p50 225.2 → 235.5 (+4.6%), p95 340.6 → 430.7 (+26.4%),
-    p99 392.0 → 487.2 (+24.3%). Commit → certificate moved 1.65 → 2.86 ms p50 and
-    4.50 → 18.27 p95 at 25 ms, and 2.16 → 3.08 / 4.36 → 19.67 at 50 ms — a 4–5×
-    tail. Rounds to finality stayed p50 2 / p95 3 at both delays (p99 4 at n=10),
-    leader p50 1, non-leader p50 2. All six n=10 runs finalized 100 of 100 samples
-    on every node and certified them on the submitter; order, state, and header
-    agreement held with 0 conflicts (1,170/1,119/1,109 commits at 25 ms and
-    1,096/1,061/1,078 at 50 ms). Two end-of-run artifacts are not failures: at
-    25 ms run 1 three nodes ended one header ahead (106/117 vs 105/116), and at
-    25 ms run 2 nine nodes had 102 headers but 99 certified; all samples still
-    finalized. The control stayed within 10% of the earlier n=4 baseline (124.7
-    vs 124.1 ms p50 at 25 ms; 225.2 vs 224.3 at 50 ms), so the comparison is
-    same-session. Both steps carry the tail: submit → commit p95 rose 17.7% and
-    20.9% while commit → certificate p95 rose 4.0–4.5×, from 4.5/4.4 ms to
-    18.3/19.7 ms, so the certificate step's relative growth is the largest but
-    contributes only 14–15 ms of the 48/90 ms submit → certified p95 increase.
-    Rounds do not change, so the median moves 5–10% and the tail 13–26%; this run
-    does not separate quorum-signature collection, certificate verification, and
-    scheduling of ten in-process tasks, so the mechanism remains an
-    interpretation. Still one process on one 16-thread machine, 1 tx/batch,
-    injected delay, n=10 — not a WAN, not one process per validator, and not a
-    committee above 10.
+28. **Certificate work grows with the committee, before any network delay.**
+    Zero-delay controls separate local cost from propagation. At n=10, submit →
+    commit p95 is 75.9 ms and commit → certificate p95 15.8 ms, against 18.0 and
+    3.4 ms at n=4 — 4.2× and 4.6× before any injected delay; submit → certified
+    p95 rises 20.6 → 89.4 ms (4.3×). At 25 ms one-way the same cells are 187.1 →
+    228.9, 5.0 → 20.2 and 191.5 → 240.8 ms: delay adds only ~4 ms to the n=10
+    certificate tail, so most of its growth is verification and scheduling of
+    more quorum signatures and more vertices per round, not waiting for the
+    network. With delay, the median moves modestly: submit → certified p50
+    125.4 → 139.1 ms (+11.0%) at 25 ms and 224.1 → 244.9 (+9.3%) at 50 ms; p95
+    moves 191.5 → 240.8 (+25.7%) at 25 ms but only 391.2 → 402.1 (+2.8%) at
+    50 ms, where the n=4 control itself carried a 391 ms p95, so the delayed tail
+    is not stable across sessions (an earlier single-run 50 ms control gave
+    +26.4%). Rounds stay p50 2 / p95 3–4; leader p50 1, non-leader p50 2. All
+    six n=10 runs finalized 100 of 100 samples on every node, certified them on
+    the submitter, and agreed with 0 conflicts and 0 rejected. Still one process
+    on one 16-thread machine, 1 tx/batch; the n=20/30 extension is finding 29.
+29. **The in-process mesh becomes a contention probe at 20–30 validators.**
+    Extending the probe to n=20 and n=30 (3 runs at each delay, same session):
+    submit → certified p50 rises 139.1 → 255.2 → 585.4 ms at 25 ms and 244.9 →
+    350.7 → 583.9 ms at 50 ms; p95 rises 240.8 → 534.3 → 1,876.9 and 402.1 →
+    832.7 → 1,862.7. The n=30 medians at the two delays are within 0.3%, but the
+    individual p50s span 488.5–631.6 and 510.3–595.9 ms, so that coincidence is
+    inside run noise. What is not noise is the load: 3.9 before the n=20 block,
+    9.2 after it, and 12.8 after n=30, on 8 cores / 16 threads; the first n=30
+    @25 run started at load 9.2 and reached p99 4,253 ms, against 2,530 and
+    2,146 ms for the next two. All 30 runs in the session finalized 100 of 100
+    samples on every node, certified them on the submitter, and agreed with
+    0 conflicts and 0 rejected, so correctness held while latency rose under
+    load. It is 20–30 validator tasks sharing one process and 16 hardware threads,
+    not 20–30 machines: the numbers are a probe, not a committee-scaling
+    prediction, and must not justify a protocol change in either direction.
 
 ## Build order
 
