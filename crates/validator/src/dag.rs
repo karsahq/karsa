@@ -421,6 +421,31 @@ impl Dag {
         missing
     }
 
+    /// Returns whether this node can still see a vote quorum for `round`'s
+    /// leader if every vertex it has not received turns out to vote for it.
+    ///
+    /// A round that cannot reach a quorum can never anchor, so an anchor ahead
+    /// of it is the lowest one that will ever exist and may be used without
+    /// waiting for it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`tally_votes`].
+    pub fn can_still_anchor(&self, round: u64) -> Result<bool, CryptoError> {
+        let Some(leader) = self.leader(round) else {
+            return Ok(false);
+        };
+        let leader_id = leader.id()?;
+        let candidates: Vec<Vertex> = self
+            .round_vertices(round + 1)
+            .into_iter()
+            .cloned()
+            .collect();
+        let voters = tally_votes(&self.set, &leader_id, &candidates, &self.schedule)?.len();
+        let missing = self.set.validators.len().saturating_sub(candidates.len());
+        Ok(voters.saturating_add(missing) >= self.set.quorum_size())
+    }
+
     /// Collects `id` and its ancestors that are not yet committed, in a
     /// deterministic order.
     fn commit_history(&mut self, id: &VertexId) -> Result<Vec<VertexId>, CryptoError> {

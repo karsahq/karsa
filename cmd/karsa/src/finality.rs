@@ -212,7 +212,7 @@ struct Validator {
     conflicts: usize,
     headers: usize,
     senders: Arc<Vec<mpsc::UnboundedSender<Inbound>>>,
-    finalized: Option<mpsc::UnboundedSender<[u8; 32]>>,
+    finalized: Option<mpsc::UnboundedSender<(usize, [u8; 32])>>,
     ack: Option<mpsc::UnboundedSender<u64>>,
     sequence: AtomicU64,
     started: Instant,
@@ -236,7 +236,7 @@ struct ValidatorTask {
     index: usize,
     context: Context,
     inbound: mpsc::UnboundedReceiver<Inbound>,
-    finalized: Option<mpsc::UnboundedSender<[u8; 32]>>,
+    finalized: Option<mpsc::UnboundedSender<(usize, [u8; 32])>>,
     ack: Option<mpsc::UnboundedSender<u64>>,
     shutdown: watch::Receiver<bool>,
 }
@@ -245,7 +245,7 @@ impl Validator {
     fn new(
         index: usize,
         context: &Context,
-        finalized: Option<mpsc::UnboundedSender<[u8; 32]>>,
+        finalized: Option<mpsc::UnboundedSender<(usize, [u8; 32])>>,
         ack: Option<mpsc::UnboundedSender<u64>>,
     ) -> Result<Self, String> {
         let committee = &context.committee;
@@ -494,7 +494,7 @@ impl Validator {
             }
             if self.certified.contains_key(&sample.header_height) {
                 self.notified.insert(sample.digest);
-                let _ = sender.send(sample.digest);
+                let _ = sender.send((self.index, sample.digest));
             }
         }
     }
@@ -837,7 +837,7 @@ async fn run_mesh(
             .ok_or("fewer inbound channels than validators")?;
         let shutdown = shutdown_rx.clone();
         let is_submitter = index == 0;
-        let finalized = is_submitter.then(|| final_tx.clone());
+        let finalized = Some(final_tx.clone());
         let ack = is_submitter.then(|| ack_tx.clone());
         tasks.push(tokio::spawn(validator_task(ValidatorTask {
             index,
@@ -858,15 +858,17 @@ async fn run_mesh(
         Arc::clone(&submissions),
     ));
 
-    let mut finalized = HashSet::new();
+    let mut finalized: Vec<HashSet<[u8; 32]>> = vec![HashSet::new(); config.validators];
     let deadline = tokio::time::sleep(config.timeout);
     tokio::pin!(deadline);
     let mut timed_out = false;
     loop {
         tokio::select! {
-            Some(digest) = final_rx.recv() => {
-                finalized.insert(digest);
-                if finalized.len() >= config.samples {
+            Some((index, digest)) = final_rx.recv() => {
+                if let Some(set) = finalized.get_mut(index) {
+                    set.insert(digest);
+                }
+                if finalized.iter().all(|set| set.len() >= config.samples) {
                     break;
                 }
             }
@@ -919,7 +921,7 @@ async fn run_mesh(
         submissions,
         results,
         elapsed: started.elapsed(),
-        finalized_on_submitter: finalized.len(),
+        finalized_on_submitter: finalized.first().map_or(0, HashSet::len),
         timed_out,
     })
 }
@@ -1200,18 +1202,20 @@ fn print(outcome: &Outcome) -> Result<(), Box<dyn Error>> {
     );
     if !leader.is_empty() {
         println!(
-            "    leader vertex        {} samples, rounds p50 {} p99 {} max {}",
+            "    leader vertex        {} samples, rounds p50 {} p95 {} p99 {} max {}",
             leader.len(),
             percentile(&leader, 50),
+            percentile(&leader, 95),
             percentile(&leader, 99),
             percentile(&leader, 100)
         );
     }
     if !non_leader.is_empty() {
         println!(
-            "    non-leader vertex    {} samples, rounds p50 {} p99 {} max {}",
+            "    non-leader vertex    {} samples, rounds p50 {} p95 {} p99 {} max {}",
             non_leader.len(),
             percentile(&non_leader, 50),
+            percentile(&non_leader, 95),
             percentile(&non_leader, 99),
             percentile(&non_leader, 100)
         );

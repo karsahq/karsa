@@ -393,10 +393,11 @@ impl Pacemaker {
     ///
     /// An anchor at round `a` probes every round `q` in `round + 2 .. a`. If `q`
     /// is already anchored it is not the lowest; that cannot happen because the
-    /// scan is ascending. If the anchor's history **proves** the leader of `q`
-    /// absent, the round can be passed over. Anything else — the leader is held
-    /// but its votes are not, or the anchor's walk reaches a vertex this node does
-    /// not hold — means the answer is unknown, so this node waits.
+    /// scan is ascending. A round can be passed over when the anchor proves its
+    /// leader absent, or when the leader is inside the anchor's history and no
+    /// vote quorum for `q` is possible any more (so `q` can never anchor). The
+    /// remaining case — the round may still anchor, or the walk is incomplete —
+    /// means the answer is unknown, so this node waits.
     ///
     /// Using a higher anchor while a lower one is still possible is what makes
     /// two nodes with the same final DAG commit the same vertices in different
@@ -414,12 +415,21 @@ impl Pacemaker {
                     continue;
                 };
                 match dag.history_contains_author(&anchor, between, author) {
-                    // Proved absent: this round can never anchor, so passing it
+                    // Proved absent from the anchor's history: passing the round
                     // cannot change the decision.
                     Ok(false) => {}
-                    // Present in the anchor's history, or the walk is incomplete:
-                    // the round may still anchor, so wait for that data.
-                    Ok(true) | Err(_) => return Ok(None),
+                    Ok(true) => {
+                        // The leader is already inside the higher anchor's history.
+                        // That is only a reason to wait while a vote quorum for the
+                        // round is still possible; if it is not, the round can never
+                        // anchor and the higher anchor is the canonical one.
+                        if dag.can_still_anchor(between)? {
+                            return Ok(None);
+                        }
+                    }
+                    // An incomplete walk proves nothing. Deciding anyway is how
+                    // the commit order starts to depend on arrival timing.
+                    Err(_) => return Ok(None),
                 }
             }
             return Ok(Some(anchor));
