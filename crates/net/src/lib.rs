@@ -238,6 +238,14 @@ impl Node {
             .iter()
             .any(|record| record.validator_id.as_slice() == self.id.as_slice())
         {
+            // A node outside the active set still has to track the DAG: its round
+            // only moves on authorship, so a validator added at a later epoch would
+            // otherwise stay at round 0 and never reach the epoch where it is a
+            // member. Jump to the round after the newest vertex this node holds; it
+            // starts authoring as soon as that round belongs to a set containing it.
+            if let Some(highest) = self.dag.highest_round() {
+                self.round = self.round.max(highest.saturating_add(1));
+            }
             return Ok(None);
         }
         let references = if round == 0 {

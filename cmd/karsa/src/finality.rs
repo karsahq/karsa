@@ -1520,6 +1520,10 @@ mod tests {
             "the old and new sets must end on the same state"
         );
         assert!(outcome.results.iter().all(|result| result.conflicts == 0));
+        assert!(
+            outcome.results[4].authored > 0,
+            "the added validator must author after the boundary"
+        );
     }
 
     #[test]
