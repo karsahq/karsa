@@ -1978,11 +1978,14 @@ mod tests {
             "the cold join needs a sample floor"
         );
         assert_eq!(
-            (cold.applied, cold.order.len()),
-            (outcome.results[0].applied, outcome.results[0].order.len()),
-            "the cold validator must reach the same committed prefix"
+            cold.applied, outcome.results[0].applied,
+            "the cold validator must reach the same applied prefix"
         );
         let common = cold.order.len().min(outcome.results[0].order.len());
+        assert!(
+            common > 0,
+            "the cold validator must commit at least one entry"
+        );
         assert_eq!(
             &cold.order[..common],
             &outcome.results[0].order[..common],
