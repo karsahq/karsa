@@ -44,7 +44,7 @@ use crypto::CryptoErrorKind;
 use crypto::scheme::Ed25519Scheme;
 use exec::State;
 use net::Node;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tx::batch::Batch;
 use validator::{
     Certificate, Header, HeaderChain, SetSchedule, Step, Vertex, bitmap_len, commit_root, set_bit,
@@ -98,6 +98,9 @@ pub struct Config {
     pub epoch_rounds: Option<u64>,
     /// Optional validator-set transition at an epoch boundary.
     pub change: Option<(SetChange, u64)>,
+    /// Start the added validator at the boundary from a replayed history instead
+    /// of running it passively from round 0.
+    pub cold_join: bool,
 }
 
 /// One client submission, as the client saw it.
@@ -118,6 +121,33 @@ struct CommittedSample {
     leader: bool,
 }
 
+/// The records a joining validator replays from genesis.
+#[derive(Clone, Debug, Default)]
+struct History {
+    vertices: BTreeMap<(u64, Vec<u8>), Vertex>,
+    batches: BTreeMap<[u8; 32], Batch>,
+    headers: BTreeMap<u64, (Header, Certificate)>,
+}
+
+/// What one cold join cost before the validator entered the live mesh.
+#[derive(Clone, Debug)]
+struct CatchUpReport {
+    elapsed_ns: u64,
+    bytes: u64,
+    rounds: u64,
+    vertices: usize,
+    batches: usize,
+    headers: usize,
+    replayed_commits: usize,
+}
+
+/// The history a joining validator starts with.
+#[derive(Clone, Debug)]
+struct ColdStart {
+    history: History,
+    joined_at: usize,
+}
+
 /// What one validator ended with.
 #[derive(Debug)]
 struct NodeResult {
@@ -134,6 +164,10 @@ struct NodeResult {
     applied: usize,
     rejected: usize,
     conflicts: usize,
+    /// Submissions before this index were already committed before the node
+    /// joined; they are replayed, not counted as live finality.
+    joined_at: Option<usize>,
+    catch_up: Option<CatchUpReport>,
 }
 
 /// Everything one run produced.
@@ -211,6 +245,11 @@ struct Validator {
     accounts: Vec<chain::Account>,
     state: State,
     batches: HashMap<[u8; 32], Batch>,
+    history: History,
+    history_built: BTreeMap<u64, Header>,
+    replaying: bool,
+    catch_up: Option<CatchUpReport>,
+    joined_at: Option<usize>,
     rejected: BTreeMap<&'static str, usize>,
     pending_batches: VecDeque<Batch>,
     pending_headers: VecDeque<PendingHeader>,
@@ -256,6 +295,9 @@ struct ValidatorTask {
     finalized: Option<mpsc::UnboundedSender<(usize, [u8; 32])>>,
     ack: Option<mpsc::UnboundedSender<u64>>,
     shutdown: watch::Receiver<bool>,
+    cold: Option<ColdStart>,
+    history_req: Option<mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<History>>>,
+    round_tx: Option<watch::Sender<u64>>,
 }
 
 impl Validator {
@@ -327,6 +369,11 @@ impl Validator {
             accounts,
             state,
             batches: HashMap::new(),
+            history: History::default(),
+            history_built: BTreeMap::new(),
+            replaying: false,
+            catch_up: None,
+            joined_at: None,
             rejected: BTreeMap::new(),
             pending_batches: VecDeque::new(),
             pending_headers: VecDeque::new(),
@@ -355,6 +402,118 @@ impl Validator {
 
     fn now(&self) -> u64 {
         u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    fn round(&self) -> u64 {
+        self.node.round()
+    }
+
+    fn history(&self) -> History {
+        self.history.clone()
+    }
+
+    /// Replays the records a joining validator received before it entered the
+    /// mesh. Every vertex and batch is verified by the same paths the live node
+    /// uses; the certified headers are checked from genesis, and the locally
+    /// rebuilt headers must match the peer's commitments.
+    fn catch_up(&mut self, cold: ColdStart) -> Result<(), String> {
+        let started = Instant::now();
+        let bytes = history_bytes(&cold.history)?;
+        self.joined_at = Some(cold.joined_at);
+        self.replaying = true;
+
+        for vertex in cold.history.vertices.values() {
+            self.node.receive(vertex.clone()).map_err(|error| {
+                format!(
+                    "validator {} cannot replay a vertex at round {}: {error}",
+                    self.index, vertex.round
+                )
+            })?;
+            self.history
+                .vertices
+                .insert((vertex.round, vertex.author.clone()), vertex.clone());
+        }
+        for (digest, batch) in &cold.history.batches {
+            self.history.batches.insert(*digest, batch.clone());
+            self.batches.insert(*digest, batch.clone());
+        }
+
+        loop {
+            let progress = self.decide()?;
+            self.apply();
+            self.build_ready_headers()?;
+            if !progress {
+                break;
+            }
+        }
+
+        for (height, (header, certificate)) in &cold.history.headers {
+            self.chain.advance(header, certificate).map_err(|error| {
+                format!(
+                    "validator {} cannot verify the certified header at height {height}: {error}",
+                    self.index
+                )
+            })?;
+            if let Some(local) = self.history_built.get(height) {
+                let local_id = local.id().map_err(|error| error.to_string())?;
+                let peer_id = header.id().map_err(|error| error.to_string())?;
+                if local_id != peer_id
+                    || local.state_root != header.state_root
+                    || local.dag_root != header.dag_root
+                    || local.applied != header.applied
+                {
+                    return Err(format!(
+                        "validator {} rebuilt a different header at height {height}",
+                        self.index
+                    ));
+                }
+            }
+            self.certified.insert(*height, 0);
+            self.certified_ids
+                .insert(*height, header.id().map_err(|error| error.to_string())?);
+        }
+
+        self.next_height = self
+            .history_built
+            .iter()
+            .next_back()
+            .map_or(self.chain.head().height + 1, |(_, header)| {
+                header.height + 1
+            });
+        self.last_built = self
+            .history_built
+            .iter()
+            .next_back()
+            .map_or_else(|| self.chain.head().clone(), |(_, header)| header.clone());
+        self.applied_cursor = self.order_len;
+        if u64::try_from(self.applied).unwrap_or(u64::MAX) != self.last_built.applied {
+            return Err(format!(
+                "validator {} replayed {} transactions but the last header says {}",
+                self.index, self.applied, self.last_built.applied
+            ));
+        }
+
+        self.committed.clear();
+        self.notified.clear();
+        self.replaying = false;
+
+        let rounds = cold
+            .history
+            .vertices
+            .keys()
+            .map(|(round, _)| *round)
+            .max()
+            .unwrap_or(0);
+        self.catch_up = Some(CatchUpReport {
+            elapsed_ns: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            bytes,
+            rounds,
+            vertices: cold.history.vertices.len(),
+            batches: cold.history.batches.len(),
+            headers: cold.history.headers.len(),
+            replayed_commits: self.order_len,
+        });
+        Ok(())
     }
 
     /// One-way delay for this link and frame, so the run has a stable topology
@@ -396,16 +555,24 @@ impl Validator {
 
     fn receive(&mut self, frame: Inbound) -> Result<(), String> {
         match frame {
-            Inbound::Submit(batch) => self.pending_batches.push_back(batch),
+            Inbound::Submit(batch) => {
+                if let Ok(digest) = batch.digest() {
+                    self.history.batches.insert(digest, batch.clone());
+                }
+                self.pending_batches.push_back(batch);
+            }
             Inbound::Vertex(vertex) => {
-                if self.node.receive(vertex).is_err() {
+                let key = (vertex.round, vertex.author.clone());
+                if self.node.receive(vertex.clone()).is_err() {
                     // A controlled mesh has no bad signatures; a rejection is a
                     // frame from a node this validator is not supposed to reject.
                     return Err(format!("validator {} refused a vertex", self.index));
                 }
+                self.history.vertices.insert(key, vertex);
             }
             Inbound::Payload(batch) => {
                 if let Ok(digest) = batch.digest() {
+                    self.history.batches.insert(digest, batch.clone());
                     self.batches.entry(digest).or_insert(batch);
                     self.apply();
                     self.build_ready_headers()?;
@@ -521,6 +688,7 @@ impl Validator {
             })?;
             self.certified.insert(height, at);
             self.certified_ids.insert(height, id);
+            self.history.headers.insert(height, (header, certificate));
             self.flush_finalized();
         }
         Ok(())
@@ -528,6 +696,9 @@ impl Validator {
 
     /// Tells the submitter which samples now have a certified header.
     fn flush_finalized(&mut self) {
+        if self.replaying {
+            return;
+        }
         let Some(sender) = &self.finalized else {
             return;
         };
@@ -550,6 +721,9 @@ impl Validator {
             match self.node.author_with(digest) {
                 Ok(Some(vertex)) => {
                     self.batches.insert(digest, batch.clone());
+                    self.history
+                        .vertices
+                        .insert((vertex.round, vertex.author.clone()), vertex.clone());
                     self.broadcast(Inbound::Vertex(vertex.clone()));
                     self.broadcast(Inbound::Payload(batch));
                     if let Some(ack) = &self.ack {
@@ -566,6 +740,9 @@ impl Validator {
 
         match self.node.author_with([0u8; 32]) {
             Ok(Some(vertex)) => {
+                self.history
+                    .vertices
+                    .insert((vertex.round, vertex.author.clone()), vertex.clone());
                 self.broadcast(Inbound::Vertex(vertex));
             }
             Ok(None) => {}
@@ -578,7 +755,8 @@ impl Validator {
 
     /// Drains every decision the pacemaker can make right now, one header per
     /// commit.
-    fn decide(&mut self) -> Result<(), String> {
+    fn decide(&mut self) -> Result<bool, String> {
+        let mut progress = false;
         loop {
             match self.node.commit_once() {
                 Ok(Step::Advanced {
@@ -587,6 +765,7 @@ impl Validator {
                     anchors,
                     ..
                 }) => {
+                    progress = true;
                     if commits > 0 {
                         self.record_commit(from)?;
                     }
@@ -601,7 +780,7 @@ impl Validator {
                 }
             }
         }
-        Ok(())
+        Ok(progress)
     }
 
     fn record_commit(&mut self, round: u64) -> Result<(), String> {
@@ -712,6 +891,11 @@ impl Validator {
 
             self.last_built = header.clone();
             self.headers += 1;
+            self.history_built.insert(pending.height, header.clone());
+
+            if self.replaying {
+                continue;
+            }
 
             if active {
                 let at = self.now();
@@ -762,8 +946,42 @@ impl Validator {
             applied: self.applied,
             rejected: self.rejected.values().sum(),
             conflicts: self.conflicts,
+            joined_at: self.joined_at,
+            catch_up: self.catch_up,
         }
     }
+}
+
+fn history_bytes(history: &History) -> Result<u64, String> {
+    let mut bytes = 0u64;
+    for vertex in history.vertices.values() {
+        bytes = bytes.saturating_add(
+            u64::try_from(vertex.encode().map_err(|error| error.to_string())?.len())
+                .unwrap_or(u64::MAX),
+        );
+    }
+    for batch in history.batches.values() {
+        bytes = bytes.saturating_add(
+            u64::try_from(batch.encode().map_err(|error| error.to_string())?.len())
+                .unwrap_or(u64::MAX),
+        );
+    }
+    for (header, certificate) in history.headers.values() {
+        bytes = bytes.saturating_add(
+            u64::try_from(header.encode().map_err(|error| error.to_string())?.len())
+                .unwrap_or(u64::MAX),
+        );
+        bytes = bytes.saturating_add(
+            u64::try_from(
+                certificate
+                    .encode()
+                    .map_err(|error| error.to_string())?
+                    .len(),
+            )
+            .unwrap_or(u64::MAX),
+        );
+    }
+    Ok(bytes)
 }
 
 /// The bytes a certificate share signs. The bitmap and signatures are not part
@@ -789,8 +1007,14 @@ async fn validator_task(task: ValidatorTask) -> Result<NodeResult, String> {
         finalized,
         ack,
         mut shutdown,
+        cold,
+        mut history_req,
+        round_tx,
     } = task;
     let mut validator = Validator::new(index, &context, finalized, ack)?;
+    if let Some(cold) = cold {
+        validator.catch_up(cold)?;
+    }
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -800,11 +1024,30 @@ async fn validator_task(task: ValidatorTask) -> Result<NodeResult, String> {
                 let Some(frame) = frame else { break };
                 validator.receive(frame)?;
             }
-            _ = ticker.tick() => validator.tick()?,
+            _ = ticker.tick() => {
+                validator.tick()?;
+                if let Some(tx) = &round_tx {
+                    let _ = tx.send(validator.round());
+                }
+            }
+            request = recv_history(&mut history_req) => {
+                if let Some(reply) = request {
+                    let _ = reply.send(validator.history());
+                }
+            }
             _ = shutdown.changed() => break,
         }
     }
     Ok(validator.finish())
+}
+
+async fn recv_history(
+    request: &mut Option<mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<History>>>,
+) -> Option<tokio::sync::oneshot::Sender<History>> {
+    match request {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn client_task(
@@ -843,6 +1086,14 @@ async fn client_task(
     Ok(())
 }
 
+fn change_round(config: &Config, committee: &chain::Membership) -> Option<u64> {
+    config.change.map(|(_, epoch)| {
+        epoch
+            .saturating_sub(committee.set.epoch)
+            .saturating_mul(committee.epoch_rounds)
+    })
+}
+
 async fn run_mesh(
     config: Config,
     committee: chain::Membership,
@@ -879,6 +1130,20 @@ async fn run_mesh(
         delay: config.delay,
         jitter: config.jitter,
     };
+    let cold_index = if config.cold_join {
+        Some(mesh - 1)
+    } else {
+        None
+    };
+    let join_round = change_round(&config, &committee);
+    if cold_index.is_some() && join_round.is_none() {
+        return Err("--cold-join requires a set change".into());
+    }
+    let (history_tx, history_rx) = mpsc::unbounded_channel::<oneshot::Sender<History>>();
+    let mut history_rx = Some(history_rx);
+    let (round_tx, mut round_rx) = watch::channel(0u64);
+    let mut cold_inbound: Option<mpsc::UnboundedReceiver<Inbound>> = None;
+
     for index in 0..mesh {
         let inbound = receivers
             .next()
@@ -887,6 +1152,10 @@ async fn run_mesh(
         let is_submitter = index == 0;
         let finalized = Some(final_tx.clone());
         let ack = is_submitter.then(|| ack_tx.clone());
+        if cold_index == Some(index) {
+            cold_inbound = Some(inbound);
+            continue;
+        }
         tasks.push(tokio::spawn(validator_task(ValidatorTask {
             index,
             context: context.clone(),
@@ -894,7 +1163,17 @@ async fn run_mesh(
             finalized,
             ack,
             shutdown,
+            cold: None,
+            history_req: if is_submitter {
+                history_rx.take()
+            } else {
+                None
+            },
+            round_tx: is_submitter.then(|| round_tx.clone()),
         })));
+    }
+    if cold_index.is_some() && cold_inbound.is_none() {
+        return Err("no inbound channel for the cold validator".into());
     }
     let client = tokio::spawn(client_task(
         config.clone(),
@@ -907,17 +1186,56 @@ async fn run_mesh(
     ));
 
     let mut finalized: Vec<HashSet<[u8; 32]>> = vec![HashSet::new(); mesh];
+    let mut required = vec![config.samples; mesh];
     let deadline = tokio::time::sleep(config.timeout);
     tokio::pin!(deadline);
     let mut timed_out = false;
+    let mut cold_started = cold_index.is_none();
     loop {
         tokio::select! {
             Some((index, digest)) = final_rx.recv() => {
                 if let Some(set) = finalized.get_mut(index) {
                     set.insert(digest);
                 }
-                if finalized.iter().all(|set| set.len() >= config.samples) {
+                if finalized
+                    .iter()
+                    .enumerate()
+                    .all(|(index, set)| set.len() >= required[index])
+                {
                     break;
+                }
+            }
+            _ = round_rx.changed(), if !cold_started => {
+                let round = *round_rx.borrow();
+                if round >= join_round.unwrap_or(u64::MAX) {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    history_tx
+                        .send(reply_tx)
+                        .map_err(|_| "validator 0 stopped before serving history")?;
+                    let history = reply_rx
+                        .await
+                        .map_err(|_| "validator 0 did not return a history")?;
+                    let joined_at = submissions
+                        .lock()
+                        .map_err(|_| "submission clock is poisoned")?
+                        .len();
+                    let cold = cold_index.ok_or("cold index disappeared")?;
+                    required[cold] = config.samples.saturating_sub(joined_at).max(1);
+                    let inbound = cold_inbound
+                        .take()
+                        .ok_or("cold inbound channel disappeared")?;
+                    tasks.push(tokio::spawn(validator_task(ValidatorTask {
+                        index: cold,
+                        context: context.clone(),
+                        inbound,
+                        finalized: Some(final_tx.clone()),
+                        ack: None,
+                        shutdown: shutdown_rx.clone(),
+                        cold: Some(ColdStart { history, joined_at }),
+                        history_req: None,
+                        round_tx: None,
+                    })));
+                    cold_started = true;
                 }
             }
             _ = &mut deadline => {
@@ -925,6 +1243,9 @@ async fn run_mesh(
                 break;
             }
         }
+    }
+    if cold_index.is_some() && !cold_started {
+        return Err("the mesh did not reach the cold-join round".into());
     }
 
     if !timed_out {
@@ -963,9 +1284,7 @@ async fn run_mesh(
         .drain(..)
         .collect();
 
-    let change_round = config
-        .change
-        .map(|(_, epoch)| epoch.saturating_sub(committee.set.epoch) * committee.epoch_rounds);
+    let change_round_at = change_round(&config, &committee);
 
     Ok(Outcome {
         config,
@@ -975,7 +1294,7 @@ async fn run_mesh(
         elapsed: started.elapsed(),
         finalized_on_submitter: finalized.first().map_or(0, HashSet::len),
         timed_out,
-        change_round,
+        change_round: change_round_at,
     })
 }
 
@@ -1002,6 +1321,14 @@ fn measure(config: Config) -> Result<Outcome, Box<dyn Error>> {
     if config.txs == 0 {
         return Err(
             "--txs must be at least 1: a batch with no transactions has no lifecycle".into(),
+        );
+    }
+    if config.cold_join && !matches!(config.change, Some((SetChange::Add, _))) {
+        return Err("--cold-join requires --add-validator-at-epoch".into());
+    }
+    if config.cold_join && config.epoch_rounds.is_none() {
+        return Err(
+            "--cold-join requires --epoch-rounds so the boundary falls inside the run".into(),
         );
     }
 
@@ -1047,6 +1374,12 @@ fn measure(config: Config) -> Result<Outcome, Box<dyn Error>> {
         Some(home) => chain::chain_id(Some(home))?,
         None => chain::demo_chain_id(),
     };
+    if config.cold_join {
+        let join = change_round(&config, &committee).ok_or("--cold-join requires a set change")?;
+        if join >= u64::try_from(config.samples).unwrap_or(u64::MAX) {
+            return Err("--cold-join boundary falls after the last sample".into());
+        }
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1073,7 +1406,7 @@ struct Finalized {
 fn merge(outcome: &Outcome) -> (Vec<Finalized>, usize) {
     let mut finalized = Vec::new();
     let mut incomplete = 0usize;
-    for submission in &outcome.submissions {
+    for (index, submission) in outcome.submissions.iter().enumerate() {
         let mut commit = u64::MAX;
         let mut cert = u64::MAX;
         let mut cert_commit = u64::MAX;
@@ -1083,6 +1416,9 @@ fn merge(outcome: &Outcome) -> (Vec<Finalized>, usize) {
         let mut complete = true;
 
         for result in &outcome.results {
+            if result.joined_at.is_some_and(|joined| index < joined) {
+                continue;
+            }
             let Some(sample) = result
                 .committed
                 .iter()
@@ -1269,6 +1605,35 @@ fn print(outcome: &Outcome) -> Result<(), Box<dyn Error>> {
         );
     }
 
+    if let Some(result) = outcome
+        .results
+        .iter()
+        .find(|result| result.catch_up.is_some())
+        && let Some(report) = &result.catch_up
+    {
+        let joined = result.joined_at.unwrap_or(0);
+        let live_required = outcome.config.samples.saturating_sub(joined);
+        println!();
+        println!(
+            "  cold join                val-{} replayed {} vertices, {} batches, {} headers \
+             in {} ({} bytes, {} commits, {} rounds)",
+            result.index,
+            report.vertices,
+            report.batches,
+            report.headers,
+            millis(report.elapsed_ns),
+            report.bytes,
+            report.replayed_commits,
+            report.rounds
+        );
+        println!(
+            "                           live from sample {joined}; finalized {} of {live_required} \
+             live samples, authored {} vertices",
+            result.committed.len(),
+            result.authored
+        );
+    }
+
     println!();
     println!(
         "  submit -> commit       p50 {}  p95 {}  p99 {}  max {}  ({} samples)",
@@ -1366,11 +1731,21 @@ fn print(outcome: &Outcome) -> Result<(), Box<dyn Error>> {
         );
     }
 
+    let summary_scope = if outcome
+        .results
+        .iter()
+        .any(|result| result.catch_up.is_some())
+    {
+        "every live node"
+    } else {
+        "every node"
+    };
     println!();
     println!(
-        "  samples                 {} of {} finalized on every node{}",
+        "  samples                 {} of {} finalized on {}{}",
         finalized.len(),
         outcome.config.samples,
+        summary_scope,
         if incomplete > 0 {
             format!(", {incomplete} incomplete")
         } else {
@@ -1464,6 +1839,7 @@ mod tests {
             home: None,
             epoch_rounds: None,
             change: None,
+            cold_join: false,
         }
     }
 
@@ -1523,6 +1899,37 @@ mod tests {
         assert!(
             outcome.results[4].authored > 0,
             "the added validator must author after the boundary"
+        );
+    }
+
+    #[test]
+    fn a_cold_validator_catches_up_and_joins() {
+        let mut config = config(12);
+        config.epoch_rounds = Some(4);
+        config.change = Some((SetChange::Add, 2));
+        config.cold_join = true;
+        let outcome = measure(config).unwrap();
+        assert_eq!(outcome.results.len(), 5);
+
+        let cold = &outcome.results[4];
+        let report = cold
+            .catch_up
+            .as_ref()
+            .expect("the cold validator must replay its history");
+        assert!(report.bytes > 0, "the history must have a byte size");
+        assert!(report.vertices > 0, "the history must contain vertices");
+        assert!(report.batches > 0, "the history must contain batches");
+        assert!(
+            cold.authored > 0,
+            "the cold validator must author after joining"
+        );
+        assert!(
+            cold.joined_at.is_some(),
+            "the cold join needs a sample floor"
+        );
+        assert_eq!(
+            cold.state_root, outcome.results[0].state_root,
+            "the cold validator must replay to the same state"
         );
     }
 

@@ -349,6 +349,9 @@ enum Command {
         /// Remove the last validator at this epoch boundary.
         #[arg(long, conflicts_with = "add_validator_at_epoch")]
         remove_validator_at_epoch: Option<u64>,
+        /// Start the added validator at the boundary from a replayed history.
+        #[arg(long)]
+        cold_join: bool,
     },
     /// Apply a node's retention policy to its store.
     Prune {
@@ -437,6 +440,7 @@ fn main() -> ExitCode {
             epoch_rounds,
             add_validator_at_epoch,
             remove_validator_at_epoch,
+            cold_join,
         } => {
             let change = match (add_validator_at_epoch, remove_validator_at_epoch) {
                 (Some(epoch), None) => Some((finality::SetChange::Add, epoch)),
@@ -456,6 +460,7 @@ fn main() -> ExitCode {
                 home,
                 epoch_rounds,
                 change,
+                cold_join,
             })
         }
         Command::Config { path, home, init } => run_config(home, path, init),
