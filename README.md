@@ -662,6 +662,40 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     activation, default change, or consensus change is made; the workspace
     default and gate do not enable `pq-testnet`.
 
+32. **A validator-set change crosses one epoch boundary without breaking
+    finality; at four validators its latency cost is inside run noise.** The
+    prototype adds or removes exactly one identity per epoch, keeps the new
+    set's fault budget at least as large as the old one, and requires any old
+    and new quorum to intersect by more than the old fault budget. The old set
+    signs the certificate that activates the new set. The finality harness ran
+    100 samples, 1 tx/batch, 3 runs per cell, on the AMD Ryzen 7 6800U, 8 cores
+    / 16 threads, with a 50-round epoch, so the change lands at round 50. All 30
+    runs finalized 100 of 100 samples on every node, with 0 conflicts, 0
+    rejected batches, and agreement inside each run; state roots differ across
+    runs as expected. At zero delay, submit → certified p50 for add 4→5 was
+    15.63 ms against a 15.16 ms control (+3.1%), and remove 5→4 was 14.57 ms
+    (−3.9%). At 25 ms one-way delay with 5 ms jitter, the same cells were 126.13
+    and 126.46 ms against 125.25 ms (+0.7% / +1.0%). The boundary is visible in
+    the small subset of samples whose vertex is before round 50 and whose
+    certificate is after it: 17.72 ms against 13.57 ms before at zero delay,
+    and 191.73 ms against 123.54 ms in two of three 25 ms runs (the third was
+    128.90 ms); one removal run had no boundary sample. That is a one-round
+    wait, not a stable percentile. The added validator authored 62–150 vertices
+    after the boundary; the removed validator authored exactly 50 (rounds 0–49)
+    and stopped, which pins the boundary. At n=10 zero delay, add 10→11 moved
+    p50 35.89 → 45.62 ms, p95 84.25 → 180.37 ms, and p99 103.91 → 252.95 ms,
+    but one of three runs carried a 484.12 ms p99 and 31 rounds against 11 in
+    the other two. At 25 ms the same cell was 145.94 → 133.54 ms p50, 264.88 →
+    253.93 ms p95, and 349.63 → 288.84 ms p99, so the zero-delay tail is local
+    contention/catch-up, not a network effect. This is not a committee-scaling
+    curve and not a TPS lever (findings 28–29); it is the first measured
+    evidence that the committee can change without losing finality. The change
+    is still a harness parameter, not an authorized on-chain record; the added
+    node is online and passive before the boundary, so a cold join/sync is not
+    measured, and the prototype holds one transition per schedule. The full
+    gate is green on the measured tree (353 tests default, 354 with all
+    features).
+
 ## Build order
 
 | Stage | Crate | State |
