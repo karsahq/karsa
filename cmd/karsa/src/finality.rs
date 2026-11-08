@@ -66,6 +66,12 @@ const VALIDATOR_SET_ID: &[u8] = b"karsa-finality-1";
 /// Time kept after the last sample finalizes, so the other nodes can catch up
 /// before the mesh is shut down.
 const DRAIN: Duration = Duration::from_millis(200);
+/// Rounds kept above the trusted header when pruning a snapshot.
+///
+/// A vertex at the snapshot round may still be in flight to the snapshot peer.
+/// Keeping a couple of rounds above it means such a vertex stays in the tail and
+/// can be committed later instead of being dropped as pruned.
+const SNAPSHOT_FLOOR_MARGIN: u64 = 2;
 
 /// One validator added or removed at an epoch boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +80,16 @@ pub enum SetChange {
     Add,
     /// Remove the last validator from the set; the new set has one fewer.
     Remove,
+}
+
+/// How a cold validator reconstructs the prefix it missed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColdHistory {
+    /// Transfer every record from genesis, as the first cold-join milestone did.
+    Full,
+    /// Transfer an encoded state snapshot, the committed order, and the tail
+    /// above the snapshot's DAG floor.
+    Snapshot,
 }
 
 /// How a finality run is configured.
@@ -101,6 +117,9 @@ pub struct Config {
     /// Start the added validator at the boundary from a replayed history instead
     /// of running it passively from round 0.
     pub cold_join: bool,
+    /// What the cold validator receives: the full history or a state snapshot
+    /// plus the tail.
+    pub cold_history: ColdHistory,
 }
 
 /// One client submission, as the client saw it.
@@ -133,6 +152,20 @@ struct History {
     last_built: Option<Header>,
     /// The next decision round after `last_built`.
     cursor: u64,
+    /// The state that replaces the replayed prefix, when the join is a snapshot.
+    snapshot: Option<Snapshot>,
+}
+
+/// The state a cold validator adopts instead of replaying from genesis.
+#[derive(Clone, Debug)]
+struct Snapshot {
+    /// Encoded `exec::State` at the trusted header.
+    state: Vec<u8>,
+    /// Rounds at or below this are covered by `state` and are not transferred.
+    ///
+    /// `None` means the snapshot could not prove a safe floor. The state is
+    /// still adopted, but the DAG is transferred whole.
+    floor: Option<u64>,
 }
 
 /// What one cold join cost before the validator entered the live mesh.
@@ -145,6 +178,14 @@ struct CatchUpReport {
     batches: usize,
     headers: usize,
     replayed_commits: usize,
+    /// Serialized state, trusted header, and cursor.
+    snapshot_bytes: u64,
+    /// Serialized committed order prefix.
+    order_bytes: u64,
+    /// Serialized vertices, batches, and certified headers above the floor.
+    tail_bytes: u64,
+    /// Rounds the snapshot covers, when the join used one.
+    floor: Option<u64>,
 }
 
 /// The history a joining validator starts with.
@@ -302,7 +343,9 @@ struct ValidatorTask {
     ack: Option<mpsc::UnboundedSender<u64>>,
     shutdown: watch::Receiver<bool>,
     cold: Option<ColdStart>,
-    history_req: Option<mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<History>>>,
+    history_req:
+        Option<mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<Result<History, String>>>>,
+    history_mode: ColdHistory,
     round_tx: Option<watch::Sender<u64>>,
 }
 
@@ -414,14 +457,121 @@ impl Validator {
         self.node.round()
     }
 
-    fn history(&self) -> History {
-        let mut history = self.history.clone();
+    /// Builds the records a joining validator receives.
+    ///
+    /// The snapshot form still carries the committed order prefix because a
+    /// header's `dag_root` commits every `VertexId` from genesis. Without the
+    /// prefix a joining node can verify and vote but cannot build the same
+    /// headers.
+    fn history(&self, mode: ColdHistory) -> Result<History, String> {
         let order = self.node.dag().order();
-        let prefix = order.len().min(self.last_built_order);
-        history.order = order[..prefix].to_vec();
-        history.last_built = Some(self.last_built.clone());
-        history.cursor = self.last_built.round.saturating_add(1);
-        history
+        if self.last_built_order > order.len() {
+            return Err(format!(
+                "validator {} built a prefix of {} over only {} commits",
+                self.index,
+                self.last_built_order,
+                order.len()
+            ));
+        }
+        let prefix = self.last_built_order;
+        let mut history = History {
+            order: order[..prefix].to_vec(),
+            last_built: Some(self.last_built.clone()),
+            cursor: self.last_built.round.saturating_add(1),
+            ..History::default()
+        };
+
+        match mode {
+            ColdHistory::Full => {
+                history.vertices = self.history.vertices.clone();
+                history.batches = self.history.batches.clone();
+                history.headers = self.history.headers.clone();
+            }
+            ColdHistory::Snapshot => {
+                if prefix == 0 {
+                    return Err(format!(
+                        "validator {} has no committed prefix to snapshot",
+                        self.index
+                    ));
+                }
+                if self.applied_cursor != prefix {
+                    return Err(format!(
+                        "validator {} applied {} of {} committed entries while snapshotting",
+                        self.index, self.applied_cursor, prefix
+                    ));
+                }
+                let committed = committed_keys(&history.order);
+                let floor = self.snapshot_floor(&committed);
+                for (key, vertex) in &self.history.vertices {
+                    if floor.is_none_or(|floor| vertex.round > floor) {
+                        history.vertices.insert(key.clone(), vertex.clone());
+                    }
+                }
+                for vertex in history.vertices.values() {
+                    let key = (vertex.round, vertex.author.clone());
+                    if vertex.payload_hash == [0u8; 32] || committed.contains(&key) {
+                        continue;
+                    }
+                    if let Some(batch) = self
+                        .batches
+                        .get(&vertex.payload_hash)
+                        .or_else(|| self.history.batches.get(&vertex.payload_hash))
+                    {
+                        history.batches.insert(vertex.payload_hash, batch.clone());
+                    }
+                }
+                let anchor_id = self.last_built.id().map_err(|error| error.to_string())?;
+                for (height, record) in &self.history.headers {
+                    let keep = if *height > self.last_built.height {
+                        true
+                    } else if *height == self.last_built.height {
+                        record.0.id().map_err(|error| error.to_string())? == anchor_id
+                    } else {
+                        false
+                    };
+                    if keep {
+                        history.headers.insert(*height, record.clone());
+                    }
+                }
+                history.snapshot = Some(Snapshot {
+                    state: self.state.encode().map_err(|error| error.to_string())?,
+                    floor,
+                });
+            }
+        }
+        Ok(history)
+    }
+
+    /// The lowest round the snapshot can drop without losing a held vertex.
+    ///
+    /// A held vertex outside the committed prefix may still be committed by a
+    /// later leader, so it stays above the floor and travels in the tail. The
+    /// margin covers vertices that were still in flight to this validator when
+    /// the snapshot was taken.
+    ///
+    /// Round 0 is never pruned: the commit walk stops at the floor, and a
+    /// round-0 vertex that is not in the prefix can still be committed as an
+    /// ancestor of a later leader. Pruning it would make the joiner's order
+    /// diverge from the nodes that kept it. When no positive floor is safe, the
+    /// snapshot carries the state only and the DAG travels whole.
+    fn snapshot_floor(&self, committed: &HashSet<(u64, Vec<u8>)>) -> Option<u64> {
+        let anchor = self.last_built.round;
+        if anchor <= SNAPSHOT_FLOOR_MARGIN {
+            return None;
+        }
+        let mut floor = anchor - SNAPSHOT_FLOOR_MARGIN;
+        for (round, author) in self.history.vertices.keys() {
+            if *round > floor {
+                continue;
+            }
+            if !committed.contains(&(*round, author.clone())) {
+                if *round == 0 {
+                    return None;
+                }
+                floor = floor.min(round - 1);
+            }
+        }
+        (floor > 0).then_some(floor)
     }
 
     /// Adopts the peer's committed prefix and state.
@@ -435,22 +585,6 @@ impl Validator {
         let bytes = history_bytes(&cold.history)?;
         self.joined_at = Some(cold.joined_at);
 
-        for vertex in cold.history.vertices.values() {
-            self.node.receive(vertex.clone()).map_err(|error| {
-                format!(
-                    "validator {} cannot replay a vertex at round {}: {error}",
-                    self.index, vertex.round
-                )
-            })?;
-            self.history
-                .vertices
-                .insert((vertex.round, vertex.author.clone()), vertex.clone());
-        }
-        for (digest, batch) in &cold.history.batches {
-            self.history.batches.insert(*digest, batch.clone());
-            self.batches.insert(*digest, batch.clone());
-        }
-
         let Some(last_built) = cold.history.last_built.clone() else {
             return Err(format!(
                 "validator {} received no trusted header to join from",
@@ -458,45 +592,9 @@ impl Validator {
             ));
         };
 
-        self.node.seed_order(cold.history.order.clone());
-        self.order_len = cold.history.order.len();
-        self.applied_cursor = 0;
-        self.apply();
-        if self.applied_cursor != self.order_len {
-            return Err(format!(
-                "validator {} replayed {} of {} committed entries",
-                self.index, self.applied_cursor, self.order_len
-            ));
-        }
-        if commit_root(&cold.history.order) != last_built.dag_root {
-            return Err(format!(
-                "validator {} rebuilt a different dag_root for {} commits",
-                self.index, self.order_len
-            ));
-        }
-        if self.state.state_root() != last_built.state_root {
-            return Err(format!(
-                "validator {} rebuilt a different state at the trusted header",
-                self.index
-            ));
-        }
-        if u64::try_from(self.applied).unwrap_or(u64::MAX) != last_built.applied {
-            return Err(format!(
-                "validator {} applied {} transactions but the trusted header says {}",
-                self.index, self.applied, last_built.applied
-            ));
-        }
-
-        for (height, (header, certificate)) in &cold.history.headers {
-            self.chain.advance(header, certificate).map_err(|error| {
-                format!(
-                    "validator {} cannot verify the certified header at height {height}: {error}",
-                    self.index
-                )
-            })?;
-            self.certified.insert(*height, 0);
-            self.certified_ids
-                .insert(*height, header.id().map_err(|error| error.to_string())?);
+        match &cold.history.snapshot {
+            Some(snapshot) => self.adopt_snapshot(snapshot, &cold.history, &last_built)?,
+            None => self.replay_full(&cold.history, &last_built)?,
         }
 
         self.last_built = last_built;
@@ -517,13 +615,202 @@ impl Validator {
             .unwrap_or(0);
         self.catch_up = Some(CatchUpReport {
             elapsed_ns: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            bytes,
+            bytes: bytes.total,
+            snapshot_bytes: bytes.snapshot,
+            order_bytes: bytes.order,
+            tail_bytes: bytes.tail,
+            floor: cold
+                .history
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.floor),
             rounds,
             vertices: cold.history.vertices.len(),
             batches: cold.history.batches.len(),
             headers: cold.history.headers.len(),
             replayed_commits: self.order_len,
         });
+        Ok(())
+    }
+
+    /// Replays every record from genesis and rebuilds the state by execution.
+    fn replay_full(&mut self, history: &History, last_built: &Header) -> Result<(), String> {
+        for vertex in history.vertices.values() {
+            self.node.receive(vertex.clone()).map_err(|error| {
+                format!(
+                    "validator {} cannot replay a vertex at round {}: {error}",
+                    self.index, vertex.round
+                )
+            })?;
+            self.history
+                .vertices
+                .insert((vertex.round, vertex.author.clone()), vertex.clone());
+        }
+        for (digest, batch) in &history.batches {
+            self.history.batches.insert(*digest, batch.clone());
+            self.batches.insert(*digest, batch.clone());
+        }
+
+        self.node.seed_order(history.order.clone());
+        self.order_len = history.order.len();
+        self.applied_cursor = 0;
+        self.apply();
+        if self.applied_cursor != self.order_len {
+            return Err(format!(
+                "validator {} replayed {} of {} committed entries",
+                self.index, self.applied_cursor, self.order_len
+            ));
+        }
+        if commit_root(&history.order) != last_built.dag_root {
+            return Err(format!(
+                "validator {} rebuilt a different dag_root for {} commits",
+                self.index, self.order_len
+            ));
+        }
+        if self.state.state_root() != last_built.state_root {
+            return Err(format!(
+                "validator {} rebuilt a different state at the trusted header",
+                self.index
+            ));
+        }
+        if u64::try_from(self.applied).unwrap_or(u64::MAX) != last_built.applied {
+            return Err(format!(
+                "validator {} applied {} transactions but the trusted header says {}",
+                self.index, self.applied, last_built.applied
+            ));
+        }
+        self.advance_tail_headers(history)
+    }
+
+    /// Adopts the snapshot state and inserts only the records above its floor.
+    fn adopt_snapshot(
+        &mut self,
+        snapshot: &Snapshot,
+        history: &History,
+        last_built: &Header,
+    ) -> Result<(), String> {
+        let state = State::decode(&snapshot.state).map_err(|error| {
+            format!(
+                "validator {} cannot decode the snapshot state: {error}",
+                self.index
+            )
+        })?;
+        if state.state_root() != last_built.state_root {
+            return Err(format!(
+                "validator {} decoded a snapshot whose state root does not match the \
+                 trusted header",
+                self.index
+            ));
+        }
+        if commit_root(&history.order) != last_built.dag_root {
+            return Err(format!(
+                "validator {} rebuilt a different dag_root for {} commits",
+                self.index,
+                history.order.len()
+            ));
+        }
+
+        self.state = state;
+        self.applied = usize::try_from(last_built.applied).map_err(|_| {
+            format!(
+                "validator {} cannot hold {} applied transactions",
+                self.index, last_built.applied
+            )
+        })?;
+        self.node.seed_order(history.order.clone());
+        self.order_len = history.order.len();
+        self.applied_cursor = self.order_len;
+        if let Some(floor) = snapshot.floor {
+            self.node.set_floor(floor);
+        }
+
+        for vertex in history.vertices.values() {
+            self.node.receive(vertex.clone()).map_err(|error| {
+                format!(
+                    "validator {} cannot replay the tail vertex at round {}: {error}",
+                    self.index, vertex.round
+                )
+            })?;
+            self.history
+                .vertices
+                .insert((vertex.round, vertex.author.clone()), vertex.clone());
+        }
+        for (digest, batch) in &history.batches {
+            self.history.batches.insert(*digest, batch.clone());
+            self.batches.insert(*digest, batch.clone());
+        }
+
+        // The trusted header replaces genesis as the chain's anchor. A tail
+        // header is verified against it; the prefix is trusted by height and
+        // hash, not re-verified header by header.
+        let schedule = self.node.dag().epoch_schedule();
+        self.chain = match self.sets.change_epoch() {
+            Some(change_epoch) => HeaderChain::with_schedule_and_change(
+                self.sets.base().clone(),
+                self.sets.set_for_epoch(change_epoch).clone(),
+                change_epoch,
+                last_built.clone(),
+                schedule,
+            )
+            .map_err(|error| error.to_string())?,
+            None => {
+                HeaderChain::with_schedule(self.sets.base().clone(), last_built.clone(), schedule)
+            }
+        };
+
+        // When the peer had the quorum certificate for the anchor, verify it: it
+        // turns the trusted height and hash into a checked quorum statement.
+        if let Some((header, certificate)) = history.headers.get(&last_built.height) {
+            let id = header.id().map_err(|error| error.to_string())?;
+            if id != last_built.id().map_err(|error| error.to_string())? {
+                return Err(format!(
+                    "validator {} received a different certified header at height {}",
+                    self.index, last_built.height
+                ));
+            }
+            if certificate.chain_id != header.chain_id
+                || certificate.epoch != header.epoch
+                || certificate.round != header.round
+                || certificate.vertex_id != id
+            {
+                return Err(format!(
+                    "validator {} received a certificate that does not name the snapshot header",
+                    self.index
+                ));
+            }
+            certificate
+                .verify_quorum(self.sets.set_for_epoch(header.epoch))
+                .map_err(|error| {
+                    format!(
+                        "validator {} cannot verify the snapshot certificate: {error}",
+                        self.index
+                    )
+                })?;
+        }
+
+        self.advance_tail_headers(history)
+    }
+
+    /// Advances the trusted chain through the certified headers in the history.
+    fn advance_tail_headers(&mut self, history: &History) -> Result<(), String> {
+        let anchor = self.chain.head().height;
+        for (height, (header, certificate)) in &history.headers {
+            if *height <= anchor {
+                continue;
+            }
+            self.chain.advance(header, certificate).map_err(|error| {
+                format!(
+                    "validator {} cannot verify the certified header at height {height}: {error}",
+                    self.index
+                )
+            })?;
+            self.certified.insert(*height, 0);
+            self.certified_ids
+                .insert(*height, header.id().map_err(|error| error.to_string())?);
+            self.history
+                .headers
+                .insert(*height, (header.clone(), certificate.clone()));
+        }
         Ok(())
     }
 
@@ -715,6 +1002,13 @@ impl Validator {
         };
         for sample in &self.committed {
             if self.notified.contains(&sample.digest) {
+                continue;
+            }
+            // A certificate can exist before this node built its own header for
+            // that height, which happens after the covering batch is applied.
+            // Reporting finality earlier would credit a state the node has not
+            // reached yet.
+            if sample.header_height > self.last_built.height {
                 continue;
             }
             if self.certified.contains_key(&sample.header_height) {
@@ -932,6 +1226,9 @@ impl Validator {
                 self.advance_certified()?;
             }
         }
+        // A commit recorded before this build is only final for this node once
+        // the header exists over the applied state and a certificate covers it.
+        self.flush_finalized();
         Ok(())
     }
 
@@ -963,26 +1260,44 @@ impl Validator {
     }
 }
 
-fn history_bytes(history: &History) -> Result<u64, String> {
-    let mut bytes = 0u64;
+/// What each part of a cold-join transfer costs on the wire.
+struct HistoryBytes {
+    total: u64,
+    snapshot: u64,
+    order: u64,
+    tail: u64,
+}
+
+fn committed_keys(order: &[validator::VertexId]) -> HashSet<(u64, Vec<u8>)> {
+    order
+        .iter()
+        .map(|id| (id.round, id.author.clone()))
+        .collect()
+}
+
+fn history_bytes(history: &History) -> Result<HistoryBytes, String> {
+    let mut snapshot = 0u64;
+    let mut order = 0u64;
+    let mut tail = 0u64;
+
     for vertex in history.vertices.values() {
-        bytes = bytes.saturating_add(
+        tail = tail.saturating_add(
             u64::try_from(vertex.encode().map_err(|error| error.to_string())?.len())
                 .unwrap_or(u64::MAX),
         );
     }
     for batch in history.batches.values() {
-        bytes = bytes.saturating_add(
+        tail = tail.saturating_add(
             u64::try_from(batch.encode().map_err(|error| error.to_string())?.len())
                 .unwrap_or(u64::MAX),
         );
     }
     for (header, certificate) in history.headers.values() {
-        bytes = bytes.saturating_add(
+        tail = tail.saturating_add(
             u64::try_from(header.encode().map_err(|error| error.to_string())?.len())
                 .unwrap_or(u64::MAX),
         );
-        bytes = bytes.saturating_add(
+        tail = tail.saturating_add(
             u64::try_from(
                 certificate
                     .encode()
@@ -993,19 +1308,34 @@ fn history_bytes(history: &History) -> Result<u64, String> {
         );
     }
     for id in &history.order {
-        bytes = bytes
+        order = order
             .saturating_add(8)
             .saturating_add(u64::try_from(id.author.len()).unwrap_or(u64::MAX))
             .saturating_add(32);
     }
-    if let Some(header) = &history.last_built {
-        bytes = bytes.saturating_add(
-            u64::try_from(header.encode().map_err(|error| error.to_string())?.len())
-                .unwrap_or(u64::MAX),
-        );
+    if let Some(snapshot_state) = &history.snapshot {
+        snapshot =
+            snapshot.saturating_add(u64::try_from(snapshot_state.state.len()).unwrap_or(u64::MAX));
+        snapshot = snapshot.saturating_add(8);
     }
-    bytes = bytes.saturating_add(8);
-    Ok(bytes)
+    if let Some(header) = &history.last_built {
+        let encoded = u64::try_from(header.encode().map_err(|error| error.to_string())?.len())
+            .unwrap_or(u64::MAX);
+        if history.snapshot.is_some() {
+            snapshot = snapshot.saturating_add(encoded);
+        } else {
+            order = order.saturating_add(encoded);
+        }
+    }
+    // The cursor is one round either way; keep it with the order prefix.
+    order = order.saturating_add(8);
+
+    Ok(HistoryBytes {
+        total: snapshot.saturating_add(order).saturating_add(tail),
+        snapshot,
+        order,
+        tail,
+    })
 }
 
 /// The bytes a certificate share signs. The bitmap and signatures are not part
@@ -1033,6 +1363,7 @@ async fn validator_task(task: ValidatorTask) -> Result<NodeResult, String> {
         mut shutdown,
         cold,
         mut history_req,
+        history_mode,
         round_tx,
     } = task;
     let mut validator = Validator::new(index, &context, finalized, ack)?;
@@ -1042,11 +1373,20 @@ async fn validator_task(task: ValidatorTask) -> Result<NodeResult, String> {
         // has already arrived before replaying, so a vertex that was still in
         // flight when the snapshot was taken is not a hole in the replay. The
         // shares are kept and applied after the prefix is adopted, because they
-        // are what advances the header chain to the snapshot height.
+        // are what advances the header chain to the snapshot height. A snapshot
+        // join drops the frames its floor covers; a full replay keeps them all.
+        let floor = cold
+            .history
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.floor);
         let mut queued_shares = Vec::new();
         while let Ok(frame) = inbound.try_recv() {
             match frame {
                 Inbound::Vertex(vertex) => {
+                    if floor.is_some_and(|floor| vertex.round <= floor) {
+                        continue;
+                    }
                     cold.history
                         .vertices
                         .insert((vertex.round, vertex.author.clone()), vertex);
@@ -1082,7 +1422,7 @@ async fn validator_task(task: ValidatorTask) -> Result<NodeResult, String> {
             }
             request = recv_history(&mut history_req) => {
                 if let Some(reply) = request {
-                    let _ = reply.send(validator.history());
+                    let _ = reply.send(validator.history(history_mode));
                 }
             }
             _ = shutdown.changed() => break,
@@ -1092,8 +1432,10 @@ async fn validator_task(task: ValidatorTask) -> Result<NodeResult, String> {
 }
 
 async fn recv_history(
-    request: &mut Option<mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<History>>>,
-) -> Option<tokio::sync::oneshot::Sender<History>> {
+    request: &mut Option<
+        mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<Result<History, String>>>,
+    >,
+) -> Option<tokio::sync::oneshot::Sender<Result<History, String>>> {
     match request {
         Some(receiver) => receiver.recv().await,
         None => std::future::pending().await,
@@ -1189,7 +1531,8 @@ async fn run_mesh(
     if cold_index.is_some() && join_round.is_none() {
         return Err("--cold-join requires a set change".into());
     }
-    let (history_tx, history_rx) = mpsc::unbounded_channel::<oneshot::Sender<History>>();
+    let (history_tx, history_rx) =
+        mpsc::unbounded_channel::<oneshot::Sender<Result<History, String>>>();
     let mut history_rx = Some(history_rx);
     let (round_tx, mut round_rx) = watch::channel(0u64);
     let mut cold_inbound: Option<mpsc::UnboundedReceiver<Inbound>> = None;
@@ -1219,6 +1562,7 @@ async fn run_mesh(
             } else {
                 None
             },
+            history_mode: config.cold_history,
             round_tx: is_submitter.then(|| round_tx.clone()),
         })));
     }
@@ -1258,17 +1602,20 @@ async fn run_mesh(
             _ = round_rx.changed(), if !cold_started => {
                 let round = *round_rx.borrow();
                 if round >= join_round.unwrap_or(u64::MAX) {
+                    // Read the sample floor before asking for the history: every
+                    // sample submitted after this count is live for the joining
+                    // node, even if the snapshot ends up carrying it as tail.
+                    let joined_at = submissions
+                        .lock()
+                        .map_err(|_| "submission clock is poisoned")?
+                        .len();
                     let (reply_tx, reply_rx) = oneshot::channel();
                     history_tx
                         .send(reply_tx)
                         .map_err(|_| "validator 0 stopped before serving history")?;
                     let history = reply_rx
                         .await
-                        .map_err(|_| "validator 0 did not return a history")?;
-                    let joined_at = submissions
-                        .lock()
-                        .map_err(|_| "submission clock is poisoned")?
-                        .len();
+                        .map_err(|_| "validator 0 did not return a history")??;
                     let cold = cold_index.ok_or("cold index disappeared")?;
                     required[cold] = config.samples.saturating_sub(joined_at).max(1);
                     let inbound = cold_inbound
@@ -1283,6 +1630,7 @@ async fn run_mesh(
                         shutdown: shutdown_rx.clone(),
                         cold: Some(ColdStart { history, joined_at }),
                         history_req: None,
+                        history_mode: config.cold_history,
                         round_tx: None,
                     })));
                     cold_started = true;
@@ -1665,16 +2013,24 @@ fn print(outcome: &Outcome) -> Result<(), Box<dyn Error>> {
         let live_required = outcome.config.samples.saturating_sub(joined);
         println!();
         println!(
-            "  cold join                val-{} replayed {} vertices, {} batches, {} headers \
-             in {} ({} bytes, {} commits, {} rounds)",
+            "  cold join                val-{} {}: {} vertices, {} batches, {} headers, {} \
+             commits, {} rounds in {}",
             result.index,
+            match (report.snapshot_bytes > 0, report.floor) {
+                (true, Some(floor)) => format!("snapshot at floor {floor}"),
+                (true, None) => "snapshot (floor not safe, DAG whole)".to_string(),
+                (false, _) => "full history".to_string(),
+            },
             report.vertices,
             report.batches,
             report.headers,
-            millis(report.elapsed_ns),
-            report.bytes,
             report.replayed_commits,
-            report.rounds
+            report.rounds,
+            millis(report.elapsed_ns)
+        );
+        println!(
+            "                           bytes: snapshot {} + order {} + tail {} = {}",
+            report.snapshot_bytes, report.order_bytes, report.tail_bytes, report.bytes
         );
         println!(
             "                           live from sample {joined}; finalized {} of {live_required} \
@@ -1890,6 +2246,7 @@ mod tests {
             epoch_rounds: None,
             change: None,
             cold_join: false,
+            cold_history: ColdHistory::Snapshot,
         }
     }
 
@@ -1967,8 +2324,15 @@ mod tests {
             .as_ref()
             .expect("the cold validator must replay its history");
         assert!(report.bytes > 0, "the history must have a byte size");
-        assert!(report.vertices > 0, "the history must contain vertices");
-        assert!(report.batches > 0, "the history must contain batches");
+        assert!(
+            report.snapshot_bytes > 0,
+            "the default cold join must adopt a state snapshot"
+        );
+        assert!(
+            report.snapshot_bytes > 0 && report.order_bytes > 0 && report.tail_bytes > 0,
+            "a snapshot join must account for state, order, and tail separately"
+        );
+        assert!(report.vertices > 0, "the tail must contain vertices");
         assert!(
             cold.authored > 0,
             "the cold validator must author after joining"
@@ -1977,24 +2341,80 @@ mod tests {
             cold.joined_at.is_some(),
             "the cold join needs a sample floor"
         );
-        assert_eq!(
-            cold.applied, outcome.results[0].applied,
-            "the cold validator must reach the same applied prefix"
-        );
         let common = cold.order.len().min(outcome.results[0].order.len());
         assert!(
             common > 0,
             "the cold validator must commit at least one entry"
         );
+        let mismatch = cold.order[..common]
+            .iter()
+            .zip(&outcome.results[0].order[..common])
+            .position(|(left, right)| left != right);
+        assert!(
+            mismatch.is_none(),
+            "the cold validator must reproduce the common commit prefix: first mismatch at \
+             {mismatch:?}, cold {} entries, validator 0 {} entries, floor {:?}, joined at {:?}",
+            cold.order.len(),
+            outcome.results[0].order.len(),
+            report.floor,
+            cold.joined_at
+        );
+        // Nodes stop at different points in the shutdown, so the last few
+        // commits can be missing from either side. When both reached the same
+        // prefix, state and applied must match exactly; otherwise the prefix
+        // check above is the assertion the run can support.
+        if cold.order.len() == outcome.results[0].order.len() {
+            assert_eq!(
+                cold.applied, outcome.results[0].applied,
+                "the cold validator must reach the same applied prefix"
+            );
+            assert_eq!(
+                cold.state_root, outcome.results[0].state_root,
+                "the cold validator must replay to the same state"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cold_validator_can_replay_the_full_history() {
+        let mut config = config(12);
+        config.epoch_rounds = Some(4);
+        config.change = Some((SetChange::Add, 2));
+        config.cold_join = true;
+        config.cold_history = ColdHistory::Full;
+        let outcome = measure(config).unwrap();
+        assert_eq!(outcome.results.len(), 5);
+
+        let cold = &outcome.results[4];
+        let report = cold
+            .catch_up
+            .as_ref()
+            .expect("the cold validator must replay its history");
+        assert!(
+            report.floor.is_none(),
+            "the full replay must not prune a floor"
+        );
+        assert!(
+            report.snapshot_bytes == 0,
+            "a full replay has no state snapshot"
+        );
+        assert!(report.batches > 0, "the full history must contain batches");
+        let common = cold.order.len().min(outcome.results[0].order.len());
         assert_eq!(
             &cold.order[..common],
             &outcome.results[0].order[..common],
             "the cold validator must reproduce the common commit prefix"
         );
-        assert_eq!(
-            cold.state_root, outcome.results[0].state_root,
-            "the cold validator must replay to the same state"
-        );
+        if cold.order.len() == outcome.results[0].order.len() {
+            assert_eq!(
+                cold.applied, outcome.results[0].applied,
+                "the cold validator must reach the same applied prefix"
+            );
+            assert_eq!(
+                cold.state_root, outcome.results[0].state_root,
+                "the cold validator must replay to the same state"
+            );
+        }
     }
 
     #[test]

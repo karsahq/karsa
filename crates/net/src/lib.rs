@@ -200,6 +200,18 @@ impl Node {
         self.dag.seed_order(order);
     }
 
+    /// Treats every round at or below `round` as covered by a state snapshot and
+    /// drops the vertices in those rounds.
+    ///
+    /// A reference into a pruned round is accepted because the state it produced
+    /// is already in the snapshot; the commit walk stops at the floor instead of
+    /// asking for vertices the node is not supposed to hold.
+    ///
+    /// Returns how many vertices were dropped.
+    pub fn set_floor(&mut self, round: u64) -> usize {
+        self.dag.set_floor(round)
+    }
+
     /// How many vertices this node has authored.
     #[must_use]
     pub fn authored(&self) -> usize {
