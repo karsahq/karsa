@@ -636,6 +636,31 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     report 2.63 ms vs BLS 1.46 ms) but was not measured in one session. Ed25519
     absolute numbers are session-sensitive while the BLS rows stayed within
     0.7%; the ratio is the stable result.
+31. **ML-DSA-65 is an experimental fallback, and it costs about 6× the
+    verification rate.** ML-DSA-65 stays activation-gated and does not replace
+    Ed25519; this measurement only prices a future PQ migration. The same
+    standalone target, `bench/crypto-verify/` with `--features pq`, measures the
+    real `Transaction::verify` path with a single-authorization ML-DSA-65 policy
+    on the 4C/8T desktop, OpenSSL 3.5+, median of three, two sessions. At 4,096
+    transactions: raw ML-DSA-65 verification is 188.9 µs/signature on one thread
+    (5.29k/s) and 52.7–52.9 µs/signature on four (18.9–19.0k/s); the full
+    transaction path is 190.9–195.3 µs/signature on one thread and 50.4–54.0
+    µs/signature on four (18.5–19.8k/s). Same-session Ed25519 controls: 41.4 µs
+    individual on one thread and 16.9 µs on four; 8.9 µs/signature for the batch
+    path on four. ML-DSA raw is therefore 4.6× individual Ed25519 on one thread
+    and 3.1× on four, but the current default is batch verification: the full
+    ML-DSA path is 5.7–6.1× the Ed25519 batch cost per signature, or a ~6× lower
+    per-validator verification ceiling (~18.5–19.8k vs ~112–122k tx/s) before
+    the larger wire and state costs. ML-DSA has no batch equation, and
+    `batch_candidate` accepts only Ed25519, so the ~2× batch factor disappears.
+    Signing is 1.06–1.16 ms/signature, 5.6–6.1× verification; that is a wallet
+    cost, not the validator bound. Sizes: public key 1,952 B, private key 4,032
+    B, signature 3,309 B, encoded transaction 3,481 B; a 1,000-transaction batch
+    carries ~3.3 MB of signatures, and each account key adds ~1.9 kB to state.
+    The ~6× chain TPS impact and the wire/state cost are modeled from the
+    measured crypto and sizes, not chain-level measurements. No registry
+    activation, default change, or consensus change is made; the workspace
+    default and gate do not enable `pq-testnet`.
 
 ## Build order
 
