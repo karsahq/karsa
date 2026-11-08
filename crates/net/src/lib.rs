@@ -184,6 +184,22 @@ impl Node {
         self.round
     }
 
+    /// The first round the pacemaker will decide.
+    #[must_use]
+    pub fn cursor(&self) -> u64 {
+        self.pacemaker.cursor()
+    }
+
+    /// Sets the next decision round after adopting a snapshot prefix.
+    pub fn set_cursor(&mut self, cursor: u64) {
+        self.pacemaker.set_cursor(cursor);
+    }
+
+    /// Adopts a verified committed order prefix from a snapshot.
+    pub fn seed_order(&mut self, order: Vec<VertexId>) {
+        self.dag.seed_order(order);
+    }
+
     /// How many vertices this node has authored.
     #[must_use]
     pub fn authored(&self) -> usize {

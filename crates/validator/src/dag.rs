@@ -560,6 +560,15 @@ impl Dag {
         &self.order
     }
 
+    /// Adopts a verified committed prefix from a snapshot.
+    ///
+    /// The caller has already verified the vertices and the header that commits
+    /// this order. New commits append after the prefix.
+    pub fn seed_order(&mut self, order: Vec<VertexId>) {
+        self.committed = order.iter().map(|id| id.digest).collect();
+        self.order = order;
+    }
+
     /// The Merkle root over everything this node has committed, in commit order.
     #[must_use]
     pub fn commit_root(&self) -> [u8; 32] {

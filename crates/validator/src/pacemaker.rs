@@ -163,6 +163,16 @@ impl Pacemaker {
         self.cursor
     }
 
+    /// Sets the first round the pacemaker will decide.
+    ///
+    /// A node that adopts a committed prefix from a snapshot starts after the
+    /// last decision; it must not re-decide rounds the snapshot already covers.
+    pub fn set_cursor(&mut self, cursor: u64) {
+        self.cursor = cursor;
+        self.observed = self.observed.max(cursor);
+        self.ticks_waited = 0;
+    }
+
     /// Highest round this node holds any vertex for.
     #[must_use]
     pub fn observed(&self) -> u64 {
