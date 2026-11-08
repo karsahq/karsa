@@ -32,8 +32,16 @@ use std::time::{Duration, Instant};
 use blst::BLST_ERROR;
 use blst::BLST_ERROR::BLST_SUCCESS;
 use blst::min_pk::{AggregatePublicKey, AggregateSignature, PublicKey, SecretKey, Signature};
+#[cfg(feature = "pq")]
+use crypto::ml_dsa;
 use crypto::registry::ALG_ED25519;
+#[cfg(feature = "pq")]
+use crypto::registry::ALG_ML_DSA_65;
 use crypto::scheme::{Ed25519BatchEntry, Ed25519Scheme, SignatureScheme, verify_ed25519_batch};
+#[cfg(feature = "pq")]
+use tx::envelope::{PROTOCOL_VERSION_V1, Transaction};
+#[cfg(feature = "pq")]
+use tx::policy::{AuthKey, AuthPolicy, AuthPolicyKind, Authorization, KeyStatus};
 use validator::{Certificate, NO_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet, bitmap_of};
 
 /// Domain separation tag for BLS signatures in G2 (the `min_pk` layout).
@@ -50,6 +58,14 @@ const RUNS: usize = 3;
 const CERTIFICATE_ITERATIONS: usize = 100;
 const CERTIFICATE_FAILURE_ITERATIONS: usize = 20;
 const SINGLE_VERIFY_ITERATIONS: usize = 10_000;
+/// ML-DSA-65 contingency constants. The scheme is experimental; Ed25519 stays
+/// the default, and this section only prices a future migration.
+#[cfg(feature = "pq")]
+const ML_DSA_NOW: u64 = 1_000;
+#[cfg(feature = "pq")]
+const ML_DSA_SIGN_ITERATIONS: usize = 100;
+#[cfg(feature = "pq")]
+const ML_DSA_CHAIN_ID: &[u8] = b"karsa-ml-dsa-bench-1";
 
 type BenchResult<T> = Result<T, Box<dyn Error>>;
 
@@ -85,6 +101,7 @@ fn run() -> BenchResult<()> {
     println!();
 
     let mut ed25519_batch_4096 = [Duration::ZERO; 2];
+    let mut ed25519_individual_4096 = [Duration::ZERO; 2];
     let mut bls_full_4096 = [Duration::ZERO; 2];
     let mut ed25519_failure_4096 = Duration::ZERO;
     let mut bls_failure_4096 = Duration::ZERO;
@@ -126,8 +143,19 @@ fn run() -> BenchResult<()> {
         "n", "threads", "median ms", "range ms", "us/signature", "tx/s"
     );
     for &n in &BATCH_SIZES {
-        let samples = measure(|| ed25519_individual(&ed25519, n));
-        print_measurement_row(n, 1, &samples, n);
+        for &threads in &THREAD_COUNTS {
+            let samples = if threads == 1 {
+                measure(|| ed25519_individual(&ed25519, n))
+            } else {
+                measure(|| ed25519_individual_threaded(&ed25519, n, threads))
+            };
+            let med = median(&samples);
+            print_measurement_row(n, threads, &samples, n);
+            if n == 4_096 {
+                let slot = if threads == 1 { 0 } else { 1 };
+                ed25519_individual_4096[slot] = med;
+            }
+        }
     }
     println!();
 
@@ -436,6 +464,15 @@ fn run() -> BenchResult<()> {
          verifier falls back or splits only its own chunk."
     );
     println!();
+
+    #[cfg(feature = "pq")]
+    ml_dsa_benchmark(&ed25519_individual_4096, &ed25519_batch_4096)?;
+    #[cfg(not(feature = "pq"))]
+    {
+        println!("== 5. ML-DSA-65 contingency (experimental) ==");
+        println!("  skipped: build with --features pq to enable the experimental ML-DSA backend");
+        println!();
+    }
 
     print_machine("end");
     Ok(())
@@ -812,6 +849,271 @@ impl BlsCertificateFixture {
 }
 
 // ---------------------------------------------------------------------------
+// ML-DSA-65 contingency (experimental, --features pq)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "pq")]
+struct MlDsaFixture {
+    transactions: Vec<Transaction>,
+    signing_payloads: Vec<Vec<u8>>,
+    public_key: Vec<u8>,
+    private_key: Vec<u8>,
+    policy: AuthPolicy,
+}
+
+#[cfg(feature = "pq")]
+impl MlDsaFixture {
+    fn new(count: usize) -> BenchResult<Self> {
+        let (public_key, private_key) = ml_dsa::generate_keypair()?;
+        let key_id = b"ml-dsa-k0".to_vec();
+        let policy = AuthPolicy {
+            kind: AuthPolicyKind::Single,
+            threshold: 0,
+            policy_nonce: 1,
+            keys: vec![AuthKey {
+                key_id: key_id.clone(),
+                algorithm_id: ALG_ML_DSA_65,
+                public_key: public_key.clone(),
+                weight: 1,
+                status: KeyStatus::Active,
+                valid_from: 0,
+                valid_until: u64::MAX,
+            }],
+        };
+
+        let mut transactions = Vec::with_capacity(count);
+        let mut signing_payloads = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut transaction = Transaction {
+                protocol_version: PROTOCOL_VERSION_V1,
+                chain_id: ML_DSA_CHAIN_ID.to_vec(),
+                sender: b"ml-dsa-bench".to_vec(),
+                sequence: u64::try_from(index).unwrap_or(0) + 1,
+                fee: 1,
+                expiration: u64::MAX,
+                policy_version: 1,
+                payload: benchmark_message(index),
+                authorization: Vec::new(),
+            };
+            let signing_payload = transaction.signing_payload()?;
+            let signature = ml_dsa::sign_with_context(&private_key, &signing_payload, &[])?;
+            transaction.authorization = vec![Authorization {
+                algorithm_id: ALG_ML_DSA_65,
+                key_id: key_id.clone(),
+                signature,
+            }];
+            signing_payloads.push(signing_payload);
+            transactions.push(transaction);
+        }
+
+        let fixture = Self {
+            transactions,
+            signing_payloads,
+            public_key,
+            private_key,
+            policy,
+        };
+        fixture.assert_valid()?;
+        Ok(fixture)
+    }
+
+    fn assert_valid(&self) -> BenchResult<()> {
+        let transaction = self
+            .transactions
+            .first()
+            .ok_or("the ML-DSA fixture is empty")?;
+        transaction.verify(&self.policy, ML_DSA_NOW)?;
+        ml_dsa::verify(
+            &self.public_key,
+            &self.signing_payloads[0],
+            &transaction.authorization[0].signature,
+        )?;
+        Ok(())
+    }
+
+    fn raw_verify_range(&self, start: usize, end: usize) -> usize {
+        let mut verified = 0;
+        for index in start..end {
+            if ml_dsa::verify(
+                &self.public_key,
+                &self.signing_payloads[index],
+                &self.transactions[index].authorization[0].signature,
+            )
+            .is_ok()
+            {
+                verified += 1;
+            }
+        }
+        verified
+    }
+
+    fn full_verify_range(&self, start: usize, end: usize) -> usize {
+        let mut verified = 0;
+        for transaction in &self.transactions[start..end] {
+            if transaction.verify(&self.policy, ML_DSA_NOW).is_ok() {
+                verified += 1;
+            }
+        }
+        verified
+    }
+
+    fn raw_verify_threaded(&self, count: usize, threads: usize) -> usize {
+        let chunk = count.div_ceil(threads);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|thread| {
+                    let start = thread * chunk;
+                    let end = ((thread + 1) * chunk).min(count);
+                    scope.spawn(move || self.raw_verify_range(start, end))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("ML-DSA worker panicked"))
+                .sum()
+        })
+    }
+
+    fn full_verify_threaded(&self, count: usize, threads: usize) -> usize {
+        let chunk = count.div_ceil(threads);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|thread| {
+                    let start = thread * chunk;
+                    let end = ((thread + 1) * chunk).min(count);
+                    scope.spawn(move || self.full_verify_range(start, end))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("ML-DSA worker panicked"))
+                .sum()
+        })
+    }
+}
+
+#[cfg(feature = "pq")]
+fn ml_dsa_benchmark(
+    ed25519_individual_4096: &[Duration; 2],
+    ed25519_batch_4096: &[Duration; 2],
+) -> BenchResult<()> {
+    println!("== 5. ML-DSA-65 contingency (experimental) ==");
+    println!(
+        "  Ed25519 remains the default. This section only prices a future PQ \
+         migration."
+    );
+    println!(
+        "  no batch equation: batch_candidate accepts only single-authorization \
+         Ed25519, so ML-DSA transactions take the per-transaction path"
+    );
+    println!();
+
+    let largest = *BATCH_SIZES.iter().max().expect("sizes are not empty");
+    println!("building ML-DSA-65 fixture (not timed)...");
+    let fixture = MlDsaFixture::new(largest)?;
+    println!(
+        "  sizes: public key {} B, private key {} B, signature {} B, encoded \
+         transaction {} B",
+        fixture.public_key.len(),
+        fixture.private_key.len(),
+        fixture.transactions[0].authorization[0].signature.len(),
+        fixture.transactions[0].encode()?.len()
+    );
+    println!();
+
+    println!("  raw signature verification (crypto::ml_dsa::verify):");
+    println!(
+        "  {:>5}  {:>7}  {:>14}  {:>15}  {:>13}  {:>10}",
+        "n", "threads", "median ms", "range ms", "us/signature", "tx/s"
+    );
+    let mut raw_4096 = [Duration::ZERO; 2];
+    for &n in &BATCH_SIZES {
+        for &threads in &THREAD_COUNTS {
+            let samples = if threads == 1 {
+                measure(|| fixture.raw_verify_range(0, n))
+            } else {
+                measure(|| fixture.raw_verify_threaded(n, threads))
+            };
+            let med = median(&samples);
+            print_measurement_row(n, threads, &samples, n);
+            if n == 4_096 {
+                let slot = if threads == 1 { 0 } else { 1 };
+                raw_4096[slot] = med;
+            }
+        }
+    }
+    println!();
+
+    println!("  full transaction verification (Transaction::verify with an ML-DSA policy):");
+    println!(
+        "  {:>5}  {:>7}  {:>14}  {:>15}  {:>13}  {:>10}",
+        "n", "threads", "median ms", "range ms", "us/signature", "tx/s"
+    );
+    let mut full_4096 = [Duration::ZERO; 2];
+    for &n in &BATCH_SIZES {
+        for &threads in &THREAD_COUNTS {
+            let samples = if threads == 1 {
+                measure(|| fixture.full_verify_range(0, n))
+            } else {
+                measure(|| fixture.full_verify_threaded(n, threads))
+            };
+            let med = median(&samples);
+            print_measurement_row(n, threads, &samples, n);
+            if n == 4_096 {
+                let slot = if threads == 1 { 0 } else { 1 };
+                full_4096[slot] = med;
+            }
+        }
+    }
+    println!();
+
+    println!("  sign only (producer/wallet cost, not validator TPS):");
+    let message = &fixture.signing_payloads[0];
+    let sign_samples = measure_repeated(ML_DSA_SIGN_ITERATIONS, || {
+        ml_dsa::sign_with_context(&fixture.private_key, message, &[])
+            .map(|signature| signature.len())
+    });
+    let sign_median = median(&sign_samples);
+    println!(
+        "    {:.2} us/signature (median of {RUNS}, {} reps)",
+        microseconds_per(sign_median, ML_DSA_SIGN_ITERATIONS),
+        ML_DSA_SIGN_ITERATIONS
+    );
+    println!();
+
+    println!("  comparison at 4,096 (per-signature cost):");
+    println!(
+        "    raw, 1 thread:   ML-DSA {:.2} us vs Ed25519 individual {:.2} us -> {:.2}x",
+        microseconds_per(raw_4096[0], 4_096),
+        microseconds_per(ed25519_individual_4096[0], 4_096),
+        microseconds_per(raw_4096[0], 4_096) / microseconds_per(ed25519_individual_4096[0], 4_096)
+    );
+    println!(
+        "    raw, 4 threads:  ML-DSA {:.2} us vs Ed25519 individual {:.2} us -> {:.2}x",
+        microseconds_per(raw_4096[1], 4_096),
+        microseconds_per(ed25519_individual_4096[1], 4_096),
+        microseconds_per(raw_4096[1], 4_096) / microseconds_per(ed25519_individual_4096[1], 4_096)
+    );
+    println!(
+        "    full, 4 threads: ML-DSA {:.2} us vs Ed25519 batch {:.2} us -> {:.2}x",
+        microseconds_per(full_4096[1], 4_096),
+        microseconds_per(ed25519_batch_4096[1], 4_096),
+        microseconds_per(full_4096[1], 4_096) / microseconds_per(ed25519_batch_4096[1], 4_096)
+    );
+    println!();
+    println!(
+        "  contingency only: this does not activate ML-DSA in the workspace, change \
+         the default, or change consensus."
+    );
+    println!(
+        "  the comparison is CPU verification; the signature is 3,309 B and the \
+         account key 1,952 B, so wire/state costs are separate"
+    );
+    println!();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Operations and timing
 // ---------------------------------------------------------------------------
 
@@ -854,6 +1156,38 @@ fn ed25519_individual(fixture: &Ed25519Fixture, count: usize) -> usize {
         }
     }
     verified
+}
+
+fn ed25519_individual_threaded(fixture: &Ed25519Fixture, count: usize, threads: usize) -> usize {
+    let chunk = count.div_ceil(threads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|thread| {
+                let start = thread * chunk;
+                let end = ((thread + 1) * chunk).min(count);
+                scope.spawn(move || {
+                    let mut verified = 0;
+                    for index in start..end {
+                        if Ed25519Scheme
+                            .verify(
+                                &fixture.public_keys[index],
+                                &fixture.messages[index],
+                                &fixture.signatures[index],
+                            )
+                            .is_ok()
+                        {
+                            verified += 1;
+                        }
+                    }
+                    verified
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("Ed25519 worker panicked"))
+            .sum()
+    })
 }
 
 fn ed25519_failure(fixture: &Ed25519Fixture, count: usize) -> (Duration, usize) {

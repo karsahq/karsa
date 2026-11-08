@@ -8,10 +8,17 @@ publish = false
 # dependency never enters the default build or the validation gate.
 [workspace]
 
+[features]
+default = []
+# Experimental ML-DSA-65 contingency measurement. It enables the PQ registry
+# entries only for this benchmark; the workspace default stays Ed25519.
+pq = ["crypto/pq-openssl", "crypto/pq-testnet"]
+
 [dependencies]
 # `no-threads` is required for a fair comparison: with the default feature blst
 # runs its own thread pool inside one verify call, which would silently turn a
 # "single-thread" number into an all-core number.
 blst = { version = "0.3.17", features = ["no-threads"] }
 crypto = { path = "../../crates/crypto" }
+tx = { path = "../../crates/tx" }
 validator = { path = "../../crates/validator" }
