@@ -1555,7 +1555,7 @@ mod tests {
                     })
                     .collect()
             };
-            for author in 0..active {
+            for (author, key) in keys.iter().enumerate().take(active) {
                 let mut vertex = Vertex {
                     chain_id: b"karsa-transition-1".to_vec(),
                     epoch,
@@ -1566,7 +1566,7 @@ mod tests {
                     signature: Vec::new(),
                 };
                 let payload = vertex.signing_payload().unwrap();
-                vertex.signature = Ed25519Scheme.sign(&keys[author], &payload).unwrap();
+                vertex.signature = Ed25519Scheme.sign(key, &payload).unwrap();
                 dag.insert(vertex)
                     .expect("the active set accepts its own vertex");
             }
