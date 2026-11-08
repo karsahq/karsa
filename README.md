@@ -16,6 +16,7 @@ not part of this repository.
 | `crates/store/` | Rust: append-only on-disk vertices, batches, and roots |
 | `crates/erasure/` | Rust: Reed-Solomon over GF(2^8) for sharded storage |
 | `cmd/karsa/` | Rust: single CLI with `genesis`, `config`, `node`, `sample-tx`, `demo`, `acvp`, `dagbench`, `loadtest`, `live`, `finality`, `dagsim`, `chain`, `net`, `persist`, `audit`, `migrate`, `sigbench`, `sweep`, `shards` |
+| `bench/crypto-verify/` | Rust: standalone crypto benchmark target; its BLS dependency is outside the workspace |
 | `.cargo/config.toml` | sccache as rustc wrapper, mold as linker |
 | `scripts/rust-check.sh` | Rust gate: fmt, clippy, tests |
 | `scripts/acvp-rust.sh` | Downloads the ACVP vectors and runs the checker |
@@ -603,6 +604,38 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     load. It is 20–30 validator tasks sharing one process and 16 hardware threads,
     not 20–30 machines: the numbers are a probe, not a committee-scaling
     prediction, and must not justify a protocol change in either direction.
+30. **BLS aggregation fails the measured 2× rule and is not a TPS lever.** The
+    pre-registered rule was to pursue BLS only if aggregate verification plus
+    failure handling is at least 2× faster than the current Ed25519 batch path
+    at 4,096 transactions. A standalone target, `bench/crypto-verify/`, measured
+    both on the 4C/8T desktop (Intel i7-4790K), release build, median of three
+    runs; blst 0.3.17 is built `no-threads` so the verifier-thread budget is
+    explicit, and the BLS dependency is outside the workspace and the default
+    build. Ed25519 is the real `verify_ed25519_batch` path (key/signature
+    parsing, small-order R guard, batch equation); BLS is `min_pk` and the full
+    wire path deserializes, subgroup-checks every signature, aggregates, and
+    verifies. At 4,096 distinct 71-byte messages with distinct keys: Ed25519
+    96.6 ms on one thread (23.6 µs/signature) and 35.7 ms on four (8.7
+    µs/signature); BLS 2,687.5 ms (656.1 µs/signature) and 720.6 ms (175.9
+    µs/signature). With one invalid signature, Ed25519's batch-fail-plus-
+    fallback path is 265.1 ms against BLS's 4,840.9 ms. BLS is therefore 27.8×
+    slower on one thread, 20.2× on four, and 18.3× on the failure path; a third
+    session under load kept the direction (33.9×/21.8×/15.4×). Aggregation itself
+    is cheap (1.9 µs/signature); the cost is one pairing per distinct message
+    (~523 µs/signature) plus the subgroup check (~132 µs/signature). Public keys
+    are assumed proof-of-possession-validated at registration, so the BLS
+    numbers are lower bounds. Certificate verification at n=10/30: Ed25519
+    batch 0.254/0.729 ms versus BLS aggregate 1.460 ms (independent of n), so
+    BLS is 5.1–5.7× slower at n=10 and 1.8–2.0× at n=30; n=20 is interpolated.
+    A FROST/Schnorr certificate is modeled as one Ed25519 verify (0.040–0.058
+    ms), but the measured n=10 commit → certificate p95 is 15.8 ms (finding 28),
+    so certificate verification is not the tail. Decision: keep the Ed25519
+    batch path; do not adopt BLS transaction aggregation or launch-size BLS
+    certificates; defer FROST until the finality tail is a product requirement.
+    The n=100 BLS certificate crossover is plausible (existing Ed25519 batch
+    report 2.63 ms vs BLS 1.46 ms) but was not measured in one session. Ed25519
+    absolute numbers are session-sensitive while the BLS rows stayed within
+    0.7%; the ratio is the stable result.
 
 ## Build order
 
