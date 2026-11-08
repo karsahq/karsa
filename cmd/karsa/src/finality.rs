@@ -346,7 +346,7 @@ struct ValidatorTask {
     history_req:
         Option<mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<Result<History, String>>>>,
     history_mode: ColdHistory,
-    round_tx: Option<watch::Sender<u64>>,
+    round_tx: Option<watch::Sender<(u64, u64)>>,
 }
 
 impl Validator {
@@ -1417,7 +1417,7 @@ async fn validator_task(task: ValidatorTask) -> Result<NodeResult, String> {
             _ = ticker.tick() => {
                 validator.tick()?;
                 if let Some(tx) = &round_tx {
-                    let _ = tx.send(validator.round());
+                    let _ = tx.send((validator.round(), validator.last_built.height));
                 }
             }
             request = recv_history(&mut history_req) => {
@@ -1534,7 +1534,7 @@ async fn run_mesh(
     let (history_tx, history_rx) =
         mpsc::unbounded_channel::<oneshot::Sender<Result<History, String>>>();
     let mut history_rx = Some(history_rx);
-    let (round_tx, mut round_rx) = watch::channel(0u64);
+    let (round_tx, mut round_rx) = watch::channel((0u64, 0u64));
     let mut cold_inbound: Option<mpsc::UnboundedReceiver<Inbound>> = None;
 
     for index in 0..mesh {
@@ -1600,8 +1600,12 @@ async fn run_mesh(
                 }
             }
             _ = round_rx.changed(), if !cold_started => {
-                let round = *round_rx.borrow();
-                if round >= join_round.unwrap_or(u64::MAX) {
+                let (round, built) = *round_rx.borrow();
+                // Wait for at least one built header before snapshotting. A node
+                // authors faster than it commits, so the change round can be
+                // reached before the first commit exists; a snapshot of an empty
+                // prefix would reject the join instead of waiting for one.
+                if round >= join_round.unwrap_or(u64::MAX) && built > 0 {
                     // Read the sample floor before asking for the history: every
                     // sample submitted after this count is live for the joining
                     // node, even if the snapshot ends up carrying it as tail.
