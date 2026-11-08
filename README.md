@@ -696,6 +696,38 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     gate is green on the measured tree (353 tests default, 354 with all
     features).
 
+33. **A validator that was not online from genesis can cold-join at the boundary
+    from a peer's committed snapshot, and the aggregate finality p50 does not
+    move.** The prototype starts the added validator only when validator 0
+    reaches round 50. The snapshot carries the peer's committed order, its last
+    built header, the next decision round, and the vertices/batches/headers.
+    The joining node verifies every record, adopts the order and pacemaker
+    cursor, applies the prefix batches in that order, checks
+    dag_root/state_root/applied, and then authors and votes live. The first
+    attempt re-decided the prefix from a partially received DAG and missed eight
+    empty vertices; adopting the peer's order fixed it. Measured on the AMD
+    Ryzen 7 6800U, 8 cores / 16 threads, in-process mesh, 100 samples, 1 tx/batch,
+    epoch 50, change at round 50, median of 3 runs: all 12 control/cold runs
+    finalized 100 of 100 on every live node, certified 100 of 100 on the
+    submitter, and agreed on order, state, and headers with 0 conflicts and 0
+    rejected. At zero delay, cold join submit → certified p50 was 15.11 ms
+    against 14.92 ms for the control (+1.3%), p95 23.71 vs 22.28 (+6.4%), p99
+    28.03 vs 25.89 (+8.3%). At 25 ms one-way delay with 5 ms jitter: p50 125.46
+    vs 125.47 (0.0%), p95 191.09 vs 193.50 (−1.2%), p99 213.78 vs 224.65
+    (−4.8%). Catch-up, median of three: 36.07 ms and 143,169 serialized bytes at
+    zero delay (197 vertices, 45 batches, 44 headers, 189 commits, 49 rounds),
+    and 50.04 ms and 138,641 bytes at 25 ms (197 vertices, 50 batches, 43
+    headers, 189 commits, 49 rounds). The added validator authored 111–119
+    vertices at zero delay and 62–63 at 25 ms; its certified header and head
+    matched the existing nodes, while its header count was lower because it
+    adopts the prefix instead of rebuilding every prefix header. The history
+    handoff is in-process and the byte figure is the serialized size, not a TCP
+    transfer; the snapshot still carries the full history, not a state snapshot
+    plus tail, and the next milestone is that smaller snapshot over a real
+    transport. The harness prints a live-sample count that includes prefix
+    samples committed after replay; the claim uses the 100-of-100 line. The full
+    gate is green (fmt, clippy, default and all-features tests).
+
 ## Build order
 
 | Stage | Crate | State |
