@@ -47,7 +47,7 @@ use net::Node;
 use tokio::sync::{mpsc, watch};
 use tx::batch::Batch;
 use validator::{
-    Certificate, Header, HeaderChain, Step, ValidatorSet, Vertex, bitmap_len, commit_root, set_bit,
+    Certificate, Header, HeaderChain, SetSchedule, Step, Vertex, bitmap_len, commit_root, set_bit,
 };
 
 use crate::chain;
@@ -67,10 +67,19 @@ const VALIDATOR_SET_ID: &[u8] = b"karsa-finality-1";
 /// before the mesh is shut down.
 const DRAIN: Duration = Duration::from_millis(200);
 
+/// One validator added or removed at an epoch boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetChange {
+    /// Append one validator to the set; the new set has one more.
+    Add,
+    /// Remove the last validator from the set; the new set has one fewer.
+    Remove,
+}
+
 /// How a finality run is configured.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Committee size.
+    /// Committee size before any transition.
     pub validators: usize,
     /// Client submissions. Each one is a separate batch and a separate round.
     pub samples: usize,
@@ -84,6 +93,11 @@ pub struct Config {
     pub timeout: Duration,
     /// Home directory whose genesis fixes the identity and the epoch length.
     pub home: Option<PathBuf>,
+    /// Override the epoch length for this experiment; `None` keeps the
+    /// membership's value.
+    pub epoch_rounds: Option<u64>,
+    /// Optional validator-set transition at an epoch boundary.
+    pub change: Option<(SetChange, u64)>,
 }
 
 /// One client submission, as the client saw it.
@@ -132,6 +146,8 @@ struct Outcome {
     elapsed: Duration,
     finalized_on_submitter: usize,
     timed_out: bool,
+    /// First round whose epoch belongs to the new set, when configured.
+    change_round: Option<u64>,
 }
 
 /// A frame moving between validators.
@@ -189,7 +205,7 @@ struct Candidate {
 struct Validator {
     index: usize,
     node: Node,
-    set: ValidatorSet,
+    sets: SetSchedule,
     chain_id: Vec<u8>,
     private_key: Vec<u8>,
     accounts: Vec<chain::Account>,
@@ -224,6 +240,7 @@ struct Validator {
 #[derive(Clone)]
 struct Context {
     committee: chain::Membership,
+    sets: SetSchedule,
     chain_id: Vec<u8>,
     senders: Arc<Vec<mpsc::UnboundedSender<Inbound>>>,
     started: Instant,
@@ -249,18 +266,31 @@ impl Validator {
         ack: Option<mpsc::UnboundedSender<u64>>,
     ) -> Result<Self, String> {
         let committee = &context.committee;
-        let set = committee.set.clone();
+        let sets = context.sets.clone();
+        let base = sets.base().clone();
         let identity = committee
             .consensus
             .get(index)
             .ok_or_else(|| format!("no consensus key for validator {index}"))?;
-        let node = Node::with_chain_id_and_epoch_length(
-            set.clone(),
-            committee.epoch_rounds,
-            identity.id.clone(),
-            identity.private_key.clone(),
-            context.chain_id.clone(),
-        );
+        let node = match sets.change_epoch() {
+            Some(change_epoch) => Node::with_chain_id_epoch_and_set_change(
+                base.clone(),
+                sets.set_for_epoch(change_epoch).clone(),
+                change_epoch,
+                committee.epoch_rounds,
+                identity.id.clone(),
+                identity.private_key.clone(),
+                context.chain_id.clone(),
+            )
+            .map_err(|error| error.to_string())?,
+            None => Node::with_chain_id_and_epoch_length(
+                base.clone(),
+                committee.epoch_rounds,
+                identity.id.clone(),
+                identity.private_key.clone(),
+                context.chain_id.clone(),
+            ),
+        };
         let accounts = committee.accounts.clone();
         let mut state = chain::genesis_state(&accounts).map_err(|error| error.to_string())?;
         for account in &accounts {
@@ -276,13 +306,22 @@ impl Validator {
             state.state_root(),
             commit_root(&[]),
         );
-        let chain =
-            HeaderChain::with_schedule(set.clone(), genesis.clone(), node.dag().epoch_schedule());
+        let chain = match sets.change_epoch() {
+            Some(change_epoch) => HeaderChain::with_schedule_and_change(
+                base,
+                sets.set_for_epoch(change_epoch).clone(),
+                change_epoch,
+                genesis.clone(),
+                node.dag().epoch_schedule(),
+            )
+            .map_err(|error| error.to_string())?,
+            None => HeaderChain::with_schedule(base, genesis.clone(), node.dag().epoch_schedule()),
+        };
 
         Ok(Self {
             index,
             node,
-            set,
+            sets,
             chain_id: context.chain_id.clone(),
             private_key: identity.private_key.clone(),
             accounts,
@@ -382,7 +421,7 @@ impl Validator {
             self.conflicts += 1;
             return Ok(());
         }
-        if share.signer >= self.set.validators.len() {
+        if share.signer >= self.sets.set_for_epoch(share.header.epoch).validators.len() {
             self.conflicts += 1;
             return Ok(());
         }
@@ -407,13 +446,16 @@ impl Validator {
         loop {
             let height = self.chain.head().height + 1;
             let previous = self.chain.head().id().map_err(|error| error.to_string())?;
-            let quorum = self.set.quorum_size();
 
             let mut candidate: Option<Candidate> = None;
             for (id, collected) in &self.share_sets {
                 if collected.header.height != height || collected.header.previous != previous {
                     continue;
                 }
+                let quorum = self
+                    .sets
+                    .set_for_epoch(collected.header.epoch)
+                    .quorum_size();
                 if collected.signatures.len() < quorum {
                     continue;
                 }
@@ -448,7 +490,8 @@ impl Validator {
             let at = signed.iter().map(|(_, _, at)| *at).max().unwrap_or(0);
             signed.sort_by_key(|(index, _, _)| *index);
 
-            let mut bitmap = vec![0u8; bitmap_len(self.set.validators.len())];
+            let set = self.sets.set_for_epoch(header.epoch);
+            let mut bitmap = vec![0u8; bitmap_len(set.validators.len())];
             for (index, _, _) in &signed {
                 set_bit(&mut bitmap, *index);
             }
@@ -464,7 +507,7 @@ impl Validator {
                     .map(|(_, signature, _)| signature)
                     .collect(),
             };
-            certificate.verify_quorum(&self.set).map_err(|error| {
+            certificate.verify_quorum(set).map_err(|error| {
                 format!(
                     "validator {} cannot verify a certificate: {error}",
                     self.index
@@ -575,15 +618,7 @@ impl Validator {
             if vertex.payload_hash == [0u8; 32] {
                 continue;
             }
-            let author = self
-                .set
-                .validators
-                .iter()
-                .position(|record| record.validator_id == id.author);
-            let validators = u64::try_from(self.set.validators.len()).unwrap_or(0);
-            let leader = author.is_some_and(|index| {
-                u64::try_from(index).is_ok_and(|index| id.round % validators == index)
-            });
+            let leader = self.node.dag().leader_author(id.round) == Some(id.author.as_slice());
             self.committed.push(CommittedSample {
                 digest: vertex.payload_hash,
                 vertex_round: id.round,
@@ -650,9 +685,16 @@ impl Validator {
                 .pop_front()
                 .ok_or("pending header disappeared")?;
             let state_root = pending.state_root.ok_or("pending header lost its root")?;
+            let epoch = self.node.dag().epoch_of(pending.round);
+            let active = self
+                .sets
+                .set_for_epoch(epoch)
+                .validators
+                .iter()
+                .any(|record| record.validator_id.as_slice() == self.node.id());
             let header = Header {
                 chain_id: self.chain_id.clone(),
-                epoch: self.node.dag().epoch_of(pending.round),
+                epoch,
                 height: pending.height,
                 round: pending.round,
                 state_root,
@@ -668,29 +710,32 @@ impl Validator {
                 self.conflicts += 1;
             }
 
-            let at = self.now();
-            let payload = signing_payload(&header).map_err(|error| error.to_string())?;
-            let signature = Ed25519Scheme
-                .sign(&self.private_key, &payload)
-                .map_err(|error| error.to_string())?;
-            let entry = self.share_sets.entry(id).or_insert_with(|| ShareSet {
-                header: header.clone(),
-                signatures: BTreeMap::new(),
-            });
-            entry.signatures.entry(self.index).or_insert(Signed {
-                signature: signature.clone(),
-                at,
-            });
             self.last_built = header.clone();
             self.headers += 1;
 
-            self.broadcast(Inbound::Share(Share {
-                header,
-                signer: self.index,
-                signature,
-                at,
-            }));
-            self.advance_certified()?;
+            if active {
+                let at = self.now();
+                let payload = signing_payload(&header).map_err(|error| error.to_string())?;
+                let signature = Ed25519Scheme
+                    .sign(&self.private_key, &payload)
+                    .map_err(|error| error.to_string())?;
+                let entry = self.share_sets.entry(id).or_insert_with(|| ShareSet {
+                    header: header.clone(),
+                    signatures: BTreeMap::new(),
+                });
+                entry.signatures.entry(self.index).or_insert(Signed {
+                    signature: signature.clone(),
+                    at,
+                });
+
+                self.broadcast(Inbound::Share(Share {
+                    header,
+                    signer: self.index,
+                    signature,
+                    at,
+                }));
+                self.advance_certified()?;
+            }
         }
         Ok(())
     }
@@ -801,12 +846,14 @@ async fn client_task(
 async fn run_mesh(
     config: Config,
     committee: chain::Membership,
+    sets: SetSchedule,
     chain_id: Vec<u8>,
     started: Instant,
 ) -> Result<Outcome, String> {
-    let mut senders = Vec::with_capacity(config.validators);
-    let mut receivers = Vec::with_capacity(config.validators);
-    for _ in 0..config.validators {
+    let mesh = sets.mesh_size();
+    let mut senders = Vec::with_capacity(mesh);
+    let mut receivers = Vec::with_capacity(mesh);
+    for _ in 0..mesh {
         let (sender, receiver) = mpsc::unbounded_channel();
         senders.push(sender);
         receivers.push(receiver);
@@ -821,17 +868,18 @@ async fn run_mesh(
     let submissions = Arc::new(Mutex::new(Vec::new()));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let mut tasks = Vec::with_capacity(config.validators);
+    let mut tasks = Vec::with_capacity(mesh);
     let mut receivers = receivers.into_iter();
     let context = Context {
         committee: committee.clone(),
+        sets: sets.clone(),
         chain_id: chain_id.clone(),
         senders: Arc::clone(&senders),
         started,
         delay: config.delay,
         jitter: config.jitter,
     };
-    for index in 0..config.validators {
+    for index in 0..mesh {
         let inbound = receivers
             .next()
             .ok_or("fewer inbound channels than validators")?;
@@ -858,7 +906,7 @@ async fn run_mesh(
         Arc::clone(&submissions),
     ));
 
-    let mut finalized: Vec<HashSet<[u8; 32]>> = vec![HashSet::new(); config.validators];
+    let mut finalized: Vec<HashSet<[u8; 32]>> = vec![HashSet::new(); mesh];
     let deadline = tokio::time::sleep(config.timeout);
     tokio::pin!(deadline);
     let mut timed_out = false;
@@ -915,6 +963,10 @@ async fn run_mesh(
         .drain(..)
         .collect();
 
+    let change_round = config
+        .change
+        .map(|(_, epoch)| epoch.saturating_sub(committee.set.epoch) * committee.epoch_rounds);
+
     Ok(Outcome {
         config,
         chain_id,
@@ -923,6 +975,7 @@ async fn run_mesh(
         elapsed: started.elapsed(),
         finalized_on_submitter: finalized.first().map_or(0, HashSet::len),
         timed_out,
+        change_round,
     })
 }
 
@@ -957,7 +1010,39 @@ fn measure(config: Config) -> Result<Outcome, Box<dyn Error>> {
         .clone()
         .map(|path| crate::home::Home::resolve(Some(path)))
         .transpose()?;
-    let committee = chain::membership(config.validators, home.as_ref())?;
+    let mesh = match config.change {
+        Some((SetChange::Add, _)) => config.validators + 1,
+        Some((SetChange::Remove, _)) | None => config.validators,
+    };
+    let mut committee = chain::membership(mesh, home.as_ref())?;
+    if let Some(rounds) = config.epoch_rounds {
+        committee.epoch_rounds = rounds;
+    }
+    let base_epoch = committee.set.epoch;
+    let sets = match config.change {
+        None => SetSchedule::single(committee.set.clone()),
+        Some((kind, change_epoch)) => {
+            let (old_set, new_set) = match kind {
+                SetChange::Add => {
+                    let mut old = committee.set.clone();
+                    old.validators.truncate(config.validators);
+                    old.epoch = base_epoch;
+                    let mut new = committee.set.clone();
+                    new.epoch = change_epoch;
+                    (old, new)
+                }
+                SetChange::Remove => {
+                    let mut old = committee.set.clone();
+                    old.epoch = base_epoch;
+                    let mut new = committee.set.clone();
+                    new.validators.truncate(config.validators - 1);
+                    new.epoch = change_epoch;
+                    (old, new)
+                }
+            };
+            SetSchedule::with_change(old_set, change_epoch, new_set)?
+        }
+    };
     let chain_id = match &home {
         Some(home) => chain::chain_id(Some(home))?,
         None => chain::demo_chain_id(),
@@ -967,7 +1052,7 @@ fn measure(config: Config) -> Result<Outcome, Box<dyn Error>> {
         .enable_all()
         .build()?;
     let started = Instant::now();
-    let outcome = runtime.block_on(run_mesh(config, committee, chain_id, started))?;
+    let outcome = runtime.block_on(run_mesh(config, committee, sets, chain_id, started))?;
     Ok(outcome)
 }
 
@@ -977,6 +1062,8 @@ struct Finalized {
     submit_ns: u64,
     commit_ns: u64,
     cert_ns: u64,
+    vertex_round: u64,
+    header_round: u64,
     /// Commit time reported by the validator whose certificate was the first one.
     cert_commit_ns: u64,
     rounds: u64,
@@ -1041,6 +1128,8 @@ fn merge(outcome: &Outcome) -> (Vec<Finalized>, usize) {
             submit_ns: submission.at,
             commit_ns: commit,
             cert_ns: cert,
+            vertex_round: vertex,
+            header_round: header,
             cert_commit_ns: cert_commit,
             // The vote round is the one after the decided round: a decision at
             // `q` exists because round `q + 1` voted for its leader.
@@ -1132,6 +1221,16 @@ fn print(outcome: &Outcome) -> Result<(), Box<dyn Error>> {
         outcome.config.jitter.as_millis(),
         millis(u64::try_from(TICK.as_nanos()).unwrap_or(u64::MAX)),
     );
+    if let Some((kind, epoch)) = outcome.config.change {
+        let (verb, new_size) = match kind {
+            SetChange::Add => ("add", outcome.config.validators + 1),
+            SetChange::Remove => ("remove", outcome.config.validators - 1),
+        };
+        println!(
+            "  set change: {verb} one validator at epoch {epoch} ({} -> {new_size} validators)",
+            outcome.config.validators
+        );
+    }
     println!(
         "  {} submissions, {} transaction{} per batch, closed loop: the next submit waits for \
          the previous authoring",
@@ -1186,6 +1285,52 @@ fn print(outcome: &Outcome) -> Result<(), Box<dyn Error>> {
         millis(percentile(&cert, 99)),
         millis(percentile(&cert, 100))
     );
+    if let Some(change_round) = outcome.change_round {
+        println!("  set change at round {change_round}:");
+        let groups = [
+            (
+                "before",
+                finalized
+                    .iter()
+                    .filter(|sample| sample.header_round < change_round)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "boundary",
+                finalized
+                    .iter()
+                    .filter(|sample| {
+                        sample.header_round >= change_round && sample.vertex_round < change_round
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "after",
+                finalized
+                    .iter()
+                    .filter(|sample| sample.vertex_round >= change_round)
+                    .collect::<Vec<_>>(),
+            ),
+        ];
+        for (label, group) in groups {
+            if group.is_empty() {
+                continue;
+            }
+            let mut cert: Vec<u64> = group
+                .iter()
+                .map(|sample| sample.cert_ns - sample.submit_ns)
+                .collect();
+            cert.sort_unstable();
+            println!(
+                "    {label:<8} {:>3} samples  submit -> certificate p50 {}  p95 {}  p99 {}",
+                group.len(),
+                millis(percentile(&cert, 50)),
+                millis(percentile(&cert, 95)),
+                millis(percentile(&cert, 99))
+            );
+        }
+        println!();
+    }
     println!(
         "  commit -> certificate  p50 {}  p95 {}  p99 {}  (at the node whose certificate \
          was first)",
@@ -1317,6 +1462,8 @@ mod tests {
             jitter: Duration::ZERO,
             timeout: Duration::from_secs(20),
             home: None,
+            epoch_rounds: None,
+            change: None,
         }
     }
 
@@ -1351,6 +1498,51 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].state_root == pair[1].state_root)
         );
+    }
+
+    #[test]
+    fn a_validator_join_at_an_epoch_boundary_finalizes() {
+        let mut config = config(8);
+        config.epoch_rounds = Some(4);
+        config.change = Some((SetChange::Add, 2));
+        let outcome = measure(config).unwrap();
+        assert_eq!(outcome.results.len(), 5, "the mesh keeps the new set's key");
+
+        let (finalized, incomplete) = merge(&outcome);
+        assert_eq!(incomplete, 0, "every node must credit every sample");
+        assert_eq!(finalized.len(), 8);
+        assert_eq!(outcome.finalized_on_submitter, 8);
+        assert!(
+            outcome
+                .results
+                .windows(2)
+                .all(|pair| pair[0].state_root == pair[1].state_root),
+            "the old and new sets must end on the same state"
+        );
+        assert!(outcome.results.iter().all(|result| result.conflicts == 0));
+    }
+
+    #[test]
+    fn a_validator_removal_at_an_epoch_boundary_finalizes() {
+        let mut config = config(4);
+        config.validators = 5;
+        config.epoch_rounds = Some(4);
+        config.change = Some((SetChange::Remove, 2));
+        let outcome = measure(config).unwrap();
+        assert_eq!(outcome.results.len(), 5, "the removed node still receives");
+
+        let (finalized, incomplete) = merge(&outcome);
+        assert_eq!(incomplete, 0, "every node must credit every sample");
+        assert_eq!(finalized.len(), 4);
+        assert_eq!(outcome.finalized_on_submitter, 4);
+        assert!(
+            outcome
+                .results
+                .windows(2)
+                .all(|pair| pair[0].state_root == pair[1].state_root),
+            "the removed node must end on the same state"
+        );
+        assert!(outcome.results.iter().all(|result| result.conflicts == 0));
     }
 
     #[test]

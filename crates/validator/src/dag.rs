@@ -24,6 +24,7 @@ use crypto::merkle::{MerkleProof, MerkleTree};
 use crypto::{CryptoError, CryptoErrorKind};
 
 use crate::schedule::{EpochSchedule, ValidatorSet};
+use crate::set_change::SetSchedule;
 use crate::vertex::{Vertex, VertexId, tally_votes};
 
 /// The outcome of asking a round to decide.
@@ -53,7 +54,7 @@ pub struct SkippedRound {
 
 /// Vertices this node holds, plus what it has already committed.
 pub struct Dag {
-    set: ValidatorSet,
+    sets: SetSchedule,
     vertices: BTreeMap<(u64, Vec<u8>), Vertex>,
     committed: HashSet<[u8; 32]>,
     order: Vec<VertexId>,
@@ -73,7 +74,7 @@ impl Dag {
     pub fn new(set: ValidatorSet) -> Self {
         let epoch = set.epoch;
         Self {
-            set,
+            sets: SetSchedule::single(set),
             vertices: BTreeMap::new(),
             committed: HashSet::new(),
             order: Vec::new(),
@@ -99,6 +100,35 @@ impl Dag {
         let mut dag = Self::new(set);
         dag.schedule = EpochSchedule::advancing(base, rounds_per_epoch);
         dag
+    }
+
+    /// Creates an empty DAG with one checked set transition at `change_epoch`.
+    ///
+    /// This is the prototype hook for a validator-set change. Key rotation keeps
+    /// the identities fixed and needs only [`Dag::with_epoch_length`]; this
+    /// constructor moves identities and therefore validates the quorum
+    /// intersection before any vertex is accepted.
+    ///
+    /// # Errors
+    ///
+    /// Every error from [`SetSchedule::with_change`].
+    pub fn with_epoch_length_and_change(
+        set: ValidatorSet,
+        next: ValidatorSet,
+        change_epoch: u64,
+        rounds_per_epoch: u64,
+    ) -> Result<Self, CryptoError> {
+        let base = set.epoch;
+        let sets = SetSchedule::with_change(set, change_epoch, next)?;
+        Ok(Self {
+            sets,
+            vertices: BTreeMap::new(),
+            committed: HashSet::new(),
+            order: Vec::new(),
+            skipped: Vec::new(),
+            schedule: EpochSchedule::advancing(base, rounds_per_epoch),
+            floor: None,
+        })
     }
 
     /// The epoch a round belongs to.
@@ -148,10 +178,28 @@ impl Dag {
         self.floor.is_some_and(|floor| round <= floor)
     }
 
-    /// The validator set this DAG resolves keys against.
+    /// The validator set this DAG resolves keys against before any transition.
     #[must_use]
     pub fn set(&self) -> &ValidatorSet {
-        &self.set
+        self.sets.base()
+    }
+
+    /// The checked set schedule, including an optional transition.
+    #[must_use]
+    pub fn set_schedule(&self) -> &SetSchedule {
+        &self.sets
+    }
+
+    /// The validator set active at `epoch`.
+    #[must_use]
+    pub fn set_for_epoch(&self, epoch: u64) -> &ValidatorSet {
+        self.sets.set_for_epoch(epoch)
+    }
+
+    /// The validator set active at `round`.
+    #[must_use]
+    pub fn set_for_round(&self, round: u64) -> &ValidatorSet {
+        self.sets.set_for_round(&self.schedule, round)
     }
 
     /// Inserts a vertex after verifying it and its shape.
@@ -173,7 +221,10 @@ impl Dag {
     /// Propagates [`Vertex::verify`], and returns
     /// [`CryptoErrorKind::InvalidVertex`] when the reference rule is not met.
     pub fn insert(&mut self, vertex: Vertex) -> Result<VertexId, CryptoError> {
-        vertex.verify(&self.set, self.epoch_of(vertex.round))?;
+        vertex.verify(
+            self.set_for_round(vertex.round),
+            self.epoch_of(vertex.round),
+        )?;
         // Below the floor the vertex is already committed and its state is in a
         // snapshot. It is still signature-checked, then dropped.
         if self.is_pruned(vertex.round) {
@@ -201,9 +252,9 @@ impl Dag {
         if self.is_pruned(previous) {
             return Ok(());
         }
+        let set = self.set_for_round(vertex.round);
         let registered = |author: &[u8]| {
-            self.set
-                .validators
+            set.validators
                 .iter()
                 .any(|record| record.validator_id == author)
         };
@@ -213,7 +264,7 @@ impl Dag {
                 authors.insert(&reference.author);
             }
         }
-        let required = self.set.quorum_size();
+        let required = set.quorum_size();
         if authors.len() < required {
             return Err(CryptoError::new(
                 CryptoErrorKind::InvalidVertex,
@@ -240,8 +291,9 @@ impl Dag {
     /// a different problem from the commit rule.
     #[must_use]
     pub fn leader_author(&self, round: u64) -> Option<&[u8]> {
-        let index = usize::try_from(round).ok()? % self.set.validators.len();
-        Some(&self.set.validators[index].validator_id)
+        let set = self.set_for_round(round);
+        let index = usize::try_from(round).ok()? % set.validators.len();
+        Some(&set.validators[index].validator_id)
     }
 
     /// The elected leader of `round`, if this node has it.
@@ -287,8 +339,9 @@ impl Dag {
             .into_iter()
             .cloned()
             .collect();
-        let voters = tally_votes(&self.set, &leader_id, &candidates, &self.schedule)?;
-        if self.set.has_supermajority(voters.len()) {
+        let voter_set = self.set_for_round(round + 1);
+        let voters = tally_votes(voter_set, &leader_id, &candidates, &self.schedule)?;
+        if voter_set.has_supermajority(voters.len()) {
             Ok(Some(leader_id))
         } else {
             Ok(None)
@@ -313,9 +366,10 @@ impl Dag {
             .into_iter()
             .cloned()
             .collect();
-        let voters = tally_votes(&self.set, &leader_id, &candidates, &self.schedule)?;
+        let voter_set = self.set_for_round(round + 1);
+        let voters = tally_votes(voter_set, &leader_id, &candidates, &self.schedule)?;
 
-        if self.set.has_supermajority(voters.len()) {
+        if voter_set.has_supermajority(voters.len()) {
             let history = self.commit_history(&leader_id)?;
             return Ok(Decision::Commit(history));
         }
@@ -323,7 +377,7 @@ impl Dag {
         // Only observed non-votes count. A voter whose vertex has not arrived is
         // unknown, not against the leader, so it cannot produce a skip.
         let non_voters = candidates.len() - voters.len();
-        if self.set.has_supermajority(non_voters) {
+        if voter_set.has_supermajority(non_voters) {
             self.record_skip(round, leader_id.author.clone(), Some(leader_id.digest));
             return Ok(Decision::Skip);
         }
@@ -350,7 +404,13 @@ impl Dag {
             .into_iter()
             .cloned()
             .collect();
-        Ok(tally_votes(&self.set, &leader_id, &candidates, &self.schedule)?.len())
+        Ok(tally_votes(
+            self.set_for_round(round + 1),
+            &leader_id,
+            &candidates,
+            &self.schedule,
+        )?
+        .len())
     }
 
     /// The first vertex the history walk from `round`'s leader cannot resolve.
@@ -444,9 +504,10 @@ impl Dag {
             .into_iter()
             .cloned()
             .collect();
-        let voters = tally_votes(&self.set, &leader_id, &candidates, &self.schedule)?.len();
-        let missing = self.set.validators.len().saturating_sub(candidates.len());
-        Ok(voters.saturating_add(missing) >= self.set.quorum_size())
+        let voter_set = self.set_for_round(round + 1);
+        let voters = tally_votes(voter_set, &leader_id, &candidates, &self.schedule)?.len();
+        let missing = voter_set.validators.len().saturating_sub(candidates.len());
+        Ok(voters.saturating_add(missing) >= voter_set.quorum_size())
     }
 
     /// Collects `id` and its ancestors that are not yet committed, in a
@@ -1426,6 +1487,144 @@ mod tests {
         assert!(
             !fixture.dag.can_still_anchor(LEADER_ROUND).unwrap(),
             "two held non-votes plus two missing votes cannot reach three"
+        );
+    }
+
+    fn transition_keys(count: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|index| {
+                let seed = [u8::try_from(index + 1).unwrap(); 32];
+                let public = Ed25519Scheme::public_key_from_seed(&seed).unwrap();
+                let mut private = Vec::with_capacity(64);
+                private.extend_from_slice(&seed);
+                private.extend_from_slice(&public);
+                private
+            })
+            .collect()
+    }
+
+    fn transition_records(count: usize, keys: &[Vec<u8>]) -> Vec<ValidatorRecord> {
+        (0..count)
+            .map(|index| ValidatorRecord {
+                validator_id: format!("val-{index}").into_bytes(),
+                keys: vec![ValidatorKey {
+                    key_id: format!("val-{index}-k0").into_bytes(),
+                    algorithm_id: ALG_ED25519,
+                    public_key: keys[index][32..].to_vec(),
+                    activation_epoch: 0,
+                    retirement_epoch: NO_EXPIRY,
+                }],
+            })
+            .collect()
+    }
+
+    /// Builds an old/new set pair and authors rounds 0..=3. The change lands at
+    /// round 2, so the first two rounds use the old set and the last two use the
+    /// new one.
+    fn transition_dag(old_count: usize, new_count: usize) -> (Dag, Vec<Vec<u8>>) {
+        let keys = transition_keys(old_count.max(new_count));
+        let records = transition_records(old_count.max(new_count), &keys);
+        let old_set = ValidatorSet {
+            epoch: 1,
+            validators: records[..old_count].to_vec(),
+        };
+        let new_set = ValidatorSet {
+            epoch: 2,
+            validators: records[..new_count].to_vec(),
+        };
+        let mut dag = Dag::with_epoch_length_and_change(old_set, new_set, 2, 2)
+            .expect("the transition is safe");
+
+        for round in 0..=3u64 {
+            let epoch = dag.epoch_of(round);
+            let active = if epoch < 2 { old_count } else { new_count };
+            let previous_active = if round == 0 {
+                0
+            } else if dag.epoch_of(round - 1) < 2 {
+                old_count
+            } else {
+                new_count
+            };
+            let references: Vec<VertexId> = if round == 0 {
+                Vec::new()
+            } else {
+                (0..previous_active)
+                    .filter_map(|author| {
+                        dag.get(round - 1, format!("val-{author}").as_bytes())
+                            .and_then(|vertex| vertex.id().ok())
+                    })
+                    .collect()
+            };
+            for author in 0..active {
+                let mut vertex = Vertex {
+                    chain_id: b"karsa-transition-1".to_vec(),
+                    epoch,
+                    round,
+                    author: format!("val-{author}").into_bytes(),
+                    payload_hash: [0u8; 32],
+                    references: references.clone(),
+                    signature: Vec::new(),
+                };
+                let payload = vertex.signing_payload().unwrap();
+                vertex.signature = Ed25519Scheme.sign(&keys[author], &payload).unwrap();
+                dag.insert(vertex)
+                    .expect("the active set accepts its own vertex");
+            }
+        }
+        (dag, keys)
+    }
+
+    #[test]
+    fn a_validator_join_at_an_epoch_boundary_keeps_committing() {
+        let (mut dag, keys) = transition_dag(4, 5);
+        assert_eq!(dag.set_for_round(1).validators.len(), 4);
+        assert_eq!(dag.set_for_round(2).validators.len(), 5);
+        assert_eq!(dag.leader_author(1), Some(b"val-1".as_slice()));
+        assert_eq!(dag.leader_author(2), Some(b"val-2".as_slice()));
+        assert!(matches!(dag.try_commit(1).unwrap(), Decision::Commit(_)));
+        assert!(matches!(dag.try_commit(2).unwrap(), Decision::Commit(_)));
+
+        // The new validator did not exist for the old epoch.
+        let mut stale = Vertex {
+            chain_id: b"karsa-transition-1".to_vec(),
+            epoch: 1,
+            round: 1,
+            author: b"val-4".to_vec(),
+            payload_hash: [0u8; 32],
+            references: Vec::new(),
+            signature: Vec::new(),
+        };
+        let payload = stale.signing_payload().unwrap();
+        stale.signature = Ed25519Scheme.sign(&keys[4], &payload).unwrap();
+        assert_eq!(
+            dag.insert(stale).unwrap_err().kind(),
+            CryptoErrorKind::UnknownValidator
+        );
+    }
+
+    #[test]
+    fn a_validator_removal_at_an_epoch_boundary_keeps_committing() {
+        let (mut dag, keys) = transition_dag(5, 4);
+        assert_eq!(dag.set_for_round(1).validators.len(), 5);
+        assert_eq!(dag.set_for_round(2).validators.len(), 4);
+        assert!(matches!(dag.try_commit(1).unwrap(), Decision::Commit(_)));
+        assert!(matches!(dag.try_commit(2).unwrap(), Decision::Commit(_)));
+
+        // The removed validator cannot author in the new epoch.
+        let mut stale = Vertex {
+            chain_id: b"karsa-transition-1".to_vec(),
+            epoch: 2,
+            round: 2,
+            author: b"val-4".to_vec(),
+            payload_hash: [0u8; 32],
+            references: Vec::new(),
+            signature: Vec::new(),
+        };
+        let payload = stale.signing_payload().unwrap();
+        stale.signature = Ed25519Scheme.sign(&keys[4], &payload).unwrap();
+        assert_eq!(
+            dag.insert(stale).unwrap_err().kind(),
+            CryptoErrorKind::UnknownValidator
         );
     }
 }

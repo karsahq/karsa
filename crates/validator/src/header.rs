@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 
 use crate::certificate::Certificate;
 use crate::schedule::{EpochSchedule, ValidatorSet};
+use crate::set_change::SetSchedule;
 
 /// Canonical header encoding version.
 pub const HEADER_VERSION_V1: u16 = 1;
@@ -172,7 +173,7 @@ impl Header {
 /// checks. It never needs the DAG, the transactions, or the account state.
 #[derive(Debug, Clone)]
 pub struct HeaderChain {
-    set: ValidatorSet,
+    sets: SetSchedule,
     schedule: EpochSchedule,
     head: Header,
 }
@@ -186,7 +187,7 @@ impl HeaderChain {
     pub fn new(set: ValidatorSet, genesis: Header) -> Self {
         let schedule = EpochSchedule::single(genesis.epoch);
         Self {
-            set,
+            sets: SetSchedule::single(set),
             schedule,
             head: genesis,
         }
@@ -200,10 +201,29 @@ impl HeaderChain {
     #[must_use]
     pub fn with_schedule(set: ValidatorSet, genesis: Header, schedule: EpochSchedule) -> Self {
         Self {
-            set,
+            sets: SetSchedule::single(set),
             schedule,
             head: genesis,
         }
+    }
+
+    /// Starts a verifier with one checked set transition at `change_epoch`.
+    ///
+    /// # Errors
+    ///
+    /// Every error from [`SetSchedule::with_change`].
+    pub fn with_schedule_and_change(
+        set: ValidatorSet,
+        next: ValidatorSet,
+        change_epoch: u64,
+        genesis: Header,
+        schedule: EpochSchedule,
+    ) -> Result<Self, CryptoError> {
+        Ok(Self {
+            sets: SetSchedule::with_change(set, change_epoch, next)?,
+            schedule,
+            head: genesis,
+        })
     }
 
     /// The header currently trusted.
@@ -212,10 +232,22 @@ impl HeaderChain {
         &self.head
     }
 
-    /// The validator set keys are resolved against.
+    /// The validator set keys are resolved against before any transition.
     #[must_use]
     pub fn set(&self) -> &ValidatorSet {
-        &self.set
+        self.sets.base()
+    }
+
+    /// The validator set active at `epoch`.
+    #[must_use]
+    pub fn set_for_epoch(&self, epoch: u64) -> &ValidatorSet {
+        self.sets.set_for_epoch(epoch)
+    }
+
+    /// The checked set schedule, including an optional transition.
+    #[must_use]
+    pub fn set_schedule(&self) -> &SetSchedule {
+        &self.sets
     }
 
     /// The round-to-epoch mapping this verifier checks against.
@@ -285,7 +317,7 @@ impl HeaderChain {
             ));
         }
 
-        certificate.verify_quorum(&self.set)?;
+        certificate.verify_quorum(self.sets.set_for_epoch(header.epoch))?;
         self.head = header.clone();
         Ok(())
     }
@@ -495,5 +527,116 @@ mod tests {
         let error = chain.advance(&header, &certificate).unwrap_err();
         assert_eq!(error.kind(), CryptoErrorKind::HeaderMismatch);
         assert_eq!(chain.head().height, 0);
+    }
+
+    fn transition_sets() -> (ValidatorSet, ValidatorSet, Vec<Vec<u8>>) {
+        let mut keys = Vec::new();
+        let mut records = Vec::new();
+        for index in 0..5usize {
+            let seed = [u8::try_from(index + 1).unwrap(); 32];
+            let public_key = Ed25519Scheme::public_key_from_seed(&seed).unwrap();
+            let mut private_key = Vec::with_capacity(64);
+            private_key.extend_from_slice(&seed);
+            private_key.extend_from_slice(&public_key);
+            records.push(ValidatorRecord {
+                validator_id: format!("val-{index}").into_bytes(),
+                keys: vec![ValidatorKey {
+                    key_id: format!("val-{index}-k0").into_bytes(),
+                    algorithm_id: ALG_ED25519,
+                    public_key: public_key.to_vec(),
+                    activation_epoch: 0,
+                    retirement_epoch: NO_EXPIRY,
+                }],
+            });
+            keys.push(private_key);
+        }
+        let old = ValidatorSet {
+            epoch: 1,
+            validators: records[..4].to_vec(),
+        };
+        let new = ValidatorSet {
+            epoch: 2,
+            validators: records,
+        };
+        old.validate().unwrap();
+        new.validate().unwrap();
+        (old, new, keys)
+    }
+
+    fn certify_with(
+        header: &Header,
+        keys: &[Vec<u8>],
+        signers: usize,
+        count: usize,
+    ) -> Certificate {
+        let mut certificate = Certificate {
+            chain_id: header.chain_id.clone(),
+            epoch: header.epoch,
+            round: header.round,
+            vertex_id: header.id().unwrap().to_vec(),
+            validator_set_id: b"karsa-transition-1".to_vec(),
+            signer_bitmap: bitmap_of(count, signers),
+            signatures: Vec::new(),
+        };
+        let payload = certificate.signing_payload().unwrap();
+        certificate.signatures = (0..signers)
+            .map(|index| Ed25519Scheme.sign(&keys[index], &payload).unwrap())
+            .collect();
+        certificate
+    }
+
+    #[test]
+    fn a_header_chain_switches_sets_at_the_epoch_boundary() {
+        let (old, new, keys) = transition_sets();
+        let schedule = EpochSchedule::advancing(1, 2);
+        let genesis = Header::genesis(b"karsa-transition-1".to_vec(), 1, [1u8; 32], [2u8; 32]);
+        let mut chain =
+            HeaderChain::with_schedule_and_change(old, new, 2, genesis.clone(), schedule)
+                .expect("the transition is safe");
+        assert_eq!(chain.set_for_epoch(1).validators.len(), 4);
+        assert_eq!(chain.set_for_epoch(2).validators.len(), 5);
+
+        let first = Header {
+            chain_id: genesis.chain_id.clone(),
+            epoch: 1,
+            height: 1,
+            round: 1,
+            state_root: [3u8; 32],
+            dag_root: [4u8; 32],
+            previous: genesis.id().unwrap(),
+            applied: 1,
+        };
+        let first_certificate = certify_with(&first, &keys, 3, 4);
+        chain.advance(&first, &first_certificate).unwrap();
+
+        let second = Header {
+            chain_id: genesis.chain_id.clone(),
+            epoch: 2,
+            height: 2,
+            round: 2,
+            state_root: [5u8; 32],
+            dag_root: [6u8; 32],
+            previous: first.id().unwrap(),
+            applied: 2,
+        };
+        let second_certificate = certify_with(&second, &keys, 4, 5);
+        chain.advance(&second, &second_certificate).unwrap();
+        assert_eq!(chain.head(), &second);
+
+        // The new epoch needs four of five signers; three of the old four are not
+        // a quorum even though every signature is valid.
+        let third = Header {
+            chain_id: genesis.chain_id.clone(),
+            epoch: 2,
+            height: 3,
+            round: 3,
+            state_root: [7u8; 32],
+            dag_root: [8u8; 32],
+            previous: second.id().unwrap(),
+            applied: 3,
+        };
+        let old_quorum_certificate = certify_with(&third, &keys, 3, 4);
+        let error = chain.advance(&third, &old_quorum_certificate).unwrap_err();
+        assert_eq!(error.kind(), CryptoErrorKind::PolicyUnsatisfied);
     }
 }

@@ -340,6 +340,15 @@ enum Command {
         /// Home directory whose genesis sets the chain identity.
         #[arg(long)]
         home: Option<std::path::PathBuf>,
+        /// Override the epoch length in rounds for this experiment.
+        #[arg(long)]
+        epoch_rounds: Option<u64>,
+        /// Add one validator at this epoch boundary.
+        #[arg(long, conflicts_with = "remove_validator_at_epoch")]
+        add_validator_at_epoch: Option<u64>,
+        /// Remove the last validator at this epoch boundary.
+        #[arg(long, conflicts_with = "add_validator_at_epoch")]
+        remove_validator_at_epoch: Option<u64>,
     },
     /// Apply a node's retention policy to its store.
     Prune {
@@ -425,15 +434,30 @@ fn main() -> ExitCode {
             jitter_ms,
             timeout_seconds,
             home,
-        } => finality::run(finality::Config {
-            validators,
-            samples,
-            txs,
-            delay: std::time::Duration::from_millis(delay_ms),
-            jitter: std::time::Duration::from_millis(jitter_ms),
-            timeout: std::time::Duration::from_secs(timeout_seconds),
-            home,
-        }),
+            epoch_rounds,
+            add_validator_at_epoch,
+            remove_validator_at_epoch,
+        } => {
+            let change = match (add_validator_at_epoch, remove_validator_at_epoch) {
+                (Some(epoch), None) => Some((finality::SetChange::Add, epoch)),
+                (None, Some(epoch)) => Some((finality::SetChange::Remove, epoch)),
+                (None, None) => None,
+                (Some(_), Some(_)) => {
+                    unreachable!("clap rejects adding and removing in the same run")
+                }
+            };
+            finality::run(finality::Config {
+                validators,
+                samples,
+                txs,
+                delay: std::time::Duration::from_millis(delay_ms),
+                jitter: std::time::Duration::from_millis(jitter_ms),
+                timeout: std::time::Duration::from_secs(timeout_seconds),
+                home,
+                epoch_rounds,
+                change,
+            })
+        }
         Command::Config { path, home, init } => run_config(home, path, init),
         Command::Peers { home, add, remove } => run_peers(home, add, remove),
         Command::Genesis {

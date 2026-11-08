@@ -142,6 +142,36 @@ impl Node {
         }
     }
 
+    /// Creates a node with one checked validator-set transition.
+    ///
+    /// The node resolves its authoring membership, the reference rule, and the
+    /// vote quorum against the set active at the round. A node that is not in the
+    /// current set stays passive instead of authoring a vertex the DAG would
+    /// reject.
+    ///
+    /// # Errors
+    ///
+    /// Every error from [`Dag::with_epoch_length_and_change`].
+    pub fn with_chain_id_epoch_and_set_change(
+        set: ValidatorSet,
+        next: ValidatorSet,
+        change_epoch: u64,
+        epoch_rounds: u64,
+        id: Vec<u8>,
+        private_key: Vec<u8>,
+        chain_id: Vec<u8>,
+    ) -> Result<Self, CryptoError> {
+        Ok(Self {
+            id,
+            private_key,
+            chain_id,
+            round: 0,
+            dag: Dag::with_epoch_length_and_change(set, next, change_epoch, epoch_rounds)?,
+            pacemaker: Pacemaker::new(PacemakerConfig::default(), 1),
+            authored: 0,
+        })
+    }
+
     /// The validator id this node speaks for.
     #[must_use]
     pub fn id(&self) -> &[u8] {
@@ -169,7 +199,7 @@ impl Node {
     /// Ids of every vertex this node holds in `round`.
     fn ids(&self, round: u64) -> Vec<VertexId> {
         self.dag
-            .set()
+            .set_for_round(round)
             .validators
             .iter()
             .filter_map(|record| self.dag.get(round, &record.validator_id))
@@ -202,6 +232,14 @@ impl Node {
     /// Propagates signing and DAG insertion errors.
     pub fn author_with(&mut self, payload_hash: [u8; 32]) -> Result<Option<Vertex>, CryptoError> {
         let round = self.round;
+        let current = self.dag.set_for_round(round);
+        if !current
+            .validators
+            .iter()
+            .any(|record| record.validator_id.as_slice() == self.id.as_slice())
+        {
+            return Ok(None);
+        }
         let references = if round == 0 {
             Vec::new()
         } else {
@@ -212,15 +250,14 @@ impl Node {
             let authors: HashSet<&[u8]> = references
                 .iter()
                 .filter(|reference| {
-                    self.dag
-                        .set()
+                    current
                         .validators
                         .iter()
                         .any(|record| record.validator_id == reference.author)
                 })
                 .map(|reference| reference.author.as_slice())
                 .collect();
-            if authors.len() < self.dag.set().quorum_size() {
+            if authors.len() < current.quorum_size() {
                 return Ok(None);
             }
         }
