@@ -46,7 +46,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tx::batch::Batch;
-use validator::{Step, VertexId, commit_root};
+use validator::{Finalizer, Header, SetSchedule, Step, VertexId, commit_root};
 
 use crate::chain;
 
@@ -185,6 +185,10 @@ struct NodeResult {
     applied: usize,
     exec_rejected: usize,
     state_root: Option<[u8; 32]>,
+    certified_ids: BTreeMap<u64, [u8; 32]>,
+    head_height: u64,
+    head_round: u64,
+    conflicts: usize,
     disk_bytes: u64,
     rejected: usize,
     committed: usize,
@@ -571,6 +575,34 @@ async fn node_task(
             .credit(&account.address, LIVE_BALANCE)
             .map_err(|error| error.to_string())?;
     }
+
+    // A header commits a state root, so finality only exists on a node that
+    // executes. The anchor is the genesis header over the same credited state
+    // every node starts from, which is what makes the first certificate cross-
+    // checkable across the mesh.
+    let mut finalizer = if config.execute {
+        let genesis = Header::genesis(
+            chain_id.clone(),
+            node.dag().epoch_of(0),
+            state.state_root(),
+            commit_root(&[]),
+        );
+        Some(
+            Finalizer::new(
+                SetSchedule::single(committee.set.clone()),
+                node.dag().epoch_schedule(),
+                chain_id.clone(),
+                identity.id.clone(),
+                identity.private_key.clone(),
+                genesis,
+                0,
+            )
+            .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+
     let mut exec_rejected: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut applied = 0usize;
     let mut applied_cursor = 0usize;
@@ -673,6 +705,20 @@ async fn node_task(
                             }
                         }
                     }
+                    Message::Share(share) => {
+                        if let Some(finalizer) = finalizer.as_mut() {
+                            let certified = finalizer
+                                .receive_share(share)
+                                .map_err(|error| error.to_string())?;
+                            for certified in certified {
+                                if let Some(store) = &store {
+                                    store
+                                        .put_header(&certified.header, &certified.certificate)
+                                        .map_err(|error| error.to_string())?;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             _ = ticker.tick() => {
@@ -765,21 +811,37 @@ async fn node_task(
                 // delivery condition, not a failure: the referenced vertex may
                 // still be in a peer's queue.
                 let commit_start = Instant::now();
-                let step = node.commit();
-                profile.commit += commit_start.elapsed();
-                match step {
-                    Ok(step) => {
-                        cursor = match step {
-                            Step::Advanced { cursor, .. }
-                            | Step::Waiting { cursor, .. }
-                            | Step::TimedOut { cursor, .. } => cursor,
-                        };
-                    }
-                    Err(error) if error.kind() == CryptoErrorKind::MissingReference => {}
-                    Err(error) => {
-                        return Err(format!("node {index} cannot commit: {error}"));
+                loop {
+                    match node.commit_once() {
+                        Ok(Step::Advanced {
+                            from,
+                            cursor: next,
+                            commits,
+                            anchors,
+                            ..
+                        }) => {
+                            cursor = next;
+                            if commits > 0
+                                && let Some(finalizer) = finalizer.as_mut()
+                            {
+                                finalizer.record_commit(from, node.dag().order().len());
+                            }
+                            if anchors > 0 {
+                                break;
+                            }
+                        }
+                        Ok(Step::Waiting { cursor: next, .. }
+                        | Step::TimedOut { cursor: next, .. }) => {
+                            cursor = next;
+                            break;
+                        }
+                        Err(error) if error.kind() == CryptoErrorKind::MissingReference => break,
+                        Err(error) => {
+                            return Err(format!("node {index} cannot commit: {error}"));
+                        }
                     }
                 }
+                profile.commit += commit_start.elapsed();
                 if config.execute {
                     // Apply in commit order, and stop at the first vertex whose
                     // batch has not arrived: applying past it would put a later
@@ -805,6 +867,35 @@ async fn node_task(
                         profile.verify += timing.verify;
                         profile.state += timing.state;
                         applied_cursor += 1;
+                        if let Some(finalizer) = finalizer.as_mut() {
+                            finalizer.mark_applied(
+                                applied_cursor,
+                                state.state_root(),
+                                u64::try_from(applied).unwrap_or(u64::MAX),
+                            );
+                        }
+                    }
+                }
+                if let Some(finalizer) = finalizer.as_mut() {
+                    finalizer.mark_applied(
+                        applied_cursor,
+                        state.state_root(),
+                        u64::try_from(applied).unwrap_or(u64::MAX),
+                    );
+                    let build = finalizer
+                        .build_ready(node.dag().order(), now())
+                        .map_err(|error| error.to_string())?;
+                    for share in build.shares {
+                        let bytes = wire::frame(&Message::Share(share), now())
+                            .map_err(|error| error.to_string())?;
+                        broadcast(&outbound, false, &bytes, &mut dropped);
+                    }
+                    for certified in build.certified {
+                        if let Some(store) = &store {
+                            store
+                                .put_header(&certified.header, &certified.certificate)
+                                .map_err(|error| error.to_string())?;
+                        }
                     }
                 }
                 if !announced && node.round() > config.rounds {
@@ -936,6 +1027,18 @@ async fn node_task(
         applied,
         exec_rejected,
         state_root,
+        certified_ids: finalizer
+            .as_ref()
+            .map_or_else(BTreeMap::new, |finalizer| finalizer.certified_ids().clone()),
+        head_height: finalizer
+            .as_ref()
+            .map_or(0, |finalizer| finalizer.head().height),
+        head_round: finalizer
+            .as_ref()
+            .map_or(0, |finalizer| finalizer.head().round),
+        conflicts: finalizer
+            .as_ref()
+            .map_or(0, |finalizer| finalizer.conflicts()),
         disk_bytes: store
             .as_ref()
             .map_or(0, |store| directory_bytes(store.path())),
@@ -1057,6 +1160,9 @@ async fn archive_task(
                     }
                     // An archive decides nothing, so a want is not addressed to it.
                     Message::Want(_) => {}
+                    // An archive does not certify; the shares it receives are for
+                    // validators to build certificates from.
+                    Message::Share(_) => {}
                     // The accept side consumes the hello before the loop starts.
                     Message::Hello(_) => rejected += 1,
                 }
@@ -1086,6 +1192,10 @@ async fn archive_task(
         applied: 0,
         exec_rejected: 0,
         state_root: None,
+        certified_ids: BTreeMap::new(),
+        head_height: 0,
+        head_round: 0,
+        conflicts: 0,
         disk_bytes: store
             .as_ref()
             .map_or(0, |store| directory_bytes(store.path())),
@@ -1278,6 +1388,14 @@ fn run_one_node(
     println!(
         "  node val-{index}: authored {}, committed {}, applied {} tx, rejected {}",
         result.authored, result.committed, result.applied, result.exec_rejected
+    );
+
+    println!(
+        "  finality          {} certified heights, head {}/{}, conflicts {}",
+        result.certified_ids.len(),
+        result.head_height,
+        result.head_round,
+        result.conflicts
     );
     if let Some(authoring) = authoring {
         println!(
@@ -1649,7 +1767,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     }
     println!();
     println!(
-        "  {}  {}  {}  {}  {}  {}  {}  {}  {}",
+        "  {}  {}  {}  {}  {}  {}  {}  {}  {}  {}  {}",
         left("node", 7),
         pad("authored", 9),
         pad("received", 9),
@@ -1657,6 +1775,8 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         pad("repaired", 9),
         pad("rejected", 9),
         pad("committed", 10),
+        pad("certified", 10),
+        pad("head", 10),
         pad("in", 10),
         pad("out", 10)
     );
@@ -1712,7 +1832,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             latencies.extend_from_slice(&result.latencies);
         }
         println!(
-            "  {}  {}  {}  {}  {}  {}  {}  {}  {}",
+            "  {}  {}  {}  {}  {}  {}  {}  {}  {}  {}  {}",
             left(
                 &format!(
                     "{}-{}",
@@ -1727,9 +1847,57 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             pad(&result.repaired.to_string(), 9),
             pad(&result.rejected.to_string(), 9),
             pad(&result.committed.to_string(), 10),
+            pad(&result.certified_ids.len().to_string(), 10),
+            pad(&format!("{}/{}", result.head_height, result.head_round), 10),
             pad(&human(result.bytes_in), 10),
             pad(&human(result.bytes_out), 10)
         );
+    }
+
+    let signers: Vec<&NodeResult> = results.iter().filter(|result| result.signs).collect();
+    if let Some(first) = signers.first() {
+        let common: Vec<u64> = first
+            .certified_ids
+            .keys()
+            .filter(|height| {
+                signers
+                    .iter()
+                    .all(|result| result.certified_ids.contains_key(height))
+            })
+            .copied()
+            .collect();
+        let agreed = common.iter().all(|height| {
+            signers
+                .iter()
+                .all(|result| result.certified_ids.get(height) == first.certified_ids.get(height))
+        });
+        let lowest_head = signers
+            .iter()
+            .map(|result| result.head_height)
+            .min()
+            .unwrap_or(0);
+        let highest_head = signers
+            .iter()
+            .map(|result| result.head_height)
+            .max()
+            .unwrap_or(0);
+        let conflicts: usize = signers.iter().map(|result| result.conflicts).sum();
+        println!(
+            "  finality          {} of {} common certified heights, agreement {}, conflicts {}, \
+             heads {}..{}",
+            common.len(),
+            first.certified_ids.len(),
+            agreed,
+            conflicts,
+            lowest_head,
+            highest_head
+        );
+        if !agreed {
+            return Err("validators certified different headers".into());
+        }
+        if conflicts > 0 {
+            return Err(format!("{conflicts} certificate conflicts across the mesh").into());
+        }
     }
 
     latencies.sort_unstable();
