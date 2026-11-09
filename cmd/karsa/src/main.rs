@@ -47,6 +47,8 @@ mod node;
 mod peers;
 mod persist;
 mod prune;
+mod rpc;
+mod send;
 mod shards;
 mod sigbench;
 mod sweep;
@@ -316,6 +318,48 @@ enum Command {
         /// Threads used to verify one batch. One keeps the serial path.
         #[arg(long, default_value_t = 1)]
         verify_threads: usize,
+        /// First loopback HTTP port; node `i` serves `rpc_port + i`. Zero disables it.
+        ///
+        /// A nonzero port requires `--execute` and takes batches from submitted
+        /// transactions instead of the demo data plane. Authoring then runs until
+        /// the process lifetime ends rather than stopping after `--rounds`.
+        #[arg(long, default_value_t = 0)]
+        rpc_port: u16,
+        /// Most mempool transactions one authored batch may carry.
+        #[arg(long, default_value_t = rpc::DEFAULT_BATCH_MAX)]
+        rpc_batch_max: usize,
+    },
+    /// Sign a transfer with a committee account and submit it to a live RPC node.
+    Send {
+        /// RPC base, as host:port or http://host:port.
+        #[arg(long, default_value = "127.0.0.1:7300")]
+        rpc: String,
+        /// Sender index in the committee fixture.
+        #[arg(long, default_value_t = 0)]
+        from: usize,
+        /// Recipient index in the committee fixture.
+        #[arg(long, default_value_t = 1)]
+        to: usize,
+        #[arg(long, default_value_t = 1)]
+        amount: u64,
+        /// Sequence to sign; zero asks the certified account state for the next one.
+        #[arg(long, default_value_t = 0)]
+        sequence: u64,
+        /// Committee size the live mesh was started with.
+        #[arg(long, default_value_t = 4)]
+        validators: usize,
+        /// Home directory whose genesis and keys the live mesh used.
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Flip one signature byte after signing, to exercise rejection.
+        #[arg(long)]
+        tamper_signature: bool,
+        /// Poll until the transaction is finalized or rejected.
+        #[arg(long)]
+        wait: bool,
+        /// How long to poll, in seconds.
+        #[arg(long, default_value_t = 30)]
+        wait_seconds: u64,
     },
     /// Measure client submit to certified header over a delayed validator mesh.
     Finality {
@@ -499,6 +543,8 @@ fn main() -> ExitCode {
             profile,
             pre_sign,
             verify_threads,
+            rpc_port,
+            rpc_batch_max,
         } => live::run(live::Config {
             validators,
             port_base,
@@ -518,6 +564,31 @@ fn main() -> ExitCode {
             profile,
             pre_sign,
             verify_threads,
+            rpc_port,
+            rpc_batch_max,
+        }),
+        Command::Send {
+            rpc,
+            from,
+            to,
+            amount,
+            sequence,
+            validators,
+            home,
+            tamper_signature,
+            wait,
+            wait_seconds,
+        } => send::run(send::Config {
+            rpc,
+            from,
+            to,
+            amount,
+            sequence,
+            validators,
+            home,
+            tamper_signature,
+            wait,
+            wait_seconds,
         }),
         Command::Prune {
             home,

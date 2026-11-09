@@ -113,6 +113,16 @@ pub struct Finalizer {
     pending: VecDeque<Pending>,
     shares: HashMap<[u8; 32], ShareSet>,
     certified_ids: BTreeMap<u64, [u8; 32]>,
+    /// Committed entries each header this node built covers, by header id.
+    ///
+    /// A share only names the header, not the commit prefix behind it, so the
+    /// mapping is recorded when the header is built and consulted when the same
+    /// header is certified. A header this node never built is certified without
+    /// an entry, and its coverage is reported as unknown rather than guessed.
+    order_lens: HashMap<[u8; 32], usize>,
+    /// The committed prefix each certified height covers, when this node built
+    /// that header itself. Heights adopted from a peer are absent.
+    certified_orders: BTreeMap<u64, usize>,
     built: usize,
     conflicts: usize,
 }
@@ -160,6 +170,8 @@ impl Finalizer {
             pending: VecDeque::new(),
             shares: HashMap::new(),
             certified_ids: BTreeMap::new(),
+            order_lens: HashMap::new(),
+            certified_orders: BTreeMap::new(),
             built: 0,
             conflicts: 0,
         })
@@ -199,6 +211,16 @@ impl Finalizer {
     #[must_use]
     pub fn certified_ids(&self) -> &BTreeMap<u64, [u8; 32]> {
         &self.certified_ids
+    }
+
+    /// Committed entries the certified header at `height` covers.
+    ///
+    /// `None` when this node did not build that header itself, which is the case
+    /// for a height it only adopted or certified from peer shares. Callers that
+    /// map work to finality must treat `None` as unknown, not as zero.
+    #[must_use]
+    pub fn certified_order(&self, height: u64) -> Option<usize> {
+        self.certified_orders.get(&height).copied()
     }
 
     /// Whether a header at `height` is certified on this chain.
@@ -308,6 +330,7 @@ impl Finalizer {
                 self.conflicts = self.conflicts.saturating_add(1);
             }
 
+            self.order_lens.insert(id, pending.order_len);
             self.last_built = header.clone();
             self.last_built_order = pending.order_len;
             self.built = self.built.saturating_add(1);
@@ -469,6 +492,9 @@ impl Finalizer {
             certificate.verify_quorum(set)?;
             self.chain.advance(&header, &certificate)?;
             self.certified_ids.insert(height, id);
+            if let Some(order_len) = self.order_lens.remove(&id) {
+                self.certified_orders.insert(height, order_len);
+            }
             certified.push(Certified {
                 header,
                 certificate,

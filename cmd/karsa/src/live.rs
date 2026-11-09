@@ -35,6 +35,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,6 +52,7 @@ use tx::batch::Batch;
 use validator::{Finalizer, Header, SetSchedule, Step, VertexId, commit_root};
 
 use crate::chain;
+use crate::rpc::{self, RpcCore, SharedRpc};
 
 /// Ids a node will ask for at once. Beyond this the queue is growing faster than
 /// repair can drain it, so the count is reported rather than the memory.
@@ -151,6 +153,14 @@ pub struct Config {
     pub pre_sign: bool,
     /// Threads used to verify one batch. One keeps the serial path.
     pub verify_threads: usize,
+    /// First loopback HTTP port; node `i` serves `rpc_port + i`.
+    ///
+    /// Zero disables the server. A nonzero port implies `--execute` and turns the
+    /// data plane into a mempool: batches come from submitted transactions instead
+    /// of [`chain::demo_batch`], and authoring does not stop at `rounds`.
+    pub rpc_port: u16,
+    /// Most mempool transactions one authored batch may carry.
+    pub rpc_batch_max: usize,
 }
 
 /// Wall time spent in the stages the live loop can name.
@@ -208,6 +218,16 @@ fn address(port_base: u16, index: usize) -> String {
         "127.0.0.1:{}",
         u32::from(port_base) + u32::try_from(index).unwrap_or(0)
     )
+}
+
+/// The HTTP address node `index` serves, when the server is enabled.
+fn rpc_address(port_base: u16, index: usize) -> Result<String, String> {
+    let offset = u32::try_from(index).map_err(|_| "node index does not fit a port offset")?;
+    let port = u32::from(port_base)
+        .checked_add(offset)
+        .filter(|port| *port <= u32::from(u16::MAX))
+        .ok_or_else(|| format!("RPC port {} + {index} is outside the u16 range", port_base))?;
+    Ok(format!("127.0.0.1:{port}"))
 }
 
 /// Renders a vertex author for a diagnostic line.
@@ -410,6 +430,16 @@ struct Notify {
     executed: mpsc::Sender<usize>,
 }
 
+/// The channels that steer one node loop.
+struct Signals {
+    /// Stop authoring while keeping the mesh and the commit loop alive.
+    stop_authoring: watch::Receiver<bool>,
+    /// End the loop.
+    shutdown: watch::Receiver<bool>,
+    /// Progress notifications for the run controller.
+    notify: Notify,
+}
+
 /// What a validator task needs at startup, grouped so the task signature stays
 /// about the node rather than about plumbing.
 struct Start {
@@ -435,6 +465,9 @@ struct Restorable<'a> {
     applied: &'a mut usize,
     applied_cursor: &'a mut usize,
     finalizer: &'a mut Option<Finalizer>,
+    /// The RPC surface, when enabled, so a restart can answer `/account` at the
+    /// certified head even though the replay may run past it.
+    rpc: Option<&'a SharedRpc>,
 }
 
 /// The state every live node starts from: the membership's accounts with the
@@ -485,7 +518,16 @@ fn restore(
         })?;
     }
     if let Some(highest) = node.dag().highest_round() {
-        node.set_round(highest.saturating_add(1));
+        // The top round may be incomplete after an abrupt stop. If this node did
+        // not author there, joining it is what lets the committee finish the
+        // round; jumping past it would leave a gap the reference rule can never
+        // fill.
+        let authored_top = node.dag().get(highest, node.id()).is_some();
+        node.set_round(if authored_top {
+            highest.saturating_add(1)
+        } else {
+            highest
+        });
     }
 
     // Rebuild the commit order from the stored DAG. The pacemaker starts at
@@ -514,6 +556,11 @@ fn restore(
             break;
         };
         *live.applied += chain::apply_batch(live.state, live.accounts, batch, live.rejected);
+        if let Some(rpc) = live.rpc {
+            rpc.lock()
+                .expect("rpc lock poisoned")
+                .note_state(*live.applied as u64, live.state);
+        }
         *live.applied_cursor += 1;
     }
 
@@ -547,9 +594,13 @@ async fn node_task(
     committee: chain::Membership,
     chain_id: Vec<u8>,
     start: Start,
-    mut shutdown: watch::Receiver<bool>,
-    notify: Notify,
+    signals: Signals,
 ) -> Result<NodeResult, String> {
+    let Signals {
+        mut stop_authoring,
+        mut shutdown,
+        notify,
+    } = signals;
     let Start {
         started,
         mut prebuilt,
@@ -748,6 +799,42 @@ async fn node_task(
         genesis
     };
 
+    // The HTTP surface shares the node loop's own state. It is created before
+    // the finalizer so the same genesis anchor is the initial head, and before
+    // restore so the replay can seed the state snapshots a certified header
+    // needs.
+    let rpc = if config.rpc_port > 0 {
+        if !config.execute {
+            return Err(format!("node {index}: an RPC server needs execution"));
+        }
+        let target = rpc_address(config.rpc_port, index)?;
+        let listener = TcpListener::bind(&target)
+            .await
+            .map_err(|error| format!("node {index} cannot listen for RPC on {target}: {error}"))?;
+        let shared = Arc::new(Mutex::new(RpcCore::new(
+            index,
+            chain_id.clone(),
+            &accounts,
+            &genesis,
+        )));
+        let mut rpc_shutdown = shutdown.clone();
+        let app = rpc::router(Arc::clone(&shared));
+        tokio::spawn(async move {
+            let served = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rpc_shutdown.changed().await;
+                })
+                .await;
+            if let Err(error) = served {
+                eprintln!("node {index} RPC server stopped: {error}");
+            }
+        });
+        println!("  node val-{index} RPC on http://{target}");
+        Some(shared)
+    } else {
+        None
+    };
+
     // A header commits a state root, so finality only exists on a node that
     // executes. The anchor is the genesis header over the same credited state
     // every node starts from, which is what makes the first certificate cross-
@@ -785,11 +872,30 @@ async fn node_task(
                 applied: &mut applied,
                 applied_cursor: &mut applied_cursor,
                 finalizer: &mut finalizer,
+                rpc: rpc.as_ref(),
             },
         )?
     } else {
         None
     };
+
+    if let Some(rpc) = &rpc {
+        let mut core = rpc.lock().expect("rpc lock poisoned");
+        core.note_state(u64::try_from(applied).unwrap_or(u64::MAX), &state);
+        if let Some(finalizer) = &finalizer {
+            let head = finalizer.head();
+            core.note_order(node.dag().order());
+            core.note_certified(head, finalizer.certified_order(head.height));
+            core.note_certified_heights(finalizer.certified_ids().len());
+        }
+        core.set_run(
+            node.round(),
+            node.dag().order().len(),
+            u64::try_from(applied).unwrap_or(u64::MAX),
+            outbound.len(),
+            finalizer.as_ref().map_or(0, Finalizer::conflicts),
+        );
+    }
 
     let mut payload_bytes = 0u64;
     let mut payloads = 0usize;
@@ -813,6 +919,7 @@ async fn node_task(
     let mut stable_ticks: u32 = 0;
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut authoring_stopped = *stop_authoring.borrow();
 
     // A single-process mesh shares one clock, so a frame's local timestamp is
     // enough. One process per validator does not: each process has its own
@@ -896,6 +1003,14 @@ async fn node_task(
                                 .receive_share(share)
                                 .map_err(|error| error.to_string())?;
                             for certified in certified {
+                                if let Some(rpc) = &rpc {
+                                    let mut core = rpc.lock().expect("rpc lock poisoned");
+                                    core.note_order(node.dag().order());
+                                    core.note_certified(
+                                        &certified.header,
+                                        finalizer.certified_order(certified.header.height),
+                                    );
+                                }
                                 if let Some(store) = &store {
                                     store
                                         .put_header(&certified.header, &certified.certificate)
@@ -906,6 +1021,9 @@ async fn node_task(
                     }
                 }
             }
+            _ = stop_authoring.changed() => {
+                authoring_stopped = *stop_authoring.borrow();
+            }
             _ = ticker.tick() => {
                 ticks = ticks.wrapping_add(1);
                 if let Some(store) = &store
@@ -915,11 +1033,20 @@ async fn node_task(
                         .record_clock(node.round(), unix_now())
                         .map_err(|error| error.to_string())?;
                 }
-                if node.round() <= config.rounds {
+                if !authoring_stopped && (config.rpc_port > 0 || node.round() <= config.rounds) {
                     let round = node.round();
                     let slot = usize::try_from(round).unwrap_or(usize::MAX);
                     let mut sign = Duration::ZERO;
-                    let payload = if config.txs == 0 {
+                    let payload = if config.rpc_port > 0 {
+                        // The mempool is the only source in RPC mode: a real client
+                        // signs before submitting, and an empty mempool is an empty
+                        // batch rather than a synthetic one.
+                        rpc.as_ref().and_then(|rpc| {
+                            rpc.lock()
+                                .expect("rpc lock poisoned")
+                                .take_batch(config.rpc_batch_max)
+                        })
+                    } else if config.txs == 0 {
                         None
                     } else if let Some(queue) = prebuilt.as_mut() {
                         match queue.get_mut(slot).and_then(Option::take) {
@@ -956,6 +1083,20 @@ async fn node_task(
                             let authored_at = unix_millis();
                             first_author_ms.get_or_insert(authored_at);
                             last_author_ms = Some(authored_at);
+                            if payload.is_some()
+                                && let Some(rpc) = &rpc
+                            {
+                                rpc.lock()
+                                    .expect("rpc lock poisoned")
+                                    .note_authored(
+                                        &digest,
+                                        vertex.id().map_err(|error| error.to_string())?,
+                                    );
+                            }
+                            if config.rpc_port > 0 && !announced {
+                                announced = true;
+                                let _ = notify.ready.send(index).await;
+                            }
                             if let Some(store) = &store {
                                 let store_start = Instant::now();
                                 store
@@ -982,11 +1123,18 @@ async fn node_task(
                         }
                         Ok(None) => {
                             // The batch was not consumed, so put it back for the
-                            // next tick instead of signing it again.
-                            if let (Some(queue), Some(batch)) = (prebuilt.as_mut(), payload)
-                                && slot < queue.len()
-                            {
-                                queue[slot] = Some(batch);
+                            // next tick instead of signing it again. In RPC mode
+                            // it goes back to the mempool, in client order.
+                            if let Some(batch) = payload {
+                                if let Some(rpc) = &rpc {
+                                    rpc.lock()
+                                        .expect("rpc lock poisoned")
+                                        .return_batch(batch);
+                                } else if let Some(queue) = prebuilt.as_mut()
+                                    && slot < queue.len()
+                                {
+                                    queue[slot] = Some(batch);
+                                }
                             }
                         }
                         Err(error) => return Err(format!("node {index} cannot author: {error}")),
@@ -1037,21 +1185,69 @@ async fn node_task(
                         let Some(vertex) = node.dag().get(id.round, &id.author) else {
                             break;
                         };
+                        // A vertex can carry no payload (an empty mempool still has
+                        // to author for the DAG to advance). There is nothing to
+                        // apply, so the cursor moves without touching state.
+                        if vertex.payload_hash == [0u8; 32] {
+                            applied_cursor += 1;
+                            // A pending header can name this exact prefix, so the
+                            // state root has to be captured here rather than only
+                            // once at the end of the tick: an all-empty stretch
+                            // would otherwise step over its order length.
+                            if let Some(finalizer) = finalizer.as_mut() {
+                                finalizer.mark_applied(
+                                    applied_cursor,
+                                    state.state_root(),
+                                    u64::try_from(applied).unwrap_or(u64::MAX),
+                                );
+                            }
+                            if let Some(rpc) = &rpc {
+                                rpc.lock().expect("rpc lock poisoned").note_state(
+                                    u64::try_from(applied).unwrap_or(u64::MAX),
+                                    &state,
+                                );
+                            }
+                            continue;
+                        }
                         let Some(batch) = batches.get(&vertex.payload_hash) else {
                             break;
                         };
                         let mut timing = chain::ApplyTiming::default();
-                        applied += chain::apply_batch_timed(
-                            &mut state,
-                            &accounts,
-                            batch,
-                            &mut exec_rejected,
-                            &mut timing,
-                            config.verify_threads,
-                        );
+                        let executed = if let Some(rpc) = &rpc {
+                            let mut report = Vec::new();
+                            let count = chain::apply_batch_timed_report(
+                                &mut state,
+                                &accounts,
+                                batch,
+                                &mut exec_rejected,
+                                &mut timing,
+                                config.verify_threads,
+                                Some(&mut report),
+                            );
+                            rpc.lock()
+                                .expect("rpc lock poisoned")
+                                .note_applied(&vertex.payload_hash, applied_cursor, &report);
+                            count
+                        } else {
+                            chain::apply_batch_timed(
+                                &mut state,
+                                &accounts,
+                                batch,
+                                &mut exec_rejected,
+                                &mut timing,
+                                config.verify_threads,
+                            )
+                        };
+                        applied += executed;
                         profile.verify += timing.verify;
                         profile.state += timing.state;
                         applied_cursor += 1;
+                        if let Some(rpc) = &rpc {
+                            rpc.lock().expect("rpc lock poisoned").note_state(
+                                u64::try_from(applied).unwrap_or(u64::MAX),
+                                &state,
+                            );
+                        }
                         if let Some(finalizer) = finalizer.as_mut() {
                             finalizer.mark_applied(
                                 applied_cursor,
@@ -1076,6 +1272,14 @@ async fn node_task(
                         broadcast(&outbound, false, &bytes, &mut dropped);
                     }
                     for certified in build.certified {
+                        if let Some(rpc) = &rpc {
+                            let mut core = rpc.lock().expect("rpc lock poisoned");
+                            core.note_order(node.dag().order());
+                            core.note_certified(
+                                &certified.header,
+                                finalizer.certified_order(certified.header.height),
+                            );
+                        }
                         if let Some(store) = &store {
                             store
                                 .put_header(&certified.header, &certified.certificate)
@@ -1083,7 +1287,23 @@ async fn node_task(
                         }
                     }
                 }
-                if !announced && node.round() > config.rounds {
+                if let Some(rpc) = &rpc {
+                    let mut core = rpc.lock().expect("rpc lock poisoned");
+                    core.note_order(node.dag().order());
+                    core.set_run(
+                        node.round(),
+                        node.dag().order().len(),
+                        u64::try_from(applied).unwrap_or(u64::MAX),
+                        outbound.len(),
+                        finalizer.as_ref().map_or(0, Finalizer::conflicts),
+                    );
+                    core.note_certified_heights(
+                        finalizer
+                            .as_ref()
+                            .map_or(0, |finalizer| finalizer.certified_ids().len()),
+                    );
+                }
+                if !announced && config.rpc_port == 0 && node.round() > config.rounds {
                     announced = true;
                     let _ = notify.ready.send(index).await;
                 }
@@ -1197,7 +1417,7 @@ async fn node_task(
         authored: node.authored(),
         first_author_ms,
         last_author_ms,
-        complete: node.round() > config.rounds,
+        complete: config.rpc_port > 0 || node.round() > config.rounds,
         received,
         dropped,
         wanted: wanted_total,
@@ -1513,6 +1733,8 @@ fn run_one_node(
     let timeout = config.timeout;
     let execute = config.execute;
     let show_profile = config.profile;
+    let rpc_mode = config.rpc_port > 0;
+    let drain = config.drain;
     let prebuilt = prebuilt.pop();
     let port = u32::from(config.port_base) + u32::try_from(index).unwrap_or(0);
     let lifetime = millis(u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX));
@@ -1526,6 +1748,7 @@ fn run_one_node(
     let (result, authoring): (NodeResult, Option<Duration>) = runtime.block_on(async move {
         let started = Instant::now();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (stop_tx, stop_rx) = watch::channel(false);
         let (ready_tx, mut ready_rx) = mpsc::channel(1);
         let (executed_tx, mut executed_rx) = mpsc::channel(1);
         let task = tokio::spawn(async move {
@@ -1535,10 +1758,13 @@ fn run_one_node(
                 committee,
                 chain_id,
                 Start { started, prebuilt },
-                shutdown_rx,
-                Notify {
-                    ready: ready_tx,
-                    executed: executed_tx,
+                Signals {
+                    stop_authoring: stop_rx,
+                    shutdown: shutdown_rx,
+                    notify: Notify {
+                        ready: ready_tx,
+                        executed: executed_tx,
+                    },
                 },
             )
             .await
@@ -1562,6 +1788,13 @@ fn run_one_node(
         // Stay on the wire until the shared lifetime ends. An early finisher that
         // closed its listener would strand the peers still authoring.
         (&mut deadline).await;
+        if rpc_mode {
+            // A continuous run has no natural last round. Stop authoring first,
+            // then keep the mesh up for the drain so the last rounds still reach
+            // peers and commit instead of being cut off mid-flight.
+            let _ = stop_tx.send(true);
+            tokio::time::sleep(drain).await;
+        }
         let _ = shutdown_tx.send(true);
         let result = match task.await {
             Ok(Ok(result)) => result,
@@ -1738,6 +1971,43 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             return Err("--node-index runs one validator per process; --archives must be 0".into());
         }
     }
+    if config.rpc_port > 0 {
+        if !config.execute {
+            return Err(
+                "--rpc-port needs --execute: account proofs and finality read state".into(),
+            );
+        }
+        if config.txs > 0 {
+            return Err("--rpc-port replaces the demo data plane; leave --txs at 0".into());
+        }
+        if config.pre_sign {
+            return Err(
+                "--rpc-port takes batches from the mempool; --pre-sign does not apply".into(),
+            );
+        }
+        if config.rpc_batch_max == 0 {
+            return Err("--rpc-batch-max must be at least 1".into());
+        }
+        // The P2P and HTTP ranges must not overlap, or the second bind fails with
+        // an address-in-use that looks like a configuration bug at runtime.
+        let p2p_first = u32::from(config.port_base);
+        let p2p_last = p2p_first + u32::try_from(total - 1).unwrap_or(0);
+        let rpc_first = u32::from(config.rpc_port);
+        let rpc_last = rpc_first + u32::try_from(config.validators - 1).unwrap_or(0);
+        if rpc_last > u32::from(u16::MAX) {
+            return Err(format!(
+                "--rpc-port {} plus {} validators exceeds the u16 port range",
+                config.rpc_port, config.validators
+            )
+            .into());
+        }
+        if rpc_first <= p2p_last && p2p_first <= rpc_last {
+            return Err(format!(
+                "the RPC range {rpc_first}..={rpc_last} overlaps the peer range {p2p_first}..={p2p_last}"
+            )
+            .into());
+        }
+    }
 
     // The genesis hash is the chain identity vertices are signed over (D29). An
     // explicit home supplies it; without one the demo identity keeps this run
@@ -1793,12 +2063,14 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let results = runtime.block_on(async {
         let started = Instant::now();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (stop_tx, stop_rx) = watch::channel(false);
         let (ready_tx, mut ready_rx) = mpsc::channel(config.validators);
         let (executed_tx, mut executed_rx) = mpsc::channel(config.validators);
 
         let mut tasks = Vec::with_capacity(total);
         for index in 0..config.validators {
             let shutdown_rx = shutdown_rx.clone();
+            let stop_rx = stop_rx.clone();
             let ready_tx = ready_tx.clone();
             let executed_tx = executed_tx.clone();
             let config = config.clone();
@@ -1816,10 +2088,13 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
                     committee,
                     chain_id,
                     Start { started, prebuilt },
-                    shutdown_rx,
-                    Notify {
-                        ready: ready_tx,
-                        executed: executed_tx,
+                    Signals {
+                        stop_authoring: stop_rx,
+                        shutdown: shutdown_rx,
+                        notify: Notify {
+                            ready: ready_tx,
+                            executed: executed_tx,
+                        },
                     },
                 )
                 .await
@@ -1860,23 +2135,32 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         // Measured before the drain, so it is the authoring pace rather than the
         // pace plus a fixed wait for the last frames.
         let authoring = started.elapsed();
-        if config.execute {
-            // Wait for every node's applied cursor to catch up with its commit
-            // cursor; the deadline above still bounds the wait.
-            let mut caught = 0usize;
-            loop {
-                tokio::select! {
-                    Some(_) = executed_rx.recv() => {
-                        caught += 1;
-                        if caught == config.validators {
-                            break;
+        if config.rpc_port > 0 {
+            // A continuous run lasts for the configured lifetime, not until a
+            // quiet window: the client decides when it is done. Stop authoring
+            // first, then drain so the last rounds still commit.
+            (&mut deadline).await;
+            let _ = stop_tx.send(true);
+            tokio::time::sleep(config.drain).await;
+        } else {
+            if config.execute {
+                // Wait for every node's applied cursor to catch up with its commit
+                // cursor; the deadline above still bounds the wait.
+                let mut caught = 0usize;
+                loop {
+                    tokio::select! {
+                        Some(_) = executed_rx.recv() => {
+                            caught += 1;
+                            if caught == config.validators {
+                                break;
+                            }
                         }
+                        _ = &mut deadline => break,
                     }
-                    _ = &mut deadline => break,
                 }
             }
+            tokio::time::sleep(config.drain).await;
         }
-        tokio::time::sleep(config.drain).await;
         let _ = shutdown_tx.send(true);
 
         let mut results = Vec::with_capacity(tasks.len());
@@ -2462,6 +2746,8 @@ mod tests {
             profile: false,
             pre_sign: false,
             verify_threads: 1,
+            rpc_port: 0,
+            rpc_batch_max: rpc::DEFAULT_BATCH_MAX,
         }
     }
 

@@ -761,12 +761,37 @@ fn batch_candidate<'a>(
     })
 }
 
+/// What happened to one transaction in a batch, in batch order.
+///
+/// This is the per-transaction form of the aggregate [`RejectReason`] counters:
+/// it exists so a client can be told whether the transaction it submitted was
+/// applied or why it was refused, without changing the counts the simulator and
+/// the live report already use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxResult {
+    /// The transaction changed state.
+    Applied,
+    /// The transaction was refused; the reason is the same string the aggregate
+    /// counters use.
+    Rejected(&'static str),
+}
+
 /// One chunk of authorization work, in input order.
+struct AuthorizedChunk<'a> {
+    /// Transactions that passed authorization, with their index in the batch.
+    authorized: Vec<(usize, &'a Transaction)>,
+    /// Rejection reasons and counts, for the aggregate map.
+    rejected: Vec<(&'static str, usize)>,
+    /// Per chunk index: `Some(reason)` when refused by authorization.
+    reasons: Vec<Option<&'static str>>,
+}
+
 fn authorize_chunk<'a>(
     transactions: &'a [Transaction],
     accounts: &'a [Account],
-) -> (Vec<&'a Transaction>, Vec<(&'static str, usize)>) {
+) -> AuthorizedChunk<'a> {
     let mut accepted = vec![false; transactions.len()];
+    let mut reasons: Vec<Option<&'static str>> = vec![None; transactions.len()];
     let mut rejected: Vec<(&'static str, usize)> = Vec::new();
     let mut candidates: Vec<BatchCandidate<'a>> = Vec::new();
 
@@ -776,13 +801,18 @@ fn authorize_chunk<'a>(
             .find(|account| account.address.as_slice() == transaction.sender.as_slice())
             .map(|account| &account.policy);
         match policy {
-            None => rejected.push((RejectReason::UnknownSender.as_str(), 1)),
+            None => {
+                let reason = RejectReason::UnknownSender.as_str();
+                reasons[index] = Some(reason);
+                rejected.push((reason, 1));
+            }
             Some(policy) => match batch_candidate(index, transaction, policy) {
                 Some(candidate) => candidates.push(candidate),
                 None => {
                     if transaction.verify(policy, NOW).is_ok() {
                         accepted[index] = true;
                     } else {
+                        reasons[index] = Some("unauthorized");
                         rejected.push(("unauthorized", 1));
                     }
                 }
@@ -813,6 +843,7 @@ fn authorize_chunk<'a>(
                 {
                     accepted[candidate.index] = true;
                 } else {
+                    reasons[candidate.index] = Some("unauthorized");
                     rejected.push(("unauthorized", 1));
                 }
             }
@@ -822,10 +853,14 @@ fn authorize_chunk<'a>(
     let mut authorized = Vec::with_capacity(transactions.len());
     for (index, transaction) in transactions.iter().enumerate() {
         if accepted[index] {
-            authorized.push(transaction);
+            authorized.push((index, transaction));
         }
     }
-    (authorized, rejected)
+    AuthorizedChunk {
+        authorized,
+        rejected,
+        reasons,
+    }
 }
 
 /// [`apply_batch`], reporting how long authorization and state application took.
@@ -837,30 +872,65 @@ pub(crate) fn apply_batch_timed(
     timing: &mut ApplyTiming,
     threads: usize,
 ) -> usize {
+    apply_batch_timed_report(state, accounts, batch, rejected, timing, threads, None)
+}
+
+/// [`apply_batch_timed`], optionally recording one result per transaction.
+///
+/// The per-transaction report is filled in batch order. Without a report the
+/// function does the same work and returns the same count, so the measured live
+/// path is unchanged.
+pub(crate) fn apply_batch_timed_report(
+    state: &mut State,
+    accounts: &[Account],
+    batch: &Batch,
+    rejected: &mut BTreeMap<&'static str, usize>,
+    timing: &mut ApplyTiming,
+    threads: usize,
+    mut report: Option<&mut Vec<TxResult>>,
+) -> usize {
     let verify_start = Instant::now();
-    let mut authorized: Vec<&Transaction> = Vec::with_capacity(batch.len());
+    let mut authorized: Vec<(usize, &Transaction)> = Vec::with_capacity(batch.len());
+    let mut reasons: Vec<Option<&'static str>> = vec![None; batch.len()];
     let mut chunk_rejected: Vec<(&'static str, usize)> = Vec::new();
     if threads <= 1 || batch.len() < 64 {
-        let (chunk, rejected) = authorize_chunk(&batch.transactions, accounts);
-        authorized = chunk;
-        chunk_rejected = rejected;
+        let chunk = authorize_chunk(&batch.transactions, accounts);
+        authorized = chunk.authorized;
+        chunk_rejected = chunk.rejected;
+        reasons = chunk.reasons;
     } else {
         let chunk_size = batch.len().div_ceil(threads).max(1);
         let chunks = std::thread::scope(|scope| {
             let handles: Vec<_> = batch
                 .transactions
                 .chunks(chunk_size)
-                .map(|slice| scope.spawn(move || authorize_chunk(slice, accounts)))
+                .enumerate()
+                .map(|(chunk_index, slice)| {
+                    let offset = chunk_index * chunk_size;
+                    scope.spawn(move || (offset, authorize_chunk(slice, accounts)))
+                })
                 .collect();
             handles
                 .into_iter()
                 .map(|handle| handle.join().expect("a verification thread panicked"))
                 .collect::<Vec<_>>()
         });
-        for (chunk, rejected) in chunks {
-            authorized.extend(chunk);
-            chunk_rejected.extend(rejected);
+        for (offset, mut chunk) in chunks {
+            // `authorize_chunk` numbers its result from zero; adding the chunk
+            // offset is what keeps the execution order global rather than four
+            // independent 0-based streams.
+            for (index, _) in &mut chunk.authorized {
+                *index += offset;
+            }
+            for (local, reason) in chunk.reasons.iter().enumerate() {
+                reasons[offset + local] = *reason;
+            }
+            authorized.extend(chunk.authorized);
+            chunk_rejected.extend(chunk.rejected);
         }
+        // Chunks arrive in order, but sorting by the original index keeps the
+        // execution order correct even if that ever changes.
+        authorized.sort_by_key(|(index, _)| *index);
     }
     for (reason, count) in chunk_rejected {
         *rejected.entry(reason).or_insert(0) += count;
@@ -868,14 +938,37 @@ pub(crate) fn apply_batch_timed(
     timing.verify += verify_start.elapsed();
 
     let state_start = Instant::now();
+    let refs: Vec<&Transaction> = authorized
+        .iter()
+        .map(|(_, transaction)| *transaction)
+        .collect();
+    let outcomes = state.apply_refs(&refs);
     let mut applied = 0usize;
-    for outcome in state.apply_refs(&authorized) {
+    let mut results: Vec<Option<TxResult>> = reasons
+        .into_iter()
+        .map(|reason| reason.map(TxResult::Rejected))
+        .collect();
+    for ((index, _), outcome) in authorized.iter().zip(outcomes) {
         match outcome.reason() {
-            None => applied += 1,
-            Some(reason) => *rejected.entry(reason.as_str()).or_insert(0) += 1,
+            None => {
+                applied += 1;
+                results[*index] = Some(TxResult::Applied);
+            }
+            Some(reason) => {
+                *rejected.entry(reason.as_str()).or_insert(0) += 1;
+                results[*index] = Some(TxResult::Rejected(reason.as_str()));
+            }
         }
     }
     timing.state += state_start.elapsed();
+
+    if let Some(report) = report.as_mut() {
+        report.extend(
+            results
+                .into_iter()
+                .map(|result| result.unwrap_or(TxResult::Rejected("unauthorized"))),
+        );
+    }
     applied
 }
 
@@ -1128,11 +1221,20 @@ mod tests {
                 transaction.verify(policy, NOW).is_ok()
             })
             .collect();
-        let (actual, rejected) = authorize_chunk(&batch.transactions, &accounts);
+        let chunk = authorize_chunk(&batch.transactions, &accounts);
+        let actual: Vec<&Transaction> = chunk
+            .authorized
+            .iter()
+            .map(|(_, transaction)| *transaction)
+            .collect();
 
         assert_eq!(actual, expected);
         assert_eq!(
-            rejected.iter().map(|(_, count)| *count).sum::<usize>(),
+            chunk
+                .rejected
+                .iter()
+                .map(|(_, count)| *count)
+                .sum::<usize>(),
             batch.len() - expected.len()
         );
     }
