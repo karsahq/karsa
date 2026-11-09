@@ -31,7 +31,7 @@
 //! fixed by `--validators`. A link opens with a hello naming the chain, so two
 //! genesis hashes never get as far as exchanging a vertex.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,12 +44,12 @@ use erasure::Code;
 use exec::State;
 use net::Node;
 use net::wire::{self, Message};
-use store::Store;
+use store::{LiveSnapshot, Store};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tx::batch::Batch;
-use validator::{Finalizer, Header, SetSchedule, Step, VertexId, commit_root};
+use validator::{Certificate, Finalizer, Header, SetSchedule, Step, VertexId, commit_root};
 
 use crate::chain;
 use crate::rpc::{self, RpcCore, SharedRpc};
@@ -87,6 +87,21 @@ const QUIET_TICKS: u32 = 50;
 const LIVE_BALANCE: u64 = 1_000_000_000;
 /// How long a peer gets to state its chain identity before the link is closed.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a joining node waits for a peer to accept a snapshot connection.
+const SNAPSHOT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a joining node keeps trying peers while they finish starting up.
+const SNAPSHOT_STARTUP_WAIT: Duration = Duration::from_secs(15);
+/// How long a joining node waits for the snapshot body.
+const SNAPSHOT_READ_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a serving node waits for the node loop to build a snapshot.
+const SNAPSHOT_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
+/// Per-`applied` states kept so a certified head's state can be served.
+const SNAPSHOT_STATES: usize = 256;
+/// Rounds kept above the certified head when choosing a snapshot floor.
+///
+/// A vertex at the head's round may still be in flight to the snapshot peer, so
+/// keeping a couple of rounds above it lets it travel in the tail.
+const SNAPSHOT_FLOOR_MARGIN: u64 = 2;
 
 /// How a live run is configured.
 #[derive(Clone)]
@@ -161,6 +176,14 @@ pub struct Config {
     pub rpc_port: u16,
     /// Most mempool transactions one authored batch may carry.
     pub rpc_batch_max: usize,
+    /// First loopback port for snapshot requests; node `i` serves
+    /// `snapshot_port + i`. Zero disables the server and the client.
+    pub snapshot_port: u16,
+    /// Ask a peer for a state snapshot at startup instead of replaying history.
+    ///
+    /// Used when this node's store is empty. The joiner still verifies the
+    /// anchor's quorum certificate before adopting anything.
+    pub sync_from_peers: bool,
 }
 
 /// Wall time spent in the stages the live loop can name.
@@ -493,6 +516,9 @@ fn restore(
     node: &mut Node,
     live: &mut Restorable<'_>,
 ) -> Result<Option<Restored>, String> {
+    if let Some(snapshot) = store.live_snapshot().map_err(|error| error.to_string())? {
+        return restore_live(store, node, live, snapshot).map(Some);
+    }
     let snapshot = store.snapshot().map_err(|error| error.to_string())?;
     let mut vertices = store.vertices().map_err(|error| error.to_string())?;
     let headers = store.headers().map_err(|error| error.to_string())?;
@@ -588,6 +614,470 @@ fn restore(
     }))
 }
 
+/// Resumes a node from the snapshot it joined through.
+///
+/// The state and committed prefix are adopted as they were verified at join
+/// time, then the tail above the floor is replayed and re-committed. The stored
+/// certified headers above the anchor advance the header chain; the anchor's own
+/// certificate is the trust root.
+fn restore_live(
+    store: &Store,
+    node: &mut Node,
+    live: &mut Restorable<'_>,
+    snapshot: LiveSnapshot,
+) -> Result<Restored, String> {
+    let state = State::decode(&snapshot.state)
+        .map_err(|error| format!("live snapshot state does not decode: {error}"))?;
+    if state.state_root() != snapshot.header.state_root {
+        return Err("live snapshot state root does not match its header".into());
+    }
+    if commit_root(&snapshot.order) != snapshot.header.dag_root {
+        return Err("live snapshot order does not reproduce its header dag_root".into());
+    }
+    let anchor_height = snapshot.header.height;
+    let finalizer = live
+        .finalizer
+        .as_mut()
+        .ok_or("a live snapshot needs execution (--execute)")?;
+    finalizer
+        .adopt_anchor(
+            snapshot.header.clone(),
+            &snapshot.certificate,
+            snapshot.order.len(),
+        )
+        .map_err(|error| format!("live snapshot anchor is not certified: {error}"))?;
+    *live.state = state;
+    *live.applied = usize::try_from(snapshot.applied)
+        .map_err(|_| format!("{} applied transactions do not fit", snapshot.applied))?;
+    *live.applied_cursor = snapshot.order.len();
+    node.seed_order(snapshot.order);
+    if let Some(floor) = snapshot.floor {
+        node.set_floor(floor);
+    }
+    node.set_cursor(snapshot.cursor);
+
+    let mut vertices = store.vertices().map_err(|error| error.to_string())?;
+    vertices.sort_by(|left, right| {
+        left.round
+            .cmp(&right.round)
+            .then_with(|| left.author.cmp(&right.author))
+    });
+    for vertex in &vertices {
+        node.receive(vertex.clone()).map_err(|error| {
+            format!(
+                "cannot replay a stored tail vertex at round {}: {error}",
+                vertex.round
+            )
+        })?;
+    }
+    if let Some(highest) = node.dag().highest_round() {
+        let authored_top = node.dag().get(highest, node.id()).is_some();
+        node.set_round(
+            if authored_top {
+                highest.saturating_add(1)
+            } else {
+                highest
+            }
+            .max(snapshot.cursor),
+        );
+    } else {
+        node.set_round(snapshot.cursor);
+    }
+    for batch in store.batches().map_err(|error| error.to_string())? {
+        let digest = batch.digest().map_err(|error| error.to_string())?;
+        live.batches.insert(digest, batch);
+    }
+
+    // Rebuild the order above the anchor, exactly as the live loop would.
+    loop {
+        match node.commit_once() {
+            Ok(Step::Advanced { anchors, .. }) if anchors > 0 => break,
+            Ok(Step::Advanced { .. }) => {}
+            Ok(Step::Waiting { .. } | Step::TimedOut { .. }) => break,
+            Err(error) if error.kind() == CryptoErrorKind::MissingReference => break,
+            Err(error) => return Err(format!("cannot rebuild the snapshot tail: {error}")),
+        }
+    }
+
+    let order = node.dag().order().to_vec();
+    while *live.applied_cursor < order.len() {
+        let id = &order[*live.applied_cursor];
+        let Some(vertex) = node.dag().get(id.round, &id.author) else {
+            break;
+        };
+        if vertex.payload_hash == [0u8; 32] {
+            *live.applied_cursor += 1;
+            continue;
+        }
+        let Some(batch) = live.batches.get(&vertex.payload_hash) else {
+            break;
+        };
+        *live.applied += chain::apply_batch(live.state, live.accounts, batch, live.rejected);
+        if let Some(rpc) = live.rpc {
+            rpc.lock()
+                .expect("rpc lock poisoned")
+                .note_state(*live.applied as u64, live.state);
+        }
+        *live.applied_cursor += 1;
+    }
+
+    let mut headers = store.headers().map_err(|error| error.to_string())?;
+    headers.sort_by_key(|record| record.header.height);
+    for record in headers {
+        if record.header.height <= anchor_height {
+            continue;
+        }
+        finalizer
+            .adopt_certified(record.header, record.certificate)
+            .map_err(|error| format!("cannot adopt a stored header: {error}"))?;
+    }
+    finalizer.resume_from_head();
+
+    Ok(Restored {
+        state_root: live.state.state_root(),
+        applied: *live.applied,
+        order_len: node.dag().order().len(),
+        head_height: finalizer.head().height,
+    })
+}
+
+/// Keeps the state at one cumulative applied count for snapshot serving.
+fn remember_state(states: &mut VecDeque<(u64, State)>, applied: u64, state: &State) {
+    if states.back().is_some_and(|(at, _)| *at == applied) {
+        return;
+    }
+    states.push_back((applied, state.clone()));
+    while states.len() > SNAPSHOT_STATES {
+        states.pop_front();
+    }
+}
+
+/// Every vertex this node still holds, in round and validator order.
+fn held_vertices(node: &Node) -> Vec<validator::Vertex> {
+    let dag = node.dag();
+    let Some(highest) = dag.highest_round() else {
+        return Vec::new();
+    };
+    let mut vertices = Vec::new();
+    for round in 0..=highest {
+        for record in &dag.set_for_round(round).validators {
+            if let Some(vertex) = dag.get(round, &record.validator_id) {
+                vertices.push(vertex.clone());
+            }
+        }
+    }
+    vertices
+}
+
+/// The lowest round a snapshot can drop without losing an uncommitted vertex.
+///
+/// Mirrors the rule the finality harness uses: a held vertex outside the committed
+/// prefix may still be committed later, so it stays above the floor. Round zero is
+/// never pruned; when no positive floor is safe the DAG travels whole.
+fn snapshot_floor(node: &Node, order: &[VertexId], anchor_round: u64) -> Option<u64> {
+    if anchor_round <= SNAPSHOT_FLOOR_MARGIN {
+        return None;
+    }
+    let committed: HashSet<(u64, Vec<u8>)> = order
+        .iter()
+        .map(|id| (id.round, id.author.clone()))
+        .collect();
+    let mut floor = anchor_round - SNAPSHOT_FLOOR_MARGIN;
+    let dag = node.dag();
+    let Some(highest) = dag.highest_round() else {
+        return (floor > 0).then_some(floor);
+    };
+    for round in 0..=highest.min(floor) {
+        for record in &dag.set_for_round(round).validators {
+            if dag.get(round, &record.validator_id).is_none() {
+                continue;
+            }
+            if !committed.contains(&(round, record.validator_id.clone())) {
+                if round == 0 {
+                    return None;
+                }
+                floor = floor.min(round - 1);
+            }
+        }
+    }
+    (floor > 0).then_some(floor)
+}
+
+/// Builds the snapshot this node can serve right now.
+///
+/// It is anchored at the certified head, so the receiver has a quorum statement
+/// for the state it adopts. The state must still be in the ring; an evicted
+/// applied count means this node declines rather than serving a root it cannot
+/// reproduce.
+fn build_live_snapshot(
+    node: &Node,
+    finalizer: &Finalizer,
+    last_certified: Option<&(Header, Certificate)>,
+    states: &VecDeque<(u64, State)>,
+    batches: &HashMap<[u8; 32], Batch>,
+) -> Option<wire::Snapshot> {
+    let head = finalizer.head();
+    let (header, certificate) = last_certified?;
+    if header.height != head.height || header.id().ok()? != head.id().ok()? {
+        return None;
+    }
+    let coverage = finalizer.certified_order(head.height)?;
+    let order = node.dag().order();
+    if coverage > order.len() {
+        return None;
+    }
+    let state = states
+        .iter()
+        .rev()
+        .find(|(applied, _)| *applied == head.applied)?
+        .1
+        .clone();
+    if state.state_root() != head.state_root {
+        return None;
+    }
+    let floor = snapshot_floor(node, &order[..coverage], head.round);
+    let vertices: Vec<validator::Vertex> = held_vertices(node)
+        .into_iter()
+        .filter(|vertex| floor.is_none_or(|floor| vertex.round > floor))
+        .collect();
+    let mut seen = HashSet::new();
+    let mut tail_batches = Vec::new();
+    for vertex in &vertices {
+        if vertex.payload_hash == [0u8; 32] || !seen.insert(vertex.payload_hash) {
+            continue;
+        }
+        if let Some(batch) = batches.get(&vertex.payload_hash) {
+            tail_batches.push(batch.clone());
+        }
+    }
+    Some(wire::Snapshot {
+        state: state.encode().ok()?,
+        order: order[..coverage].to_vec(),
+        anchor: header.clone(),
+        certificate: certificate.clone(),
+        cursor: head.round.saturating_add(1),
+        floor,
+        vertices,
+        batches: tail_batches,
+    })
+}
+
+/// Reads one message from a stream whose handshake buffer may already hold bytes.
+async fn read_one_message(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+) -> Result<wire::Message, String> {
+    loop {
+        match wire::take_frame(buffer) {
+            Ok(Some(frame)) => return Ok(frame.message),
+            Ok(None) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        let mut chunk = [0u8; 64 * 1024];
+        let read = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|error| format!("snapshot link read: {error}"))?;
+        if read == 0 {
+            return Err("peer closed before sending a frame".into());
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// Requests one snapshot from a peer's dedicated snapshot port.
+async fn fetch_one(target: &str, chain_id: &[u8]) -> Result<wire::Snapshot, String> {
+    let mut stream = tokio::time::timeout(SNAPSHOT_CONNECT_TIMEOUT, TcpStream::connect(target))
+        .await
+        .map_err(|_| format!("connect to {target} timed out"))?
+        .map_err(|error| format!("connect to {target}: {error}"))?;
+    let mut buffer = Vec::new();
+    tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        handshake(&mut stream, &mut buffer, chain_id),
+    )
+    .await
+    .map_err(|_| format!("handshake with {target} timed out"))?
+    .map_err(|error| format!("handshake with {target}: {error}"))?;
+    let request =
+        wire::frame(&Message::SnapshotWant, unix_nanos()).map_err(|error| error.to_string())?;
+    stream
+        .write_all(&request)
+        .await
+        .map_err(|error| format!("snapshot request to {target}: {error}"))?;
+    let deadline = tokio::time::Instant::now() + SNAPSHOT_READ_TIMEOUT;
+    loop {
+        match wire::take_frame(&mut buffer) {
+            Ok(Some(frame)) => {
+                return match frame.message {
+                    Message::Snapshot(snapshot) => Ok(*snapshot),
+                    other => Err(format!("{target} answered with {other:?}")),
+                };
+            }
+            Ok(None) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("timed out waiting for {target}'s snapshot"));
+        }
+        let mut chunk = vec![0u8; 64 * 1024];
+        let read = tokio::time::timeout(remaining, stream.read(&mut chunk))
+            .await
+            .map_err(|_| format!("timed out reading {target}'s snapshot"))?
+            .map_err(|error| format!("snapshot read from {target}: {error}"))?;
+        if read == 0 {
+            return Err(format!("{target} closed before sending a snapshot"));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// Tries every peer's snapshot port until one answers.
+async fn fetch_snapshot(
+    port_base: u16,
+    index: usize,
+    total: usize,
+    chain_id: &[u8],
+) -> Result<wire::Snapshot, String> {
+    let deadline = tokio::time::Instant::now() + SNAPSHOT_STARTUP_WAIT;
+    let mut last = String::from("no peers were tried");
+    loop {
+        for peer in 0..total {
+            if peer == index {
+                continue;
+            }
+            let target = rpc_address(port_base, peer)?;
+            match fetch_one(&target, chain_id).await {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(error) => last = format!("{target}: {error}"),
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("no peer served a snapshot ({last})"));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// What a snapshot join adopted.
+struct Adopted {
+    state: State,
+    applied: usize,
+    order_len: usize,
+    anchor: Header,
+    certificate: Certificate,
+    floor: Option<u64>,
+    vertices: usize,
+    batches: usize,
+}
+
+/// Verifies a received snapshot and starts the node from its anchor.
+///
+/// Nothing is trusted because it arrived: the state root must match the anchor,
+/// the order must reproduce its `dag_root`, and the certificate must carry a
+/// quorum for the anchor's epoch before the anchor replaces genesis.
+fn adopt_snapshot(
+    snapshot: wire::Snapshot,
+    node: &mut Node,
+    finalizer: &mut Option<Finalizer>,
+    batches: &mut HashMap<[u8; 32], Batch>,
+    chain_id: &[u8],
+    store: Option<&Store>,
+) -> Result<Adopted, String> {
+    let wire::Snapshot {
+        state,
+        order,
+        anchor,
+        certificate,
+        cursor,
+        floor,
+        vertices,
+        batches: incoming,
+    } = snapshot;
+    if anchor.chain_id != chain_id {
+        return Err("snapshot is anchored on another chain".into());
+    }
+    let decoded = State::decode(&state)
+        .map_err(|error| format!("snapshot state does not decode: {error}"))?;
+    if decoded.state_root() != anchor.state_root {
+        return Err("snapshot state root does not match the anchor".into());
+    }
+    if commit_root(&order) != anchor.dag_root {
+        return Err("snapshot order does not reproduce the anchor dag_root".into());
+    }
+    let finalizer = finalizer
+        .as_mut()
+        .ok_or("a snapshot join needs execution (--execute)")?;
+    finalizer
+        .adopt_anchor(anchor.clone(), &certificate, order.len())
+        .map_err(|error| format!("snapshot anchor is not certified: {error}"))?;
+    if let Some(store) = store {
+        store
+            .put_live_snapshot(&store::LiveSnapshot {
+                round: anchor.round,
+                floor,
+                cursor,
+                applied: anchor.applied,
+                state: state.clone(),
+                order: order.clone(),
+                header: anchor.clone(),
+                certificate: certificate.clone(),
+            })
+            .map_err(|error| error.to_string())?;
+    }
+    let order_len = order.len();
+    node.seed_order(order);
+    if let Some(floor) = floor {
+        node.set_floor(floor);
+    }
+    node.set_cursor(cursor);
+    for vertex in &vertices {
+        node.receive(vertex.clone())
+            .map_err(|error| format!("cannot replay a snapshot tail vertex: {error}"))?;
+    }
+    let batch_count = incoming.len();
+    if let Some(store) = store {
+        store
+            .put_header(&anchor, &certificate)
+            .map_err(|error| error.to_string())?;
+        for vertex in &vertices {
+            store
+                .append_vertex(vertex)
+                .map_err(|error| error.to_string())?;
+        }
+        for batch in &incoming {
+            store.put_batch(batch).map_err(|error| error.to_string())?;
+        }
+    }
+    for batch in incoming {
+        if let Ok(digest) = batch.digest() {
+            batches.insert(digest, batch);
+        }
+    }
+    let highest = node.dag().highest_round().unwrap_or(anchor.round);
+    let authored_top = node.dag().get(highest, node.id()).is_some();
+    let round = if authored_top {
+        highest.saturating_add(1)
+    } else {
+        highest
+    }
+    .max(cursor);
+    node.set_round(round);
+    let applied = usize::try_from(anchor.applied)
+        .map_err(|_| format!("{} applied transactions do not fit", anchor.applied))?;
+    Ok(Adopted {
+        state: decoded,
+        applied,
+        order_len,
+        anchor,
+        certificate,
+        floor,
+        vertices: vertices.len(),
+        batches: batch_count,
+    })
+}
+
 async fn node_task(
     index: usize,
     config: &Config,
@@ -630,6 +1120,7 @@ async fn node_task(
                 .map_err(|error| error.to_string())?,
         )
     };
+    let total = config.validators + config.archives;
 
     let listener = TcpListener::bind(address(config.port_base, index))
         .await
@@ -640,7 +1131,14 @@ async fn node_task(
     // Both directions use the same depth: the inbound channel is what keeps a
     // reader from acknowledging frames faster than the node loop can judge them,
     // so tuning only one side would leave the other free to absorb the backlog.
-    let (frames_tx, mut frames_rx) = mpsc::channel(config.queue.max(1));
+    // A joiner leaves the mesh running while it fetches a snapshot, so its queue
+    // is enlarged to absorb that window without dropping payloads.
+    let queue = if config.sync_from_peers {
+        config.queue.max(1).saturating_mul(4)
+    } else {
+        config.queue.max(1)
+    };
+    let (frames_tx, mut frames_rx) = mpsc::channel(queue);
 
     // Inbound: accept from every peer.
     {
@@ -686,11 +1184,36 @@ async fn node_task(
         });
     }
 
+    // The listener is up first so peers can finish their outbound connects and
+    // start their own snapshot servers; only then can this node ask for one. The
+    // snapshot exchange uses its own port, not the consensus links.
+    let synced = if config.sync_from_peers {
+        let empty = match &store {
+            Some(store) => store
+                .vertices()
+                .map_err(|error| error.to_string())?
+                .is_empty(),
+            None => true,
+        };
+        if !empty {
+            println!(
+                "  node val-{index} has history; restore takes precedence over --sync-from-peers"
+            );
+            None
+        } else {
+            if config.snapshot_port == 0 {
+                return Err(format!("node {index} cannot sync without --snapshot-port"));
+            }
+            Some(fetch_snapshot(config.snapshot_port, index, total, &chain_id).await?)
+        }
+    } else {
+        None
+    };
+
     // Outbound: one link per peer, connected with retries because the nodes start
     // together and a listener may not exist yet. Archives are peers too: what makes
     // an archive an archive is that validators send it everything, not that it
     // participates.
-    let total = config.validators + config.archives;
     let mut outbound: Vec<Link> = Vec::with_capacity(total.saturating_sub(1));
     for peer in 0..total {
         if peer == index {
@@ -835,6 +1358,65 @@ async fn node_task(
         None
     };
 
+    // A snapshot link is separate from the consensus mesh: the joiner asks, the
+    // server answers from the node loop's own state, and nothing is broadcast.
+    let (snapshot_tx, mut snapshot_rx) =
+        mpsc::channel::<oneshot::Sender<Option<wire::Snapshot>>>(4);
+    if config.snapshot_port > 0 {
+        let target = rpc_address(config.snapshot_port, index)?;
+        let listener = TcpListener::bind(&target)
+            .await
+            .map_err(|error| format!("node {index} cannot serve snapshots on {target}: {error}"))?;
+        println!("  node val-{index} snapshot server on {target}");
+        let mut snapshot_shutdown = shutdown.clone();
+        let snapshot_chain = chain_id.clone();
+        let snapshot_tx = snapshot_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((mut stream, _)) = accepted else { return };
+                        let chain = snapshot_chain.clone();
+                        let tx = snapshot_tx.clone();
+                        tokio::spawn(async move {
+                            let mut buffer = Vec::new();
+                            let hello = tokio::time::timeout(
+                                HANDSHAKE_TIMEOUT,
+                                handshake(&mut stream, &mut buffer, &chain),
+                            )
+                            .await;
+                            if !matches!(hello, Ok(Ok(()))) {
+                                return;
+                            }
+                            let Ok(message) = read_one_message(&mut stream, &mut buffer).await else {
+                                return;
+                            };
+                            if message != Message::SnapshotWant {
+                                return;
+                            }
+                            let (reply_tx, reply_rx) = oneshot::channel();
+                            if tx.send(reply_tx).await.is_err() {
+                                return;
+                            }
+                            let Ok(Ok(Some(snapshot))) =
+                                tokio::time::timeout(SNAPSHOT_REPLY_TIMEOUT, reply_rx).await
+                            else {
+                                return;
+                            };
+                            if let Ok(frame) =
+                                wire::frame(&Message::Snapshot(Box::new(snapshot)), unix_nanos())
+                            {
+                                let _ = stream.write_all(&frame).await;
+                                let _ = stream.flush().await;
+                            }
+                        });
+                    }
+                    _ = snapshot_shutdown.changed() => return,
+                }
+            }
+        });
+    }
+
     // A header commits a state root, so finality only exists on a node that
     // executes. The anchor is the genesis header over the same credited state
     // every node starts from, which is what makes the first certificate cross-
@@ -860,7 +1442,40 @@ async fn node_task(
     let mut applied = 0usize;
     let mut applied_cursor = 0usize;
 
-    let restored = if let Some(store) = &store {
+    let mut adopted_anchor: Option<(Header, Certificate)> = None;
+    if let Some(snapshot) = synced {
+        let adopted = adopt_snapshot(
+            snapshot,
+            &mut node,
+            &mut finalizer,
+            &mut batches,
+            &chain_id,
+            store.as_ref(),
+        )?;
+        let state_root = adopted.state.state_root();
+        println!(
+            "  node val-{index} adopted snapshot height {} round {}, floor {:?}, {} tail \
+             vertices, {} batches, state {}",
+            adopted.anchor.height,
+            adopted.anchor.round,
+            adopted.floor,
+            adopted.vertices,
+            adopted.batches,
+            hex::encode(&state_root[..6])
+        );
+        let anchor = adopted.anchor.clone();
+        let certificate = adopted.certificate.clone();
+        let applied_count = adopted.applied;
+        let order_len = adopted.order_len;
+        state = adopted.state;
+        applied = applied_count;
+        applied_cursor = order_len;
+        adopted_anchor = Some((anchor, certificate));
+    }
+
+    let restored = if adopted_anchor.is_some() {
+        None
+    } else if let Some(store) = &store {
         restore(
             store,
             &mut node,
@@ -878,6 +1493,27 @@ async fn node_task(
     } else {
         None
     };
+
+    let mut last_certified: Option<(Header, Certificate)> = adopted_anchor;
+    if last_certified.is_none()
+        && let Some(store) = &store
+        && let Some(record) = store
+            .headers()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next_back()
+    {
+        last_certified = Some((record.header, record.certificate));
+    }
+
+    let mut state_history: VecDeque<(u64, State)> = VecDeque::new();
+    if config.snapshot_port > 0 {
+        remember_state(
+            &mut state_history,
+            u64::try_from(applied).unwrap_or(u64::MAX),
+            &state,
+        );
+    }
 
     if let Some(rpc) = &rpc {
         let mut core = rpc.lock().expect("rpc lock poisoned");
@@ -1003,6 +1639,15 @@ async fn node_task(
                                 .receive_share(share)
                                 .map_err(|error| error.to_string())?;
                             for certified in certified {
+                                if last_certified
+                                    .as_ref()
+                                    .is_none_or(|(current, _)| current.height <= certified.header.height)
+                                {
+                                    last_certified = Some((
+                                        certified.header.clone(),
+                                        certified.certificate.clone(),
+                                    ));
+                                }
                                 if let Some(rpc) = &rpc {
                                     let mut core = rpc.lock().expect("rpc lock poisoned");
                                     core.note_order(node.dag().order());
@@ -1019,10 +1664,24 @@ async fn node_task(
                             }
                         }
                     }
+                    // Snapshots travel on their own link, not on the mesh.
+                    Message::SnapshotWant | Message::Snapshot(_) => rejected += 1,
                 }
             }
             _ = stop_authoring.changed() => {
                 authoring_stopped = *stop_authoring.borrow();
+            }
+            Some(reply) = snapshot_rx.recv() => {
+                let built = finalizer.as_ref().and_then(|finalizer| {
+                    build_live_snapshot(
+                        &node,
+                        finalizer,
+                        last_certified.as_ref(),
+                        &state_history,
+                        &batches,
+                    )
+                });
+                let _ = reply.send(built);
             }
             _ = ticker.tick() => {
                 ticks = ticks.wrapping_add(1);
@@ -1248,6 +1907,13 @@ async fn node_task(
                                 &state,
                             );
                         }
+                        if config.snapshot_port > 0 {
+                            remember_state(
+                                &mut state_history,
+                                u64::try_from(applied).unwrap_or(u64::MAX),
+                                &state,
+                            );
+                        }
                         if let Some(finalizer) = finalizer.as_mut() {
                             finalizer.mark_applied(
                                 applied_cursor,
@@ -1272,6 +1938,15 @@ async fn node_task(
                         broadcast(&outbound, false, &bytes, &mut dropped);
                     }
                     for certified in build.certified {
+                        if last_certified
+                            .as_ref()
+                            .is_none_or(|(current, _)| current.height <= certified.header.height)
+                        {
+                            last_certified = Some((
+                                certified.header.clone(),
+                                certified.certificate.clone(),
+                            ));
+                        }
                         if let Some(rpc) = &rpc {
                             let mut core = rpc.lock().expect("rpc lock poisoned");
                             core.note_order(node.dag().order());
@@ -1569,6 +2244,8 @@ async fn archive_task(
                     // An archive does not certify; the shares it receives are for
                     // validators to build certificates from.
                     Message::Share(_) => {}
+                    // Snapshots need execution state, which an archive does not keep.
+                    Message::SnapshotWant | Message::Snapshot(_) => {}
                     // The accept side consumes the hello before the loop starts.
                     Message::Hello(_) => rejected += 1,
                 }
@@ -2006,6 +2683,46 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
                 "the RPC range {rpc_first}..={rpc_last} overlaps the peer range {p2p_first}..={p2p_last}"
             )
             .into());
+        }
+    }
+    if config.sync_from_peers {
+        if !config.execute {
+            return Err("--sync-from-peers needs --execute: the snapshot carries state".into());
+        }
+        if config.snapshot_port == 0 {
+            return Err("--sync-from-peers needs --snapshot-port".into());
+        }
+        if config.store.as_os_str().is_empty() {
+            return Err("--sync-from-peers needs --store: the adopted history is persisted".into());
+        }
+    }
+    if config.snapshot_port > 0 {
+        let first = u32::from(config.snapshot_port);
+        let last = first + u32::try_from(total - 1).unwrap_or(0);
+        if last > u32::from(u16::MAX) {
+            return Err(format!(
+                "--snapshot-port {} plus {total} nodes exceeds the u16 port range",
+                config.snapshot_port
+            )
+            .into());
+        }
+        let p2p_first = u32::from(config.port_base);
+        let p2p_last = p2p_first + u32::try_from(total - 1).unwrap_or(0);
+        if first <= p2p_last && p2p_first <= last {
+            return Err(format!(
+                "the snapshot range {first}..={last} overlaps the peer range {p2p_first}..={p2p_last}"
+            )
+            .into());
+        }
+        if config.rpc_port > 0 {
+            let rpc_first = u32::from(config.rpc_port);
+            let rpc_last = rpc_first + u32::try_from(config.validators - 1).unwrap_or(0);
+            if first <= rpc_last && rpc_first <= last {
+                return Err(format!(
+                    "the snapshot range {first}..={last} overlaps the RPC range {rpc_first}..={rpc_last}"
+                )
+                .into());
+            }
         }
     }
 
@@ -2748,6 +3465,8 @@ mod tests {
             verify_threads: 1,
             rpc_port: 0,
             rpc_batch_max: rpc::DEFAULT_BATCH_MAX,
+            snapshot_port: 0,
+            sync_from_peers: false,
         }
     }
 

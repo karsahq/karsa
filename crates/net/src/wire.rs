@@ -36,7 +36,7 @@
 use crypto::encoding::{Decoder, Encoder};
 use crypto::{CryptoError, CryptoErrorKind};
 use tx::batch::Batch;
-use validator::{Header, Share, Vertex, VertexId};
+use validator::{Certificate, Header, Share, Vertex, VertexId};
 
 /// Largest body this parser will accept.
 ///
@@ -53,13 +53,15 @@ const KIND_WANT: u8 = 2;
 const KIND_PAYLOAD: u8 = 3;
 const KIND_HELLO: u8 = 4;
 const KIND_SHARE: u8 = 5;
+const KIND_SNAPSHOT_WANT: u8 = 6;
+const KIND_SNAPSHOT: u8 = 7;
 
 /// The framing and message layout this build speaks.
 ///
 /// A peer that answers with another number is not necessarily hostile; it may be a
 /// different build. The link is closed rather than parsed optimistically, because
 /// the next frame kind could mean something else there.
-pub const WIRE_PROTOCOL: u16 = 2;
+pub const WIRE_PROTOCOL: u16 = 3;
 
 /// The first frame on every link: which chain the sender is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +83,33 @@ impl Hello {
     }
 }
 
+/// A state snapshot a joining node can adopt instead of replaying from genesis.
+///
+/// The anchor is the certified header the state belongs to. Its certificate is
+/// carried so the receiver can check the quorum rather than trust the sender.
+/// `order` is the committed prefix the anchor commits, which a header's
+/// `dag_root` needs; `floor` is the highest round the state covers, so the DAG
+/// travels only above it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    /// Encoded `exec::State` at the anchor.
+    pub state: Vec<u8>,
+    /// Committed order prefix ending at the anchor.
+    pub order: Vec<VertexId>,
+    /// The certified header the snapshot is anchored at.
+    pub anchor: Header,
+    /// Quorum certificate over the anchor.
+    pub certificate: Certificate,
+    /// Decision round the joiner resumes from.
+    pub cursor: u64,
+    /// Rounds at or below this are covered by `state` and are not transferred.
+    pub floor: Option<u64>,
+    /// Vertices above the floor.
+    pub vertices: Vec<Vertex>,
+    /// Batches named by those vertices.
+    pub batches: Vec<Batch>,
+}
+
 /// What a frame carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -94,6 +123,10 @@ pub enum Message {
     Payload(Batch),
     /// One validator's signature over one header.
     Share(Share),
+    /// A request for a state snapshot, sent on a dedicated snapshot link.
+    SnapshotWant,
+    /// A state snapshot response.
+    Snapshot(Box<Snapshot>),
 }
 
 /// One decoded frame.
@@ -169,6 +202,100 @@ fn decode_share(payload: &[u8]) -> Result<Share, CryptoError> {
     })
 }
 
+fn count(value: usize, what: &str) -> Result<u32, CryptoError> {
+    u32::try_from(value).map_err(|_| {
+        CryptoError::new(
+            CryptoErrorKind::FieldTooLong,
+            format!("{what} count does not fit a u32"),
+        )
+    })
+}
+
+fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>, CryptoError> {
+    let mut encoder = Encoder::with_capacity(64 + snapshot.state.len());
+    encoder.put_bytes(&snapshot.state)?;
+    encoder.put_u32(count(snapshot.order.len(), "order")?);
+    for id in &snapshot.order {
+        encoder.put_bytes(&encode_id(id)?)?;
+    }
+    encoder.put_bytes(&snapshot.anchor.encode()?)?;
+    encoder.put_bytes(&snapshot.certificate.encode()?)?;
+    encoder.put_u64(snapshot.cursor);
+    match snapshot.floor {
+        None => encoder.put_u8(0),
+        Some(floor) => {
+            encoder.put_u8(1);
+            encoder.put_u64(floor);
+        }
+    }
+    encoder.put_u32(count(snapshot.vertices.len(), "vertex")?);
+    for vertex in &snapshot.vertices {
+        encoder.put_bytes(&vertex.encode()?)?;
+    }
+    encoder.put_u32(count(snapshot.batches.len(), "batch")?);
+    for batch in &snapshot.batches {
+        encoder.put_bytes(&batch.encode()?)?;
+    }
+    Ok(encoder.finish())
+}
+
+fn decode_snapshot(payload: &[u8]) -> Result<Snapshot, CryptoError> {
+    let mut decoder = Decoder::new(payload);
+    let state = decoder.read_bytes()?.to_vec();
+    let order_count = decoder.read_u32()? as usize;
+    if order_count > MAX_FRAME {
+        return Err(CryptoError::new(
+            CryptoErrorKind::FieldTooLong,
+            format!("{order_count} order entries exceed the frame cap"),
+        ));
+    }
+    let mut order = Vec::with_capacity(order_count.min(1024));
+    for _ in 0..order_count {
+        order.push(decode_id(&mut Decoder::new(decoder.read_bytes()?))?);
+    }
+    let anchor = Header::decode(decoder.read_bytes()?)?;
+    let certificate = Certificate::decode(decoder.read_bytes()?)?;
+    let cursor = decoder.read_u64()?;
+    let floor = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(decoder.read_u64()?),
+        other => return Err(invalid(format!("unknown snapshot floor flag {other}"))),
+    };
+    let vertex_count = decoder.read_u32()? as usize;
+    if vertex_count > MAX_FRAME {
+        return Err(CryptoError::new(
+            CryptoErrorKind::FieldTooLong,
+            format!("{vertex_count} vertices exceed the frame cap"),
+        ));
+    }
+    let mut vertices = Vec::with_capacity(vertex_count.min(1024));
+    for _ in 0..vertex_count {
+        vertices.push(Vertex::decode(decoder.read_bytes()?)?);
+    }
+    let batch_count = decoder.read_u32()? as usize;
+    if batch_count > MAX_FRAME {
+        return Err(CryptoError::new(
+            CryptoErrorKind::FieldTooLong,
+            format!("{batch_count} batches exceed the frame cap"),
+        ));
+    }
+    let mut batches = Vec::with_capacity(batch_count.min(1024));
+    for _ in 0..batch_count {
+        batches.push(Batch::decode(decoder.read_bytes()?)?);
+    }
+    decoder.finish()?;
+    Ok(Snapshot {
+        state,
+        order,
+        anchor,
+        certificate,
+        cursor,
+        floor,
+        vertices,
+        batches,
+    })
+}
+
 /// Encodes one message into a length-prefixed frame.
 ///
 /// # Errors
@@ -187,6 +314,8 @@ pub fn frame(message: &Message, sent_at_nanos: u64) -> Result<Vec<u8>, CryptoErr
         Message::Want(id) => (KIND_WANT, encode_id(id)?),
         Message::Payload(batch) => (KIND_PAYLOAD, batch.encode()?),
         Message::Share(share) => (KIND_SHARE, encode_share(share)?),
+        Message::SnapshotWant => (KIND_SNAPSHOT_WANT, Vec::new()),
+        Message::Snapshot(snapshot) => (KIND_SNAPSHOT, encode_snapshot(snapshot)?),
     };
     let length = u32::try_from(8 + 1 + payload.len()).map_err(|_| {
         CryptoError::new(
@@ -250,6 +379,16 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
         KIND_WANT => Message::Want(decode_id(&mut Decoder::new(payload))?),
         KIND_PAYLOAD => Message::Payload(Batch::decode(payload)?),
         KIND_SHARE => Message::Share(decode_share(payload)?),
+        KIND_SNAPSHOT_WANT => {
+            if !payload.is_empty() {
+                return Err(CryptoError::new(
+                    CryptoErrorKind::TrailingBytes,
+                    "a snapshot request carries no payload",
+                ));
+            }
+            Message::SnapshotWant
+        }
+        KIND_SNAPSHOT => Message::Snapshot(Box::new(decode_snapshot(payload)?)),
         other => return Err(invalid(format!("unknown frame kind {other}"))),
     };
     buffer.drain(..total);
@@ -356,6 +495,60 @@ mod tests {
         let mut buffer = frame(&Message::Payload(batch.clone()), 5).unwrap();
         let frame = take_frame(&mut buffer).unwrap().unwrap();
         assert_eq!(frame.message, Message::Payload(batch));
+    }
+
+    #[test]
+    fn a_snapshot_frame_round_trips() {
+        let batch = tx::batch::Batch::new(vec![tx::envelope::Transaction {
+            protocol_version: tx::envelope::PROTOCOL_VERSION_V1,
+            chain_id: b"karsa-wire-1".to_vec(),
+            sender: b"alice".to_vec(),
+            sequence: 1,
+            fee: 1,
+            expiration: 100,
+            policy_version: 1,
+            payload: vec![1, 2, 3],
+            authorization: Vec::new(),
+        }]);
+        let anchor = Header {
+            chain_id: b"karsa-wire-1".to_vec(),
+            epoch: 1,
+            height: 4,
+            round: 4,
+            state_root: [3; 32],
+            dag_root: [4; 32],
+            previous: [5; 32],
+            applied: 2,
+        };
+        let snapshot = Snapshot {
+            state: b"encoded state".to_vec(),
+            order: vec![want(1), want(2)],
+            anchor: anchor.clone(),
+            certificate: Certificate {
+                chain_id: anchor.chain_id.clone(),
+                epoch: anchor.epoch,
+                round: anchor.round,
+                vertex_id: anchor.id().unwrap().to_vec(),
+                validator_set_id: b"set".to_vec(),
+                signer_bitmap: vec![0b1],
+                signatures: vec![vec![9u8; 64]],
+            },
+            cursor: 5,
+            floor: Some(2),
+            vertices: vec![vertex(4)],
+            batches: vec![batch],
+        };
+        let mut buffer = frame(&Message::Snapshot(Box::new(snapshot.clone())), 13).unwrap();
+        let frame = take_frame(&mut buffer).unwrap().unwrap();
+        assert_eq!(frame.message, Message::Snapshot(Box::new(snapshot)));
+        assert_eq!(frame.sent_at_nanos, 13);
+    }
+
+    #[test]
+    fn a_snapshot_request_round_trips_without_a_payload() {
+        let mut buffer = frame(&Message::SnapshotWant, 3).unwrap();
+        let frame = take_frame(&mut buffer).unwrap().unwrap();
+        assert_eq!(frame.message, Message::SnapshotWant);
     }
 
     #[test]

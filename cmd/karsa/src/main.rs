@@ -328,6 +328,13 @@ enum Command {
         /// Most mempool transactions one authored batch may carry.
         #[arg(long, default_value_t = rpc::DEFAULT_BATCH_MAX)]
         rpc_batch_max: usize,
+        /// First loopback port for snapshot requests; node `i` serves
+        /// `snapshot_port + i`. Zero disables the server and the client.
+        #[arg(long, default_value_t = 0)]
+        snapshot_port: u16,
+        /// Ask a peer for a state snapshot when this node's store has no history.
+        #[arg(long)]
+        sync_from_peers: bool,
     },
     /// Sign a transfer with a committee account and submit it to a live RPC node.
     Send {
@@ -545,6 +552,8 @@ fn main() -> ExitCode {
             verify_threads,
             rpc_port,
             rpc_batch_max,
+            snapshot_port,
+            sync_from_peers,
         } => live::run(live::Config {
             validators,
             port_base,
@@ -566,6 +575,8 @@ fn main() -> ExitCode {
             verify_threads,
             rpc_port,
             rpc_batch_max,
+            snapshot_port,
+            sync_from_peers,
         }),
         Command::Send {
             rpc,

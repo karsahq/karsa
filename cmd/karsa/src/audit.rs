@@ -86,6 +86,7 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
                 .into(),
         );
     };
+    let live = store.live_snapshot()?;
 
     let set = committee.set.clone();
     let accounts = committee.accounts.clone();
@@ -101,10 +102,30 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
 
     // Every height must extend the one before it and carry a quorum. This needs no
     // payload, so it is checked over the *whole* header chain even when the store
-    // has been pruned.
+    // has been pruned. A snapshot join has no headers below its anchor; the
+    // anchor's certificate is checked once and the chain starts there.
     let schedule = EpochSchedule::advancing(set.epoch, committee.epoch_rounds);
-    let mut verifier = HeaderChain::with_schedule(set.clone(), genesis.clone(), schedule);
+    let mut verifier = if let Some(live) = &live {
+        let id = live.header.id()?;
+        if live.certificate.chain_id != live.header.chain_id
+            || live.certificate.epoch != live.header.epoch
+            || live.certificate.round != live.header.round
+            || live.certificate.vertex_id != id
+        {
+            return Err("the live snapshot certificate does not name its anchor".into());
+        }
+        live.certificate.verify_quorum(&set)?;
+        HeaderChain::with_schedule(set.clone(), live.header.clone(), schedule)
+    } else {
+        HeaderChain::with_schedule(set.clone(), genesis.clone(), schedule)
+    };
     for entry in &certified {
+        if live
+            .as_ref()
+            .is_some_and(|live| entry.header.height <= live.header.height)
+        {
+            continue;
+        }
         verifier.advance(&entry.header, &entry.certificate)?;
     }
 
@@ -121,21 +142,30 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
     let snapshot = store.snapshot()?;
     let full = lowest == Some(0);
 
-    let (mut state, floor) = if full {
+    let (mut state, floor, prefix_len, settle_from, mut applied) = if let Some(live) = &live {
+        let state = State::decode(&live.state)?;
+        if state.state_root() != live.header.state_root {
+            return Err("the live snapshot state does not match its anchor root".into());
+        }
+        if commit_root(&live.order) != live.header.dag_root {
+            return Err("the live snapshot order does not reproduce its anchor dag_root".into());
+        }
+        let applied = usize::try_from(live.applied)
+            .map_err(|_| format!("{} applied transactions do not fit", live.applied))?;
+        (state, live.floor, live.order.len(), live.cursor, applied)
+    } else if full {
         let state = match store.genesis_state()? {
             Some(bytes) => State::decode(&bytes)?,
             None => chain::genesis_state(&accounts)?,
         };
-        (state, None)
+        (state, None, 0, 1, 0)
     } else {
         let snapshot = snapshot.ok_or(
             "the store is pruned but holds no snapshot, so there is no trust anchor \
              to replay from",
         )?;
-        (State::decode(&snapshot.state)?, Some(snapshot.round))
-    };
-
-    if let Some(round) = floor {
+        let round = snapshot.round;
+        let state = State::decode(&snapshot.state)?;
         let claimed = certified
             .iter()
             .find(|entry| entry.header.round == round)
@@ -156,16 +186,20 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
                 );
             }
         }
-    }
+        (state, Some(round), 0, round + 1, 0)
+    };
 
     let mut dag = Dag::with_epoch_length(set, committee.epoch_rounds);
+    if let Some(live) = &live {
+        dag.seed_order(live.order.clone());
+    }
     if let Some(round) = floor {
         dag.set_floor(round);
     }
     for vertex in &vertices {
         dag.insert(vertex.clone())?;
     }
-    chain::settle(&mut dag, floor.map_or(1, |round| round + 1))?;
+    chain::settle(&mut dag, settle_from)?;
 
     let order: Vec<VertexId> = dag.order().to_vec();
     let mut headers_by_round: BTreeMap<u64, &Header> = BTreeMap::new();
@@ -173,18 +207,23 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
         headers_by_round.insert(entry.header.round, &entry.header);
     }
 
-    let mut applied = 0usize;
     let mut rejected: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut rows: Vec<Row> = Vec::new();
 
-    if full {
+    if full || live.is_some() {
         // A commit can include only part of a round, so a round boundary is not
         // the prefix a header commits. The header's `dag_root` names that prefix
         // exactly; walk the order once and match it. This is an offline audit, so
         // the repeated prefix root is acceptable; it is the check, not a hot path.
-        let mut previous = 0usize;
+        let mut previous = prefix_len;
         for entry in &certified {
             let header = &entry.header;
+            if live
+                .as_ref()
+                .is_some_and(|live| header.height <= live.header.height)
+            {
+                continue;
+            }
             let mut cursor = previous;
             let mut root = commit_root(&order[..cursor]);
             while root != header.dag_root && cursor < order.len() {
@@ -260,10 +299,16 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
     }
 
     // A certified height with no matching round in the replayed order means the
-    // store cannot account for it at all.
+    // store cannot account for it at all. A snapshot's anchor is the trust root,
+    // so it is not a missing row.
     let missing = certified
         .iter()
         .filter(|entry| entry.header.round > floor.unwrap_or(0))
+        .filter(|entry| {
+            !live
+                .as_ref()
+                .is_some_and(|live| entry.header.height <= live.header.height)
+        })
         .filter(|entry| !rows.iter().any(|row| row.height == entry.header.height))
         .count();
 
@@ -292,6 +337,17 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
     );
     if full {
         println!("  trust anchor:     genesis - the whole chain was re-derived");
+    } else if let Some(live) = &live {
+        println!(
+            "  trust anchor:     live snapshot at height {} round {} (certificate verified)",
+            live.header.height, live.header.round
+        );
+        println!(
+            "  snapshot floor:   {}",
+            live.floor
+                .map_or_else(|| "none".to_string(), |floor| floor.to_string())
+        );
+        println!("  audit window:     heights above {}", live.header.height);
     } else {
         println!(
             "  trust anchor:     snapshot at round {} (its root is a certified header)",
@@ -367,13 +423,21 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
 
     if !full {
         println!();
-        println!("  applied counts from the snapshot, not from genesis.");
+        if live.is_some() {
+            println!("  applied counts from the live snapshot anchor, not from genesis.");
+        } else {
+            println!("  applied counts from the snapshot, not from genesis.");
+        }
     }
     println!();
     if full {
         println!("  The certified state is the state these vertices produce. At every");
         println!("  height, the link between the two committed roots is checkable");
         println!("  rather than assumed.");
+    } else if live.is_some() {
+        println!("  Above the live snapshot anchor, the certified state is the state these");
+        println!("  vertices produce. The anchor itself is trusted because its quorum");
+        println!("  certificate verified; the prefix below it is not in this store.");
     } else {
         println!("  Above the snapshot, the certified state is the state these vertices");
         println!("  produce. Below it the DAG root is no longer checkable: pruning traded");

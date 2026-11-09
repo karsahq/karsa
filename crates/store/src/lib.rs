@@ -24,8 +24,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crypto::CryptoError;
+use crypto::encoding::{Decoder, Encoder};
 use tx::batch::Batch;
-use validator::{Certificate, Header, Vertex};
+use validator::{Certificate, Header, Vertex, VertexId};
 
 /// Where the last reported roots are kept.
 const ROOTS_FILE: &str = "roots";
@@ -128,6 +129,31 @@ pub struct Snapshot {
     pub state: Vec<u8>,
 }
 
+/// The snapshot a live node adopted when it joined from a peer.
+///
+/// Unlike [`Snapshot`], this carries everything needed to resume consensus: the
+/// certified anchor, the committed order prefix, the decision cursor, and the
+/// DAG floor. It is written once after a snapshot join and read before a replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveSnapshot {
+    /// Round of the certified anchor.
+    pub round: u64,
+    /// Rounds at or below this are covered by `state`.
+    pub floor: Option<u64>,
+    /// Decision round the node resumes from.
+    pub cursor: u64,
+    /// Transactions applied at the anchor.
+    pub applied: u64,
+    /// Encoded execution state at the anchor.
+    pub state: Vec<u8>,
+    /// Committed order prefix ending at the anchor.
+    pub order: Vec<VertexId>,
+    /// The certified header the state belongs to.
+    pub header: Header,
+    /// Quorum certificate over `header`.
+    pub certificate: Certificate,
+}
+
 /// What one pruning pass did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PruneReport {
@@ -208,6 +234,12 @@ pub struct StoredShard {
     /// Shard bytes.
     pub bytes: Vec<u8>,
 }
+
+/// The certified snapshot a node joined from, kept so a restart resumes from it
+/// instead of replaying a history it never had.
+const LIVE_SNAPSHOT_FILE: &str = "live.snapshot";
+/// Version of the live snapshot record.
+const LIVE_SNAPSHOT_VERSION: u16 = 1;
 
 /// A finalised header together with the quorum certificate that finalised it.
 ///
@@ -542,6 +574,122 @@ impl Store {
         Ok(Some(Snapshot {
             round: u64::from_le_bytes(round),
             state: record[start..end].to_vec(),
+        }))
+    }
+
+    /// Writes the snapshot a snapshot join adopted, replacing any previous one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on write failure, [`StoreError::Decode`] when a field
+    /// does not encode.
+    pub fn put_live_snapshot(&self, snapshot: &LiveSnapshot) -> Result<(), StoreError> {
+        let mut encoder = Encoder::with_capacity(64 + snapshot.state.len());
+        encoder.put_u16(LIVE_SNAPSHOT_VERSION);
+        encoder.put_u64(snapshot.round);
+        match snapshot.floor {
+            None => encoder.put_u8(0),
+            Some(floor) => {
+                encoder.put_u8(1);
+                encoder.put_u64(floor);
+            }
+        }
+        encoder.put_u64(snapshot.cursor);
+        encoder.put_u64(snapshot.applied);
+        encoder.put_bytes(&snapshot.state)?;
+        let count = u32::try_from(snapshot.order.len()).map_err(|_| {
+            StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::FieldTooLong,
+                "live snapshot order does not fit a u32 count",
+            ))
+        })?;
+        encoder.put_u32(count);
+        for id in &snapshot.order {
+            encoder.put_u64(id.round);
+            encoder.put_bytes(&id.author)?;
+            encoder.put_bytes(&id.digest)?;
+        }
+        encoder.put_bytes(&snapshot.header.encode()?)?;
+        encoder.put_bytes(&snapshot.certificate.encode()?)?;
+
+        let temporary = self.path_of("live.snapshot.tmp");
+        {
+            let mut file = File::create(&temporary)?;
+            file.write_all(encoder.as_slice())?;
+        }
+        fs::rename(&temporary, self.path_of(LIVE_SNAPSHOT_FILE))?;
+        Ok(())
+    }
+
+    /// Reads the snapshot a snapshot join adopted, if one was written.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on read failure, [`StoreError::Decode`] when the record
+    /// is short or a field does not decode.
+    pub fn live_snapshot(&self) -> Result<Option<LiveSnapshot>, StoreError> {
+        let path = self.path_of(LIVE_SNAPSHOT_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let record = fs::read(&path)?;
+        let mut decoder = Decoder::new(&record);
+        let version = decoder.read_u16()?;
+        if version != LIVE_SNAPSHOT_VERSION {
+            return Err(StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::MalformedCertificate,
+                format!("unsupported live snapshot version {version}"),
+            )));
+        }
+        let round = decoder.read_u64()?;
+        let floor = match decoder.read_u8()? {
+            0 => None,
+            1 => Some(decoder.read_u64()?),
+            other => {
+                return Err(StoreError::Decode(CryptoError::new(
+                    crypto::CryptoErrorKind::InvalidVertex,
+                    format!("unknown live snapshot floor flag {other}"),
+                )));
+            }
+        };
+        let cursor = decoder.read_u64()?;
+        let applied = decoder.read_u64()?;
+        let state = decoder.read_bytes()?.to_vec();
+        let count = decoder.read_u32()? as usize;
+        if count > record.len() {
+            return Err(StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::FieldTooLong,
+                "live snapshot order count exceeds the record",
+            )));
+        }
+        let mut order = Vec::with_capacity(count.min(1024));
+        for _ in 0..count {
+            let round = decoder.read_u64()?;
+            let author = decoder.read_bytes()?.to_vec();
+            let digest: [u8; 32] = decoder.read_bytes()?.try_into().map_err(|_| {
+                StoreError::Decode(CryptoError::new(
+                    crypto::CryptoErrorKind::TruncatedInput,
+                    "live snapshot order digest is not 32 bytes",
+                ))
+            })?;
+            order.push(VertexId {
+                round,
+                author,
+                digest,
+            });
+        }
+        let header = Header::decode(decoder.read_bytes()?)?;
+        let certificate = Certificate::decode(decoder.read_bytes()?)?;
+        decoder.finish()?;
+        Ok(Some(LiveSnapshot {
+            round,
+            floor,
+            cursor,
+            applied,
+            state,
+            order,
+            header,
+            certificate,
         }))
     }
 
@@ -1335,6 +1483,47 @@ mod tests {
                 state: b"encoded state".to_vec(),
             })
         );
+    }
+
+    #[test]
+    fn a_live_snapshot_round_trips() {
+        let dir = TempDir::new();
+        let header = Header::genesis(b"karsa-store-1".to_vec(), 0, [1; 32], [2; 32]);
+        let snapshot = LiveSnapshot {
+            round: 7,
+            floor: Some(5),
+            cursor: 8,
+            applied: 3,
+            state: b"encoded state".to_vec(),
+            order: vec![
+                VertexId {
+                    round: 1,
+                    author: b"val-0".to_vec(),
+                    digest: [3; 32],
+                },
+                VertexId {
+                    round: 2,
+                    author: b"val-1".to_vec(),
+                    digest: [4; 32],
+                },
+            ],
+            header: header.clone(),
+            certificate: Certificate {
+                chain_id: header.chain_id.clone(),
+                epoch: 0,
+                round: 0,
+                vertex_id: header.id().unwrap().to_vec(),
+                validator_set_id: b"set".to_vec(),
+                signer_bitmap: vec![0b1],
+                signatures: vec![vec![9u8; 64]],
+            },
+        };
+        {
+            let store = Store::open(&dir.0).unwrap();
+            store.put_live_snapshot(&snapshot).unwrap();
+        }
+        let store = Store::open(&dir.0).unwrap();
+        assert_eq!(store.live_snapshot().unwrap(), Some(snapshot));
     }
 
     fn vertex(round: u64, batch: &Batch) -> Vertex {

@@ -419,6 +419,62 @@ impl Finalizer {
         Ok(())
     }
 
+    /// Replaces the trusted anchor with a snapshot's certified header.
+    ///
+    /// A joining node cannot advance from genesis to a distant header without the
+    /// headers in between, so it verifies the quorum certificate over the anchor
+    /// once and starts its chain there. `anchor_order_len` is the committed prefix
+    /// the anchor covers.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoErrorKind::HeaderMismatch`] when the certificate does not name the
+    /// anchor, every error from [`Certificate::verify_quorum`], header id encoding,
+    /// and [`HeaderChain::with_schedule_and_change`] for an inconsistent schedule.
+    pub fn adopt_anchor(
+        &mut self,
+        anchor: Header,
+        certificate: &Certificate,
+        anchor_order_len: usize,
+    ) -> Result<(), CryptoError> {
+        let id = anchor.id()?;
+        if certificate.chain_id != anchor.chain_id
+            || certificate.epoch != anchor.epoch
+            || certificate.round != anchor.round
+            || certificate.vertex_id != id
+        {
+            return Err(CryptoError::new(
+                CryptoErrorKind::HeaderMismatch,
+                "certificate does not name the snapshot anchor",
+            ));
+        }
+        certificate.verify_quorum(self.sets.set_for_epoch(anchor.epoch))?;
+        self.chain = match self.sets.change_epoch() {
+            Some(change_epoch) => HeaderChain::with_schedule_and_change(
+                self.sets.base().clone(),
+                self.sets.set_for_epoch(change_epoch).clone(),
+                change_epoch,
+                anchor.clone(),
+                self.schedule,
+            )?,
+            None => {
+                HeaderChain::with_schedule(self.sets.base().clone(), anchor.clone(), self.schedule)
+            }
+        };
+        self.last_built = anchor.clone();
+        self.last_built_order = anchor_order_len;
+        self.next_height = anchor.height.saturating_add(1);
+        self.pending.clear();
+        self.shares.clear();
+        self.certified_ids.clear();
+        self.certified_ids.insert(anchor.height, id);
+        self.order_lens.clear();
+        self.certified_orders.clear();
+        self.certified_orders
+            .insert(anchor.height, anchor_order_len);
+        Ok(())
+    }
+
     /// Continues above the certified head after a restart.
     ///
     /// The store persisted the certified chain, not every built header. The next
