@@ -2,7 +2,8 @@
 //!
 //! Every other command in this workspace moves vertices through a deterministic
 //! queue. This one puts them on TCP, one listener per node, full mesh, with a
-//! length-prefixed frame and nothing else added.
+//! length-prefixed frame. Once a node executes, the same links also carry the
+//! certificate shares the finality pipeline produces.
 //!
 //! # What it measures that the simulator cannot
 //!
@@ -39,6 +40,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crypto::CryptoErrorKind;
 use erasure::Code;
+use exec::State;
 use net::Node;
 use net::wire::{self, Message};
 use store::Store;
@@ -189,6 +191,7 @@ struct NodeResult {
     head_height: u64,
     head_round: u64,
     conflicts: usize,
+    restored: Option<Restored>,
     disk_bytes: u64,
     rejected: usize,
     committed: usize,
@@ -414,6 +417,130 @@ struct Start {
     prebuilt: Option<Vec<Option<Batch>>>,
 }
 
+/// What a restart rebuilt before the live loop started.
+#[derive(Debug, Clone, Copy)]
+struct Restored {
+    state_root: [u8; 32],
+    applied: usize,
+    order_len: usize,
+    head_height: u64,
+}
+
+/// The live state a restart rebuilds.
+struct Restorable<'a> {
+    state: &'a mut State,
+    accounts: &'a [chain::Account],
+    batches: &'a mut HashMap<[u8; 32], Batch>,
+    rejected: &'a mut BTreeMap<&'static str, usize>,
+    applied: &'a mut usize,
+    applied_cursor: &'a mut usize,
+    finalizer: &'a mut Option<Finalizer>,
+}
+
+/// The state every live node starts from: the membership's accounts with the
+/// harness balance credited.
+fn credited_genesis(accounts: &[chain::Account]) -> Result<State, String> {
+    let mut state = chain::genesis_state(accounts).map_err(|error| error.to_string())?;
+    for account in accounts {
+        state
+            .credit(&account.address, LIVE_BALANCE)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(state)
+}
+
+/// Rebuilds a node from its store before the live loop starts.
+///
+/// The live store keeps every vertex, batch, and certified header, so a restart
+/// replays from genesis. A pruned store is refused: its missing prefix carries
+/// the committed order, and a header's `dag_root` needs that order to build the
+/// next header, so guessing would be worse than failing closed.
+fn restore(
+    store: &Store,
+    node: &mut Node,
+    live: &mut Restorable<'_>,
+) -> Result<Option<Restored>, String> {
+    let snapshot = store.snapshot().map_err(|error| error.to_string())?;
+    let mut vertices = store.vertices().map_err(|error| error.to_string())?;
+    let headers = store.headers().map_err(|error| error.to_string())?;
+    if vertices.is_empty() && headers.is_empty() {
+        return Ok(None);
+    }
+    let lowest = vertices.iter().map(|vertex| vertex.round).min();
+    if snapshot.is_some() || lowest != Some(0) {
+        return Err("restart from a pruned store is not supported yet: the committed order prefix is not persisted".into());
+    }
+
+    vertices.sort_by(|left, right| {
+        left.round
+            .cmp(&right.round)
+            .then_with(|| left.author.cmp(&right.author))
+    });
+    for vertex in &vertices {
+        node.receive(vertex.clone()).map_err(|error| {
+            format!(
+                "cannot replay a stored vertex at round {}: {error}",
+                vertex.round
+            )
+        })?;
+    }
+    if let Some(highest) = node.dag().highest_round() {
+        node.set_round(highest.saturating_add(1));
+    }
+
+    // Rebuild the commit order from the stored DAG. The pacemaker starts at
+    // round 1, so this is the same decision sequence the original run performed.
+    loop {
+        match node.commit_once() {
+            Ok(Step::Advanced { anchors, .. }) if anchors > 0 => break,
+            Ok(Step::Advanced { .. }) => {}
+            Ok(Step::Waiting { .. } | Step::TimedOut { .. }) => break,
+            Err(error) if error.kind() == CryptoErrorKind::MissingReference => break,
+            Err(error) => return Err(format!("cannot rebuild the commit order: {error}")),
+        }
+    }
+
+    for batch in store.batches().map_err(|error| error.to_string())? {
+        let digest = batch.digest().map_err(|error| error.to_string())?;
+        live.batches.insert(digest, batch);
+    }
+    let order = node.dag().order().to_vec();
+    while *live.applied_cursor < order.len() {
+        let id = &order[*live.applied_cursor];
+        let Some(vertex) = node.dag().get(id.round, &id.author) else {
+            break;
+        };
+        let Some(batch) = live.batches.get(&vertex.payload_hash) else {
+            break;
+        };
+        *live.applied += chain::apply_batch(live.state, live.accounts, batch, live.rejected);
+        *live.applied_cursor += 1;
+    }
+
+    if let Some(finalizer) = live.finalizer {
+        let mut stored = headers;
+        stored.sort_by_key(|record| record.header.height);
+        for record in stored {
+            if record.header.height == 0 {
+                continue;
+            }
+            finalizer
+                .adopt_certified(record.header, record.certificate)
+                .map_err(|error| format!("cannot adopt a stored header: {error}"))?;
+        }
+        finalizer.resume_from_head();
+    }
+    Ok(Some(Restored {
+        state_root: live.state.state_root(),
+        applied: *live.applied,
+        order_len: node.dag().order().len(),
+        head_height: live
+            .finalizer
+            .as_ref()
+            .map_or(0, |finalizer| finalizer.head().height),
+    }))
+}
+
 async fn node_task(
     index: usize,
     config: &Config,
@@ -569,24 +696,63 @@ async fn node_task(
 
     let mut wanted: HashMap<VertexId, Want> = HashMap::new();
     let mut batches: HashMap<[u8; 32], Batch> = HashMap::new();
-    let mut state = chain::genesis_state(&accounts).map_err(|error| error.to_string())?;
-    for account in &accounts {
-        state
-            .credit(&account.address, LIVE_BALANCE)
-            .map_err(|error| error.to_string())?;
-    }
+    let mut state = if let Some(store) = &store {
+        match store.genesis_state().map_err(|error| error.to_string())? {
+            Some(bytes) => State::decode(&bytes).map_err(|error| error.to_string())?,
+            None => {
+                let state = credited_genesis(&accounts)?;
+                store
+                    .put_genesis_state(&state.encode().map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())?;
+                state
+            }
+        }
+    } else {
+        credited_genesis(&accounts)?
+    };
+
+    // The store binds the chain and, once finality exists, the exact genesis
+    // header. The header matters because a live node credits balances above the
+    // membership's genesis; audit and restart must use that same state root.
+    let genesis = Header::genesis(
+        chain_id.clone(),
+        node.dag().epoch_of(0),
+        state.state_root(),
+        commit_root(&[]),
+    );
+    let genesis = if let Some(store) = &store {
+        if let Ok(hash) = <[u8; 32]>::try_from(chain_id.as_slice()) {
+            store
+                .bind_genesis(&hash)
+                .map_err(|error| error.to_string())?;
+        }
+        match store.genesis_header().map_err(|error| error.to_string())? {
+            Some(stored) => {
+                if stored.id().map_err(|error| error.to_string())?
+                    != genesis.id().map_err(|error| error.to_string())?
+                {
+                    return Err(format!(
+                        "node {index}'s store was written under another genesis state"
+                    ));
+                }
+                stored
+            }
+            None => {
+                store
+                    .put_genesis_header(&genesis)
+                    .map_err(|error| error.to_string())?;
+                genesis
+            }
+        }
+    } else {
+        genesis
+    };
 
     // A header commits a state root, so finality only exists on a node that
     // executes. The anchor is the genesis header over the same credited state
     // every node starts from, which is what makes the first certificate cross-
     // checkable across the mesh.
     let mut finalizer = if config.execute {
-        let genesis = Header::genesis(
-            chain_id.clone(),
-            node.dag().epoch_of(0),
-            state.state_root(),
-            commit_root(&[]),
-        );
         Some(
             Finalizer::new(
                 SetSchedule::single(committee.set.clone()),
@@ -606,6 +772,25 @@ async fn node_task(
     let mut exec_rejected: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut applied = 0usize;
     let mut applied_cursor = 0usize;
+
+    let restored = if let Some(store) = &store {
+        restore(
+            store,
+            &mut node,
+            &mut Restorable {
+                state: &mut state,
+                accounts: &accounts,
+                batches: &mut batches,
+                rejected: &mut exec_rejected,
+                applied: &mut applied,
+                applied_cursor: &mut applied_cursor,
+                finalizer: &mut finalizer,
+            },
+        )?
+    } else {
+        None
+    };
+
     let mut payload_bytes = 0u64;
     let mut payloads = 0usize;
     let mut txs_received = 0usize;
@@ -618,7 +803,7 @@ async fn node_task(
     let mut served = 0u64;
     let mut gave_up = 0u64;
     let mut ticks: u32 = 0;
-    let mut cursor: u64 = 1;
+    let mut cursor: u64 = node.cursor();
     let mut announced = false;
     let mut first_author_ms: Option<u64> = None;
     let mut last_author_ms: Option<u64> = None;
@@ -1039,6 +1224,7 @@ async fn node_task(
         conflicts: finalizer
             .as_ref()
             .map_or(0, |finalizer| finalizer.conflicts()),
+        restored,
         disk_bytes: store
             .as_ref()
             .map_or(0, |store| directory_bytes(store.path())),
@@ -1196,6 +1382,7 @@ async fn archive_task(
         head_height: 0,
         head_round: 0,
         conflicts: 0,
+        restored: None,
         disk_bytes: store
             .as_ref()
             .map_or(0, |store| directory_bytes(store.path())),
@@ -1397,6 +1584,15 @@ fn run_one_node(
         result.head_round,
         result.conflicts
     );
+    if let Some(restored) = &result.restored {
+        println!(
+            "  restored          {} tx applied, order {}, certified head {}, state root {}",
+            restored.applied,
+            restored.order_len,
+            restored.head_height,
+            hex::encode(&restored.state_root[..6])
+        );
+    }
     if let Some(authoring) = authoring {
         println!(
             "  finished          authoring after {} (including startup)",
@@ -1900,6 +2096,25 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         }
     }
 
+    let restorations: Vec<&Restored> = signers
+        .iter()
+        .filter_map(|result| result.restored.as_ref())
+        .collect();
+    if let Some(first) = restorations.first() {
+        let agree = restorations
+            .iter()
+            .all(|restored| restored.state_root == first.state_root);
+        println!(
+            "  restart           {} tx applied, order {}, certified head {}, state root {} \
+             ({} nodes, all agree: {agree})",
+            first.applied,
+            first.order_len,
+            first.head_height,
+            hex::encode(&first.state_root[..6]),
+            restorations.len()
+        );
+    }
+
     latencies.sort_unstable();
     println!();
     println!(
@@ -1953,7 +2168,10 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
              (~{per_day:.1} GB/day at 1k TPS){coding}",
             human(disk_bytes)
         );
-        println!("                    vertices and batches only: no snapshot, no pruning here");
+        println!(
+            "                    vertices, batches, and certified headers: no state snapshot \
+             and no pruning here"
+        );
         if disk_bytes_archives > 0 {
             let per_tx_archive = if archive_txs == 0 {
                 0.0

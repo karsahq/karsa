@@ -396,6 +396,19 @@ impl Finalizer {
         Ok(())
     }
 
+    /// Continues above the certified head after a restart.
+    ///
+    /// The store persisted the certified chain, not every built header. The next
+    /// header therefore extends the certified head, and a commit that was built
+    /// but not certified before the restart is covered by that next header. The
+    /// order length at the head is not persisted: the live node does not serve a
+    /// snapshot from it yet, and a tail snapshot will carry it explicitly.
+    pub fn resume_from_head(&mut self) {
+        self.last_built = self.chain.head().clone();
+        self.last_built_order = 0;
+        self.next_height = self.last_built.height.saturating_add(1);
+    }
+
     /// Verifies a certificate against a header without advancing the chain.
     ///
     /// This is what a joining node uses to check the snapshot anchor when the

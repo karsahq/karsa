@@ -195,6 +195,15 @@ impl Node {
         self.pacemaker.set_cursor(cursor);
     }
 
+    /// Sets the round this node will author in next.
+    ///
+    /// A node that restarts from a store already authored the rounds the store
+    /// holds. Without this it would try to author round zero again and broadcast
+    /// duplicates.
+    pub fn set_round(&mut self, round: u64) {
+        self.round = round;
+    }
+
     /// Adopts a verified committed order prefix from a snapshot.
     pub fn seed_order(&mut self, order: Vec<VertexId>) {
         self.dag.seed_order(order);
