@@ -9,12 +9,13 @@
 //! u32 body length || u64 sent-at nanos || u8 kind || payload
 //! ```
 //!
-//! Four kinds share a link:
+//! Five kinds share a link:
 //!
 //! - [`Message::Hello`] is the first frame on a link and names the chain.
 //! - [`Message::Vertex`] is the broadcast.
 //! - [`Message::Want`] asks a peer for one vertex by id.
 //! - [`Message::Payload`] carries the batch a vertex names, on the data plane.
+//! - [`Message::Share`] carries one validator's signature over a header.
 //!
 //! The hello exists because a vertex is only meaningful on one chain: the chain id
 //! is part of what a validator signs, so a peer on another genesis would produce
@@ -35,7 +36,7 @@
 use crypto::encoding::{Decoder, Encoder};
 use crypto::{CryptoError, CryptoErrorKind};
 use tx::batch::Batch;
-use validator::{Vertex, VertexId};
+use validator::{Header, Share, Vertex, VertexId};
 
 /// Largest body this parser will accept.
 ///
@@ -51,13 +52,14 @@ const KIND_VERTEX: u8 = 1;
 const KIND_WANT: u8 = 2;
 const KIND_PAYLOAD: u8 = 3;
 const KIND_HELLO: u8 = 4;
+const KIND_SHARE: u8 = 5;
 
 /// The framing and message layout this build speaks.
 ///
 /// A peer that answers with another number is not necessarily hostile; it may be a
 /// different build. The link is closed rather than parsed optimistically, because
 /// the next frame kind could mean something else there.
-pub const WIRE_PROTOCOL: u16 = 1;
+pub const WIRE_PROTOCOL: u16 = 2;
 
 /// The first frame on every link: which chain the sender is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +92,8 @@ pub enum Message {
     Want(VertexId),
     /// A batch a vertex names, sent on the data plane.
     Payload(Batch),
+    /// One validator's signature over one header.
+    Share(Share),
 }
 
 /// One decoded frame.
@@ -134,6 +138,37 @@ fn decode_id(decoder: &mut Decoder<'_>) -> Result<VertexId, CryptoError> {
     })
 }
 
+fn encode_share(share: &Share) -> Result<Vec<u8>, CryptoError> {
+    let header = share.header.encode()?;
+    let signer = u32::try_from(share.signer).map_err(|_| {
+        CryptoError::new(
+            CryptoErrorKind::FieldTooLong,
+            "share signer does not fit a u32",
+        )
+    })?;
+    let mut encoder = Encoder::with_capacity(header.len() + share.signature.len() + 24);
+    encoder.put_bytes(&header)?;
+    encoder.put_u32(signer);
+    encoder.put_bytes(&share.signature)?;
+    encoder.put_u64(share.at);
+    Ok(encoder.finish())
+}
+
+fn decode_share(payload: &[u8]) -> Result<Share, CryptoError> {
+    let mut decoder = Decoder::new(payload);
+    let header = Header::decode(decoder.read_bytes()?)?;
+    let signer = decoder.read_u32()? as usize;
+    let signature = decoder.read_bytes()?.to_vec();
+    let at = decoder.read_u64()?;
+    decoder.finish()?;
+    Ok(Share {
+        header,
+        signer,
+        signature,
+        at,
+    })
+}
+
 /// Encodes one message into a length-prefixed frame.
 ///
 /// # Errors
@@ -151,6 +186,7 @@ pub fn frame(message: &Message, sent_at_nanos: u64) -> Result<Vec<u8>, CryptoErr
         Message::Vertex(vertex) => (KIND_VERTEX, vertex.encode()?),
         Message::Want(id) => (KIND_WANT, encode_id(id)?),
         Message::Payload(batch) => (KIND_PAYLOAD, batch.encode()?),
+        Message::Share(share) => (KIND_SHARE, encode_share(share)?),
     };
     let length = u32::try_from(8 + 1 + payload.len()).map_err(|_| {
         CryptoError::new(
@@ -213,6 +249,7 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
         KIND_VERTEX => Message::Vertex(Vertex::decode(payload)?),
         KIND_WANT => Message::Want(decode_id(&mut Decoder::new(payload))?),
         KIND_PAYLOAD => Message::Payload(Batch::decode(payload)?),
+        KIND_SHARE => Message::Share(decode_share(payload)?),
         other => return Err(invalid(format!("unknown frame kind {other}"))),
     };
     buffer.drain(..total);
