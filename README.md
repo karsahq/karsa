@@ -728,6 +728,39 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     samples committed after replay; the claim uses the 100-of-100 line. The full
     gate is green (fmt, clippy, default and all-features tests).
 
+34. **A state snapshot plus the DAG tail cuts cold-join transfer and catch-up
+    by about 6× and 14–20×, and finality does not move outside the run spread.**
+    The second cold-join milestone replaces the full history with the encoded
+    account state at a trusted header, the committed order prefix, and the
+    vertices, batches, and certified headers above a DAG floor. The joining
+    node decodes the state, checks its root against `state_root`, checks the
+    prefix against `dag_root`, seeds the order and pacemaker cursor, prunes at
+    the floor, and verifies the tail. Measured on the Intel i7-4790K, 4 cores /
+    8 threads, in-process mesh, 100 samples, 1 tx/batch, epoch 50, change at
+    round 50, 12 runs with full and snapshot alternated in one session, median
+    of 3: at zero delay, snapshot catch-up was 2.13 ms and 22,612 serialized
+    bytes against 41.55 ms and 143,041 bytes for the full history (6.3× fewer
+    bytes, 19.5× faster); at 25 ms one-way delay with 5 ms jitter, 4.78 ms and
+    20,827 bytes against 67.46 ms and 136,667 bytes (6.6×, 14.1×). The state is
+    450 bytes; the committed order prefix is 13.3–13.8 KB and is now 60–65% of
+    the snapshot; the tail is 6.7–10.9 KB over 13–16 vertices and 1–4 batches.
+    The floor was 44–45 in every snapshot run. Submit → certified p50/p95/p99
+    moved −5.5%/+11.6%/+7.2% at zero delay and +0.3%/+4.5%/+1.0% at 25 ms; the
+    zero tail is inside the run-to-run spread, the 25 ms row is unchanged. All
+    12 runs finalized 100 of 100 on every live node, certified 100 of 100 on the
+    submitter, agreed on order, state, and headers, with 0 conflicts and 0
+    rejected. The handoff is still in-process and the byte figure is the
+    serialized size, not a TCP transfer; the anchor is trusted by height and
+    hash, with its quorum certificate verified when the peer had it. The order
+    prefix is the remaining cost: `dag_root` commits every commit from genesis,
+    so a Merkle frontier or a different commitment is the next lever, not a
+    larger committee. The floor rule is a prototype (two-round margin, round 0
+    never pruned, whole-DAG fallback when no positive floor is safe). The first
+    measurement counted queued payloads from genesis (42 batches); filtering to
+    the payloads the tail executes changed it to 1–4, so the byte model reflects
+    the transfer. The full gate is green on the measured tree (355 tests
+    default, 356 with all features).
+
 ## Build order
 
 | Stage | Crate | State |
