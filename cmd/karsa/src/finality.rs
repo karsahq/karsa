@@ -1381,6 +1381,7 @@ async fn validator_task(task: ValidatorTask) -> Result<NodeResult, String> {
             .as_ref()
             .and_then(|snapshot| snapshot.floor);
         let mut queued_shares = Vec::new();
+        let mut queued_batches = Vec::new();
         while let Ok(frame) = inbound.try_recv() {
             match frame {
                 Inbound::Vertex(vertex) => {
@@ -1391,13 +1392,27 @@ async fn validator_task(task: ValidatorTask) -> Result<NodeResult, String> {
                         .vertices
                         .insert((vertex.round, vertex.author.clone()), vertex);
                 }
-                Inbound::Payload(batch) => {
-                    if let Ok(digest) = batch.digest() {
-                        cold.history.batches.insert(digest, batch);
-                    }
-                }
+                Inbound::Payload(batch) => queued_batches.push(batch),
                 Inbound::Share(share) => queued_shares.push(share),
                 Inbound::Submit(_) => {}
+            }
+        }
+        // The queue holds every payload broadcast since round 0, but a snapshot
+        // join only needs the ones its tail still has to execute. Keeping the
+        // rest would inflate the transfer model and the replay state with
+        // records the prefix already carries.
+        let committed = committed_keys(&cold.history.order);
+        let mut needed: HashSet<[u8; 32]> = HashSet::new();
+        for (key, vertex) in &cold.history.vertices {
+            if vertex.payload_hash != [0u8; 32] && !committed.contains(key) {
+                needed.insert(vertex.payload_hash);
+            }
+        }
+        for batch in queued_batches {
+            if let Ok(digest) = batch.digest()
+                && needed.contains(&digest)
+            {
+                cold.history.batches.insert(digest, batch);
             }
         }
         validator.catch_up(cold)?;
