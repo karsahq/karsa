@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use erasure::Code;
 use exec::State;
 use store::{PruneReport, Roots, Store};
-use validator::{Dag, VertexId, commit_root};
+use validator::{Dag, Header, VertexId, commit_root};
 
 use crate::chain;
 
@@ -112,6 +112,15 @@ pub(crate) fn save(
     if let Ok(hash) = <[u8; 32]>::try_from(chain_id) {
         store.bind_genesis(&hash)?;
     }
+    let genesis_state = chain::genesis_state(accounts)?;
+    let genesis = Header::genesis(
+        chain_id.to_vec(),
+        simulation.dag.set().epoch,
+        genesis_state.state_root(),
+        commit_root(&[]),
+    );
+    store.put_genesis_header(&genesis)?;
+    store.put_genesis_state(&genesis_state.encode()?)?;
 
     let mut batches_before = 0usize;
     let code = Code::new(validators - validators / 3, validators)?;

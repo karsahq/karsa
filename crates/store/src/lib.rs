@@ -39,6 +39,8 @@ const SNAPSHOT_FILE: &str = "snapshot";
 const SHARDS_FILE: &str = "shards.log";
 /// The chain this directory belongs to.
 const GENESIS_FILE: &str = "genesis";
+const GENESIS_HEADER_FILE: &str = "genesis.header";
+const GENESIS_STATE_FILE: &str = "genesis.state";
 /// The certified header log.
 const HEADERS_FILE: &str = "headers.log";
 /// Rounds seen at a wall-clock time, for age-based retention.
@@ -920,6 +922,76 @@ impl Store {
         }
     }
 
+    /// Writes the genesis header this store was built under.
+    ///
+    /// The chain id binding says *which* chain; this says where that chain's
+    /// state started. A live node credits balances on top of the demo genesis, so
+    /// the state root in its first header is not the one a command can rebuild
+    /// from the membership alone. Persisting the header makes audit and restart
+    /// use the same anchor instead of guessing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on write failure and [`StoreError::Decode`] when the
+    /// header does not encode.
+    pub fn put_genesis_header(&self, header: &Header) -> Result<(), StoreError> {
+        let encoded = header.encode()?;
+        let temporary = self.path_of("genesis.header.tmp");
+        {
+            let mut file = File::create(&temporary)?;
+            file.write_all(&encoded)?;
+        }
+        fs::rename(&temporary, self.path_of(GENESIS_HEADER_FILE))?;
+        Ok(())
+    }
+
+    /// Reads the genesis header, if one was written.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on read failure and [`StoreError::Decode`] when the
+    /// record does not decode.
+    pub fn genesis_header(&self) -> Result<Option<Header>, StoreError> {
+        let path = self.path_of(GENESIS_HEADER_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(Header::decode(&fs::read(&path)?)?))
+    }
+
+    /// Writes the encoded state the chain started from.
+    ///
+    /// A genesis header names only a root. If the starting state is not the one a
+    /// command can rebuild from the membership alone — the live harness credits
+    /// demo balances — the root cannot be checked by replaying from a guessed
+    /// genesis. Persisting the bytes makes audit and restart use the exact state.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on write failure.
+    pub fn put_genesis_state(&self, state: &[u8]) -> Result<(), StoreError> {
+        let temporary = self.path_of("genesis.state.tmp");
+        {
+            let mut file = File::create(&temporary)?;
+            file.write_all(state)?;
+        }
+        fs::rename(&temporary, self.path_of(GENESIS_STATE_FILE))?;
+        Ok(())
+    }
+
+    /// Reads the encoded genesis state, if one was written.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on read failure.
+    pub fn genesis_state(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        let path = self.path_of(GENESIS_STATE_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(fs::read(&path)?))
+    }
+
     /// The chain recorded in this directory, if one was ever written.
     ///
     /// # Errors
@@ -1413,6 +1485,39 @@ mod tests {
         assert_eq!(read[0].header, header(1));
         assert_eq!(read[1].header, header(2));
         assert_eq!(read[1].certificate, certificate(2));
+    }
+
+    #[test]
+    fn a_genesis_header_round_trips() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        assert!(store.genesis_header().unwrap().is_none());
+
+        store.put_genesis_header(&header(0)).unwrap();
+        assert_eq!(store.genesis_header().unwrap(), Some(header(0)));
+
+        // The file is replaced atomically and survives a reopen.
+        let reopened = Store::open(&dir.0).unwrap();
+        assert_eq!(reopened.genesis_header().unwrap(), Some(header(0)));
+    }
+
+    #[test]
+    fn a_genesis_state_round_trips() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        assert!(store.genesis_state().unwrap().is_none());
+
+        store.put_genesis_state(b"state-bytes").unwrap();
+        assert_eq!(
+            store.genesis_state().unwrap(),
+            Some(b"state-bytes".to_vec())
+        );
+
+        let reopened = Store::open(&dir.0).unwrap();
+        assert_eq!(
+            reopened.genesis_state().unwrap(),
+            Some(b"state-bytes".to_vec())
+        );
     }
 
     #[test]
