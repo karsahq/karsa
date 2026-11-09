@@ -89,12 +89,15 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
 
     let set = committee.set.clone();
     let accounts = committee.accounts.clone();
-    let genesis = Header::genesis(
-        first.header.chain_id.clone(),
-        first.header.epoch,
-        chain::genesis_state(&accounts)?.state_root(),
-        commit_root(&[]),
-    );
+    let genesis = match store.genesis_header()? {
+        Some(header) => header,
+        None => Header::genesis(
+            first.header.chain_id.clone(),
+            first.header.epoch,
+            chain::genesis_state(&accounts)?.state_root(),
+            commit_root(&[]),
+        ),
+    };
 
     // Every height must extend the one before it and carry a quorum. This needs no
     // payload, so it is checked over the *whole* header chain even when the store
@@ -119,7 +122,11 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
     let full = lowest == Some(0);
 
     let (mut state, floor) = if full {
-        (chain::genesis_state(&accounts)?, None)
+        let state = match store.genesis_state()? {
+            Some(bytes) => State::decode(&bytes)?,
+            None => chain::genesis_state(&accounts)?,
+        };
+        (state, None)
     } else {
         let snapshot = snapshot.ok_or(
             "the store is pruned but holds no snapshot, so there is no trust anchor \
@@ -169,38 +176,87 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
     let mut applied = 0usize;
     let mut rejected: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut rows: Vec<Row> = Vec::new();
-    let mut cursor = 0usize;
-    while cursor < order.len() {
-        let round = order[cursor].round;
-        let start = cursor;
-        while cursor < order.len() && order[cursor].round == round {
-            cursor += 1;
-        }
 
-        for id in &order[start..cursor] {
-            let Some(vertex) = dag.get(id.round, &id.author) else {
+    if full {
+        // A commit can include only part of a round, so a round boundary is not
+        // the prefix a header commits. The header's `dag_root` names that prefix
+        // exactly; walk the order once and match it. This is an offline audit, so
+        // the repeated prefix root is acceptable; it is the check, not a hot path.
+        let mut previous = 0usize;
+        for entry in &certified {
+            let header = &entry.header;
+            let mut cursor = previous;
+            let mut root = commit_root(&order[..cursor]);
+            while root != header.dag_root && cursor < order.len() {
+                cursor += 1;
+                root = commit_root(&order[..cursor]);
+            }
+            if root != header.dag_root {
+                rows.push(Row {
+                    height: header.height,
+                    round: header.round,
+                    applied,
+                    state_root: state.state_root(),
+                    dag_root: Some(root),
+                    state_ok: false,
+                    dag_ok: Some(false),
+                });
+                continue;
+            }
+            for id in &order[previous..cursor] {
+                let Some(vertex) = dag.get(id.round, &id.author) else {
+                    continue;
+                };
+                let Some(batch) = batches.get(&vertex.payload_hash) else {
+                    continue;
+                };
+                applied += chain::apply_batch(&mut state, &accounts, batch, &mut rejected);
+            }
+            previous = cursor;
+            let recomputed_state = state.state_root();
+            rows.push(Row {
+                height: header.height,
+                round: header.round,
+                applied,
+                state_root: recomputed_state,
+                dag_root: Some(root),
+                state_ok: recomputed_state == header.state_root,
+                dag_ok: Some(root == header.dag_root),
+            });
+        }
+    } else {
+        let mut cursor = 0usize;
+        while cursor < order.len() {
+            let round = order[cursor].round;
+            let start = cursor;
+            while cursor < order.len() && order[cursor].round == round {
+                cursor += 1;
+            }
+
+            for id in &order[start..cursor] {
+                let Some(vertex) = dag.get(id.round, &id.author) else {
+                    continue;
+                };
+                let Some(batch) = batches.get(&vertex.payload_hash) else {
+                    continue;
+                };
+                applied += chain::apply_batch(&mut state, &accounts, batch, &mut rejected);
+            }
+
+            let Some(header) = headers_by_round.get(&round) else {
                 continue;
             };
-            let Some(batch) = batches.get(&vertex.payload_hash) else {
-                continue;
-            };
-            applied += chain::apply_batch(&mut state, &accounts, batch, &mut rejected);
+            let recomputed_state = state.state_root();
+            rows.push(Row {
+                height: header.height,
+                round,
+                applied,
+                state_root: recomputed_state,
+                dag_root: None,
+                state_ok: recomputed_state == header.state_root,
+                dag_ok: None,
+            });
         }
-
-        let Some(header) = headers_by_round.get(&round) else {
-            continue;
-        };
-        let recomputed_state = state.state_root();
-        let recomputed_dag = full.then(|| commit_root(&order[..cursor]));
-        rows.push(Row {
-            height: header.height,
-            round,
-            applied,
-            state_root: recomputed_state,
-            dag_root: recomputed_dag,
-            state_ok: recomputed_state == header.state_root,
-            dag_ok: recomputed_dag.map(|root| root == header.dag_root),
-        });
     }
 
     // A certified height with no matching round in the replayed order means the
