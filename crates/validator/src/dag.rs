@@ -25,7 +25,7 @@ use crypto::{CryptoError, CryptoErrorKind};
 
 use crate::frontier::CommitFrontier;
 use crate::schedule::{EpochSchedule, ValidatorSet};
-use crate::set_change::SetSchedule;
+use crate::set_change::{SetChangeError, SetSchedule, Transition, TransitionCertificate};
 use crate::vertex::{Vertex, VertexId, tally_votes};
 
 /// The outcome of asking a round to decide.
@@ -139,6 +139,47 @@ impl Dag {
             schedule: EpochSchedule::advancing(base, rounds_per_epoch),
             floor: None,
         })
+    }
+
+    /// Installs a transition certificate authorized by the old set.
+    ///
+    /// The DAG keeps every vertex it already holds; only the set schedule changes,
+    /// so rounds before the activation epoch still verify against the old set and
+    /// rounds at or after it verify against the new one. A second, different
+    /// transition is refused: the prototype supports one boundary per schedule.
+    /// Re-adopting the same certificate is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Every error from [`TransitionCertificate::verify`], and
+    /// [`SetChangeError::Mismatch`] when another transition is already installed.
+    pub fn adopt_set_change(
+        &mut self,
+        certificate: &TransitionCertificate,
+    ) -> Result<Transition, SetChangeError> {
+        if self.sets.change_epoch().is_some() {
+            if self
+                .sets
+                .certificate()
+                .is_some_and(|current| current == certificate)
+            {
+                return Ok(self
+                    .sets
+                    .transition()
+                    .expect("a change epoch always carries its transition")
+                    .clone());
+            }
+            return Err(SetChangeError::Mismatch(
+                "this DAG already installed a different set change".to_string(),
+            ));
+        }
+        let sets = SetSchedule::with_certificate(self.sets.base().clone(), certificate.clone())?;
+        let transition = sets
+            .transition()
+            .expect("a certificate always installs a transition")
+            .clone();
+        self.sets = sets;
+        Ok(transition)
     }
 
     /// The epoch a round belongs to.
@@ -834,7 +875,9 @@ impl CommitProof {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::certificate::{bitmap_len, set_bit};
     use crate::schedule::{NO_EXPIRY, ValidatorKey, ValidatorRecord};
+    use crate::set_change::SetChange;
     use crypto::registry::ALG_ED25519;
     use crypto::scheme::Ed25519Scheme;
 
@@ -944,6 +987,47 @@ mod tests {
         let genesis = fixture.ids(0);
         fixture.full_round(LEADER_ROUND, &genesis).unwrap();
         fixture
+    }
+
+    #[test]
+    fn an_authorized_certificate_switches_the_set_at_the_epoch_boundary() {
+        let fixture = fixture(4);
+        let old = fixture.dag.set().clone();
+        let (public_key, _) = Ed25519Scheme::generate_keypair().unwrap();
+        let mut new = old.clone();
+        new.epoch = 2;
+        new.validators.push(ValidatorRecord {
+            validator_id: b"val-4".to_vec(),
+            keys: vec![ValidatorKey {
+                key_id: b"val-4-k0".to_vec(),
+                algorithm_id: ALG_ED25519,
+                public_key: public_key.to_vec(),
+                activation_epoch: 0,
+                retirement_epoch: NO_EXPIRY,
+            }],
+        });
+        let change = SetChange::new(b"karsa-dag-1".to_vec(), &old, &new).unwrap();
+        let payload = change.signing_payload().unwrap();
+        let mut signer_bitmap = vec![0u8; bitmap_len(old.validators.len())];
+        let mut signatures = Vec::new();
+        for index in 0..old.quorum_size() {
+            set_bit(&mut signer_bitmap, index);
+            signatures.push(Ed25519Scheme.sign(&fixture.keys[index], &payload).unwrap());
+        }
+        let certificate = TransitionCertificate {
+            change,
+            new_set: new.clone(),
+            signer_bitmap,
+            signatures,
+        };
+
+        let mut dag = fixture.dag;
+        let transition = dag.adopt_set_change(&certificate).unwrap();
+        assert_eq!(transition.old_epoch, 1);
+        assert_eq!(transition.new_epoch, 2);
+        assert_eq!(dag.set_for_epoch(1).validators.len(), 4);
+        assert_eq!(dag.set_for_epoch(2), &new);
+        assert!(dag.adopt_set_change(&certificate).is_ok());
     }
 
     #[test]

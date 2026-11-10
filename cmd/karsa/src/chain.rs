@@ -109,6 +109,52 @@ pub(crate) fn consensus_set(
     Ok((set, keys))
 }
 
+/// Appends one deterministic validator identity for a checked set change.
+///
+/// The new validator is passive in the prototype: its public key lets the new
+/// set verify a quorum, and its private key is not needed unless it later runs.
+/// The address is derived from the key schedule, exactly like every other
+/// validator identity, so every node computes the same record.
+pub(crate) fn append_validator(
+    set: &ValidatorSet,
+    epoch: u64,
+) -> Result<ValidatorSet, Box<dyn Error>> {
+    let index = set.validators.len();
+    let seed = u8::try_from(index + 1).map_err(|_| "a set change cannot index beyond 255")?;
+    let (public_key, _) = keypair(seed)?;
+    let keys = vec![ValidatorKey {
+        key_id: format!("val-{index}-k0").into_bytes(),
+        algorithm_id: ALG_ED25519,
+        public_key,
+        activation_epoch: 0,
+        retirement_epoch: NO_EXPIRY,
+    }];
+    let address = validator_address(&keys)?;
+    let mut next = set.clone();
+    next.validators.push(ValidatorRecord {
+        validator_id: address.to_vec(),
+        keys,
+    });
+    next.epoch = epoch;
+    next.validate()?;
+    Ok(next)
+}
+
+/// Removes the last validator identity for a checked set change.
+pub(crate) fn remove_last_validator(
+    set: &ValidatorSet,
+    epoch: u64,
+) -> Result<ValidatorSet, Box<dyn Error>> {
+    if set.validators.len() <= 1 {
+        return Err("a set change cannot remove the last validator".into());
+    }
+    let mut next = set.clone();
+    next.validators.pop();
+    next.epoch = epoch;
+    next.validate()?;
+    Ok(next)
+}
+
 pub(crate) fn accounts(count: usize) -> Result<Vec<Account>, crypto::CryptoError> {
     let mut accounts = Vec::with_capacity(count);
     for index in 0..count {

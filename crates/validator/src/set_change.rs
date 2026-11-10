@@ -14,7 +14,7 @@
 //! budget. A later version can allow more changes if it keeps both the
 //! intersection and the fault-budget checks.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
 use crypto::domain::{
@@ -25,7 +25,7 @@ use crypto::scheme::verify_signature;
 use crypto::{CryptoError, CryptoErrorKind};
 use sha2::{Digest, Sha256};
 
-use crate::certificate::{bit_is_set, bitmap_len};
+use crate::certificate::{bit_is_set, bitmap_len, set_bit};
 use crate::schedule::{EpochSchedule, ValidatorKey, ValidatorRecord, ValidatorSet};
 
 /// Canonical set-change descriptor version.
@@ -241,24 +241,100 @@ impl TransitionCertificate {
     /// [`SetChangeError::Signer`] when a key cannot be resolved or a signature
     /// does not verify.
     pub fn verify(&self, old: &ValidatorSet) -> Result<Transition, SetChangeError> {
+        let transition = self.check(old)?;
+        if !old.has_supermajority(self.signer_count()) {
+            return Err(SetChangeError::NoQuorum {
+                signers: self.signer_count(),
+                required: old.quorum_size(),
+            });
+        }
+        Ok(transition)
+    }
+
+    /// Verifies the transition and every present signature, without requiring a
+    /// quorum.
+    ///
+    /// This is the partial-certificate check a node runs while collecting old-set
+    /// sponsors. [`Self::verify`] adds the quorum rule on top.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`Self::verify`], except [`SetChangeError::NoQuorum`].
+    pub fn check(&self, old: &ValidatorSet) -> Result<Transition, SetChangeError> {
         self.change.check_against(old, &self.new_set)?;
         self.check_shape(old)?;
         let transition =
             check_transition(old, &self.new_set).map_err(SetChangeError::Transition)?;
         let signers = self.resolve_signers(old)?;
-        if !old.has_supermajority(signers.len()) {
-            return Err(SetChangeError::NoQuorum {
-                signers: signers.len(),
-                required: old.quorum_size(),
-            });
-        }
-
         let payload = self.change.signing_payload()?;
         for (_, key, signature) in signers {
             verify_signature(key.algorithm_id, &key.public_key, &payload, signature)
                 .map_err(SetChangeError::Signer)?;
         }
         Ok(transition)
+    }
+
+    /// Adds the valid signatures in `other` to this partial certificate.
+    ///
+    /// Both sides must describe the same transition and carry only signatures for
+    /// the old set. A signer already present is kept, even when a randomized
+    /// scheme produced a different valid signature. Returns whether anything was
+    /// added.
+    ///
+    /// # Errors
+    ///
+    /// [`SetChangeError::Mismatch`] when the certificates describe different
+    /// transitions, plus every error from [`Self::check`].
+    pub fn merge(&mut self, other: &Self, old: &ValidatorSet) -> Result<bool, SetChangeError> {
+        if self.change != other.change || self.new_set != other.new_set {
+            return Err(mismatch("the certificates describe different transitions"));
+        }
+        self.check(old)?;
+        other.check(old)?;
+
+        let mut merged: BTreeMap<usize, Vec<u8>> = self
+            .shares(old)
+            .into_iter()
+            .map(|(index, signature)| (index, signature.to_vec()))
+            .collect();
+        let mut changed = false;
+        for (index, signature) in other.shares(old) {
+            if let std::collections::btree_map::Entry::Vacant(slot) = merged.entry(index) {
+                slot.insert(signature.to_vec());
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(false);
+        }
+
+        let validators = old.validators.len();
+        let mut bitmap = vec![0u8; bitmap_len(validators)];
+        let mut signatures = Vec::with_capacity(merged.len());
+        for (index, signature) in merged {
+            set_bit(&mut bitmap, index);
+            signatures.push(signature);
+        }
+        self.signer_bitmap = bitmap;
+        self.signatures = signatures;
+        Ok(true)
+    }
+
+    /// The signatures this certificate carries, paired with their old-set index.
+    fn shares<'a>(&'a self, old: &'a ValidatorSet) -> Vec<(usize, &'a [u8])> {
+        let mut shares = Vec::with_capacity(self.signatures.len());
+        let mut signature_index = 0;
+        for (index, _) in old.validators.iter().enumerate() {
+            if !bit_is_set(&self.signer_bitmap, index) {
+                continue;
+            }
+            let Some(signature) = self.signatures.get(signature_index) else {
+                break;
+            };
+            shares.push((index, signature.as_slice()));
+            signature_index += 1;
+        }
+        shares
     }
 
     /// Writes the canonical certificate encoding.
@@ -465,6 +541,7 @@ struct Change {
     epoch: u64,
     set: ValidatorSet,
     transition: Transition,
+    certificate: Option<TransitionCertificate>,
 }
 
 impl SetSchedule {
@@ -501,8 +578,44 @@ impl SetSchedule {
                 epoch: change_epoch,
                 set: next,
                 transition,
+                certificate: None,
             }),
         })
+    }
+
+    /// A schedule built from a certificate the old set signed.
+    ///
+    /// The certificate is verified against `base` before it is installed, so a
+    /// caller cannot schedule a transition that no quorum authorized. The
+    /// certificate is retained for snapshot, restart, and audit.
+    ///
+    /// # Errors
+    ///
+    /// Every error from [`TransitionCertificate::verify`].
+    pub fn with_certificate(
+        base: ValidatorSet,
+        certificate: TransitionCertificate,
+    ) -> Result<Self, SetChangeError> {
+        let epoch = certificate.change.activation_epoch;
+        let transition = certificate.verify(&base)?;
+        let set = certificate.new_set.clone();
+        Ok(Self {
+            base,
+            change: Some(Change {
+                epoch,
+                set,
+                transition,
+                certificate: Some(certificate),
+            }),
+        })
+    }
+
+    /// The authorized certificate that installed the transition, if any.
+    #[must_use]
+    pub fn certificate(&self) -> Option<&TransitionCertificate> {
+        self.change
+            .as_ref()
+            .and_then(|change| change.certificate.as_ref())
     }
 
     /// The set that is active before any transition.
@@ -710,7 +823,7 @@ fn policy(detail: String) -> CryptoError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::certificate::bitmap_of;
+    use crate::certificate::{bitmap_len, bitmap_of, set_bit};
     use crate::schedule::{NO_EXPIRY, ValidatorKey, ValidatorRecord};
     use crypto::registry::ALG_ED25519;
     use crypto::scheme::Ed25519Scheme;
@@ -948,6 +1061,46 @@ mod tests {
             decoded.verify(&old).unwrap(),
             certificate.verify(&old).unwrap()
         );
+    }
+
+    #[test]
+    fn partial_certificates_merge_until_the_quorum_is_reached() {
+        let (old, new, signers) = fixture(4, 5);
+        let change = propose(&old, &new);
+        let payload = change.signing_payload().unwrap();
+        let partial = || TransitionCertificate {
+            change: change.clone(),
+            new_set: new.clone(),
+            signer_bitmap: vec![0u8; bitmap_len(old.validators.len())],
+            signatures: Vec::new(),
+        };
+        let share = |index: usize| {
+            let mut certificate = partial();
+            set_bit(&mut certificate.signer_bitmap, index);
+            certificate.signatures.push(
+                Ed25519Scheme
+                    .sign(&signers[index].private_key, &payload)
+                    .unwrap(),
+            );
+            certificate
+        };
+
+        let mut merged = partial();
+        assert!(merged.merge(&share(0), &old).unwrap());
+        assert!(merged.merge(&share(1), &old).unwrap());
+        assert!(!merged.merge(&share(0), &old).unwrap());
+        assert_eq!(merged.signer_count(), 2);
+        assert!(matches!(
+            merged.verify(&old),
+            Err(SetChangeError::NoQuorum {
+                signers: 2,
+                required: 3
+            })
+        ));
+
+        assert!(merged.merge(&share(2), &old).unwrap());
+        assert_eq!(merged.signer_count(), 3);
+        merged.verify(&old).expect("three of four is a quorum");
     }
 
     #[test]

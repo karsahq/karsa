@@ -87,6 +87,10 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
         );
     };
     let live = store.live_snapshot()?;
+    let transition_certificate = store.set_change()?.or_else(|| {
+        live.as_ref()
+            .and_then(|snapshot| snapshot.transition.clone())
+    });
 
     let set = committee.set.clone();
     let accounts = committee.accounts.clone();
@@ -105,6 +109,10 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
     // has been pruned. A snapshot join has no headers below its anchor; the
     // anchor's certificate is checked once and the chain starts there.
     let schedule = EpochSchedule::advancing(set.epoch, committee.epoch_rounds);
+    let transition = match &transition_certificate {
+        Some(certificate) => Some(certificate.verify(&set)?),
+        None => None,
+    };
     let mut verifier = if let Some(live) = &live {
         let id = live.header.id()?;
         if live.certificate.chain_id != live.header.chain_id
@@ -115,9 +123,27 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
             return Err("the live snapshot certificate does not name its anchor".into());
         }
         live.certificate.verify_quorum(&set)?;
-        HeaderChain::with_schedule(set.clone(), live.header.clone(), schedule)
+        match &transition_certificate {
+            Some(certificate) => HeaderChain::with_schedule_and_change(
+                set.clone(),
+                certificate.new_set.clone(),
+                certificate.change.activation_epoch,
+                live.header.clone(),
+                schedule,
+            )?,
+            None => HeaderChain::with_schedule(set.clone(), live.header.clone(), schedule),
+        }
     } else {
-        HeaderChain::with_schedule(set.clone(), genesis.clone(), schedule)
+        match &transition_certificate {
+            Some(certificate) => HeaderChain::with_schedule_and_change(
+                set.clone(),
+                certificate.new_set.clone(),
+                certificate.change.activation_epoch,
+                genesis.clone(),
+                schedule,
+            )?,
+            None => HeaderChain::with_schedule(set.clone(), genesis.clone(), schedule),
+        }
     };
     for entry in &certified {
         if live
@@ -193,6 +219,9 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
     };
 
     let mut dag = Dag::with_epoch_length(set, committee.epoch_rounds);
+    if let Some(certificate) = &transition_certificate {
+        dag.adopt_set_change(certificate)?;
+    }
     if let Some(live) = &live {
         dag.seed_prefix(live.prefix.clone(), live.order.clone());
     }
@@ -343,6 +372,12 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
         vertices.len(),
         batches.len()
     );
+    if let Some(transition) = &transition {
+        println!(
+            "  set change:       epoch {} -> {}, {} -> {} validators (old-set quorum)",
+            transition.old_epoch, transition.new_epoch, transition.old_size, transition.new_size
+        );
+    }
     println!(
         "  replayed order:   {} vertices over {} rounds",
         order_len,

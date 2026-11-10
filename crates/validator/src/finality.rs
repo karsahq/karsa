@@ -29,7 +29,7 @@ use crate::certificate::{Certificate, bitmap_len, set_bit};
 use crate::frontier::CommitFrontier;
 use crate::header::{Header, HeaderChain};
 use crate::schedule::EpochSchedule;
-use crate::set_change::SetSchedule;
+use crate::set_change::{SetChangeError, SetSchedule, Transition, TransitionCertificate};
 use crate::vertex::VertexId;
 
 /// Opaque validator-set label carried by every certificate.
@@ -175,6 +175,79 @@ impl Finalizer {
             built: 0,
             conflicts: 0,
         })
+    }
+
+    /// Installs a transition certificate authorized by the old set.
+    ///
+    /// The certified head has to lie strictly below the activation epoch: a header
+    /// at or above it was built and signed under the old set, and rebuilding the
+    /// chain schedule underneath it would reinterpret that certificate. The method
+    /// is idempotent for the certificate already installed.
+    ///
+    /// # Errors
+    ///
+    /// Every error from [`TransitionCertificate::verify`],
+    /// [`SetChangeError::Mismatch`] when another transition is already installed or
+    /// the head has reached the boundary, and any error rebuilding the header
+    /// chain with the new set.
+    pub fn adopt_set_change(
+        &mut self,
+        certificate: &TransitionCertificate,
+    ) -> Result<Transition, SetChangeError> {
+        if self.sets.change_epoch().is_some() {
+            if self
+                .sets
+                .certificate()
+                .is_some_and(|current| current == certificate)
+            {
+                return Ok(self
+                    .sets
+                    .transition()
+                    .expect("a change epoch always carries its transition")
+                    .clone());
+            }
+            return Err(SetChangeError::Mismatch(
+                "this finalizer already installed a different set change".to_string(),
+            ));
+        }
+
+        let old = self.sets.base().clone();
+        let transition = certificate.verify(&old)?;
+        let change_epoch = certificate.change.activation_epoch;
+        if self.chain.head().epoch >= change_epoch {
+            return Err(SetChangeError::Mismatch(format!(
+                "the certified head is already at epoch {}, not below the activation epoch {}",
+                self.chain.head().epoch,
+                change_epoch
+            )));
+        }
+        if self.last_built.epoch >= change_epoch {
+            return Err(SetChangeError::Mismatch(
+                "a header at or above the activation epoch is already built".to_string(),
+            ));
+        }
+
+        let new_set = certificate.new_set.clone();
+        let chain = HeaderChain::with_schedule_and_change(
+            old.clone(),
+            new_set,
+            change_epoch,
+            self.chain.head().clone(),
+            self.schedule,
+        )
+        .map_err(SetChangeError::Transition)?;
+        let sets = SetSchedule::with_certificate(old, certificate.clone())?;
+        self.sets = sets;
+        self.chain = chain;
+
+        // Nothing built or collected for the new epoch was signed by the old set
+        // that is no longer allowed to certify there.
+        let schedule = self.schedule;
+        self.pending
+            .retain(|pending| schedule.epoch_of(pending.round) < change_epoch);
+        self.shares
+            .retain(|_, collected| collected.header.epoch < change_epoch);
+        Ok(transition)
     }
 
     /// The header at the head of the verified chain.

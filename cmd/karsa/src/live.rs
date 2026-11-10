@@ -40,6 +40,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crypto::CryptoErrorKind;
+use crypto::scheme::Ed25519Scheme;
 use erasure::Code;
 use exec::State;
 use net::Node;
@@ -50,7 +51,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tx::batch::Batch;
 use validator::{
-    Certificate, FailureDetector, Finalizer, Header, SetSchedule, Step, VertexId, commit_root,
+    Certificate, FailureDetector, Finalizer, Header, SetChange, SetSchedule, Step,
+    TransitionCertificate, ValidatorSet, VertexId, bitmap_len, commit_root, set_bit,
 };
 
 use crate::chain;
@@ -137,6 +139,20 @@ const CHECKPOINT_TICKS: u32 = 250;
 /// A vertex at the head's round may still be in flight to the snapshot peer, so
 /// keeping a couple of rounds above it lets it travel in the tail.
 const SNAPSHOT_FLOOR_MARGIN: u64 = 2;
+/// Ticks between rebroadcasts of a partial or adopted set-change certificate.
+///
+/// The certificate is the durable authorization; repeating it costs one small
+/// frame per interval and lets a peer that reconnects catch up.
+const SET_CHANGE_TICKS: u32 = 25;
+
+/// One checked validator-set change a live run may propose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetChangeKind {
+    /// Append one deterministic validator identity.
+    Add,
+    /// Remove the last validator identity.
+    Remove,
+}
 
 /// How a live run is configured.
 #[derive(Clone)]
@@ -232,6 +248,12 @@ pub struct Config {
     /// different delivery may disagree, and a transition that acts on it must be
     /// authorized by the set.
     pub failure_rounds: u64,
+    /// One checked set change to propose and authorize at an epoch boundary.
+    ///
+    /// Every node with the same configuration constructs the same new set and
+    /// signs the same descriptor; the old-set quorum travels as partial
+    /// certificates and the full certificate is adopted before activation.
+    pub change: Option<(SetChangeKind, u64)>,
 }
 
 /// Wall time spent in the stages the live loop can name.
@@ -851,6 +873,18 @@ fn restore(
         return Err("restart from a pruned store is not supported yet: the committed order prefix is not persisted".into());
     }
 
+    // A transition is installed before any stored vertex or header is replayed:
+    // otherwise vertices at the new epoch would be checked against the old set.
+    if let Some(transition) = store.set_change().map_err(|error| error.to_string())? {
+        node.adopt_set_change(&transition)
+            .map_err(|error| format!("stored set change is not authorized: {error}"))?;
+        if let Some(finalizer) = live.finalizer.as_mut() {
+            finalizer
+                .adopt_set_change(&transition)
+                .map_err(|error| format!("stored set change cannot be activated: {error}"))?;
+        }
+    }
+
     vertices.sort_by(|left, right| {
         left.round
             .cmp(&right.round)
@@ -961,6 +995,13 @@ fn restore_live(
         .finalizer
         .as_mut()
         .ok_or("a live snapshot needs execution (--execute)")?;
+    if let Some(transition) = &snapshot.transition {
+        node.adopt_set_change(transition)
+            .map_err(|error| format!("live snapshot set change is not authorized: {error}"))?;
+        finalizer
+            .adopt_set_change(transition)
+            .map_err(|error| format!("live snapshot set change cannot be activated: {error}"))?;
+    }
     finalizer
         .adopt_anchor(
             snapshot.header.clone(),
@@ -1143,6 +1184,76 @@ fn snapshot_floor(node: &Node, order: &[VertexId], anchor_round: u64) -> Option<
     (floor > 0).then_some(floor)
 }
 
+/// Builds the checked transition this run is configured to propose.
+///
+/// Every node computes the same new set from the same base, so the descriptor
+/// and the signing payload are identical across the mesh.
+fn proposed_change(
+    config: &Config,
+    set: &ValidatorSet,
+    chain_id: &[u8],
+) -> Result<Option<(SetChange, ValidatorSet)>, String> {
+    let Some((kind, epoch)) = config.change else {
+        return Ok(None);
+    };
+    if epoch <= set.epoch {
+        return Err(format!(
+            "set-change epoch {epoch} must advance past the current epoch {}",
+            set.epoch
+        ));
+    }
+    let next = match kind {
+        SetChangeKind::Add => chain::append_validator(set, epoch),
+        SetChangeKind::Remove => chain::remove_last_validator(set, epoch),
+    }
+    .map_err(|error| format!("cannot build the next validator set: {error}"))?;
+    let change = SetChange::new(chain_id.to_vec(), set, &next)
+        .map_err(|error| format!("the proposed set change is not safe: {error}"))?;
+    Ok(Some((change, next)))
+}
+
+/// One empty partial certificate for a transition, sized to the old set.
+fn empty_change_certificate(
+    certificate: &TransitionCertificate,
+    set: &ValidatorSet,
+) -> TransitionCertificate {
+    TransitionCertificate {
+        change: certificate.change.clone(),
+        new_set: certificate.new_set.clone(),
+        signer_bitmap: vec![0u8; bitmap_len(set.validators.len())],
+        signatures: Vec::new(),
+    }
+}
+
+/// This node's own share of a proposed transition.
+fn own_change_share(
+    change: &SetChange,
+    next: &ValidatorSet,
+    set: &ValidatorSet,
+    signer: &[u8],
+    private_key: &[u8],
+) -> Result<TransitionCertificate, String> {
+    let index = set
+        .validators
+        .iter()
+        .position(|record| record.validator_id == signer)
+        .ok_or("this node is not in the old validator set")?;
+    let payload = change
+        .signing_payload()
+        .map_err(|error| error.to_string())?;
+    let signature = Ed25519Scheme
+        .sign(private_key, &payload)
+        .map_err(|error| error.to_string())?;
+    let mut signer_bitmap = vec![0u8; bitmap_len(set.validators.len())];
+    set_bit(&mut signer_bitmap, index);
+    Ok(TransitionCertificate {
+        change: change.clone(),
+        new_set: next.clone(),
+        signer_bitmap,
+        signatures: vec![signature],
+    })
+}
+
 /// Builds the snapshot this node can serve right now.
 ///
 /// It is anchored at the certified head, so the receiver has a quorum statement
@@ -1210,6 +1321,7 @@ fn build_live_snapshot(
         prefix,
         anchor: header.clone(),
         certificate: certificate.clone(),
+        transition: node.dag().set_schedule().certificate().cloned(),
         cursor: head.round.saturating_add(1),
         floor: Some(floor),
         vertices,
@@ -1359,6 +1471,7 @@ fn adopt_snapshot(
         prefix,
         anchor,
         certificate,
+        transition,
         cursor,
         floor,
         vertices,
@@ -1381,6 +1494,18 @@ fn adopt_snapshot(
     let finalizer = finalizer
         .as_mut()
         .ok_or("a snapshot join needs execution (--execute)")?;
+    if let Some(transition) = &transition {
+        node.adopt_set_change(transition)
+            .map_err(|error| format!("snapshot set change is not authorized: {error}"))?;
+        finalizer
+            .adopt_set_change(transition)
+            .map_err(|error| format!("snapshot set change cannot be activated: {error}"))?;
+        if let Some(store) = store {
+            store
+                .put_set_change(transition)
+                .map_err(|error| error.to_string())?;
+        }
+    }
     finalizer
         .adopt_anchor(anchor.clone(), &certificate, order_len)
         .map_err(|error| format!("snapshot anchor is not certified: {error}"))?;
@@ -1397,6 +1522,7 @@ fn adopt_snapshot(
                 prefix: prefix.clone(),
                 header: anchor.clone(),
                 certificate: certificate.clone(),
+                transition: transition.clone(),
             })
             .map_err(|error| error.to_string())?;
     }
@@ -1908,6 +2034,26 @@ async fn node_task(
         None
     };
 
+    // A transition already installed by a snapshot or a restart is rebroadcast
+    // so a peer that missed the control frame can still adopt it. Otherwise this
+    // node signs the configured proposal and starts collecting the old-set
+    // quorum.
+    let mut pending_change = node.dag().set_schedule().certificate().cloned();
+    let mut set_change_adopted = pending_change.is_some();
+    let mut pending_dirty = pending_change.is_some();
+    if pending_change.is_none()
+        && let Some((change, next)) = proposed_change(config, node.dag().set(), &chain_id)?
+    {
+        pending_change = Some(own_change_share(
+            &change,
+            &next,
+            node.dag().set(),
+            &identity.id,
+            &identity.private_key,
+        )?);
+        pending_dirty = true;
+    }
+
     let mut failures = (config.failure_rounds > 0)
         .then(|| FailureDetector::new(node.dag().set(), config.failure_rounds));
     if let Some(failures) = failures.as_mut() {
@@ -2122,11 +2268,68 @@ async fn node_task(
                     }
                     // Snapshots travel on their own link, not on the mesh.
                     Message::SnapshotWant | Message::Snapshot(_) => rejected += 1,
-                    // The old-set quorum authorizes the certificate, but the DAG
-                    // boundary and the store audit are not wired to it yet. A node
-                    // must not act on a change it cannot record, so drop the frame
-                    // until activation lands.
-                    Message::SetChange(_) => rejected += 1,
+                    Message::SetChange(certificate) => {
+                        if set_change_adopted {
+                            let same = pending_change.as_ref().is_some_and(|current| {
+                                current.change == certificate.change
+                                    && current.new_set == certificate.new_set
+                            });
+                            if !same {
+                                rejected += 1;
+                            }
+                        } else {
+                            let old = node.dag().set().clone();
+                            let ready = {
+                                let pending = pending_change
+                                    .get_or_insert_with(|| empty_change_certificate(&certificate, &old));
+                                match pending.merge(&certificate, &old) {
+                                    Ok(true) => pending_dirty = true,
+                                    Ok(false) => {}
+                                    Err(_) => rejected += 1,
+                                }
+                                pending
+                                    .verify(&old)
+                                    .ok()
+                                    .map(|_| pending.clone())
+                            };
+                            if let Some(certificate) = ready {
+                                let epoch = node.dag().epoch_of(node.round());
+                                if epoch >= certificate.change.activation_epoch {
+                                    rejected += 1;
+                                    eprintln!(
+                                        "node {index} refused a set change for epoch {} while at epoch {epoch}",
+                                        certificate.change.activation_epoch
+                                    );
+                                } else {
+                                    if let Some(finalizer) = finalizer.as_mut() {
+                                        finalizer.adopt_set_change(&certificate).map_err(|error| {
+                                            format!(
+                                                "cannot install the set change in the finalizer: {error}"
+                                            )
+                                        })?;
+                                    }
+                                    let transition = node
+                                        .adopt_set_change(&certificate)
+                                        .map_err(|error| format!("cannot install the set change: {error}"))?;
+                                    if let Some(store) = &store {
+                                        store
+                                            .put_set_change(&certificate)
+                                            .map_err(|error| error.to_string())?;
+                                    }
+                                    set_change_adopted = true;
+                                    pending_change = Some(certificate);
+                                    pending_dirty = true;
+                                    println!(
+                                        "node val-{index} adopted set change at epoch {}: {} -> {} validators ({})",
+                                        transition.new_epoch,
+                                        transition.old_size,
+                                        transition.new_size,
+                                        transition.changes()
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
             _ = stop_authoring.changed() => {
@@ -2172,6 +2375,20 @@ async fn node_task(
                             .map_err(|error| error.to_string())?;
                         broadcast(&outbound, true, &bytes, &mut dropped);
                     }
+                }
+                // A set-change certificate is control traffic, but it must reach
+                // every validator that may cross the boundary. Repeating it also
+                // repairs a link that reconnected after the first frame.
+                if let Some(certificate) = &pending_change
+                    && (pending_dirty || ticks % SET_CHANGE_TICKS == 0)
+                {
+                    let bytes = wire::frame(
+                        &Message::SetChange(Box::new(certificate.clone())),
+                        now(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    broadcast(&outbound, true, &bytes, &mut dropped);
+                    pending_dirty = false;
                 }
                 if !authoring_stopped && (config.rpc_port > 0 || node.round() <= config.rounds) {
                     let round = node.round();
@@ -2652,6 +2869,7 @@ async fn node_task(
                             prefix: snapshot.prefix,
                             header: snapshot.anchor,
                             certificate: snapshot.certificate,
+                            transition: snapshot.transition,
                         })
                         .map_err(|error| error.to_string())?;
                     // The checkpoint is also the licence to prune: its floor is
@@ -4215,6 +4433,7 @@ mod tests {
             sync_from_peers: false,
             checkpoint_every: 0,
             failure_rounds: 0,
+            change: None,
         }
     }
 
@@ -4292,7 +4511,55 @@ mod tests {
             sync_from_peers: false,
             checkpoint_every,
             failure_rounds: 0,
+            change: None,
         }
+    }
+
+    #[test]
+    fn a_mesh_authorizes_a_set_change_and_crosses_the_boundary() {
+        let dir = TestDir::new("set-change");
+        let home = crate::home::Home::resolve(Some(dir.0.clone())).expect("a test home");
+        crate::genesis::run(&home, None, true, Some(4)).expect("a four-round genesis");
+
+        let mut config = mesh_config(&dir, a_free_port_base(4), 25, 2);
+        config.home = Some(dir.0.clone());
+        config.change = Some((SetChangeKind::Add, 4));
+        let result = run(config);
+        assert!(result.is_ok(), "the set-change run failed: {result:?}");
+
+        for index in 0..4 {
+            let store = Store::open(dir.0.join(format!("val-{index}"))).unwrap();
+            let change = store
+                .set_change()
+                .unwrap()
+                .unwrap_or_else(|| panic!("node {index} did not persist the set change"));
+            assert_eq!(change.change.activation_epoch, 4);
+            let headers = store.headers().unwrap();
+            assert!(
+                headers
+                    .iter()
+                    .any(|entry| entry.header.epoch >= change.change.activation_epoch),
+                "node {index} never certified a header after the boundary"
+            );
+            let snapshot = store
+                .live_snapshot()
+                .unwrap()
+                .unwrap_or_else(|| panic!("node {index} wrote no checkpoint"));
+            assert!(
+                snapshot.transition.is_some(),
+                "node {index} lost the transition from its checkpoint"
+            );
+        }
+
+        // The restart proposes nothing: it has to recover the transition from
+        // the checkpoint and keep certifying above the boundary with the new set.
+        let mut restart = mesh_config(&dir, a_free_port_base(4), 8, 0);
+        restart.home = Some(dir.0.clone());
+        let second = run(restart);
+        assert!(second.is_ok(), "the set-change restart failed: {second:?}");
+
+        crate::audit::run(dir.0.join("val-0"), 4, Some(dir.0.clone()))
+            .expect("a store with an authorized transition must audit");
     }
 
     #[test]

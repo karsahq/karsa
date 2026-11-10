@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use crypto::CryptoError;
 use crypto::encoding::{Decoder, Encoder};
 use tx::batch::Batch;
-use validator::{Certificate, CommitFrontier, Header, Vertex, VertexId};
+use validator::{Certificate, CommitFrontier, Header, TransitionCertificate, Vertex, VertexId};
 
 /// Where the last reported roots are kept.
 const ROOTS_FILE: &str = "roots";
@@ -38,6 +38,8 @@ const BATCHES_FILE: &str = "batches.log";
 const SNAPSHOT_FILE: &str = "snapshot";
 /// The erasure-coded shard log.
 const SHARDS_FILE: &str = "shards.log";
+/// The one authorized set change this store has seen.
+const SET_CHANGE_FILE: &str = "set-change";
 /// The chain this directory belongs to.
 const GENESIS_FILE: &str = "genesis";
 const GENESIS_HEADER_FILE: &str = "genesis.header";
@@ -161,6 +163,8 @@ pub struct LiveSnapshot {
     pub header: Header,
     /// Quorum certificate over `header`.
     pub certificate: Certificate,
+    /// The authorized set change that applies above this snapshot, if any.
+    pub transition: Option<TransitionCertificate>,
 }
 
 /// What one pruning pass did.
@@ -250,8 +254,11 @@ pub struct StoredShard {
 /// instead of replaying a history it never had.
 const LIVE_SNAPSHOT_FILE: &str = "live.snapshot";
 /// Version of the live snapshot record.
-const LIVE_SNAPSHOT_VERSION: u16 = 2;
-/// The legacy version, which stored the full committed order with no frontier.
+///
+/// Version 3 adds the optional set-change certificate. Version 2 stored the
+/// compact prefix and tail; version 1 stored the full committed order.
+const LIVE_SNAPSHOT_VERSION: u16 = 3;
+const LIVE_SNAPSHOT_VERSION_PREFIX: u16 = 2;
 const LIVE_SNAPSHOT_VERSION_FULL: u16 = 1;
 
 /// A finalised header together with the quorum certificate that finalised it.
@@ -571,6 +578,51 @@ impl Store {
         }))
     }
 
+    /// Writes the authorized set change this store adopted.
+    ///
+    /// The prototype allows one transition per chain. Rewriting the same
+    /// certificate is a no-op; a different certificate is refused rather than
+    /// silently replacing the authorization a restart and an audit depend on.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on write failure, [`StoreError::Decode`] when the
+    /// certificate does not encode, or when a different change is already stored.
+    pub fn put_set_change(&self, certificate: &TransitionCertificate) -> Result<(), StoreError> {
+        if let Some(existing) = self.set_change()? {
+            if existing != *certificate {
+                return Err(StoreError::Decode(CryptoError::new(
+                    crypto::CryptoErrorKind::InvalidKeySchedule,
+                    "the store already holds a different set change",
+                )));
+            }
+            return Ok(());
+        }
+        let encoded = certificate.encode()?;
+        let temporary = self.path_of("set-change.tmp");
+        {
+            let mut file = File::create(&temporary)?;
+            file.write_all(&encoded)?;
+        }
+        fs::rename(&temporary, self.path_of(SET_CHANGE_FILE))?;
+        Ok(())
+    }
+
+    /// Reads the set change this store adopted, if any.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on read failure, [`StoreError::Decode`] when the file
+    /// does not decode.
+    pub fn set_change(&self) -> Result<Option<TransitionCertificate>, StoreError> {
+        let path = self.path_of(SET_CHANGE_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path)?;
+        Ok(Some(TransitionCertificate::decode(&bytes)?))
+    }
+
     /// Writes the snapshot a snapshot join adopted, replacing any previous one.
     ///
     /// The committed order is written as a compact frontier plus its tail above
@@ -639,6 +691,13 @@ impl Store {
         }
         encoder.put_bytes(&snapshot.header.encode()?)?;
         encoder.put_bytes(&snapshot.certificate.encode()?)?;
+        match &snapshot.transition {
+            None => encoder.put_u8(0),
+            Some(transition) => {
+                encoder.put_u8(1);
+                encoder.put_bytes(&transition.encode()?)?;
+            }
+        }
 
         let temporary = self.path_of("live.snapshot.tmp");
         {
@@ -667,7 +726,10 @@ impl Store {
         let record = fs::read(&path)?;
         let mut decoder = Decoder::new(&record);
         let version = decoder.read_u16()?;
-        if version != LIVE_SNAPSHOT_VERSION && version != LIVE_SNAPSHOT_VERSION_FULL {
+        if version != LIVE_SNAPSHOT_VERSION
+            && version != LIVE_SNAPSHOT_VERSION_PREFIX
+            && version != LIVE_SNAPSHOT_VERSION_FULL
+        {
             return Err(StoreError::Decode(CryptoError::new(
                 crypto::CryptoErrorKind::MalformedCertificate,
                 format!("unsupported live snapshot version {version}"),
@@ -732,6 +794,20 @@ impl Store {
         };
         let header = Header::decode(decoder.read_bytes()?)?;
         let certificate = Certificate::decode(decoder.read_bytes()?)?;
+        let transition = if version == LIVE_SNAPSHOT_VERSION {
+            match decoder.read_u8()? {
+                0 => None,
+                1 => Some(TransitionCertificate::decode(decoder.read_bytes()?)?),
+                other => {
+                    return Err(StoreError::Decode(CryptoError::new(
+                        crypto::CryptoErrorKind::InvalidVertex,
+                        format!("unknown live snapshot transition flag {other}"),
+                    )));
+                }
+            }
+        } else {
+            None
+        };
         decoder.finish()?;
         Ok(Some(LiveSnapshot {
             round,
@@ -744,6 +820,7 @@ impl Store {
             prefix,
             header,
             certificate,
+            transition,
         }))
     }
 
@@ -1515,8 +1592,10 @@ fn read_records<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crypto::registry::ALG_ED25519;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tx::envelope::{PROTOCOL_VERSION_V1, Transaction};
+    use validator::{NO_EXPIRY, SetChange, ValidatorKey, ValidatorRecord, ValidatorSet};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1537,6 +1616,33 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn transition_certificate() -> TransitionCertificate {
+        let set = |epoch: u64, count: usize| ValidatorSet {
+            epoch,
+            validators: (0..count)
+                .map(|index| ValidatorRecord {
+                    validator_id: format!("val-{index}").into_bytes(),
+                    keys: vec![ValidatorKey {
+                        key_id: format!("val-{index}-k0").into_bytes(),
+                        algorithm_id: ALG_ED25519,
+                        public_key: vec![u8::try_from(index + 1).unwrap(); 32],
+                        activation_epoch: 0,
+                        retirement_epoch: NO_EXPIRY,
+                    }],
+                })
+                .collect(),
+        };
+        let old = set(1, 1);
+        let new = set(2, 2);
+        let change = SetChange::new(b"karsa-store-1".to_vec(), &old, &new).unwrap();
+        TransitionCertificate {
+            change,
+            new_set: new,
+            signer_bitmap: vec![0b1],
+            signatures: vec![vec![9u8; 64]],
         }
     }
 
@@ -1694,6 +1800,7 @@ mod tests {
                 signer_bitmap: vec![0b1],
                 signatures: vec![vec![9u8; 64]],
             },
+            transition: Some(transition_certificate()),
         };
         {
             let store = Store::open(&dir.0).unwrap();
@@ -1701,6 +1808,21 @@ mod tests {
         }
         let store = Store::open(&dir.0).unwrap();
         assert_eq!(store.live_snapshot().unwrap(), Some(snapshot));
+    }
+
+    #[test]
+    fn a_set_change_round_trips_and_cannot_be_replaced() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        assert_eq!(store.set_change().unwrap(), None);
+        let certificate = transition_certificate();
+        store.put_set_change(&certificate).unwrap();
+        store.put_set_change(&certificate).unwrap();
+        assert_eq!(store.set_change().unwrap(), Some(certificate.clone()));
+
+        let mut different = certificate;
+        different.change.activation_epoch += 1;
+        assert!(store.put_set_change(&different).is_err());
     }
 
     #[test]
@@ -1870,6 +1992,7 @@ mod tests {
                 prefix: CommitFrontier::empty(),
                 header: header(4),
                 certificate: certificate(4),
+                transition: None,
             })
             .unwrap();
 
@@ -1927,6 +2050,7 @@ mod tests {
                 prefix: CommitFrontier::empty(),
                 header: header(2),
                 certificate: certificate(2),
+                transition: None,
             })
             .unwrap();
 

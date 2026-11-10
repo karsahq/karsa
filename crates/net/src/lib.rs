@@ -33,8 +33,8 @@ use crypto::registry::ALG_ED25519;
 use crypto::scheme::Ed25519Scheme;
 use crypto::{CryptoError, CryptoErrorKind};
 use validator::{
-    CommitFrontier, Dag, NO_EXPIRY, Pacemaker, PacemakerConfig, Step, ValidatorKey,
-    ValidatorRecord, ValidatorSet, Vertex, VertexId,
+    CommitFrontier, Dag, NO_EXPIRY, Pacemaker, PacemakerConfig, SetChangeError, Step, Transition,
+    TransitionCertificate, ValidatorKey, ValidatorRecord, ValidatorSet, Vertex, VertexId,
 };
 
 const CHAIN_ID: &[u8] = b"karsa-net-1";
@@ -241,6 +241,18 @@ impl Node {
     #[must_use]
     pub fn dag(&self) -> &Dag {
         &self.dag
+    }
+
+    /// Installs a set-change certificate in this node's DAG.
+    ///
+    /// # Errors
+    ///
+    /// Every error from [`Dag::adopt_set_change`].
+    pub fn adopt_set_change(
+        &mut self,
+        certificate: &TransitionCertificate,
+    ) -> Result<Transition, SetChangeError> {
+        self.dag.adopt_set_change(certificate)
     }
 
     /// Ids of every vertex this node holds in `round`.

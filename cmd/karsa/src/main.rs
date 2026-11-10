@@ -351,6 +351,12 @@ enum Command {
         /// an authorized set change.
         #[arg(long, default_value_t = 50)]
         failure_rounds: u64,
+        /// Append one validator at this epoch, authorized by the old-set quorum.
+        #[arg(long, conflicts_with = "remove_validator_at_epoch")]
+        add_validator_at_epoch: Option<u64>,
+        /// Remove the last validator at this epoch, authorized by the old-set quorum.
+        #[arg(long, conflicts_with = "add_validator_at_epoch")]
+        remove_validator_at_epoch: Option<u64>,
     },
     /// Sign a transfer with a committee account and submit it to a live RPC node.
     Send {
@@ -572,6 +578,8 @@ fn main() -> ExitCode {
             sync_from_peers,
             checkpoint_every,
             failure_rounds,
+            add_validator_at_epoch,
+            remove_validator_at_epoch,
         } => live::run(live::Config {
             validators,
             port_base,
@@ -597,6 +605,11 @@ fn main() -> ExitCode {
             sync_from_peers,
             checkpoint_every,
             failure_rounds,
+            change: add_validator_at_epoch
+                .map(|epoch| (live::SetChangeKind::Add, epoch))
+                .or_else(|| {
+                    remove_validator_at_epoch.map(|epoch| (live::SetChangeKind::Remove, epoch))
+                }),
         }),
         Command::Send {
             rpc,

@@ -69,7 +69,7 @@ const KIND_SET_CHANGE: u8 = 9;
 /// A peer that answers with another number is not necessarily hostile; it may be a
 /// different build. The link is closed rather than parsed optimistically, because
 /// the next frame kind could mean something else there.
-pub const WIRE_PROTOCOL: u16 = 6;
+pub const WIRE_PROTOCOL: u16 = 7;
 
 /// The first frame on every link: which chain the sender is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +112,8 @@ pub struct Snapshot {
     pub anchor: Header,
     /// Quorum certificate over the anchor.
     pub certificate: Certificate,
+    /// Authorized set change that applies above the anchor, if any.
+    pub transition: Option<TransitionCertificate>,
     /// Decision round the joiner resumes from.
     pub cursor: u64,
     /// Rounds at or below this are covered by `state` and are not transferred.
@@ -258,6 +260,13 @@ fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>, CryptoError> {
     }
     encoder.put_bytes(&snapshot.anchor.encode()?)?;
     encoder.put_bytes(&snapshot.certificate.encode()?)?;
+    match &snapshot.transition {
+        None => encoder.put_u8(0),
+        Some(transition) => {
+            encoder.put_u8(1);
+            encoder.put_bytes(&transition.encode()?)?;
+        }
+    }
     encoder.put_u64(snapshot.cursor);
     match snapshot.floor {
         None => encoder.put_u8(0),
@@ -317,6 +326,11 @@ fn decode_snapshot(payload: &[u8]) -> Result<Snapshot, CryptoError> {
     }
     let anchor = Header::decode(decoder.read_bytes()?)?;
     let certificate = Certificate::decode(decoder.read_bytes()?)?;
+    let transition = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(TransitionCertificate::decode(decoder.read_bytes()?)?),
+        other => return Err(invalid(format!("unknown snapshot transition flag {other}"))),
+    };
     let cursor = decoder.read_u64()?;
     let floor = match decoder.read_u8()? {
         0 => None,
@@ -353,6 +367,7 @@ fn decode_snapshot(payload: &[u8]) -> Result<Snapshot, CryptoError> {
         prefix,
         anchor,
         certificate,
+        transition,
         cursor,
         floor,
         vertices,
@@ -622,6 +637,7 @@ mod tests {
                 signer_bitmap: vec![0b1],
                 signatures: vec![vec![9u8; 64]],
             },
+            transition: Some(transition_certificate()),
             cursor: 5,
             floor: Some(2),
             vertices: vec![vertex(4)],

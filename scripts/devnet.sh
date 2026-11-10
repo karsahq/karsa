@@ -11,6 +11,9 @@
 #   SNAPSHOT_PORT=7620         snapshot base; node i uses snapshot_port + i
 #   BIN=target/release/karsa
 #   RESET=1                    wipe the devnet directory first
+#   EPOCH_ROUNDS=32            epoch length when --init writes genesis
+#   ADD_VALIDATOR_AT_EPOCH=4   propose one authorized addition at this epoch
+#   REMOVE_VALIDATOR_AT_EPOCH  propose one authorized removal at this epoch
 #
 # The genesis is the four-validator example `karsa genesis --init` writes; its
 # keys are the demo keys and are public knowledge. peers.json is written for the
@@ -30,8 +33,19 @@ PORT_BASE=${PORT_BASE:-7600}
 RPC_PORT=${RPC_PORT:-7610}
 SNAPSHOT_PORT=${SNAPSHOT_PORT:-7620}
 CHECKPOINT_EVERY=${CHECKPOINT_EVERY:-1024}
+EPOCH_ROUNDS=${EPOCH_ROUNDS:-}
+ADD_VALIDATOR_AT_EPOCH=${ADD_VALIDATOR_AT_EPOCH:-}
+REMOVE_VALIDATOR_AT_EPOCH=${REMOVE_VALIDATOR_AT_EPOCH:-}
 BIN=${BIN:-target/release/karsa}
 VALIDATORS=4
+
+CHANGE_ARGS=""
+if [ -n "$ADD_VALIDATOR_AT_EPOCH" ]; then
+    CHANGE_ARGS="$CHANGE_ARGS --add-validator-at-epoch $ADD_VALIDATOR_AT_EPOCH"
+fi
+if [ -n "$REMOVE_VALIDATOR_AT_EPOCH" ]; then
+    CHANGE_ARGS="$CHANGE_ARGS --remove-validator-at-epoch $REMOVE_VALIDATOR_AT_EPOCH"
+fi
 
 if [ "${RESET:-0}" = 1 ]; then
     rm -rf "$DEVNET"
@@ -39,7 +53,11 @@ fi
 mkdir -p "$DEVNET"
 
 if [ ! -f "$DEVNET/genesis.json" ]; then
-    "$BIN" genesis --home "$DEVNET" --init > /dev/null
+    if [ -n "$EPOCH_ROUNDS" ]; then
+        "$BIN" genesis --home "$DEVNET" --init --epoch-rounds "$EPOCH_ROUNDS" > /dev/null
+    else
+        "$BIN" genesis --home "$DEVNET" --init > /dev/null
+    fi
 fi
 
 i=0
@@ -71,6 +89,7 @@ while [ "$i" -lt "$VALIDATORS" ]; do
         --checkpoint-every "$CHECKPOINT_EVERY" \
         --home "$DEVNET" \
         --store "$DEVNET/data" \
+        $CHANGE_ARGS \
         > "$DEVNET/val-$i.log" 2>&1 &
     pids="$pids $!"
     i=$((i + 1))
@@ -82,6 +101,9 @@ echo "  p2p       $PORT_BASE..$((PORT_BASE + VALIDATORS - 1))"
 echo "  rpc       http://127.0.0.1:$RPC_PORT..$((RPC_PORT + VALIDATORS - 1))"
 echo "  snapshot  $SNAPSHOT_PORT..$((SNAPSHOT_PORT + VALIDATORS - 1))"
 echo "  checkpoint every $CHECKPOINT_EVERY certified heights (0 disables; each write prunes below its floor)"
+if [ -n "$CHANGE_ARGS" ]; then
+    echo "  set change        $CHANGE_ARGS"
+fi
 echo "  send      $BIN send --home $DEVNET --rpc 127.0.0.1:$RPC_PORT --from 0 --to 1 --amount 1 --wait"
 echo "  logs      $DEVNET/val-*.log"
 
