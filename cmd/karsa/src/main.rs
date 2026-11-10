@@ -332,7 +332,8 @@ enum Command {
         /// `snapshot_port + i`. Zero disables the server and the client.
         #[arg(long, default_value_t = 0)]
         snapshot_port: u16,
-        /// Ask a peer for a state snapshot when this node's store has no history.
+        /// Ask a peer for a state snapshot. A store with history is moved forward
+        /// to the peer's certified anchor.
         #[arg(long)]
         sync_from_peers: bool,
     },

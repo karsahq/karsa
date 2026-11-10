@@ -1189,6 +1189,7 @@ async fn fetch_snapshot(
     index: usize,
     total: usize,
     chain_id: &[u8],
+    min_height: u64,
 ) -> Result<wire::Snapshot, String> {
     let deadline = tokio::time::Instant::now() + SNAPSHOT_STARTUP_WAIT;
     let mut last = String::from("no peers were tried");
@@ -1199,12 +1200,23 @@ async fn fetch_snapshot(
             }
             let target = rpc_address(port_base, peer)?;
             match fetch_one(&target, chain_id).await {
-                Ok(snapshot) => return Ok(snapshot),
+                // A snapshot at or below what this node already certified would
+                // move its trust anchor backwards. Keep looking for one that is
+                // ahead, which is what a lagging node needs.
+                Ok(snapshot) if snapshot.anchor.height > min_height => return Ok(snapshot),
+                Ok(snapshot) => {
+                    last = format!(
+                        "{target}: snapshot height {} is not above the stored head {min_height}",
+                        snapshot.anchor.height
+                    );
+                }
                 Err(error) => last = format!("{target}: {error}"),
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("no peer served a snapshot ({last})"));
+            return Err(format!(
+                "no peer served a snapshot above height {min_height} ({last})"
+            ));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -1438,24 +1450,23 @@ async fn node_task(
     // start their own snapshot servers; only then can this node ask for one. The
     // snapshot exchange uses its own port, not the consensus links.
     let synced = if config.sync_from_peers {
-        let empty = match &store {
-            Some(store) => store
-                .vertices()
-                .map_err(|error| error.to_string())?
-                .is_empty(),
-            None => true,
-        };
-        if !empty {
-            println!(
-                "  node val-{index} has history; restore takes precedence over --sync-from-peers"
-            );
-            None
-        } else {
-            if config.snapshot_port == 0 {
-                return Err(format!("node {index} cannot sync without --snapshot-port"));
-            }
-            Some(fetch_snapshot(config.snapshot_port, index, total, &chain_id).await?)
+        if config.snapshot_port == 0 {
+            return Err(format!("node {index} cannot sync without --snapshot-port"));
         }
+        let stored_head = match &store {
+            Some(store) => store
+                .headers()
+                .map_err(|error| error.to_string())?
+                .last()
+                .map_or(0, |record| record.header.height),
+            None => 0,
+        };
+        if stored_head > 0 {
+            println!(
+                "  node val-{index} has history to height {stored_head}; --sync-from-peers adopts a peer snapshot above it"
+            );
+        }
+        Some(fetch_snapshot(config.snapshot_port, index, total, &chain_id, stored_head).await?)
     } else {
         None
     };
