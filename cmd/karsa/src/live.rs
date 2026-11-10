@@ -36,7 +36,7 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crypto::CryptoErrorKind;
@@ -63,8 +63,24 @@ const WANT_RETRY: Duration = Duration::from_millis(250);
 const WANT_TRIES: u8 = 8;
 /// Control frames a peer may have queued: wants and their answers.
 const CONTROL_QUEUE: usize = 256;
+/// Share frames kept so a reconnected peer can recover a signature that was in
+/// flight when the link broke.
+///
+/// Certificate shares are produced once per height and never retransmitted, so a
+/// peer that misses even one height can never certify that height or any above it.
+/// The window has to cover a restart, not a single frame: a peer may be away for
+/// several seconds while it replays its store. A thousand heights is about fifteen
+/// seconds at this committee's certificate rate; a longer outage needs a snapshot
+/// resync rather than a replay.
+const RECENT_SHARES: usize = 1024;
 /// How long to keep retrying a connection before giving up.
 const CONNECT_TRIES: usize = 400;
+/// Delay before the first attempt to reconnect a link that dropped.
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(10);
+/// Ceiling on the reconnect backoff.
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+/// How long one reconnect attempt may spend connecting and shaking hands.
+const RECONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Tick period: the authoring and pacemaker cadence.
 const TICK: Duration = Duration::from_millis(2);
 /// Ticks between persisted clock samples, about one second at the tick cadence.
@@ -377,37 +393,230 @@ async fn read_peer(
     }
 }
 
+/// How one outbound connection ended.
+enum LinkEnd {
+    /// The socket failed; the peer may still be starting up.
+    Broken,
+    /// The run is shutting down.
+    Shutdown,
+    /// Both queues closed, so there is nothing left to send.
+    Closed,
+}
+
+/// What one outbound link task needs besides the socket and its two queues.
+struct LinkTask {
+    index: usize,
+    target: String,
+    chain_id: Vec<u8>,
+    bytes_out: Arc<AtomicU64>,
+    up: Arc<AtomicBool>,
+    /// The most recent share frames this node produced, replayed to a peer that
+    /// reconnects so a signature lost at the break cannot wedge its finality.
+    recent_shares: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    send_buffer: usize,
+    shutdown: watch::Receiver<bool>,
+}
+
 /// Writes frames to one peer from two queues, control first.
 ///
 /// One writer, because two tasks writing the same socket would interleave frame
 /// bodies. Control frames (a want, and the vertex sent back for one) go first so a
 /// repair never sits behind a burst of broadcasts in the same queue — that is how a
 /// want ended up dropped and eventually abandoned under load.
+///
+/// A dropped link is re-established: a validator that restarts has to receive the
+/// mesh's traffic again, and its peers' old sockets died with the previous process.
+/// Frames already queued survive the break; the one frame that was mid-write is
+/// retried, and the recent shares are replayed so a certificate that lost one
+/// signature at the break can still form.
 async fn write_peer(
     mut stream: TcpStream,
     mut control: mpsc::Receiver<Vec<u8>>,
     mut data: mpsc::Receiver<Vec<u8>>,
-    bytes_out: Arc<AtomicU64>,
+    task: LinkTask,
 ) {
+    let LinkTask {
+        index,
+        target,
+        chain_id,
+        bytes_out,
+        up,
+        recent_shares,
+        send_buffer,
+        mut shutdown,
+    } = task;
+    // The frame that was in flight when a socket failed. It is retried on the next
+    // connection, because a share lost exactly at the break would leave the peer one
+    // signature short of a certificate for that height, and no later share can stand
+    // in for it.
+    let mut pending = None;
     loop {
-        let bytes = tokio::select! {
-            biased;
-            Some(bytes) = control.recv() => bytes,
-            Some(bytes) = data.recv() => bytes,
-            else => break,
+        let end = write_connected(
+            &mut stream,
+            &mut control,
+            &mut data,
+            &bytes_out,
+            &mut pending,
+            &mut shutdown,
+        )
+        .await;
+        up.store(false, Ordering::Relaxed);
+        let _ = stream.shutdown().await;
+        match end {
+            LinkEnd::Closed | LinkEnd::Shutdown => return,
+            LinkEnd::Broken => {}
+        }
+        eprintln!("node {index} lost {target}; reconnecting");
+        match reconnect(index, &target, &chain_id, send_buffer, &mut shutdown).await {
+            Some(fresh) => {
+                stream = fresh;
+                up.store(true, Ordering::Relaxed);
+                resend_recent(&mut stream, &recent_shares, &bytes_out).await;
+                eprintln!("node {index} reconnected {target}");
+            }
+            None => return,
+        }
+    }
+}
+
+/// Writes the retained share frames to a freshly established link.
+async fn resend_recent(
+    stream: &mut TcpStream,
+    recent: &Mutex<VecDeque<Vec<u8>>>,
+    bytes_out: &AtomicU64,
+) {
+    let frames: Vec<Vec<u8>> = {
+        let recent = recent.lock().expect("recent shares lock poisoned");
+        recent.iter().cloned().collect()
+    };
+    for frame in frames {
+        if stream.write_all(&frame).await.is_err() {
+            return;
+        }
+        bytes_out.fetch_add(frame.len() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Keeps the latest share frame, dropping the oldest once the window is full.
+fn remember_share(recent: &Mutex<VecDeque<Vec<u8>>>, bytes: &[u8]) {
+    let mut recent = recent.lock().expect("recent shares lock poisoned");
+    if recent.len() == RECENT_SHARES {
+        recent.pop_front();
+    }
+    recent.push_back(bytes.to_vec());
+}
+
+/// Writes queued frames until the socket fails, the run ends, or every sender is
+/// gone.
+async fn write_connected(
+    stream: &mut TcpStream,
+    control: &mut mpsc::Receiver<Vec<u8>>,
+    data: &mut mpsc::Receiver<Vec<u8>>,
+    bytes_out: &AtomicU64,
+    pending: &mut Option<Vec<u8>>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> LinkEnd {
+    loop {
+        let bytes = match pending.take() {
+            Some(bytes) => bytes,
+            None => tokio::select! {
+                biased;
+                Some(bytes) = control.recv() => bytes,
+                Some(bytes) = data.recv() => bytes,
+                _ = shutdown.changed() => return LinkEnd::Shutdown,
+                else => return LinkEnd::Closed,
+            },
         };
         if stream.write_all(&bytes).await.is_err() {
-            break;
+            *pending = Some(bytes);
+            return LinkEnd::Broken;
         }
         bytes_out.fetch_add(bytes.len() as u64, Ordering::Relaxed);
     }
-    let _ = stream.shutdown().await;
+}
+
+/// Re-establishes one outbound link, backing off between attempts.
+///
+/// The retry is unbounded because a restarted validator may take as long as its
+/// operator needs; the run's shutdown signal is what ends it. A refused handshake is
+/// reported once and then retried, since a peer that is still starting up may answer
+/// abruptly for a moment.
+async fn reconnect(
+    index: usize,
+    target: &str,
+    chain_id: &[u8],
+    send_buffer: usize,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<TcpStream> {
+    let mut delay = RECONNECT_BACKOFF_MIN;
+    let mut reported = false;
+    loop {
+        let attempt = tokio::select! {
+            _ = shutdown.changed() => return None,
+            result = tokio::time::timeout(RECONNECT_TIMEOUT, TcpStream::connect(target)) => result,
+        };
+        match attempt {
+            Ok(Ok(mut stream)) => {
+                let mut trailing = Vec::new();
+                let hello = tokio::select! {
+                    _ = shutdown.changed() => return None,
+                    result = tokio::time::timeout(
+                        HANDSHAKE_TIMEOUT,
+                        handshake(&mut stream, &mut trailing, chain_id),
+                    ) => result,
+                };
+                match hello {
+                    Ok(Ok(())) => {
+                        if send_buffer > 0
+                            && let Err(error) =
+                                socket2::SockRef::from(&stream).set_send_buffer_size(send_buffer)
+                        {
+                            eprintln!("node {index} cannot size the link to {target}: {error}");
+                        }
+                        return Some(stream);
+                    }
+                    Ok(Err(error)) => {
+                        if !reported {
+                            eprintln!("node {index} cannot rejoin {target}: {error}");
+                            reported = true;
+                        }
+                    }
+                    Err(_) => {
+                        if !reported {
+                            eprintln!("node {index} handshake with {target} timed out");
+                            reported = true;
+                        }
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                if !reported {
+                    eprintln!("node {index} cannot reconnect {target}: {error}");
+                    reported = true;
+                }
+            }
+            Err(_) => {
+                if !reported {
+                    eprintln!("node {index} connect to {target} timed out");
+                    reported = true;
+                }
+            }
+        }
+        tokio::select! {
+            _ = shutdown.changed() => return None,
+            _ = tokio::time::sleep(delay) => {}
+        }
+        delay = (delay * 2).min(RECONNECT_BACKOFF_MAX);
+    }
 }
 
 /// One peer's two outbound queues.
 struct Link {
     control: mpsc::Sender<Vec<u8>>,
     data: mpsc::Sender<Vec<u8>>,
+    /// Whether the writer currently has a socket for this peer. A link without one
+    /// queues what fits but never blocks the node loop.
+    up: Arc<AtomicBool>,
 }
 
 /// Queues one frame for every peer, never waiting.
@@ -430,11 +639,18 @@ fn broadcast(links: &[Link], control: bool, bytes: &[u8], dropped: &mut u64) {
 /// Payload is large and every node has to execute it, so it blocks rather than
 /// drops: losing a batch costs more than slowing down for it. The wait is for a
 /// queue slot, not for delivery, but it is real — a peer that cannot keep up now
-/// costs the sender throughput, which is the trade D22 recorded.
+/// costs the sender throughput, which is the trade D22 recorded. A link that has no
+/// socket queues what fits and lets the rest go, so one peer leaving never stops
+/// payload reaching the rest.
 async fn broadcast_payload(links: &[Link], bytes: &[u8]) {
     for link in links {
-        if link.data.send(bytes.to_vec()).await.is_err() {
-            break;
+        if link.up.load(Ordering::Relaxed) {
+            let _ = link.data.send(bytes.to_vec()).await;
+        } else {
+            // A peer with no live socket cannot drain the queue. Queue the payload
+            // if there is room, so a short drop still delivers; if it is full, let
+            // it go instead of stalling every live peer behind a link that is down.
+            let _ = link.data.try_send(bytes.to_vec());
         }
     }
 }
@@ -505,6 +721,50 @@ fn credited_genesis(accounts: &[chain::Account]) -> Result<State, String> {
     Ok(state)
 }
 
+/// Replays the stored DAG up to the prefix the latest certificate covers.
+///
+/// The pacemaker starts at the current cursor, so this is the same decision
+/// sequence the original run performed. It stops at the committed prefix named by
+/// `head_root`, not at the DAG tip: a header the finalizer builds later names the
+/// whole order prefix it covers, so replaying past the certificate would make the
+/// first header after restart cover several decisions at once, a header no other
+/// validator ever signed. The live loop redoes the decisions above that prefix and
+/// records one header per decision.
+///
+/// The initial boundary is whatever order the node started with: empty for a full
+/// replay, and the snapshot's committed prefix for a snapshot restart.
+fn replay_to_head(node: &mut Node, head_root: [u8; 32]) -> Result<(), String> {
+    let mut boundaries: Vec<(usize, u64)> = vec![(node.dag().order().len(), node.cursor())];
+    loop {
+        match node.commit_once() {
+            Ok(Step::Advanced {
+                cursor, anchors, ..
+            }) => {
+                boundaries.push((node.dag().order().len(), cursor));
+                if anchors > 0 {
+                    break;
+                }
+            }
+            Ok(Step::Waiting { .. } | Step::TimedOut { .. }) => break,
+            Err(error) if error.kind() == CryptoErrorKind::MissingReference => break,
+            Err(error) => return Err(format!("cannot rebuild the committed order: {error}")),
+        }
+    }
+    let order = node.dag().order().to_vec();
+    let Some(index) = boundaries
+        .iter()
+        .rposition(|(len, _)| commit_root(&order[..*len]) == head_root)
+    else {
+        return Err("the certified head does not match any committed prefix".into());
+    };
+    let (head_len, head_cursor) = boundaries[index];
+    if head_len < order.len() {
+        node.seed_order(order[..head_len].to_vec());
+        node.set_cursor(head_cursor);
+    }
+    Ok(())
+}
+
 /// Rebuilds a node from its store before the live loop starts.
 ///
 /// The live store keeps every vertex, batch, and certified header, so a restart
@@ -556,17 +816,10 @@ fn restore(
         });
     }
 
-    // Rebuild the commit order from the stored DAG. The pacemaker starts at
-    // round 1, so this is the same decision sequence the original run performed.
-    loop {
-        match node.commit_once() {
-            Ok(Step::Advanced { anchors, .. }) if anchors > 0 => break,
-            Ok(Step::Advanced { .. }) => {}
-            Ok(Step::Waiting { .. } | Step::TimedOut { .. }) => break,
-            Err(error) if error.kind() == CryptoErrorKind::MissingReference => break,
-            Err(error) => return Err(format!("cannot rebuild the commit order: {error}")),
-        }
-    }
+    let head_root = headers
+        .last()
+        .map_or_else(|| commit_root(&[]), |record| record.header.dag_root);
+    replay_to_head(node, head_root)?;
 
     for batch in store.batches().map_err(|error| error.to_string())? {
         let digest = batch.digest().map_err(|error| error.to_string())?;
@@ -688,16 +941,15 @@ fn restore_live(
         live.batches.insert(digest, batch);
     }
 
-    // Rebuild the order above the anchor, exactly as the live loop would.
-    loop {
-        match node.commit_once() {
-            Ok(Step::Advanced { anchors, .. }) if anchors > 0 => break,
-            Ok(Step::Advanced { .. }) => {}
-            Ok(Step::Waiting { .. } | Step::TimedOut { .. }) => break,
-            Err(error) if error.kind() == CryptoErrorKind::MissingReference => break,
-            Err(error) => return Err(format!("cannot rebuild the snapshot tail: {error}")),
-        }
-    }
+    // Rebuild the order above the anchor, exactly as the live loop would, and
+    // stop at the prefix the latest stored certificate covers. The decisions above
+    // it are redone by the live loop so every header covers one decision.
+    let mut headers = store.headers().map_err(|error| error.to_string())?;
+    headers.sort_by_key(|record| record.header.height);
+    let head_root = headers
+        .last()
+        .map_or(snapshot.header.dag_root, |record| record.header.dag_root);
+    replay_to_head(node, head_root)?;
 
     let order = node.dag().order().to_vec();
     while *live.applied_cursor < order.len() {
@@ -721,8 +973,6 @@ fn restore_live(
         *live.applied_cursor += 1;
     }
 
-    let mut headers = store.headers().map_err(|error| error.to_string())?;
-    headers.sort_by_key(|record| record.header.height);
     for record in headers {
         if record.header.height <= anchor_height {
             continue;
@@ -1215,6 +1465,7 @@ async fn node_task(
     // an archive an archive is that validators send it everything, not that it
     // participates.
     let mut outbound: Vec<Link> = Vec::with_capacity(total.saturating_sub(1));
+    let recent_shares: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
     for peer in 0..total {
         if peer == index {
             continue;
@@ -1253,9 +1504,11 @@ async fn node_task(
         }
         let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE);
         let (data_tx, data_rx) = mpsc::channel(config.queue.max(1));
+        let up = Arc::new(AtomicBool::new(true));
         outbound.push(Link {
             control: control_tx,
             data: data_tx,
+            up: Arc::clone(&up),
         });
         if config.send_buffer > 0 {
             socket2::SockRef::from(&stream)
@@ -1263,8 +1516,28 @@ async fn node_task(
                 .map_err(|error| format!("node {index} cannot size the socket: {error}"))?;
         }
         let bytes_out = Arc::clone(&bytes_out);
+        let link_target = target.clone();
+        let link_chain = chain_id.clone();
+        let link_shutdown = shutdown.clone();
+        let link_recent = Arc::clone(&recent_shares);
+        let send_buffer = config.send_buffer;
         tokio::spawn(async move {
-            write_peer(stream, control_rx, data_rx, bytes_out).await;
+            write_peer(
+                stream,
+                control_rx,
+                data_rx,
+                LinkTask {
+                    index,
+                    target: link_target,
+                    chain_id: link_chain,
+                    bytes_out,
+                    up,
+                    recent_shares: link_recent,
+                    send_buffer,
+                    shutdown: link_shutdown,
+                },
+            )
+            .await;
         });
     }
 
@@ -1935,6 +2208,7 @@ async fn node_task(
                     for share in build.shares {
                         let bytes = wire::frame(&Message::Share(share), now())
                             .map_err(|error| error.to_string())?;
+                        remember_share(&recent_shares, &bytes);
                         broadcast(&outbound, false, &bytes, &mut dropped);
                     }
                     for certified in build.certified {
@@ -3441,6 +3715,106 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error, "peer sent data before its hello");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_link_reconnects_and_keeps_delivering() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        let chain = b"chain-a".to_vec();
+        let (first_read_tx, first_read_rx) = oneshot::channel();
+
+        let server = {
+            let chain = chain.clone();
+            tokio::spawn(async move {
+                // First connection: take one frame, then reset the socket.
+                let (mut first, _) = listener.accept().await.unwrap();
+                let mut buffer = Vec::new();
+                handshake(&mut first, &mut buffer, &chain).await.unwrap();
+                let first_frame = read_one_message(&mut first, &mut buffer).await.unwrap();
+                socket2::SockRef::from(&first)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+                drop(first);
+                let _ = first_read_tx.send(());
+
+                // The restarting peer: the retained shares arrive first, then the
+                // frame that was in flight when the link broke.
+                let (mut second, _) = listener.accept().await.unwrap();
+                let mut buffer = Vec::new();
+                handshake(&mut second, &mut buffer, &chain).await.unwrap();
+                let resent = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    read_one_message(&mut second, &mut buffer),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let retried = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    read_one_message(&mut second, &mut buffer),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                (first_frame, resent, retried)
+            })
+        };
+
+        let mut stream = TcpStream::connect(&target).await.unwrap();
+        let mut buffer = Vec::new();
+        handshake(&mut stream, &mut buffer, &chain).await.unwrap();
+        let (control_tx, control_rx) = mpsc::channel(8);
+        let (data_tx, data_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let want = |round: u64| {
+            wire::frame(
+                &Message::Want(VertexId {
+                    round,
+                    author: b"val-0".to_vec(),
+                    digest: [round as u8; 32],
+                }),
+                0,
+            )
+            .unwrap()
+        };
+        let recent = Arc::new(Mutex::new(VecDeque::from([want(99)])));
+        let writer = tokio::spawn(write_peer(
+            stream,
+            control_rx,
+            data_rx,
+            LinkTask {
+                index: 0,
+                target,
+                chain_id: chain.clone(),
+                bytes_out: Arc::new(AtomicU64::new(0)),
+                up: Arc::new(AtomicBool::new(true)),
+                recent_shares: Arc::clone(&recent),
+                send_buffer: 0,
+                shutdown: shutdown_rx,
+            },
+        ));
+
+        control_tx.send(want(1)).await.unwrap();
+        first_read_rx.await.unwrap();
+        // The first socket now resets. The next frame can only arrive if the
+        // writer keeps the frame that failed and sends it on the new link.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        control_tx.send(want(2)).await.unwrap();
+
+        let (first, resent, retried) = server.await.unwrap();
+        assert!(matches!(first, Message::Want(_)));
+        assert!(
+            matches!(&resent, Message::Want(id) if id.round == 99),
+            "{resent:?}"
+        );
+        assert!(
+            matches!(&retried, Message::Want(id) if id.round == 2),
+            "{retried:?}"
+        );
+        assert!(!writer.is_finished());
+        drop(control_tx);
+        drop(data_tx);
     }
 
     fn node_mode_config(validators: usize, node_index: Option<usize>) -> Config {
