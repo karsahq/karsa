@@ -868,7 +868,7 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     informational because the live mesh still derives endpoints from
     `--port-base`. `WIRE_PROTOCOL` is 5 since finding 41, so an old and a new
     node refuse each other at the handshake. The gate is green on this tree
-    (393 tests default, 394 with all features).
+    (394 tests default, 395 with all features).
 
 39. **A Merkle frontier bounds the checkpoint and the snapshot transfer.**
     A header's `dag_root` commits every entry from genesis, but entries below the
@@ -965,6 +965,28 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       leaf. Pinned by `a_finalized_proof_survives_the_order_prefix`, which clears
       the retained order, the prefix, and the certified-header window before asking
       for the proof.
+
+43. **The devnet is an automated integration test.**
+    `cmd/karsa/tests/devnet.rs` generates a home with `karsa genesis --init`,
+    starts four `karsa live --node-index i` processes over a free loopback port
+    block with `--execute`, `--checkpoint-every 16`, and a 25 s lifetime, and
+    waits until every node has certified two heights before submitting.
+    `karsa send --wait` then submits a signed transfer through node 0, and the
+    test reads `/tx/{id}?proof=1` on each node, requiring `finalized` and a commit
+    proof, plus `/status` with `applied_txs >= 1`, `tracked_transactions >= 1`, and
+    0 conflicts. All four must agree on the finalized height and state root.
+    `Devnet` kills and reaps its children on drop, and a failure prints each node's
+    log.
+    - Passed three runs in a row standalone in 1.35–1.90 s, and the full gate
+      passed twice (default and all-features); no child process or temp directory
+      survives. The readiness gate requires two certified heights per node; the
+      earlier version checked only node 0's round and timed out on node 2 in the
+      gate. Head roots are not compared because nodes certify at their own pace;
+      the test compares the header that finalized the transaction instead.
+    - Port discovery binds a contiguous block, drops it, and starts the processes,
+      so a port stolen in that window fails the test. This is the cold devnet;
+      fault and restart probes remain manual, while the in-process restart test
+      covers the checkpoint path.
 
 ## Build order
 
