@@ -28,10 +28,12 @@ pub use frontier::CommitFrontier;
 pub use header::{HEADER_VERSION_V1, Header, HeaderChain};
 pub use pacemaker::{Pacemaker, PacemakerConfig, Step};
 pub use schedule::{
-    EpochSchedule, NO_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet, ValidatorSignature,
+    EpochSchedule, NO_EXPIRY, VALIDATOR_SET_VERSION_V1, ValidatorKey, ValidatorRecord,
+    ValidatorSet, ValidatorSignature,
 };
 pub use set_change::{
-    SetChange, SetChangeError, SetSchedule, Transition, TransitionCertificate, check_transition,
+    SET_CHANGE_VERSION_V1, SetChange, SetChangeError, SetSchedule,
+    TRANSITION_CERTIFICATE_VERSION_V1, Transition, TransitionCertificate, check_transition,
     min_intersection,
 };
 pub use vertex::{VERTEX_VERSION_V1, Vertex, VertexId, tally_votes};

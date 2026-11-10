@@ -8,10 +8,13 @@
 use std::collections::HashSet;
 
 use crypto::domain::DOMAIN_VALIDATOR_SET_V1;
-use crypto::encoding::Encoder;
+use crypto::encoding::{Decoder, Encoder};
 use crypto::scheme::verify_signature;
 use crypto::{CryptoError, CryptoErrorKind};
 use sha2::{Digest, Sha256};
+
+/// Canonical validator-set encoding version.
+pub const VALIDATOR_SET_VERSION_V1: u16 = 1;
 
 /// Sentinel for a key with no planned retirement.
 ///
@@ -245,6 +248,13 @@ impl ValidatorSet {
     pub fn id(&self) -> Result<[u8; 32], CryptoError> {
         let mut encoder = Encoder::with_capacity(64 + self.validators.len() * 64);
         encoder.put_bytes(DOMAIN_VALIDATOR_SET_V1.as_bytes())?;
+        self.put_fields(&mut encoder)?;
+        Ok(Sha256::digest(encoder.finish()).into())
+    }
+
+    /// Writes the canonical set body shared by [`ValidatorSet::id`] and
+    /// [`ValidatorSet::encode`].
+    fn put_fields(&self, encoder: &mut Encoder) -> Result<(), CryptoError> {
         encoder.put_u64(self.epoch);
         encoder.put_u32(count_field(self.validators.len(), "validators")?);
         for record in &self.validators {
@@ -258,7 +268,87 @@ impl ValidatorSet {
                 encoder.put_u64(key.retirement_epoch);
             }
         }
-        Ok(Sha256::digest(encoder.finish()).into())
+        Ok(())
+    }
+
+    /// Writes the canonical validator-set encoding.
+    ///
+    /// The encoding is the same body [`ValidatorSet::id`] hashes, prefixed with
+    /// [`VALIDATOR_SET_VERSION_V1`]. Decoding is structural; callers still run
+    /// [`ValidatorSet::validate`] or the transition checks before trusting it.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoErrorKind::FieldTooLong`] when a field or count exceeds the
+    /// canonical encoding limit.
+    pub fn encode(&self) -> Result<Vec<u8>, CryptoError> {
+        let mut encoder = Encoder::with_capacity(16 + self.validators.len() * 64);
+        encoder.put_u16(VALIDATOR_SET_VERSION_V1);
+        self.put_fields(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    /// Reads a canonical validator-set encoding.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoErrorKind::TruncatedInput`] or
+    /// [`CryptoErrorKind::TrailingBytes`] for a bad buffer,
+    /// [`CryptoErrorKind::InvalidKeySchedule`] for an unknown version, and
+    /// [`CryptoErrorKind::FieldTooLong`] for an oversized field or an
+    /// implausible count.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let mut decoder = Decoder::new(bytes);
+        let version = decoder.read_u16()?;
+        if version != VALIDATOR_SET_VERSION_V1 {
+            return Err(CryptoError::new(
+                CryptoErrorKind::InvalidKeySchedule,
+                format!("unsupported validator-set version {version}"),
+            ));
+        }
+        let epoch = decoder.read_u64()?;
+        let validator_count = decoder.read_u32()? as usize;
+        // Every record needs an id length and a key count. This keeps a hostile
+        // count from driving a long loop or a large allocation.
+        if validator_count > bytes.len() / 8 {
+            return Err(CryptoError::new(
+                CryptoErrorKind::FieldTooLong,
+                format!(
+                    "{validator_count} validators exceed the {} byte payload",
+                    bytes.len()
+                ),
+            ));
+        }
+        let mut validators = Vec::with_capacity(validator_count.min(1024));
+        for _ in 0..validator_count {
+            let validator_id = decoder.read_bytes()?.to_vec();
+            let key_count = decoder.read_u32()? as usize;
+            // A key needs two length prefixes, an algorithm id, and two epochs.
+            if key_count > bytes.len() / 26 {
+                return Err(CryptoError::new(
+                    CryptoErrorKind::FieldTooLong,
+                    format!("{key_count} keys exceed the {} byte payload", bytes.len()),
+                ));
+            }
+            let mut keys = Vec::with_capacity(key_count.min(1024));
+            for _ in 0..key_count {
+                let key_id = decoder.read_bytes()?.to_vec();
+                let algorithm_id = decoder.read_u16()?;
+                let public_key = decoder.read_bytes()?.to_vec();
+                let activation_epoch = decoder.read_u64()?;
+                let retirement_epoch = decoder.read_u64()?;
+                keys.push(ValidatorKey {
+                    key_id,
+                    algorithm_id,
+                    public_key,
+                    activation_epoch,
+                    retirement_epoch,
+                });
+            }
+            validators.push(ValidatorRecord { validator_id, keys });
+        }
+        decoder.finish()?;
+        Ok(Self { epoch, validators })
     }
 
     /// Returns the record for `validator_id`.
@@ -644,6 +734,22 @@ mod tests {
         };
         let signers = set.verify_signatures(&message, 100, &[entry]).unwrap();
         assert_eq!(signers, vec![b"v1".to_vec()]);
+    }
+
+    #[test]
+    fn a_set_roundtrips_and_keeps_its_id() {
+        let record = |id: &[u8], key_id: &[u8]| ValidatorRecord {
+            validator_id: id.to_vec(),
+            keys: vec![dummy_key(key_id, 0, NO_EXPIRY)],
+        };
+        let set = ValidatorSet {
+            epoch: 5,
+            validators: vec![record(b"v1", b"v1-k0"), record(b"v2", b"v2-k0")],
+        };
+        let encoded = set.encode().unwrap();
+        let decoded = ValidatorSet::decode(&encoded).unwrap();
+        assert_eq!(decoded, set);
+        assert_eq!(decoded.id().unwrap(), set.id().unwrap());
     }
 
     #[test]

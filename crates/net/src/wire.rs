@@ -9,7 +9,7 @@
 //! u32 body length || u64 sent-at nanos || u8 kind || payload
 //! ```
 //!
-//! Seven kinds share a link:
+//! Nine kinds share a link:
 //!
 //! - [`Message::Hello`] is the first frame on a link and names the chain.
 //! - [`Message::Vertex`] is the broadcast.
@@ -18,6 +18,8 @@
 //! - [`Message::Share`] carries one validator's signature over a header.
 //! - [`Message::SnapshotWant`] and [`Message::Snapshot`] are a snapshot link.
 //! - [`Message::Tx`] gossips one signed envelope so every node can track it.
+//! - [`Message::SetChange`] carries a transition certificate authorized by the
+//!   old set.
 //!
 //! The hello exists because a vertex is only meaningful on one chain: the chain id
 //! is part of what a validator signs, so a peer on another genesis would produce
@@ -38,7 +40,9 @@
 use crypto::encoding::{Decoder, Encoder};
 use crypto::{CryptoError, CryptoErrorKind};
 use tx::batch::Batch;
-use validator::{Certificate, CommitFrontier, Header, Share, Vertex, VertexId};
+use validator::{
+    Certificate, CommitFrontier, Header, Share, TransitionCertificate, Vertex, VertexId,
+};
 
 /// Largest body this parser will accept.
 ///
@@ -58,13 +62,14 @@ const KIND_SHARE: u8 = 5;
 const KIND_SNAPSHOT_WANT: u8 = 6;
 const KIND_SNAPSHOT: u8 = 7;
 const KIND_TX: u8 = 8;
+const KIND_SET_CHANGE: u8 = 9;
 
 /// The framing and message layout this build speaks.
 ///
 /// A peer that answers with another number is not necessarily hostile; it may be a
 /// different build. The link is closed rather than parsed optimistically, because
 /// the next frame kind could mean something else there.
-pub const WIRE_PROTOCOL: u16 = 5;
+pub const WIRE_PROTOCOL: u16 = 6;
 
 /// The first frame on every link: which chain the sender is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +145,11 @@ pub enum Message {
     /// the receiver re-checks the chain, policy, and signature before it is
     /// admitted, so a gossiped frame has the same trust as a client submission.
     Tx(Vec<u8>),
+    /// A validator-set transition certificate signed by the old-set quorum.
+    ///
+    /// The certificate carries the new set and is verified against the old set
+    /// the receiver already holds; activation is a separate step.
+    SetChange(Box<TransitionCertificate>),
 }
 
 /// One decoded frame.
@@ -375,6 +385,7 @@ pub fn frame(message: &Message, sent_at_nanos: u64) -> Result<Vec<u8>, CryptoErr
             encoder.put_bytes(envelope)?;
             encoder.finish()
         }),
+        Message::SetChange(certificate) => (KIND_SET_CHANGE, certificate.encode()?),
     };
     let length = u32::try_from(8 + 1 + payload.len()).map_err(|_| {
         CryptoError::new(
@@ -454,6 +465,7 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
             decoder.finish()?;
             Message::Tx(envelope)
         }
+        KIND_SET_CHANGE => Message::SetChange(Box::new(TransitionCertificate::decode(payload)?)),
         other => return Err(invalid(format!("unknown frame kind {other}"))),
     };
     buffer.drain(..total);
@@ -467,6 +479,8 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crypto::registry::ALG_ED25519;
+    use validator::{NO_EXPIRY, SetChange, ValidatorKey, ValidatorRecord, ValidatorSet};
 
     fn vertex(round: u64) -> Vertex {
         // Signatures are not checked by the codec, so a placeholder is enough here.
@@ -617,6 +631,42 @@ mod tests {
         let frame = take_frame(&mut buffer).unwrap().unwrap();
         assert_eq!(frame.message, Message::Snapshot(Box::new(snapshot)));
         assert_eq!(frame.sent_at_nanos, 13);
+    }
+
+    fn transition_certificate() -> TransitionCertificate {
+        let set = |epoch: u64, count: usize| ValidatorSet {
+            epoch,
+            validators: (0..count)
+                .map(|index| ValidatorRecord {
+                    validator_id: format!("val-{index}").into_bytes(),
+                    keys: vec![ValidatorKey {
+                        key_id: format!("val-{index}-k0").into_bytes(),
+                        algorithm_id: ALG_ED25519,
+                        public_key: vec![u8::try_from(index + 1).unwrap(); 32],
+                        activation_epoch: 0,
+                        retirement_epoch: NO_EXPIRY,
+                    }],
+                })
+                .collect(),
+        };
+        let old = set(1, 1);
+        let new = set(2, 2);
+        let change = SetChange::new(b"karsa-wire-1".to_vec(), &old, &new).unwrap();
+        TransitionCertificate {
+            change,
+            new_set: new,
+            signer_bitmap: vec![0b1],
+            signatures: vec![vec![9u8; 64]],
+        }
+    }
+
+    #[test]
+    fn a_set_change_frame_round_trips() {
+        let certificate = transition_certificate();
+        let mut buffer = frame(&Message::SetChange(Box::new(certificate.clone())), 17).unwrap();
+        let frame = take_frame(&mut buffer).unwrap().unwrap();
+        assert_eq!(frame.message, Message::SetChange(Box::new(certificate)));
+        assert_eq!(frame.sent_at_nanos, 17);
     }
 
     #[test]

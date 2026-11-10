@@ -20,13 +20,18 @@ use std::fmt;
 use crypto::domain::{
     DOMAIN_SET_TRANSITION_V1, SetChangeSigningFields, encode_set_change_signing_payload,
 };
-use crypto::encoding::Encoder;
+use crypto::encoding::{Decoder, Encoder};
 use crypto::scheme::verify_signature;
 use crypto::{CryptoError, CryptoErrorKind};
 use sha2::{Digest, Sha256};
 
 use crate::certificate::{bit_is_set, bitmap_len};
 use crate::schedule::{EpochSchedule, ValidatorKey, ValidatorRecord, ValidatorSet};
+
+/// Canonical set-change descriptor version.
+pub const SET_CHANGE_VERSION_V1: u16 = 1;
+/// Canonical transition-certificate version.
+pub const TRANSITION_CERTIFICATE_VERSION_V1: u16 = 1;
 
 /// The arithmetic of one checked transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +130,51 @@ impl SetChange {
         .map_err(SetChangeError::Encoding)
     }
 
+    /// Writes the canonical descriptor encoding.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoErrorKind::FieldTooLong`] when a field exceeds the encoding limit.
+    pub fn encode(&self) -> Result<Vec<u8>, CryptoError> {
+        let mut encoder = Encoder::with_capacity(128 + self.chain_id.len());
+        encoder.put_u16(SET_CHANGE_VERSION_V1);
+        encoder.put_bytes(&self.chain_id)?;
+        encoder.put_bytes(&self.old_set_id)?;
+        encoder.put_bytes(&self.new_set_id)?;
+        encoder.put_u64(self.activation_epoch);
+        encoder.put_bytes(&self.transition_hash)?;
+        Ok(encoder.finish())
+    }
+
+    /// Reads a canonical descriptor encoding.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoErrorKind::TruncatedInput`] or
+    /// [`CryptoErrorKind::TrailingBytes`] for a bad buffer,
+    /// [`CryptoErrorKind::MalformedCertificate`] for an unknown version, and
+    /// [`CryptoErrorKind::FieldTooLong`] for an oversized field.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let mut decoder = Decoder::new(bytes);
+        let version = decoder.read_u16()?;
+        if version != SET_CHANGE_VERSION_V1 {
+            return Err(codec(format!("unsupported set-change version {version}")));
+        }
+        let chain_id = decoder.read_bytes()?.to_vec();
+        let old_set_id = read_digest(&mut decoder, "old set id")?;
+        let new_set_id = read_digest(&mut decoder, "new set id")?;
+        let activation_epoch = decoder.read_u64()?;
+        let transition_hash = read_digest(&mut decoder, "transition hash")?;
+        decoder.finish()?;
+        Ok(Self {
+            chain_id,
+            old_set_id,
+            new_set_id,
+            activation_epoch,
+            transition_hash,
+        })
+    }
+
     /// Checks that the descriptor names exactly the supplied old and new sets.
     fn check_against(&self, old: &ValidatorSet, new: &ValidatorSet) -> Result<(), SetChangeError> {
         let old_set_id = old.id().map_err(SetChangeError::Encoding)?;
@@ -209,6 +259,82 @@ impl TransitionCertificate {
                 .map_err(SetChangeError::Signer)?;
         }
         Ok(transition)
+    }
+
+    /// Writes the canonical certificate encoding.
+    ///
+    /// # Errors
+    ///
+    /// Every error from [`SetChange::encode`] or [`ValidatorSet::encode`], plus
+    /// [`CryptoErrorKind::FieldTooLong`] for an oversized signature count.
+    pub fn encode(&self) -> Result<Vec<u8>, CryptoError> {
+        let change = self.change.encode()?;
+        let new_set = self.new_set.encode()?;
+        let mut encoder =
+            Encoder::with_capacity(change.len() + new_set.len() + self.signer_bitmap.len() + 64);
+        encoder.put_u16(TRANSITION_CERTIFICATE_VERSION_V1);
+        encoder.put_bytes(&change)?;
+        encoder.put_bytes(&new_set)?;
+        encoder.put_bytes(&self.signer_bitmap)?;
+        encoder.put_u32(count_field(self.signatures.len(), "signatures")?);
+        for signature in &self.signatures {
+            encoder.put_bytes(signature)?;
+        }
+        Ok(encoder.finish())
+    }
+
+    /// Reads a canonical certificate encoding.
+    ///
+    /// The bitmap is checked against the signature count, but not against the
+    /// old set: the old set is not part of this object. [`Self::verify`] does
+    /// the remaining shape and quorum checks.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoErrorKind::TruncatedInput`] or
+    /// [`CryptoErrorKind::TrailingBytes`] for a bad buffer,
+    /// [`CryptoErrorKind::MalformedCertificate`] for an unknown version or an
+    /// inconsistent bitmap and signature list, plus every error from
+    /// [`SetChange::decode`] or [`ValidatorSet::decode`].
+    pub fn decode(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let mut decoder = Decoder::new(bytes);
+        let version = decoder.read_u16()?;
+        if version != TRANSITION_CERTIFICATE_VERSION_V1 {
+            return Err(codec(format!(
+                "unsupported transition-certificate version {version}"
+            )));
+        }
+        let change = SetChange::decode(decoder.read_bytes()?)?;
+        let new_set = ValidatorSet::decode(decoder.read_bytes()?)?;
+        let signer_bitmap = decoder.read_bytes()?.to_vec();
+        let signature_count = decoder.read_u32()? as usize;
+        // Each signature has at least its four-byte length prefix.
+        if signature_count > bytes.len() / 4 {
+            return Err(codec(format!(
+                "{signature_count} signatures exceed the {} byte payload",
+                bytes.len()
+            )));
+        }
+        let mut signatures = Vec::with_capacity(signature_count.min(1024));
+        for _ in 0..signature_count {
+            signatures.push(decoder.read_bytes()?.to_vec());
+        }
+        decoder.finish()?;
+
+        let certificate = Self {
+            change,
+            new_set,
+            signer_bitmap,
+            signatures,
+        };
+        if certificate.signer_count() != certificate.signatures.len() {
+            return Err(codec(format!(
+                "bitmap marks {} signers but {} signatures are present",
+                certificate.signer_count(),
+                certificate.signatures.len()
+            )));
+        }
+        Ok(certificate)
     }
 
     /// Checks the bitmap and signature count against the old set.
@@ -529,6 +655,29 @@ pub fn check_transition(old: &ValidatorSet, new: &ValidatorSet) -> Result<Transi
     })
 }
 
+fn read_digest(decoder: &mut Decoder<'_>, what: &str) -> Result<[u8; 32], CryptoError> {
+    let bytes = decoder.read_bytes()?;
+    <[u8; 32]>::try_from(bytes).map_err(|_| {
+        CryptoError::new(
+            CryptoErrorKind::TruncatedInput,
+            format!("{what} is {} bytes, expected 32", bytes.len()),
+        )
+    })
+}
+
+fn count_field(count: usize, what: &str) -> Result<u32, CryptoError> {
+    u32::try_from(count).map_err(|_| {
+        CryptoError::new(
+            CryptoErrorKind::FieldTooLong,
+            format!("{what} count does not fit a u32"),
+        )
+    })
+}
+
+fn codec(detail: impl Into<String>) -> CryptoError {
+    CryptoError::new(CryptoErrorKind::MalformedCertificate, detail)
+}
+
 fn transition_hash(
     old_set_id: &[u8; 32],
     new_set_id: &[u8; 32],
@@ -782,6 +931,23 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn a_transition_certificate_roundtrips() {
+        let (old, new, signers) = fixture(4, 5);
+        let change = propose(&old, &new);
+        let encoded_change = change.encode().unwrap();
+        assert_eq!(SetChange::decode(&encoded_change).unwrap(), change);
+
+        let certificate = certificate(change, new, 4, &signers, 3);
+        let encoded = certificate.encode().unwrap();
+        let decoded = TransitionCertificate::decode(&encoded).unwrap();
+        assert_eq!(decoded, certificate);
+        assert_eq!(
+            decoded.verify(&old).unwrap(),
+            certificate.verify(&old).unwrap()
+        );
     }
 
     #[test]

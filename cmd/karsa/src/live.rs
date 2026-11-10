@@ -2122,6 +2122,11 @@ async fn node_task(
                     }
                     // Snapshots travel on their own link, not on the mesh.
                     Message::SnapshotWant | Message::Snapshot(_) => rejected += 1,
+                    // The old-set quorum authorizes the certificate, but the DAG
+                    // boundary and the store audit are not wired to it yet. A node
+                    // must not act on a change it cannot record, so drop the frame
+                    // until activation lands.
+                    Message::SetChange(_) => rejected += 1,
                 }
             }
             _ = stop_authoring.changed() => {
@@ -2858,6 +2863,9 @@ async fn archive_task(
                     // An archive has no RPC state, so a gossiped envelope has no
                     // record to attach to. It is ignored rather than stored.
                     Message::Tx(_) => {}
+                    // An archive has no schedule to activate. The certificate is
+                    // stored with the boundary when activation lands.
+                    Message::SetChange(_) => {}
                     // The accept side consumes the hello before the loop starts.
                     Message::Hello(_) => rejected += 1,
                 }
@@ -4018,6 +4026,16 @@ mod tests {
     fn another_wire_protocol_is_refused() {
         let hello = wire::Hello {
             protocol: wire::WIRE_PROTOCOL + 1,
+            chain_id: b"chain-a".to_vec(),
+        };
+        let error = check_hello(b"chain-a", &hello).unwrap_err();
+        assert!(error.contains("wire protocol"), "{error}");
+    }
+
+    #[test]
+    fn the_previous_wire_protocol_is_refused() {
+        let hello = wire::Hello {
+            protocol: wire::WIRE_PROTOCOL - 1,
             chain_id: b"chain-a".to_vec(),
         };
         let error = check_hello(b"chain-a", &hello).unwrap_err();
