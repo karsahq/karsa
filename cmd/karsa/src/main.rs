@@ -339,7 +339,8 @@ enum Command {
         /// Persist a live snapshot every N certified heights. Zero disables it.
         ///
         /// Needs --store and --execute; the checkpoint bounds how much history a
-        /// restart has to replay.
+        /// restart has to replay, and each write prunes vertices, payloads, and
+        /// headers below its floor.
         #[arg(long, default_value_t = 0)]
         checkpoint_every: u64,
     },

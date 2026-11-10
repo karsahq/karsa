@@ -81,7 +81,7 @@ echo "  home      $DEVNET"
 echo "  p2p       $PORT_BASE..$((PORT_BASE + VALIDATORS - 1))"
 echo "  rpc       http://127.0.0.1:$RPC_PORT..$((RPC_PORT + VALIDATORS - 1))"
 echo "  snapshot  $SNAPSHOT_PORT..$((SNAPSHOT_PORT + VALIDATORS - 1))"
-echo "  checkpoint every $CHECKPOINT_EVERY certified heights (0 disables)"
+echo "  checkpoint every $CHECKPOINT_EVERY certified heights (0 disables; each write prunes below its floor)"
 echo "  send      $BIN send --home $DEVNET --rpc 127.0.0.1:$RPC_PORT --from 0 --to 1 --amount 1 --wait"
 echo "  logs      $DEVNET/val-*.log"
 

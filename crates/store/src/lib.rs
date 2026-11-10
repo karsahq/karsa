@@ -159,6 +159,8 @@ pub struct LiveSnapshot {
 pub struct PruneReport {
     /// Vertices removed from the log.
     pub vertices: usize,
+    /// Certified headers removed from the log.
+    pub headers: usize,
     /// Batches whose payload was removed.
     pub batches_dropped: usize,
     /// Batches whose payload was kept because no shard backs it.
@@ -460,27 +462,8 @@ impl Store {
     /// [`StoreError::Io`] on write failure, [`StoreError::Decode`] when either
     /// object does not encode or the record exceeds the length field.
     pub fn put_header(&self, header: &Header, certificate: &Certificate) -> Result<(), StoreError> {
-        let header = header.encode()?;
-        let certificate = certificate.encode()?;
-        let mut record = Vec::with_capacity(8 + header.len() + certificate.len());
-        let header_len = u32::try_from(header.len()).map_err(|_| {
-            StoreError::Decode(CryptoError::new(
-                crypto::CryptoErrorKind::FieldTooLong,
-                "header does not fit a u32 length",
-            ))
-        })?;
-        let certificate_len = u32::try_from(certificate.len()).map_err(|_| {
-            StoreError::Decode(CryptoError::new(
-                crypto::CryptoErrorKind::FieldTooLong,
-                "certificate does not fit a u32 length",
-            ))
-        })?;
-        record.extend_from_slice(&header_len.to_le_bytes());
-        record.extend_from_slice(&header);
-        record.extend_from_slice(&certificate_len.to_le_bytes());
-        record.extend_from_slice(&certificate);
-        append_record(&self.path_of(HEADERS_FILE), &record)?;
-        Ok(())
+        let record = encode_header_record(header, certificate)?;
+        append_record(&self.path_of(HEADERS_FILE), &record)
     }
 
     /// Reads every certified header, last write per height, sorted by height.
@@ -712,7 +695,7 @@ impl Store {
     /// which round a batch belonged to, so there is no way to age it out later.
     /// A longer payload window therefore means a longer vertex window too.
     ///
-    /// Both logs are rewritten through a temporary file and renamed into place, so a
+    /// Each log is rewritten through a temporary file and renamed into place, so a
     /// crash leaves either the old log or the new one.
     ///
     /// # Errors
@@ -720,6 +703,47 @@ impl Store {
     /// [`StoreError::Io`] on read or write failure, [`StoreError::Decode`] when a
     /// record does not decode.
     pub fn prune_below(&self, round: u64, min_shards: usize) -> Result<PruneReport, StoreError> {
+        self.prune_records(round, min_shards, None)
+    }
+
+    /// Drops everything the stored live snapshot already covers.
+    ///
+    /// The live snapshot is the trust anchor a restart resumes from: it carries
+    /// the state, the committed order prefix, and the certificate for its header.
+    /// Everything at or below its floor has therefore been decided, and the tail
+    /// above it is all a restart still has to replay. Certified headers below the
+    /// anchor height go too; the anchor's own header is kept, so an audit and a
+    /// restart still see the certified height they resume above.
+    ///
+    /// `min_shards` has the same meaning as in [`Store::prune_below`]. A live node
+    /// that stores whole payloads is outside the erasure set and passes zero; a node
+    /// that holds one shard per batch passes one. A payload named by a kept vertex
+    /// is never dropped, because the vertex may still be committed after the restart.
+    ///
+    /// With no live snapshot, or with one whose floor is absent, nothing is dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on read or write failure, [`StoreError::Decode`] when a
+    /// record does not decode.
+    pub fn prune_to_checkpoint(&self, min_shards: usize) -> Result<PruneReport, StoreError> {
+        let Some(snapshot) = self.live_snapshot()? else {
+            return Ok(PruneReport::default());
+        };
+        let Some(floor) = snapshot.floor else {
+            return Ok(PruneReport::default());
+        };
+        let report = self.prune_records(floor, min_shards, Some(snapshot.header.height))?;
+        self.trim_clock(floor)?;
+        Ok(report)
+    }
+
+    fn prune_records(
+        &self,
+        round: u64,
+        min_shards: usize,
+        keep_headers_from: Option<u64>,
+    ) -> Result<PruneReport, StoreError> {
         let vertices = self.vertices()?;
         let kept: Vec<&Vertex> = vertices
             .iter()
@@ -744,6 +768,9 @@ impl Store {
             if path.exists() {
                 before += fs::metadata(&path)?.len();
             }
+        }
+        if keep_headers_from.is_some() && self.path_of(HEADERS_FILE).exists() {
+            before += fs::metadata(self.path_of(HEADERS_FILE))?.len();
         }
 
         let mut kept_batches = Vec::new();
@@ -779,6 +806,26 @@ impl Store {
         if report.batches_dropped > 0 {
             rewrite(&self.path_of(BATCHES_FILE), &kept_batches)?;
         }
+        if let Some(keep_from) = keep_headers_from {
+            let headers = self.headers()?;
+            let removed = headers
+                .iter()
+                .filter(|record| record.header.height < keep_from)
+                .count();
+            if removed > 0 {
+                let mut encoded = Vec::new();
+                for record in headers
+                    .iter()
+                    .filter(|record| record.header.height >= keep_from)
+                {
+                    let bytes = encode_header_record(&record.header, &record.certificate)?;
+                    encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    encoded.extend_from_slice(&bytes);
+                }
+                rewrite(&self.path_of(HEADERS_FILE), &encoded)?;
+            }
+            report.headers = removed;
+        }
 
         let mut after: u64 = 0;
         for name in [VERTICES_FILE, BATCHES_FILE] {
@@ -786,6 +833,9 @@ impl Store {
             if path.exists() {
                 after += fs::metadata(&path)?.len();
             }
+        }
+        if keep_headers_from.is_some() && self.path_of(HEADERS_FILE).exists() {
+            after += fs::metadata(self.path_of(HEADERS_FILE))?.len();
         }
         report.bytes_freed = before.saturating_sub(after);
 
@@ -1217,6 +1267,30 @@ impl Store {
     }
 }
 
+/// Encodes one `u32 header len || header || u32 certificate len || certificate`.
+fn encode_header_record(header: &Header, certificate: &Certificate) -> Result<Vec<u8>, StoreError> {
+    let header = header.encode()?;
+    let certificate = certificate.encode()?;
+    let mut record = Vec::with_capacity(8 + header.len() + certificate.len());
+    let header_len = u32::try_from(header.len()).map_err(|_| {
+        StoreError::Decode(CryptoError::new(
+            crypto::CryptoErrorKind::FieldTooLong,
+            "header does not fit a u32 length",
+        ))
+    })?;
+    let certificate_len = u32::try_from(certificate.len()).map_err(|_| {
+        StoreError::Decode(CryptoError::new(
+            crypto::CryptoErrorKind::FieldTooLong,
+            "certificate does not fit a u32 length",
+        ))
+    })?;
+    record.extend_from_slice(&header_len.to_le_bytes());
+    record.extend_from_slice(&header);
+    record.extend_from_slice(&certificate_len.to_le_bytes());
+    record.extend_from_slice(&certificate);
+    Ok(record)
+}
+
 /// Decodes one `u32 header len || header || u32 certificate len || certificate`.
 fn decode_header_record(bytes: &[u8]) -> Result<CertifiedHeader, CryptoError> {
     if bytes.len() < 8 {
@@ -1617,6 +1691,92 @@ mod tests {
         assert_eq!(report.batches_dropped, 0);
         assert_eq!(report.batches_held, 1);
         assert_eq!(store.batches().unwrap(), vec![payload]);
+    }
+
+    #[test]
+    fn a_checkpoint_prune_drops_everything_below_its_floor() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        for round in 0..6u64 {
+            let payload = batch(round + 1);
+            store.put_batch(&payload).unwrap();
+            store.append_vertex(&vertex(round, &payload)).unwrap();
+            store
+                .put_header(&header(round), &certificate(round))
+                .unwrap();
+        }
+        store
+            .put_live_snapshot(&LiveSnapshot {
+                round: 4,
+                floor: Some(3),
+                cursor: 5,
+                applied: 40,
+                state: b"state".to_vec(),
+                order: Vec::new(),
+                header: header(4),
+                certificate: certificate(4),
+            })
+            .unwrap();
+
+        let report = store.prune_to_checkpoint(0).unwrap();
+        assert_eq!(report.vertices, 4, "rounds 0 through 3 are covered");
+        assert_eq!(report.headers, 4, "heights below the anchor are gone");
+        assert!(report.bytes_freed > 0);
+
+        let kept: Vec<u64> = store
+            .vertices()
+            .unwrap()
+            .iter()
+            .map(|vertex| vertex.round)
+            .collect();
+        assert_eq!(kept, vec![4, 5]);
+        assert_eq!(
+            store.batches().unwrap(),
+            vec![batch(5), batch(6)],
+            "only payloads a kept vertex names survive"
+        );
+        let heights: Vec<u64> = store
+            .headers()
+            .unwrap()
+            .iter()
+            .map(|record| record.header.height)
+            .collect();
+        assert_eq!(
+            heights,
+            vec![4, 5],
+            "the anchor's own header stays so a restart and an audit see it"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_without_a_floor_drops_nothing() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        for round in 0..3u64 {
+            let payload = batch(round + 1);
+            store.put_batch(&payload).unwrap();
+            store.append_vertex(&vertex(round, &payload)).unwrap();
+            store
+                .put_header(&header(round), &certificate(round))
+                .unwrap();
+        }
+        store
+            .put_live_snapshot(&LiveSnapshot {
+                round: 2,
+                floor: None,
+                cursor: 3,
+                applied: 20,
+                state: b"state".to_vec(),
+                order: Vec::new(),
+                header: header(2),
+                certificate: certificate(2),
+            })
+            .unwrap();
+
+        let report = store.prune_to_checkpoint(0).unwrap();
+        assert_eq!(report, PruneReport::default());
+        assert_eq!(store.vertices().unwrap().len(), 3);
+        assert_eq!(store.headers().unwrap().len(), 3);
     }
 
     #[test]

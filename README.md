@@ -112,7 +112,12 @@ which are still open.
   drops everything at or below a state snapshot, so restart replays only the tail,
   and it will only drop a payload this node cannot lose: a batch is deletable when
   nothing in the retained tail names it **and** a shard of it is already on disk.
-  A node holding no shards keeps every payload, and the report says so.
+  The retention path (`karsa prune`) keeps every payload on a node holding no
+  shards and says so. A live checkpoint (`--checkpoint-every`) applies the same
+  vertex and payload rule at its DAG floor (whole-payload nodes pass
+  `min_shards = 0`, `--shard` nodes pass 1) and also drops certified headers
+  below the anchor height; the anchor header itself stays, so a restart and an
+  audit still start where they resume.
   `karsa persist` saves, prunes, drops the simulation, reopens, replays, and fails
   unless the state root comes back identical. It also records the chain the
   directory belongs to, and refuses to open against another genesis.
@@ -191,6 +196,12 @@ which are still open.
   `VERIFY_THREADS` default follows the per-process CPU slice, because verifier
   threads are the leverage, not the process boundary (finding 26); set
   `VERIFY_THREADS=1` only to reproduce the old serial configuration.
+  `--snapshot-port N` serves a state snapshot plus the DAG tail above a floor over
+  TCP, and `--sync-from-peers` fetches one from a peer above the stored certified
+  head instead of replaying history it does not have. `--checkpoint-every N`
+  writes `live.snapshot` every N certified heights and prunes vertices, payloads,
+  and headers below its floor; it needs `--execute` and `--store` (findings 36–37).
+  `scripts/devnet.sh` brings up four such processes from one home.
 - `karsa finality`: the client-side metric `live` cannot produce. A closed-loop
   client submits a signed batch to validator 0; a vertex names it, the same
   pacemaker decides it, and the commit is written into a header that the
@@ -255,7 +266,7 @@ which are still open.
   key), and `POST /epoch`. With `--config node.toml` it binds to
   `network.rpc_listen` and writes the file with defaults first if it is missing,
   instead of refusing its own first run.
-- 278 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 379 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
@@ -760,6 +771,96 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     the payloads the tail executes changed it to 1–4, so the byte model reflects
     the transfer. The full gate is green on the measured tree (355 tests
     default, 356 with all features).
+
+35. **A restarted validator reconnects and catches up without stalling finality.**
+    An outbound link is rebuilt after a drop, the frame that failed mid-write is
+    retried on the new socket, and the last 1,024 shares are replayed to a peer
+    that returns. A share whose height below it is not certified waits for the gap
+    instead of being applied out of order, and shares older than the window are
+    dropped. This closed a permanent stall: shares are produced once and were
+    never repeated, so one lost share stopped that node's finality. Measured on
+    four loopback processes on the Intel i7-4790K (4 cores / 8 threads): a node
+    stopped for 10 s resumed with the observer's head 625 → 1,105 and committed
+    2,819 → 4,751, 0 conflicts. A full restart from the store put node 2 at head
+    1,686 against 1,686 and committed 7,887 against 7,890, 0 conflicts. A signed
+    transfer sent after recovery finalized in 106 ms; all four nodes reached
+    head 1,898 with state root `86387ef2bd72`, one applied transaction, 0 conflicts,
+    and a verified commit proof; `karsa audit` on the recovered store re-derived
+    3,053 of 3,053 heights. The replay window is 1,024 shares, about 15 s at this
+    machine's certificate rate, so a longer outage needs the snapshot resync in
+    finding 36. Recovery is not instant: after a 10 s outage the returning node
+    was still at 1,487 against 2,020 after a 35 s run.
+
+36. **A store that already has history moves forward by adopting a peer snapshot.**
+    `--sync-from-peers` fetches a snapshot over TCP, verifies the anchor's quorum
+    certificate, state root, and `dag_root`, and adopts it only when its height is
+    above the stored certified head. The anchor, state, order prefix, floor, and
+    tail are written to `live.snapshot`, so the next restart resumes from it
+    instead of replaying history the node never had. Measured: a node at stored
+    head 552 adopted a peer snapshot at height 1,068 and reached head 1,131 against
+    1,130 on node 0, with commit root `2517def7…` and 0 conflicts. The next restart
+    on the old store plus `live.snapshot` had all four nodes at head 2,636, commit
+    root `c86d8123…`, 0 conflicts. A peer snapshot below the stored head is refused
+    after 15 s rather than moving the store backwards. The snapshot still carries
+    the full committed order prefix (finding 37), not a Merkle frontier. On the
+    pruning run, a node that had history to height 1,169 adopted a peer snapshot
+    at height 1,862 (floor 1,346), pruned the 24 old vertices and 2 headers it
+    still held, and ended on the same commit root `b98f42ae…` as the three nodes
+    that stayed up. A restart then restored all four from checkpoints around
+    2,487–2,504 and reached head 3,083, commit root `755d22f0…`, 0 conflicts;
+    `karsa audit` on the resynced store re-derived 58 of 58 heights on both roots.
+
+37. **A checkpoint bounds the replay tail, and its floor bounds the history files.**
+    `--checkpoint-every N` writes `live.snapshot` every N certified heights (it
+    needs `--execute` and `--store`); a head whose floor is not safe to prune is
+    skipped. Each successful checkpoint also prunes: vertices at or below the
+    snapshot floor, payloads no kept vertex names, and certified headers below the
+    anchor height. The anchor's own header is kept, so a restart and `karsa audit`
+    still see the certified height they resume above. A payload named by a kept
+    vertex stays, because that vertex may still be committed after the restart.
+    The interval is measured from the checkpoint or head the run resumed at, so a
+    large N does not fire a checkpoint immediately after a restart.
+    - Single process, 200 rounds, every 64 heights: 8 writes at heights 64–96 and
+      155–160; a restart from checkpoint 129 restored order 797 to head 176, with
+      all four nodes agreeing.
+    - Four-process devnet, every 1,024 heights: a restart resumed from checkpoint
+      1,405, wrote 1,934, and all four nodes ended on commit root `28de7f08…`.
+    - Pruning run, every 128 heights, 35 s: 13 checkpoints, each dropping about
+      700 vertices, 150–175 headers, 0–1 batches, and 400–480 kB; after the last
+      checkpoint the logs held 6.5 kB of vertices, 513 B of headers, and 0 batches.
+      A restart from checkpoints 2,197–2,310 replayed the tail to head 3,802 on all
+      four nodes, commit root `2042ff83…`, state root `20c162bd…`, one applied
+      transaction, 0 conflicts.
+    - `karsa audit` re-derived 235 of 235 heights on both `state_root` and `dag_root`
+      above a checkpoint 235 heights behind the head; a store checkpointed at the
+      head reported 0 of 0 heights and verified the anchor certificate instead.
+    The checkpoint file is still the full committed order prefix, so it grows with
+    height (~1.4 MB at head 3,802 here); pruning bounds the append-only logs,
+    not `live.snapshot`. A Merkle frontier is the next lever. The floor rule is
+    the snapshot one (two-round margin, round 0 never pruned, whole-DAG fallback).
+    Whole-payload nodes prune with `min_shards = 0`; `--shard` nodes pass 1.
+    Restart from checkpoint is now covered by an automated in-process test:
+    four nodes author 20 rounds with `checkpoint_every = 2`, drain for a second
+    so the committed prefix catches up, assert that no vertex below the floor and
+    the anchor header survive, restart from the same stores, and audit the pruned
+    store. The store prune, the checkpoint cadence, and the two config checks also
+    have unit tests.
+
+38. **A four-validator devnet is a script, not an in-process flag.**
+    `scripts/devnet.sh` starts one `karsa live --node-index i` process per
+    validator from a real home, writes the genesis once (the init path refuses
+    when `keys.json` exists), registers each validator in `peers.json`, sets the
+    store, RPC, snapshot, and checkpoint paths, and writes one log per node.
+    `RESET=1` wipes the directory; the default checkpoint is every 1,024 heights.
+    Cold: all four nodes completed, commit root `4d4aec7c…`, state root
+    `690cb32b…`; a restart restored all four, commit root `d95a3702…`; `karsa
+    send --home` submitted a signed transfer on chain `b920e1221bd1`, finalized
+    in 106 ms, and the commit proof verified. This is a devnet, not a deployment:
+    every process runs on loopback under one user, and `peers.json` is
+    informational because the live mesh still derives endpoints from
+    `--port-base`. `WIRE_PROTOCOL` is 3, so an old and a new node refuse each
+    other at the handshake. The gate is green on this tree (379 tests default,
+    380 with all features).
 
 ## Build order
 

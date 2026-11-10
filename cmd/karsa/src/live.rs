@@ -207,8 +207,9 @@ pub struct Config {
     pub sync_from_peers: bool,
     /// Persist a live snapshot every N certified heights. Zero disables it.
     ///
-    /// The checkpoint bounds the history a restart has to replay. It needs a store
-    /// and execution, because the snapshot carries the state.
+    /// The checkpoint bounds the history a restart has to replay, and each write
+    /// prunes the logs below its floor. It needs a store and execution, because
+    /// the snapshot carries the state.
     pub checkpoint_every: u64,
 }
 
@@ -705,6 +706,19 @@ struct Restored {
     head_height: u64,
     /// Height of the stored snapshot the restart resumed from, when it used one.
     checkpoint: Option<u64>,
+}
+
+/// The height a restarted run measures its checkpoint interval from.
+///
+/// A restored checkpoint is the last anchor a restart resumed from, so the
+/// interval continues from it rather than from process start. A store replayed
+/// without a checkpoint resumes at its certified head, and a snapshot join
+/// resumes at the adopted anchor.
+fn resumed_checkpoint_height(restored: Option<&Restored>, certified: Option<u64>) -> u64 {
+    match restored {
+        Some(restored) => restored.checkpoint.unwrap_or(restored.head_height),
+        None => certified.unwrap_or(0),
+    }
 }
 
 /// The live state a restart rebuilds.
@@ -1761,6 +1775,21 @@ async fn node_task(
             adopted.batches,
             hex::encode(&state_root[..6])
         );
+        if let Some(store) = &store {
+            // A resync moves a store that already has history forward. The data
+            // below the adopted floor can no longer be reached by a restart, so
+            // dropping it here is what keeps the directory from growing with a
+            // history the node has already left behind.
+            let pruned = store
+                .prune_to_checkpoint(usize::from(config.shard))
+                .map_err(|error| error.to_string())?;
+            if pruned.vertices > 0 || pruned.headers > 0 {
+                println!(
+                    "  node val-{index} pruned {} vertices, {} headers, {} batches below the adopted floor",
+                    pruned.vertices, pruned.headers, pruned.batches_dropped
+                );
+            }
+        }
         let anchor = adopted.anchor.clone();
         let certificate = adopted.certificate.clone();
         let applied_count = adopted.applied;
@@ -1844,7 +1873,14 @@ async fn node_task(
     let mut gave_up = 0u64;
     let mut ticks: u32 = 0;
     let mut cursor: u64 = node.cursor();
-    let mut last_checkpoint: u64 = 0;
+    // The interval is measured from the checkpoint or head this run resumed at,
+    // not from process start: otherwise a restart with a large interval would
+    // fire a checkpoint (and now a prune) as soon as the head passed the
+    // interval, however little history had been added since the last one.
+    let mut last_checkpoint = resumed_checkpoint_height(
+        restored.as_ref(),
+        last_certified.as_ref().map(|(header, _)| header.height),
+    );
     let mut announced = false;
     let mut first_author_ms: Option<u64> = None;
     let mut last_author_ms: Option<u64> = None;
@@ -2392,8 +2428,17 @@ async fn node_task(
                             certificate: snapshot.certificate,
                         })
                         .map_err(|error| error.to_string())?;
+                    // The checkpoint is also the licence to prune: its floor is
+                    // the lowest round still reachable by a restart, and its
+                    // anchor header is the oldest one an audit still walks.
+                    let pruned = store
+                        .prune_to_checkpoint(usize::from(config.shard))
+                        .map_err(|error| error.to_string())?;
                     last_checkpoint = height;
-                    eprintln!("node {index} checkpoint at height {height}");
+                    eprintln!(
+                        "node {index} checkpoint at height {height} (pruned {} vertices, {} headers, {} batches, {} bytes)",
+                        pruned.vertices, pruned.headers, pruned.batches_dropped, pruned.bytes_freed
+                    );
                 }
             }
             _ = shutdown.changed() => break,
@@ -3923,6 +3968,154 @@ mod tests {
             sync_from_peers: false,
             checkpoint_every: 0,
         }
+    }
+
+    /// A temp directory removed when the test ends.
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "karsa-live-{name}-{}-{sequence}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Finds one contiguous port range the mesh can bind.
+    fn a_free_port_base(validators: usize) -> u16 {
+        for base in (20000u16..50000).step_by(8) {
+            let mut probes = Vec::new();
+            let mut free = true;
+            for offset in 0..validators {
+                let Ok(offset) = u16::try_from(offset) else {
+                    free = false;
+                    break;
+                };
+                let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", base + offset)) else {
+                    free = false;
+                    break;
+                };
+                probes.push(listener);
+            }
+            if free {
+                drop(probes);
+                return base;
+            }
+        }
+        panic!("no free contiguous port range for the live mesh");
+    }
+
+    fn mesh_config(dir: &TestDir, port_base: u16, rounds: u64, checkpoint_every: u64) -> Config {
+        Config {
+            validators: 4,
+            port_base,
+            rounds,
+            slow_ms: 0,
+            timeout: Duration::from_secs(30),
+            queue: 64,
+            send_buffer: 0,
+            txs: 0,
+            archives: 0,
+            node_index: None,
+            execute: true,
+            store: dir.0.clone(),
+            shard: false,
+            drain: Duration::from_secs(1),
+            home: None,
+            profile: false,
+            pre_sign: false,
+            verify_threads: 1,
+            rpc_port: 0,
+            rpc_batch_max: rpc::DEFAULT_BATCH_MAX,
+            snapshot_port: 0,
+            sync_from_peers: false,
+            checkpoint_every,
+        }
+    }
+
+    #[test]
+    fn a_mesh_restarts_from_a_checkpoint_and_audits() {
+        let dir = TestDir::new("checkpoint-restart");
+        let first = run(mesh_config(&dir, a_free_port_base(4), 20, 2));
+        assert!(first.is_ok(), "the first run failed: {first:?}");
+
+        for index in 0..4 {
+            let store = Store::open(dir.0.join(format!("val-{index}"))).unwrap();
+            let snapshot = store
+                .live_snapshot()
+                .unwrap()
+                .unwrap_or_else(|| panic!("node {index} finished without writing a checkpoint"));
+            let floor = snapshot.floor.expect("a checkpoint always has a floor");
+            for vertex in store.vertices().unwrap() {
+                assert!(
+                    vertex.round > floor,
+                    "node {index} kept vertex round {} below floor {floor}",
+                    vertex.round
+                );
+            }
+            let anchor_headers: Vec<u64> = store
+                .headers()
+                .unwrap()
+                .iter()
+                .map(|record| record.header.height)
+                .collect();
+            assert_eq!(
+                anchor_headers.first().copied(),
+                Some(snapshot.header.height),
+                "the checkpoint anchor is the oldest header on disk"
+            );
+        }
+
+        // Restart from the same stores. The pruned history cannot be replayed
+        // from genesis, so a successful run means restore_live used the
+        // checkpoint, and the convergence check inside run means four nodes
+        // agreed on the result.
+        let second = run(mesh_config(&dir, a_free_port_base(4), 5, 0));
+        assert!(second.is_ok(), "the restart failed: {second:?}");
+
+        let store = Store::open(dir.0.join("val-0")).unwrap();
+        assert!(
+            store.live_snapshot().unwrap().is_some(),
+            "the restart must not discard the checkpoint"
+        );
+        crate::audit::run(dir.0.join("val-0"), 4, None)
+            .expect("a checkpoint-pruned store must audit above its anchor");
+    }
+
+    #[test]
+    fn the_checkpoint_interval_continues_from_the_resumed_head() {
+        let restored = Restored {
+            state_root: [0; 32],
+            applied: 0,
+            order_len: 0,
+            head_height: 176,
+            checkpoint: Some(129),
+        };
+        assert_eq!(
+            resumed_checkpoint_height(Some(&restored), Some(176)),
+            129,
+            "the interval continues from the checkpoint, not from process start"
+        );
+        let full_store = Restored {
+            checkpoint: None,
+            ..restored
+        };
+        assert_eq!(resumed_checkpoint_height(Some(&full_store), Some(176)), 176);
+        assert_eq!(resumed_checkpoint_height(None, Some(42)), 42);
+        assert_eq!(resumed_checkpoint_height(None, None), 0);
     }
 
     #[test]
