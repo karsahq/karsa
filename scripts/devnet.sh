@@ -29,6 +29,7 @@ DEVNET=${DEVNET:-/tmp/karsa-devnet}
 PORT_BASE=${PORT_BASE:-7600}
 RPC_PORT=${RPC_PORT:-7610}
 SNAPSHOT_PORT=${SNAPSHOT_PORT:-7620}
+CHECKPOINT_EVERY=${CHECKPOINT_EVERY:-1024}
 BIN=${BIN:-target/release/karsa}
 VALIDATORS=4
 
@@ -67,6 +68,7 @@ while [ "$i" -lt "$VALIDATORS" ]; do
         --execute \
         --txs 0 \
         --timeout-seconds "$LIFETIME" \
+        --checkpoint-every "$CHECKPOINT_EVERY" \
         --home "$DEVNET" \
         --store "$DEVNET/data" \
         > "$DEVNET/val-$i.log" 2>&1 &
@@ -79,6 +81,7 @@ echo "  home      $DEVNET"
 echo "  p2p       $PORT_BASE..$((PORT_BASE + VALIDATORS - 1))"
 echo "  rpc       http://127.0.0.1:$RPC_PORT..$((RPC_PORT + VALIDATORS - 1))"
 echo "  snapshot  $SNAPSHOT_PORT..$((SNAPSHOT_PORT + VALIDATORS - 1))"
+echo "  checkpoint every $CHECKPOINT_EVERY certified heights (0 disables)"
 echo "  send      $BIN send --home $DEVNET --rpc 127.0.0.1:$RPC_PORT --from 0 --to 1 --amount 1 --wait"
 echo "  logs      $DEVNET/val-*.log"
 

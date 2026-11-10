@@ -336,6 +336,12 @@ enum Command {
         /// to the peer's certified anchor.
         #[arg(long)]
         sync_from_peers: bool,
+        /// Persist a live snapshot every N certified heights. Zero disables it.
+        ///
+        /// Needs --store and --execute; the checkpoint bounds how much history a
+        /// restart has to replay.
+        #[arg(long, default_value_t = 0)]
+        checkpoint_every: u64,
     },
     /// Sign a transfer with a committee account and submit it to a live RPC node.
     Send {
@@ -555,6 +561,7 @@ fn main() -> ExitCode {
             rpc_batch_max,
             snapshot_port,
             sync_from_peers,
+            checkpoint_every,
         } => live::run(live::Config {
             validators,
             port_base,
@@ -578,6 +585,7 @@ fn main() -> ExitCode {
             rpc_batch_max,
             snapshot_port,
             sync_from_peers,
+            checkpoint_every,
         }),
         Command::Send {
             rpc,

@@ -113,6 +113,11 @@ const SNAPSHOT_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const SNAPSHOT_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 /// Per-`applied` states kept so a certified head's state can be served.
 const SNAPSHOT_STATES: usize = 256;
+/// Ticks between attempts to write a periodic checkpoint.
+///
+/// Building one clones the state, the committed prefix, and the tail. A head whose
+/// floor is not safe to prune must not make that work happen on every 2 ms tick.
+const CHECKPOINT_TICKS: u32 = 250;
 /// Rounds kept above the certified head when choosing a snapshot floor.
 ///
 /// A vertex at the head's round may still be in flight to the snapshot peer, so
@@ -197,9 +202,14 @@ pub struct Config {
     pub snapshot_port: u16,
     /// Ask a peer for a state snapshot at startup instead of replaying history.
     ///
-    /// Used when this node's store is empty. The joiner still verifies the
-    /// anchor's quorum certificate before adopting anything.
+    /// The joiner still verifies the anchor's quorum certificate. A store with
+    /// history is moved forward to a snapshot above its certified head.
     pub sync_from_peers: bool,
+    /// Persist a live snapshot every N certified heights. Zero disables it.
+    ///
+    /// The checkpoint bounds the history a restart has to replay. It needs a store
+    /// and execution, because the snapshot carries the state.
+    pub checkpoint_every: u64,
 }
 
 /// Wall time spent in the stages the live loop can name.
@@ -693,6 +703,8 @@ struct Restored {
     applied: usize,
     order_len: usize,
     head_height: u64,
+    /// Height of the stored snapshot the restart resumed from, when it used one.
+    checkpoint: Option<u64>,
 }
 
 /// The live state a restart rebuilds.
@@ -864,6 +876,7 @@ fn restore(
             .finalizer
             .as_ref()
             .map_or(0, |finalizer| finalizer.head().height),
+        checkpoint: None,
     }))
 }
 
@@ -988,6 +1001,7 @@ fn restore_live(
         applied: *live.applied,
         order_len: node.dag().order().len(),
         head_height: finalizer.head().height,
+        checkpoint: Some(anchor_height),
     })
 }
 
@@ -1791,7 +1805,7 @@ async fn node_task(
     }
 
     let mut state_history: VecDeque<(u64, State)> = VecDeque::new();
-    if config.snapshot_port > 0 {
+    if config.snapshot_port > 0 || config.checkpoint_every > 0 {
         remember_state(
             &mut state_history,
             u64::try_from(applied).unwrap_or(u64::MAX),
@@ -1830,6 +1844,7 @@ async fn node_task(
     let mut gave_up = 0u64;
     let mut ticks: u32 = 0;
     let mut cursor: u64 = node.cursor();
+    let mut last_checkpoint: u64 = 0;
     let mut announced = false;
     let mut first_author_ms: Option<u64> = None;
     let mut last_author_ms: Option<u64> = None;
@@ -2191,7 +2206,7 @@ async fn node_task(
                                 &state,
                             );
                         }
-                        if config.snapshot_port > 0 {
+                        if config.snapshot_port > 0 || config.checkpoint_every > 0 {
                             remember_state(
                                 &mut state_history,
                                 u64::try_from(applied).unwrap_or(u64::MAX),
@@ -2340,6 +2355,45 @@ async fn node_task(
                             broadcast(&outbound, true, &bytes, &mut dropped);
                         }
                     }
+                }
+
+                // A checkpoint is a fresh anchor for the next restart. Without
+                // one, replay starts at the last snapshot the node adopted and
+                // grows with uptime; with one, the tail is at most this interval.
+                // A head whose state is no longer retained, or whose order length
+                // the finalizer does not know, simply waits for the next one.
+                if config.checkpoint_every > 0
+                    && ticks % CHECKPOINT_TICKS == 0
+                    && let Some(store) = &store
+                    && let Some(finalizer) = finalizer.as_ref()
+                    && last_certified.as_ref().is_some_and(|(header, _)| {
+                        header.height
+                            >= last_checkpoint.saturating_add(config.checkpoint_every)
+                    })
+                    && let Some(snapshot) = build_live_snapshot(
+                        &node,
+                        finalizer,
+                        last_certified.as_ref(),
+                        &state_history,
+                        &batches,
+                    )
+                    && snapshot.floor.is_some()
+                {
+                    let height = snapshot.anchor.height;
+                    store
+                        .put_live_snapshot(&store::LiveSnapshot {
+                            round: snapshot.anchor.round,
+                            floor: snapshot.floor,
+                            cursor: snapshot.cursor,
+                            applied: snapshot.anchor.applied,
+                            state: snapshot.state,
+                            order: snapshot.order,
+                            header: snapshot.anchor,
+                            certificate: snapshot.certificate,
+                        })
+                        .map_err(|error| error.to_string())?;
+                    last_checkpoint = height;
+                    eprintln!("node {index} checkpoint at height {height}");
                 }
             }
             _ = shutdown.changed() => break,
@@ -2780,8 +2834,11 @@ fn run_one_node(
         result.conflicts
     );
     if let Some(restored) = &result.restored {
+        let checkpoint = restored
+            .checkpoint
+            .map_or_else(String::new, |height| format!(" (checkpoint {height})"));
         println!(
-            "  restored          {} tx applied, order {}, certified head {}, state root {}",
+            "  restored          {} tx applied, order {}, certified head {}, state root {}{checkpoint}",
             restored.applied,
             restored.order_len,
             restored.head_height,
@@ -2979,6 +3036,14 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         }
         if config.store.as_os_str().is_empty() {
             return Err("--sync-from-peers needs --store: the adopted history is persisted".into());
+        }
+    }
+    if config.checkpoint_every > 0 {
+        if !config.execute {
+            return Err("--checkpoint-every needs --execute: the snapshot carries state".into());
+        }
+        if config.store.as_os_str().is_empty() {
+            return Err("--checkpoint-every needs --store: the checkpoint is written there".into());
         }
     }
     if config.snapshot_port > 0 {
@@ -3390,9 +3455,13 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         let agree = restorations
             .iter()
             .all(|restored| restored.state_root == first.state_root);
+        let checkpoint = first.checkpoint.map_or_else(
+            || String::from("from history"),
+            |height| format!("from checkpoint {height}"),
+        );
         println!(
             "  restart           {} tx applied, order {}, certified head {}, state root {} \
-             ({} nodes, all agree: {agree})",
+             {checkpoint} ({} nodes, all agree: {agree})",
             first.applied,
             first.order_len,
             first.head_height,
@@ -3852,7 +3921,32 @@ mod tests {
             rpc_batch_max: rpc::DEFAULT_BATCH_MAX,
             snapshot_port: 0,
             sync_from_peers: false,
+            checkpoint_every: 0,
         }
+    }
+
+    #[test]
+    fn checkpointing_needs_a_store() {
+        let mut config = node_mode_config(2, Some(0));
+        config.execute = true;
+        config.checkpoint_every = 1;
+        let error = run(config).unwrap_err().to_string();
+        assert!(
+            error.contains("--checkpoint-every needs --store"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn checkpointing_needs_execution() {
+        let mut config = node_mode_config(2, Some(0));
+        config.store = PathBuf::from("/tmp/karsa-checkpoint-test");
+        config.checkpoint_every = 1;
+        let error = run(config).unwrap_err().to_string();
+        assert!(
+            error.contains("--checkpoint-every needs --execute"),
+            "{error}"
+        );
     }
 
     #[test]
