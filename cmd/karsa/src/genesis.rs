@@ -54,7 +54,7 @@ const DOMAIN: &[u8] = b"KARSA/GENESIS/v1";
 ///
 /// Propagates the demo membership generation.
 pub(crate) fn example() -> Result<Genesis, Box<dyn Error>> {
-    Ok(crate::keys::demo_genesis()?.0)
+    Ok(crate::keys::demo_genesis(4)?.0)
 }
 
 /// The whole file.
@@ -595,14 +595,19 @@ pub fn run(
     explicit: Option<std::path::PathBuf>,
     init: bool,
     epoch_rounds: Option<u64>,
+    validators: Option<usize>,
 ) -> Result<(), Box<dyn Error>> {
     let path = home.file(explicit, "genesis.json");
     let keys_path = home.keys_json();
     if init {
+        let validators = validators.unwrap_or(4);
         if keys_path.exists() {
             return Err(format!("{} already exists; not overwriting", keys_path.display()).into());
         }
-        let (mut genesis, keys) = crate::keys::demo_genesis()?;
+        if validators < 2 {
+            return Err("a genesis needs at least two validators".into());
+        }
+        let (mut genesis, keys) = crate::keys::demo_genesis(validators)?;
         apply_epoch_rounds(&mut genesis, epoch_rounds)?;
         write(&path, &genesis)?;
         keys.save(&keys_path)?;
@@ -611,6 +616,9 @@ pub fn run(
     }
     if epoch_rounds.is_some() {
         return Err("--epoch-rounds only applies with --init".into());
+    }
+    if validators.is_some() {
+        return Err("--validators only applies with --init".into());
     }
 
     let genesis = Genesis::ensure(&path)?;

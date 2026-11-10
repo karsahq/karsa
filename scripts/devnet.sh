@@ -1,11 +1,12 @@
 #!/bin/sh
-# Brings up a four-validator devnet, one process per validator, from a real home.
+# Brings up an N-validator devnet, one process per validator, from a real home.
 #
 # Usage:
 #   ./scripts/devnet.sh [lifetime-seconds]
 #
 # Environment:
 #   DEVNET=/tmp/karsa-devnet   home directory and parent of the stores
+#   VALIDATORS=4               committee size; a fresh genesis is written for it
 #   PORT_BASE=7600             consensus base; node i uses port_base + i
 #   RPC_PORT=7610              HTTP base; node i uses rpc_port + i
 #   SNAPSHOT_PORT=7620         snapshot base; node i uses snapshot_port + i
@@ -41,7 +42,7 @@ REMOVE_VALIDATOR_AT_EPOCH=${REMOVE_VALIDATOR_AT_EPOCH:-}
 FENCE_SILENT=${FENCE_SILENT:-}
 FAILURE_ROUNDS=${FAILURE_ROUNDS:-50}
 BIN=${BIN:-target/release/karsa}
-VALIDATORS=4
+VALIDATORS=${VALIDATORS:-4}
 
 CHANGE_ARGS=""
 if [ -n "$ADD_VALIDATOR_AT_EPOCH" ]; then
@@ -63,9 +64,9 @@ mkdir -p "$DEVNET"
 
 if [ ! -f "$DEVNET/genesis.json" ]; then
     if [ -n "$EPOCH_ROUNDS" ]; then
-        "$BIN" genesis --home "$DEVNET" --init --epoch-rounds "$EPOCH_ROUNDS" > /dev/null
+        "$BIN" genesis --home "$DEVNET" --init --validators "$VALIDATORS" --epoch-rounds "$EPOCH_ROUNDS" > /dev/null
     else
-        "$BIN" genesis --home "$DEVNET" --init > /dev/null
+        "$BIN" genesis --home "$DEVNET" --init --validators "$VALIDATORS" > /dev/null
     fi
 fi
 

@@ -34,7 +34,7 @@ use std::path::PathBuf;
 
 use exec::State;
 use store::{CertifiedHeader, Store};
-use validator::{Dag, EpochSchedule, Header, HeaderChain, VertexId, commit_root};
+use validator::{Dag, EpochSchedule, Header, HeaderChain, SetSchedule, VertexId, commit_root};
 
 use crate::chain;
 
@@ -113,6 +113,13 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
         Some(certificate) => Some(certificate.verify(&set)?),
         None => None,
     };
+    // The snapshot anchor is verified against the set that was active when it
+    // was certified. After a set change that is the new set, not the base one:
+    // the old set's quorum no longer describes who signed the anchor.
+    let sets = match &transition_certificate {
+        Some(certificate) => SetSchedule::with_certificate(set.clone(), certificate.clone())?,
+        None => SetSchedule::single(set.clone()),
+    };
     let mut verifier = if let Some(live) = &live {
         let id = live.header.id()?;
         if live.certificate.chain_id != live.header.chain_id
@@ -122,7 +129,8 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
         {
             return Err("the live snapshot certificate does not name its anchor".into());
         }
-        live.certificate.verify_quorum(&set)?;
+        live.certificate
+            .verify_quorum(sets.set_for_epoch(live.header.epoch))?;
         match &transition_certificate {
             Some(certificate) => HeaderChain::with_schedule_and_change(
                 set.clone(),

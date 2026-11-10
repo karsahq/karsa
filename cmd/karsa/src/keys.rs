@@ -82,7 +82,7 @@ impl Keys {
             {
                 std::fs::create_dir_all(parent)?;
             }
-            let keys = demo_genesis()?.1;
+            let keys = demo_genesis(4)?.1;
             keys.save(path)?;
             println!(
                 "  no keys at {}; wrote demo keys for the generated genesis",
@@ -270,10 +270,9 @@ fn restrict_permissions(_path: &Path) -> Result<(), Box<dyn Error>> {
 /// # Errors
 ///
 /// Propagates the demo key generation and the genesis schema conversions.
-pub(crate) fn demo_genesis() -> Result<(Genesis, Keys), Box<dyn Error>> {
-    const VALIDATORS: usize = 4;
-    let accounts = chain::accounts(VALIDATORS)?;
-    let (set, consensus) = chain::consensus_set(VALIDATORS)?;
+pub(crate) fn demo_genesis(validators: usize) -> Result<(Genesis, Keys), Box<dyn Error>> {
+    let accounts = chain::accounts(validators)?;
+    let (set, consensus) = chain::consensus_set(validators)?;
 
     let genesis_accounts = accounts
         .iter()
@@ -395,7 +394,19 @@ mod tests {
 
     #[test]
     fn the_demo_keys_match_the_demo_genesis() {
-        let (genesis, keys) = demo_genesis().unwrap();
+        let (genesis, keys) = demo_genesis(4).unwrap();
+        assert!(genesis.problems().is_empty(), "{:?}", genesis.problems());
+        assert!(
+            keys.problems(&genesis).is_empty(),
+            "{:?}",
+            keys.problems(&genesis)
+        );
+    }
+
+    #[test]
+    fn a_larger_demo_genesis_keeps_matching_keys() {
+        let (genesis, keys) = demo_genesis(5).unwrap();
+        assert_eq!(genesis.validators.len(), 5);
         assert!(genesis.problems().is_empty(), "{:?}", genesis.problems());
         assert!(
             keys.problems(&genesis).is_empty(),
@@ -409,7 +420,7 @@ mod tests {
         let committed = include_str!("../../../keys.json.example");
         let generated = format!(
             "{}\n",
-            serde_json::to_string_pretty(&demo_genesis().unwrap().1).unwrap()
+            serde_json::to_string_pretty(&demo_genesis(4).unwrap().1).unwrap()
         );
         assert_eq!(
             committed, generated,
@@ -419,7 +430,7 @@ mod tests {
 
     #[test]
     fn a_key_for_another_chain_is_reported() {
-        let (genesis, mut keys) = demo_genesis().unwrap();
+        let (genesis, mut keys) = demo_genesis(4).unwrap();
         keys.accounts[0].address = tx::address::encode(&[0u8; 32]);
         assert!(
             keys.problems(&genesis)
@@ -430,7 +441,7 @@ mod tests {
 
     #[test]
     fn a_public_half_that_disagrees_with_the_seed_is_reported() {
-        let (genesis, mut keys) = demo_genesis().unwrap();
+        let (genesis, mut keys) = demo_genesis(4).unwrap();
         let mut bytes = hex::decode(&keys.accounts[0].private_key).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;

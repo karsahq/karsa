@@ -1371,12 +1371,12 @@ fn build_live_snapshot(
     states: &VecDeque<(u64, State)>,
     batches: &HashMap<[u8; 32], Batch>,
 ) -> Option<wire::Snapshot> {
-    let head = finalizer.head();
+    // The anchor is the latest *certified* header, not the finalizer's built head.
+    // Those can differ: a node that built one header and certified another at the
+    // same height would otherwise never checkpoint, and its store would grow until
+    // the next restart. A certificate is self-contained, so anchoring at it is safe.
     let (header, certificate) = last_certified?;
-    if header.height != head.height || header.id().ok()? != head.id().ok()? {
-        return None;
-    }
-    let coverage = finalizer.certified_order(head.height)?;
+    let coverage = finalizer.certified_order(header.height)?;
     let dag = node.dag();
     let base = dag.prefix().len();
     if coverage > dag.order_len() || coverage < base {
@@ -1384,7 +1384,7 @@ fn build_live_snapshot(
     }
     let tail_coverage = coverage - base;
     let committed_tail = &dag.order()[..tail_coverage];
-    let proposed = snapshot_floor(node, committed_tail, head.round)?;
+    let proposed = snapshot_floor(node, committed_tail, header.round)?;
     // The floor only rises: a held prefix below the current floor is already
     // committed, so a candidate that would go backwards cannot drop it again.
     let floor = proposed.max(dag.floor().unwrap_or(0));
@@ -1398,10 +1398,10 @@ fn build_live_snapshot(
     let state = states
         .iter()
         .rev()
-        .find(|(applied, _)| *applied == head.applied)?
+        .find(|(applied, _)| *applied == header.applied)?
         .1
         .clone();
-    if state.state_root() != head.state_root {
+    if state.state_root() != header.state_root {
         return None;
     }
     let vertices: Vec<validator::Vertex> = held_vertices(node)
@@ -1426,7 +1426,7 @@ fn build_live_snapshot(
         anchor: header.clone(),
         certificate: certificate.clone(),
         transition: node.dag().set_schedule().certificate().cloned(),
-        cursor: head.round.saturating_add(1),
+        cursor: header.round.saturating_add(1),
         floor: Some(floor),
         vertices,
         batches: tail_batches,
@@ -4778,7 +4778,7 @@ mod tests {
         let _mesh = mesh_test_lock();
         let dir = TestDir::new("set-change");
         let home = crate::home::Home::resolve(Some(dir.0.clone())).expect("a test home");
-        crate::genesis::run(&home, None, true, Some(4)).expect("a four-round genesis");
+        crate::genesis::run(&home, None, true, Some(4), None).expect("a four-round genesis");
 
         let mut config = mesh_config(&dir, a_free_port_base(4), 25, 2);
         config.home = Some(dir.0.clone());

@@ -243,6 +243,9 @@ enum Command {
         /// Rounds per key epoch when --init writes a new genesis.
         #[arg(long)]
         epoch_rounds: Option<u64>,
+        /// Validators the generated devnet has; only applies with --init.
+        #[arg(long)]
+        validators: Option<usize>,
         /// Write the example instead of reading it.
         #[arg(long)]
         init: bool,
@@ -555,7 +558,8 @@ fn main() -> ExitCode {
             home,
             init,
             epoch_rounds,
-        } => run_genesis(home, path, init, epoch_rounds),
+            validators,
+        } => run_genesis(home, path, init, epoch_rounds, validators),
         Command::Live {
             validators,
             port_base,
@@ -688,9 +692,10 @@ fn run_genesis(
     path: Option<PathBuf>,
     init: bool,
     epoch_rounds: Option<u64>,
+    validators: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let home = home::Home::resolve(home_path)?;
-    genesis::run(&home, path, init, epoch_rounds)
+    genesis::run(&home, path, init, epoch_rounds, validators)
 }
 
 fn run_node(
