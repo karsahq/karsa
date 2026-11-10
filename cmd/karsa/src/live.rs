@@ -31,7 +31,7 @@
 //! fixed by `--validators`. A link opens with a hello naming the chain, so two
 //! genesis hashes never get as far as exchanging a vertex.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,7 +49,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tx::batch::Batch;
-use validator::{Certificate, Finalizer, Header, SetSchedule, Step, VertexId, commit_root};
+use validator::{
+    Certificate, FailureDetector, Finalizer, Header, SetSchedule, Step, VertexId, commit_root,
+};
 
 use crate::chain;
 use crate::rpc::{self, RpcCore, SharedRpc};
@@ -223,6 +225,13 @@ pub struct Config {
     /// prunes the logs below its floor. It needs a store and execution, because
     /// the snapshot carries the state.
     pub checkpoint_every: u64,
+    /// Rounds a validator may be silent before the local failure detector reports
+    /// it. Zero disables the report.
+    ///
+    /// The report is a local liveness view, not a consensus input: two nodes with
+    /// different delivery may disagree, and a transition that acts on it must be
+    /// authorized by the set.
+    pub failure_rounds: u64,
 }
 
 /// Wall time spent in the stages the live loop can name.
@@ -1899,6 +1908,14 @@ async fn node_task(
         None
     };
 
+    let mut failures = (config.failure_rounds > 0)
+        .then(|| FailureDetector::new(node.dag().set(), config.failure_rounds));
+    if let Some(failures) = failures.as_mut() {
+        for vertex in held_vertices(&node) {
+            failures.observe(vertex.round, &vertex.author);
+        }
+    }
+
     let mut last_certified: Option<(Header, Certificate)> = adopted_anchor;
     if last_certified.is_none()
         && let Some(store) = &store
@@ -1972,6 +1989,7 @@ async fn node_task(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut authoring_stopped = *stop_authoring.borrow();
     let mut replayed = false;
+    let mut reported_silent: BTreeSet<Vec<u8>> = BTreeSet::new();
 
     // A single-process mesh shares one clock, so a frame's local timestamp is
     // enough. One process per validator does not: each process has its own
@@ -2025,6 +2043,9 @@ async fn node_task(
                         let known = node.dag().get(vertex.round, &vertex.author).is_some();
                         match node.receive(vertex.clone()) {
                             Ok(()) => {
+                                if let Some(failures) = failures.as_mut() {
+                                    failures.observe(vertex.round, &vertex.author);
+                                }
                                 // A vertex at or below the floor is already covered by
                                 // the state snapshot; storing it would put back history
                                 // the checkpoint just pruned.
@@ -2194,6 +2215,9 @@ async fn node_task(
                     profile.author += author_start.elapsed();
                     match author {
                         Ok(Some(vertex)) => {
+                            if let Some(failures) = failures.as_mut() {
+                                failures.observe(vertex.round, &vertex.author);
+                            }
                             let authored_at = unix_millis();
                             first_author_ms.get_or_insert(authored_at);
                             last_author_ms = Some(authored_at);
@@ -2468,9 +2492,34 @@ async fn node_task(
                         }
                     }
                 }
+                // The failure detector is a report, not an input to the commit
+                // rule. It names validators this node has not seen for longer than
+                // the configured threshold; the line is printed once per silence.
+                let mut silent = Vec::new();
+                if let Some(failures) = failures.as_ref() {
+                    silent = failures.silent();
+                    for (validator, last_round) in &silent {
+                        if reported_silent.insert(validator.clone()) {
+                            let name = hex::encode(&validator[..validator.len().min(8)]);
+                            let detail = if *last_round == 0 {
+                                "never seen".to_string()
+                            } else {
+                                format!("last seen at round {last_round}")
+                            };
+                            eprintln!(
+                                "node {index} failure detector: {name} silent ({detail}, highest round {})",
+                                failures.highest_round()
+                            );
+                        }
+                    }
+                    let current: BTreeSet<Vec<u8>> =
+                        silent.iter().map(|(validator, _)| validator.clone()).collect();
+                    reported_silent.retain(|validator| current.contains(validator));
+                }
                 if let Some(rpc) = &rpc {
                     let mut core = rpc.lock().expect("rpc lock poisoned");
                     core.note_order_from(node.dag().prefix(), node.dag().order());
+                    core.note_failures(&silent);
                     core.set_run(
                         node.round(),
                         node.dag().order_len(),
@@ -4147,6 +4196,7 @@ mod tests {
             snapshot_port: 0,
             sync_from_peers: false,
             checkpoint_every: 0,
+            failure_rounds: 0,
         }
     }
 
@@ -4223,6 +4273,7 @@ mod tests {
             snapshot_port: 0,
             sync_from_peers: false,
             checkpoint_every,
+            failure_rounds: 0,
         }
     }
 

@@ -233,6 +233,8 @@ pub(crate) struct RpcCore {
     head: HeadView,
     run: RunView,
     certified_heights: usize,
+    /// Validators this node's local failure detector reports as silent.
+    silent: Vec<SilentView>,
 }
 
 impl RpcCore {
@@ -275,6 +277,7 @@ impl RpcCore {
             },
             run: RunView::default(),
             certified_heights: 0,
+            silent: Vec::new(),
         }
     }
 
@@ -811,6 +814,20 @@ impl RpcCore {
         self.certified_heights = heights;
     }
 
+    /// Replaces the local silence report shown by `/status`.
+    ///
+    /// This is a view, not a decision: the node loop computes it from vertices it
+    /// holds, and two nodes may disagree while their delivery differs.
+    pub(crate) fn note_failures(&mut self, silent: &[(Vec<u8>, u64)]) {
+        self.silent = silent
+            .iter()
+            .map(|(validator, last_round)| SilentView {
+                validator: hex::encode(validator),
+                last_round: *last_round,
+            })
+            .collect();
+    }
+
     fn record_view(&self, id: &[u8; 32]) -> Option<SubmitView> {
         let record = self.records.get(id)?;
         Some(SubmitView {
@@ -840,6 +857,7 @@ impl RpcCore {
             peers: self.run.peers,
             conflicts: self.run.conflicts,
             tracked_transactions: self.records.len(),
+            silent: self.silent.clone(),
         }
     }
 
@@ -1101,6 +1119,13 @@ struct AccountView {
     proof: ProofView,
 }
 
+/// One validator the local failure detector reports as silent.
+#[derive(Debug, Clone, Serialize)]
+struct SilentView {
+    validator: String,
+    last_round: u64,
+}
+
 #[derive(Serialize)]
 struct StatusView {
     node: usize,
@@ -1119,6 +1144,7 @@ struct StatusView {
     peers: usize,
     conflicts: usize,
     tracked_transactions: usize,
+    silent: Vec<SilentView>,
 }
 
 #[derive(Deserialize)]

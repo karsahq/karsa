@@ -868,7 +868,7 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     informational because the live mesh still derives endpoints from
     `--port-base`. `WIRE_PROTOCOL` is 5 since finding 41, so an old and a new
     node refuse each other at the handshake. The gate is green on this tree
-    (396 tests default, 397 with all features).
+    (399 tests default, 400 with all features).
 
 39. **A Merkle frontier bounds the checkpoint and the snapshot transfer.**
     A header's `dag_root` commits every entry from genesis, but entries below the
@@ -1052,6 +1052,31 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       undecidable under the no-absence rule. The `recent_vertices` ring covers the
       same loss on a same-process link break. Permanent failure needs a view
       change or a failure detector, which is outside the prototype.
+
+47. **The failure detector is a local silence report, not a decision.**
+    `validator::FailureDetector` records the last round each validator was seen at
+    and reports those more than `--failure-rounds` rounds behind the highest round
+    the node holds. The threshold is in rounds, not wall time; zero disables it.
+    The detector is seeded from the restored DAG and fed by every accepted or
+    authored vertex, and it is exposed as `/status.silent` (`validator`,
+    `last_round`) plus one log line per new silence, cleared when the validator
+    returns. It feeds no commit, skip, or quorum rule: a local view is not shared
+    evidence, two nodes with different delivery may disagree, and a transition that
+    acts on a report must be authorized by the set (the checked set-change path,
+    D41).
+    - Four-process devnet, checkpoints disabled, threshold 50: before the kill a
+      survivor's `/status` reported `silent: []`. Node 0 was killed; after about a
+      second the survivor reported node 0's validator address with `last_round`
+      1984 while its highest round was 2035 (51 rounds), and the log line read
+      `failure detector: 0400601c39bf002c silent (last seen at round 1984, highest
+      round 2035)`. The other two survivors reported the same author. A healthy run
+      before the kill reported nothing.
+    - The detector stores one entry per validator and recomputes the list per tick,
+      O(n); a delivery gap is reported as quickly as a dead node, so the threshold
+      trades false positives for speed. It does not by itself recover the stalled
+      cursor; the restart replay in finding 46 does that for a returning node.
+      Permanent failure needs an authorized transition or a view change, which
+      remains open. Pinned by three `failure` unit tests over a fixed set.
 
 ## Build order
 

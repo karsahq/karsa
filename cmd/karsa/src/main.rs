@@ -343,6 +343,14 @@ enum Command {
         /// headers below its floor.
         #[arg(long, default_value_t = 0)]
         checkpoint_every: u64,
+        /// Rounds a validator may be silent before the local failure detector
+        /// reports it. Zero disables the report.
+        ///
+        /// This is a liveness view, not a consensus decision: two nodes may see
+        /// different silence while their delivery differs, and acting on it needs
+        /// an authorized set change.
+        #[arg(long, default_value_t = 50)]
+        failure_rounds: u64,
     },
     /// Sign a transfer with a committee account and submit it to a live RPC node.
     Send {
@@ -563,6 +571,7 @@ fn main() -> ExitCode {
             snapshot_port,
             sync_from_peers,
             checkpoint_every,
+            failure_rounds,
         } => live::run(live::Config {
             validators,
             port_base,
@@ -587,6 +596,7 @@ fn main() -> ExitCode {
             snapshot_port,
             sync_from_peers,
             checkpoint_every,
+            failure_rounds,
         }),
         Command::Send {
             rpc,
