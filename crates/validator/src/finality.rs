@@ -391,6 +391,11 @@ impl Finalizer {
         if header.height <= self.chain.head().height {
             return Ok(Vec::new());
         }
+        // Only the first uncertified height can advance the chain; a share for a
+        // later height is stored and picked up by `advance_certified` once the
+        // gaps below it close. Advancing on every share would scan the whole map
+        // each time, which is what made a reconnected peer's replay quadratic.
+        let first_missing = header.height == self.chain.head().height.saturating_add(1);
         let id = header.id()?;
         let entry = self.shares.entry(id).or_insert_with(|| ShareSet {
             header,
@@ -400,7 +405,10 @@ impl Finalizer {
             .signatures
             .entry(signer)
             .or_insert(Signed { signature, at });
-        self.advance_certified()
+        if first_missing {
+            return self.advance_certified();
+        }
+        Ok(Vec::new())
     }
 
     /// Adopts a certified header above the current head, as a tail replay does.
@@ -548,6 +556,10 @@ impl Finalizer {
             certificate.verify_quorum(set)?;
             self.chain.advance(&header, &certificate)?;
             self.certified_ids.insert(height, id);
+            // Nothing below the new head can be certified again; keeping those
+            // share sets would only make the lookup for the next height scan old
+            // history that a long run keeps growing.
+            self.shares.retain(|_, set| set.header.height > height);
             if let Some(order_len) = self.order_lens.remove(&id) {
                 self.certified_orders.insert(height, order_len);
             }
@@ -706,6 +718,81 @@ mod tests {
         assert_eq!(finalizer.head().height, 1, "three of four certify");
         assert!(finalizer.is_certified(1));
         assert_eq!(finalizer.conflicts(), 0);
+    }
+
+    #[test]
+    fn a_future_share_waits_for_the_height_below_it() {
+        let (set, keys) = fixture(4);
+        let sets = SetSchedule::single(set.clone());
+        let schedule = EpochSchedule::single(1);
+        let chain_id = b"karsa-test-1".to_vec();
+        let anchor = genesis(&chain_id, [0u8; 32]);
+        let mut finalizer = Finalizer::new(
+            sets,
+            schedule,
+            chain_id,
+            b"val-0".to_vec(),
+            keys[0].clone(),
+            anchor,
+            0,
+        )
+        .unwrap();
+
+        finalizer.record_commit(1, 1);
+        finalizer.record_commit(2, 2);
+        finalizer.mark_applied(1, [7u8; 32], 1);
+        finalizer.mark_applied(2, [9u8; 32], 2);
+        let order = vec![order_entry(1, b"val-0"), order_entry(2, b"val-1")];
+        let build = finalizer.build_ready(&order, 10).unwrap();
+        let first = build
+            .shares
+            .iter()
+            .find(|share| share.header.height == 1)
+            .unwrap()
+            .header
+            .clone();
+        let second = build
+            .shares
+            .iter()
+            .find(|share| share.header.height == 2)
+            .unwrap()
+            .header
+            .clone();
+
+        // A quorum for height 2 arrives before height 1 has one. It must be held,
+        // not treated as an advance, because the chain cannot skip the gap.
+        let payload = signing_payload(&second).unwrap();
+        for (signer, key) in keys.iter().enumerate().skip(1) {
+            finalizer
+                .receive_share(Share {
+                    header: second.clone(),
+                    signer,
+                    signature: Ed25519Scheme.sign(key, &payload).unwrap(),
+                    at: 20 + signer as u64,
+                })
+                .unwrap();
+        }
+        assert_eq!(finalizer.head().height, 0, "a later height waits its turn");
+
+        // Closing height 1 must also pick up the quorum already held for height 2.
+        let payload = signing_payload(&first).unwrap();
+        for (signer, key) in keys.iter().enumerate().skip(1) {
+            finalizer
+                .receive_share(Share {
+                    header: first.clone(),
+                    signer,
+                    signature: Ed25519Scheme.sign(key, &payload).unwrap(),
+                    at: 30 + signer as u64,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            finalizer.head().height,
+            2,
+            "the held height is certified too"
+        );
+        assert!(finalizer.is_certified(1));
+        assert!(finalizer.is_certified(2));
     }
 
     #[test]
