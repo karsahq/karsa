@@ -73,6 +73,13 @@ const CONTROL_QUEUE: usize = 256;
 /// seconds at this committee's certificate rate; a longer outage needs a snapshot
 /// resync rather than a replay.
 const RECENT_SHARES: usize = 1024;
+/// How many of this node's own vertices are replayed once at startup.
+///
+/// A validator that was killed between authoring a vertex and its broadcast leaves
+/// a vote that no peer holds; a want cannot ask for an id nobody knows. Replaying
+/// the last own vertices after a restart puts that vote back on the wire. The
+/// window covers a few hundred rounds at the observed cadence.
+const RECENT_VERTICES: usize = 1024;
 /// How long to keep retrying a connection before giving up.
 const CONNECT_TRIES: usize = 400;
 /// Delay before the first attempt to reconnect a link that dropped.
@@ -94,11 +101,11 @@ const CLOCK_TICKS: u32 = 500;
 const WANT_SWEEP_TICKS: u32 = 25;
 /// Ticks the commit cursor must stand still before execution is called caught up.
 const QUIET_TICKS: u32 = 50;
-/// Pacemaker timeouts at one cursor before a stall is logged.
+/// Wall time one cursor may stand still before a stall is logged.
 ///
-/// A timeout is ordinary while waiting for a vote; 250 of them (roughly a second
-/// and a half at the tick cadence) is a cursor that is not moving.
-const STALL_REPORT_TIMEOUTS: u32 = 250;
+/// Anchors ahead of the cursor keep the pacemaker productive, so a timeout count
+/// never fires while the DAG still grows; the cursor's own age is the signal.
+const STALL_REPORT_AFTER: Duration = Duration::from_millis(1_500);
 /// Balance each demo account starts with in a live run.
 ///
 /// The chain demo funds accounts with a thousand units, which is plenty for a
@@ -429,6 +436,9 @@ struct LinkTask {
     /// The most recent share frames this node produced, replayed to a peer that
     /// reconnects so a signature lost at the break cannot wedge its finality.
     recent_shares: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    /// The most recent vertex frames this node authored, replayed on reconnect
+    /// for the same reason: a vote lost at the break has no repair id to ask for.
+    recent_vertices: Arc<Mutex<VecDeque<Vec<u8>>>>,
     send_buffer: usize,
     shutdown: watch::Receiver<bool>,
 }
@@ -458,6 +468,7 @@ async fn write_peer(
         bytes_out,
         up,
         recent_shares,
+        recent_vertices,
         send_buffer,
         mut shutdown,
     } = task;
@@ -488,6 +499,7 @@ async fn write_peer(
                 stream = fresh;
                 up.store(true, Ordering::Relaxed);
                 resend_recent(&mut stream, &recent_shares, &bytes_out).await;
+                resend_recent(&mut stream, &recent_vertices, &bytes_out).await;
                 eprintln!("node {index} reconnected {target}");
             }
             None => return,
@@ -513,13 +525,23 @@ async fn resend_recent(
     }
 }
 
-/// Keeps the latest share frame, dropping the oldest once the window is full.
-fn remember_share(recent: &Mutex<VecDeque<Vec<u8>>>, bytes: &[u8]) {
-    let mut recent = recent.lock().expect("recent shares lock poisoned");
-    if recent.len() == RECENT_SHARES {
+/// Keeps the latest frame, dropping the oldest once the window is full.
+fn remember_frame(recent: &Mutex<VecDeque<Vec<u8>>>, bytes: &[u8], limit: usize) {
+    let mut recent = recent.lock().expect("recent frame lock poisoned");
+    if recent.len() == limit {
         recent.pop_front();
     }
     recent.push_back(bytes.to_vec());
+}
+
+/// Keeps the latest share frame, dropping the oldest once the window is full.
+fn remember_share(recent: &Mutex<VecDeque<Vec<u8>>>, bytes: &[u8]) {
+    remember_frame(recent, bytes, RECENT_SHARES);
+}
+
+/// Keeps the latest authored-vertex frame for a reconnect replay.
+fn remember_vertex(recent: &Mutex<VecDeque<Vec<u8>>>, bytes: &[u8]) {
+    remember_frame(recent, bytes, RECENT_VERTICES);
 }
 
 /// Writes queued frames until the socket fails, the run ends, or every sender is
@@ -1047,6 +1069,20 @@ fn remember_state(states: &mut VecDeque<(u64, State)>, applied: u64, state: &Sta
     }
 }
 
+/// The last `limit` vertices this node authored, oldest first.
+fn recent_own_vertices(node: &Node, index: usize, limit: usize) -> Vec<validator::Vertex> {
+    let Some(record) = node.dag().set().validators.get(index) else {
+        return Vec::new();
+    };
+    let own = record.validator_id.clone();
+    let mut held = held_vertices(node);
+    held.retain(|vertex| vertex.author == own);
+    if held.len() > limit {
+        held.drain(..held.len() - limit);
+    }
+    held
+}
+
 /// Every vertex this node still holds, in round and validator order.
 fn held_vertices(node: &Node) -> Vec<validator::Vertex> {
     let dag = node.dag();
@@ -1543,6 +1579,7 @@ async fn node_task(
     // participates.
     let mut outbound: Vec<Link> = Vec::with_capacity(total.saturating_sub(1));
     let recent_shares: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_vertices: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
     for peer in 0..total {
         if peer == index {
             continue;
@@ -1597,6 +1634,7 @@ async fn node_task(
         let link_chain = chain_id.clone();
         let link_shutdown = shutdown.clone();
         let link_recent = Arc::clone(&recent_shares);
+        let link_vertices = Arc::clone(&recent_vertices);
         let send_buffer = config.send_buffer;
         tokio::spawn(async move {
             write_peer(
@@ -1610,6 +1648,7 @@ async fn node_task(
                     bytes_out,
                     up,
                     recent_shares: link_recent,
+                    recent_vertices: link_vertices,
                     send_buffer,
                     shutdown: link_shutdown,
                 },
@@ -1912,7 +1951,8 @@ async fn node_task(
     let mut gave_up = 0u64;
     let mut ticks: u32 = 0;
     let mut cursor: u64 = node.cursor();
-    let mut last_stalled: Option<(u64, u32)> = None;
+    let mut cursor_since = Instant::now();
+    let mut reported_stall: Option<u64> = None;
     // The interval is measured from the checkpoint or head this run resumed at,
     // not from process start: otherwise a restart with a large interval would
     // fire a checkpoint (and now a prune) as soon as the head passed the
@@ -1931,6 +1971,7 @@ async fn node_task(
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut authoring_stopped = *stop_authoring.borrow();
+    let mut replayed = false;
 
     // A single-process mesh shares one clock, so a frame's local timestamp is
     // enough. One process per validator does not: each process has its own
@@ -2086,6 +2127,17 @@ async fn node_task(
                         .record_clock(node.round(), unix_now())
                         .map_err(|error| error.to_string())?;
                 }
+                // A restarted node puts its own recent vertices back on the wire
+                // once. The missing vote may not be referenced by anyone, so the
+                // want sweep has no id to ask for; only the author can supply it.
+                if !replayed {
+                    replayed = true;
+                    for vertex in recent_own_vertices(&node, index, RECENT_VERTICES) {
+                        let bytes = wire::frame(&Message::Vertex(vertex), now())
+                            .map_err(|error| error.to_string())?;
+                        broadcast(&outbound, false, &bytes, &mut dropped);
+                    }
+                }
                 // Gossip is drained every tick and sent on the control plane: one
                 // small frame per submitted envelope, never re-gossiped on receipt.
                 if let Some(rpc) = &rpc {
@@ -2173,6 +2225,7 @@ async fn node_task(
                             let bytes = wire::frame(&Message::Vertex(vertex), now())
                                 .map_err(|error| error.to_string())?;
                             profile.frame += frame_start.elapsed();
+                            remember_vertex(&recent_vertices, &bytes);
                             broadcast(&outbound, false, &bytes, &mut dropped);
                             if let Some(batch) = payload {
                                 let frame_start = Instant::now();
@@ -2216,7 +2269,8 @@ async fn node_task(
                             ..
                         }) => {
                             if next > cursor {
-                                last_stalled = None;
+                                cursor_since = Instant::now();
+                                reported_stall = None;
                             }
                             cursor = next;
                             if commits > 0
@@ -2232,41 +2286,7 @@ async fn node_task(
                             cursor = next;
                             break;
                         }
-                        Ok(Step::TimedOut {
-                            cursor: next,
-                            observed,
-                            ..
-                        }) => {
-                            // A stalled cursor is the one condition an operator
-                            // cannot see from `/status`: rounds keep advancing while
-                            // committed entries freeze. A single timeout is normal
-                            // while waiting for a vote, so report only a cursor that
-                            // has timed out repeatedly, and only once for that round.
-                            let stalled = match last_stalled {
-                                Some((round, seen)) if round == next => {
-                                    let seen = seen.saturating_add(1);
-                                    (seen == STALL_REPORT_TIMEOUTS, seen)
-                                }
-                                _ => (false, 1),
-                            };
-                            last_stalled = Some((next, stalled.1));
-                            if stalled.0 {
-                                let missing = node.dag().missing_history(next);
-                                let detail = missing.map_or_else(
-                                    || "none".to_string(),
-                                    |id| {
-                                        format!(
-                                            "{} at round {} by {}",
-                                            hex::encode(&id.digest[..6]),
-                                            id.round,
-                                            hex::encode(&id.author[..6])
-                                        )
-                                    },
-                                );
-                                eprintln!(
-                                    "node {index} commit stalled at round {next} (observed {observed}), missing {detail}"
-                                );
-                            }
+                        Ok(Step::TimedOut { cursor: next, .. }) => {
                             cursor = next;
                             break;
                         }
@@ -2277,6 +2297,34 @@ async fn node_task(
                     }
                 }
                 profile.commit += commit_start.elapsed();
+                // A frozen cursor is the one condition an operator cannot see
+                // from `/status`: rounds and anchors keep advancing while committed
+                // entries stop. Anchors ahead reset the pacemaker's stall counter,
+                // so this measures the cursor's own age and prints once per round.
+                if cursor_since.elapsed() >= STALL_REPORT_AFTER
+                    && reported_stall != Some(cursor)
+                {
+                    reported_stall = Some(cursor);
+                    let observed = node.dag().highest_round().unwrap_or(cursor);
+                    let missing = node.dag().missing_history(cursor);
+                    let detail = missing.map_or_else(
+                        || "none".to_string(),
+                        |id| {
+                            format!(
+                                "{} at round {} by {}",
+                                hex::encode(&id.digest[..6]),
+                                id.round,
+                                hex::encode(&id.author[..6])
+                            )
+                        },
+                    );
+                    let voters = node.dag().held_voters(cursor).unwrap_or(0);
+                    let quorum = node.dag().set().quorum_size();
+                    let can_anchor = node.dag().can_still_anchor(cursor).unwrap_or(true);
+                    eprintln!(
+                        "node {index} commit stalled at round {cursor} (observed {observed}), missing {detail}, votes {voters} of quorum {quorum}, can-anchor {can_anchor}"
+                    );
+                }
                 if config.execute {
                     // Apply in commit order, and stop at the first vertex whose
                     // batch has not arrived: applying past it would put a later
@@ -2535,13 +2583,13 @@ async fn node_task(
                         &state_history,
                         &batches,
                     )
-                    && snapshot.floor.is_some()
+                    && let Some(floor) = snapshot.floor
                 {
                     let height = snapshot.anchor.height;
                     store
                         .put_live_snapshot(&store::LiveSnapshot {
                             round: snapshot.anchor.round,
-                            floor: snapshot.floor,
+                            floor: Some(floor),
                             cursor: snapshot.cursor,
                             applied: snapshot.anchor.applied,
                             state: snapshot.state,
@@ -2555,6 +2603,10 @@ async fn node_task(
                     // The checkpoint is also the licence to prune: its floor is
                     // the lowest round still reachable by a restart, and its
                     // anchor header is the oldest one an audit still walks.
+                    // The running DAG takes the same floor: a late vertex at or
+                    // below it must be dropped rather than written back into the
+                    // store the checkpoint just pruned.
+                    node.set_floor(floor);
                     let pruned = store
                         .prune_to_checkpoint(usize::from(config.shard))
                         .map_err(|error| error.to_string())?;
@@ -4042,6 +4094,7 @@ mod tests {
                 bytes_out: Arc::new(AtomicU64::new(0)),
                 up: Arc::new(AtomicBool::new(true)),
                 recent_shares: Arc::clone(&recent),
+                recent_vertices: Arc::new(Mutex::new(VecDeque::new())),
                 send_buffer: 0,
                 shutdown: shutdown_rx,
             },

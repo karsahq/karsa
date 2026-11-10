@@ -42,7 +42,9 @@ impl Devnet {
                 .args(["--node-index", &index.to_string()])
                 .args(["--port-base", &p2p_base.to_string()])
                 .args(["--rpc-port", &rpc_base.to_string()])
-                .args(["--checkpoint-every", "16"])
+                // The checkpoint path has its own restart test; this test is the
+                // cold mesh and the gossip status, without 16-height prune work.
+                .args(["--checkpoint-every", "0"])
                 .args(["--timeout-seconds", "25"])
                 .args(["--execute", "--home"])
                 .arg(&dir)

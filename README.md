@@ -969,7 +969,7 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
 43. **The devnet is an automated integration test.**
     `cmd/karsa/tests/devnet.rs` generates a home with `karsa genesis --init`,
     starts four `karsa live --node-index i` processes over a free loopback port
-    block with `--execute`, `--checkpoint-every 16`, and a 25 s lifetime, and
+    block with `--execute`, `--checkpoint-every 0`, and a 25 s lifetime, and
     waits until every node has certified two heights before submitting.
     `karsa send --wait` then submits a signed transfer through node 0, and the
     test reads `/tx/{id}?proof=1` on each node, requiring `finalized` and a commit
@@ -1010,27 +1010,48 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       share reached a quorum. That is a vertex-delivery gap, not ownership; testing
       the takeover live needs a kill that leaves the mesh certifying.
 
-45. **A stalled commit cursor reports the vertex that blocks it.**
-    The live loop counts consecutive pacemaker timeouts at one cursor. After
-    250 (`STALL_REPORT_TIMEOUTS`, about 1.5 s at the tick cadence) it prints once
-    `node i commit stalled at round X (observed Y), missing <digest> at round R by
-    <author>`, using the same history walk the commit rule performs
-    (`Dag::missing_history`). A single timeout is ordinary while waiting for a
-    vote, so short waits stay silent.
-    - A healthy four-process devnet with checkpoint every 64 for 20 s logged no
-      stall lines while its heads advanced from startup. Two kill runs after the
-      change did not stall (heads advanced after the kill); the stall this is for
-      was seen twice before the diagnostic existed, when committed entries froze
-      while rounds kept advancing.
+45. **A stalled commit cursor reports the vote or vertex that blocks it.**
+    The live loop measures how long the commit cursor has been unchanged. After
+    1.5 s (`STALL_REPORT_AFTER`) it prints once `node i commit stalled at round X
+    (observed Y), missing <digest> at round R by <author>, votes V of quorum Q,
+    can-anchor B`; the id comes from `Dag::missing_history`, the vote count and
+    anchor answer from `held_voters` and `can_still_anchor`. Timeouts are not the
+    signal because anchors ahead keep the pacemaker productive; a healthy 20 s
+    checkpoint devnet logged no lines.
+    - A probe that killed node 0 at 8.0–9.2 s reproduced the stall twice; both
+      lines reported `missing none, votes 1 of quorum 3, can-anchor false` at
+      cursors 1,065 and 1,071. That is a missing **vote**, not a missing vertex:
+      the leader and its history are held, the dead validator's next-round vertex
+      never arrived, and the no-absence rule refuses either a commit (fewer than
+      two held votes) or a skip (only two observed non-votes).
     - A synthetic DAG where `val-1` stops authoring at round 5 and later rounds
-      carry three vertices still passes the cursor through the missing leader
+      carry three vertices still passes the missing leader
       (`a_dead_author_does_not_block_rounds_that_follow_it`), so the decision logic
-      is not the blocker in that case. The report costs one history walk when it
-      fires and nothing in the normal case. It does not fix the data-availability
-      gap: a vertex only the dead node held cannot be fetched, and the protocol
-      must not decide without proof. The next live reproduction will name the id;
-      replicating a node's last vertices or a write lease around authoring and
-      broadcast would be the mechanism.
+      is not the blocker when the surrounding data is complete. The report does
+      not fix the gap; finding 46 supplies the vote when the node returns.
+
+46. **A restart replays its own recent vertices, and a live checkpoint sets the
+    DAG floor.**
+    A node sorts its own held vertices above the DAG floor and broadcasts the last
+    1,024 (`RECENT_VERTICES`) once on the first tick after startup; it also keeps
+    the last 1,024 authored vertex frames in memory and the link writer replays
+    them on reconnect. A successful live checkpoint calls `Dag::set_floor(floor)`
+    after writing the snapshot, so a late vertex at or below the floor is dropped
+    in memory and cannot be written back into the store the checkpoint pruned.
+    - Probe with checkpoint every 64, node 0 killed at about 8.4 s: the survivors
+      stalled at cursor 1,065 (`missing none, votes 1 of quorum 3,
+      can-anchor false`); head 931 and committed 4,254 froze while rounds reached
+      1,538. Restarting node 0 from its store without `RESET` made node 1 reach
+      head 1,703 and committed 8,216 within 12 s. The restarted node itself logged
+      a transient stall at round 1,547 while catching up, so recovery is not
+      instant. A healthy 20 s run still logged no stall line, and the checkpoint
+      restart test passes with the store free of below-floor vertices.
+    - The startup replay sends up to 1,024 frames per peer once on the best-effort
+      data queue; duplicates are ignored. It heals a returning node, not a
+      permanently dead one: an absent vote with no author to replay remains
+      undecidable under the no-absence rule. The `recent_vertices` ring covers the
+      same loss on a same-process link break. Permanent failure needs a view
+      change or a failure detector, which is outside the prototype.
 
 ## Build order
 
