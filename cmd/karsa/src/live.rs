@@ -94,6 +94,11 @@ const CLOCK_TICKS: u32 = 500;
 const WANT_SWEEP_TICKS: u32 = 25;
 /// Ticks the commit cursor must stand still before execution is called caught up.
 const QUIET_TICKS: u32 = 50;
+/// Pacemaker timeouts at one cursor before a stall is logged.
+///
+/// A timeout is ordinary while waiting for a vote; 250 of them (roughly a second
+/// and a half at the tick cadence) is a cursor that is not moving.
+const STALL_REPORT_TIMEOUTS: u32 = 250;
 /// Balance each demo account starts with in a live run.
 ///
 /// The chain demo funds accounts with a thousand units, which is plenty for a
@@ -1907,6 +1912,7 @@ async fn node_task(
     let mut gave_up = 0u64;
     let mut ticks: u32 = 0;
     let mut cursor: u64 = node.cursor();
+    let mut last_stalled: Option<(u64, u32)> = None;
     // The interval is measured from the checkpoint or head this run resumed at,
     // not from process start: otherwise a restart with a large interval would
     // fire a checkpoint (and now a prune) as soon as the head passed the
@@ -2209,6 +2215,9 @@ async fn node_task(
                             anchors,
                             ..
                         }) => {
+                            if next > cursor {
+                                last_stalled = None;
+                            }
                             cursor = next;
                             if commits > 0
                                 && let Some(finalizer) = finalizer.as_mut()
@@ -2219,8 +2228,45 @@ async fn node_task(
                                 break;
                             }
                         }
-                        Ok(Step::Waiting { cursor: next, .. }
-                        | Step::TimedOut { cursor: next, .. }) => {
+                        Ok(Step::Waiting { cursor: next, .. }) => {
+                            cursor = next;
+                            break;
+                        }
+                        Ok(Step::TimedOut {
+                            cursor: next,
+                            observed,
+                            ..
+                        }) => {
+                            // A stalled cursor is the one condition an operator
+                            // cannot see from `/status`: rounds keep advancing while
+                            // committed entries freeze. A single timeout is normal
+                            // while waiting for a vote, so report only a cursor that
+                            // has timed out repeatedly, and only once for that round.
+                            let stalled = match last_stalled {
+                                Some((round, seen)) if round == next => {
+                                    let seen = seen.saturating_add(1);
+                                    (seen == STALL_REPORT_TIMEOUTS, seen)
+                                }
+                                _ => (false, 1),
+                            };
+                            last_stalled = Some((next, stalled.1));
+                            if stalled.0 {
+                                let missing = node.dag().missing_history(next);
+                                let detail = missing.map_or_else(
+                                    || "none".to_string(),
+                                    |id| {
+                                        format!(
+                                            "{} at round {} by {}",
+                                            hex::encode(&id.digest[..6]),
+                                            id.round,
+                                            hex::encode(&id.author[..6])
+                                        )
+                                    },
+                                );
+                                eprintln!(
+                                    "node {index} commit stalled at round {next} (observed {observed}), missing {detail}"
+                                );
+                            }
                             cursor = next;
                             break;
                         }

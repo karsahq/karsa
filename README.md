@@ -868,7 +868,7 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     informational because the live mesh still derives endpoints from
     `--port-base`. `WIRE_PROTOCOL` is 5 since finding 41, so an old and a new
     node refuse each other at the handshake. The gate is green on this tree
-    (395 tests default, 396 with all features).
+    (396 tests default, 397 with all features).
 
 39. **A Merkle frontier bounds the checkpoint and the snapshot transfer.**
     A header's `dag_root` commits every entry from genesis, but entries below the
@@ -1009,6 +1009,28 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       the dead node's last vertices were missing from the survivors and no new
       share reached a quorum. That is a vertex-delivery gap, not ownership; testing
       the takeover live needs a kill that leaves the mesh certifying.
+
+45. **A stalled commit cursor reports the vertex that blocks it.**
+    The live loop counts consecutive pacemaker timeouts at one cursor. After
+    250 (`STALL_REPORT_TIMEOUTS`, about 1.5 s at the tick cadence) it prints once
+    `node i commit stalled at round X (observed Y), missing <digest> at round R by
+    <author>`, using the same history walk the commit rule performs
+    (`Dag::missing_history`). A single timeout is ordinary while waiting for a
+    vote, so short waits stay silent.
+    - A healthy four-process devnet with checkpoint every 64 for 20 s logged no
+      stall lines while its heads advanced from startup. Two kill runs after the
+      change did not stall (heads advanced after the kill); the stall this is for
+      was seen twice before the diagnostic existed, when committed entries froze
+      while rounds kept advancing.
+    - A synthetic DAG where `val-1` stops authoring at round 5 and later rounds
+      carry three vertices still passes the cursor through the missing leader
+      (`a_dead_author_does_not_block_rounds_that_follow_it`), so the decision logic
+      is not the blocker in that case. The report costs one history walk when it
+      fires and nothing in the normal case. It does not fix the data-availability
+      gap: a vertex only the dead node held cannot be fetched, and the protocol
+      must not decide without proof. The next live reproduction will name the id;
+      replicating a node's last vertices or a write lease around authoring and
+      broadcast would be the mechanism.
 
 ## Build order
 

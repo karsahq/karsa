@@ -703,6 +703,28 @@ mod tests {
     }
 
     #[test]
+    fn a_dead_author_does_not_block_rounds_that_follow_it() {
+        // `val-1` stops authoring at round 5, the way a killed validator does. The
+        // later rounds have three vertices, which is still a quorum; the missing
+        // leader must be skippable without ever receiving its vertex.
+        let absent: Vec<(u64, usize)> = (5..=10).map(|round| (round, 1)).collect();
+        let mut fixture = chain(10, &absent);
+        let mut pacemaker = pacemaker(3);
+
+        let step = pacemaker.tick(&mut fixture.dag).unwrap();
+        assert!(
+            matches!(step, Step::Advanced { .. }),
+            "a dead author must not stall the cursor: {step:?}"
+        );
+        assert!(
+            pacemaker.cursor() > 5,
+            "the missing leader at round 5 was not passed: cursor {}",
+            pacemaker.cursor()
+        );
+        assert_eq!(fixture.dag.skipped()[0].round, 5);
+    }
+
+    #[test]
     fn a_missing_leader_is_skipped_once_a_later_anchor_commits() {
         // Round 5 is led by `val-1` (5 % 4), and `val-1` never authored it.
         let mut fixture = chain(8, &[(5, 1)]);
