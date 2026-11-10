@@ -9,13 +9,15 @@
 //! u32 body length || u64 sent-at nanos || u8 kind || payload
 //! ```
 //!
-//! Five kinds share a link:
+//! Seven kinds share a link:
 //!
 //! - [`Message::Hello`] is the first frame on a link and names the chain.
 //! - [`Message::Vertex`] is the broadcast.
 //! - [`Message::Want`] asks a peer for one vertex by id.
 //! - [`Message::Payload`] carries the batch a vertex names, on the data plane.
 //! - [`Message::Share`] carries one validator's signature over a header.
+//! - [`Message::SnapshotWant`] and [`Message::Snapshot`] are a snapshot link.
+//! - [`Message::Tx`] gossips one signed envelope so every node can track it.
 //!
 //! The hello exists because a vertex is only meaningful on one chain: the chain id
 //! is part of what a validator signs, so a peer on another genesis would produce
@@ -55,13 +57,14 @@ const KIND_HELLO: u8 = 4;
 const KIND_SHARE: u8 = 5;
 const KIND_SNAPSHOT_WANT: u8 = 6;
 const KIND_SNAPSHOT: u8 = 7;
+const KIND_TX: u8 = 8;
 
 /// The framing and message layout this build speaks.
 ///
 /// A peer that answers with another number is not necessarily hostile; it may be a
 /// different build. The link is closed rather than parsed optimistically, because
 /// the next frame kind could mean something else there.
-pub const WIRE_PROTOCOL: u16 = 4;
+pub const WIRE_PROTOCOL: u16 = 5;
 
 /// The first frame on every link: which chain the sender is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +134,12 @@ pub enum Message {
     SnapshotWant,
     /// A state snapshot response.
     Snapshot(Box<Snapshot>),
+    /// One encoded transaction envelope, gossiped so a peer can track it.
+    ///
+    /// The frame carries the canonical envelope, not a decoded transaction:
+    /// the receiver re-checks the chain, policy, and signature before it is
+    /// admitted, so a gossiped frame has the same trust as a client submission.
+    Tx(Vec<u8>),
 }
 
 /// One decoded frame.
@@ -361,6 +370,11 @@ pub fn frame(message: &Message, sent_at_nanos: u64) -> Result<Vec<u8>, CryptoErr
         Message::Share(share) => (KIND_SHARE, encode_share(share)?),
         Message::SnapshotWant => (KIND_SNAPSHOT_WANT, Vec::new()),
         Message::Snapshot(snapshot) => (KIND_SNAPSHOT, encode_snapshot(snapshot)?),
+        Message::Tx(envelope) => (KIND_TX, {
+            let mut encoder = Encoder::with_capacity(4 + envelope.len());
+            encoder.put_bytes(envelope)?;
+            encoder.finish()
+        }),
     };
     let length = u32::try_from(8 + 1 + payload.len()).map_err(|_| {
         CryptoError::new(
@@ -434,6 +448,12 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
             Message::SnapshotWant
         }
         KIND_SNAPSHOT => Message::Snapshot(Box::new(decode_snapshot(payload)?)),
+        KIND_TX => {
+            let mut decoder = Decoder::new(payload);
+            let envelope = decoder.read_bytes()?.to_vec();
+            decoder.finish()?;
+            Message::Tx(envelope)
+        }
         other => return Err(invalid(format!("unknown frame kind {other}"))),
     };
     buffer.drain(..total);
@@ -540,6 +560,14 @@ mod tests {
         let mut buffer = frame(&Message::Payload(batch.clone()), 5).unwrap();
         let frame = take_frame(&mut buffer).unwrap().unwrap();
         assert_eq!(frame.message, Message::Payload(batch));
+    }
+
+    #[test]
+    fn a_transaction_frame_round_trips() {
+        let envelope = vec![7u8, 8, 9, 10];
+        let mut buffer = frame(&Message::Tx(envelope.clone()), 6).unwrap();
+        let frame = take_frame(&mut buffer).unwrap().unwrap();
+        assert_eq!(frame.message, Message::Tx(envelope));
     }
 
     #[test]

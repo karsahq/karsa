@@ -2008,6 +2008,18 @@ async fn node_task(
                             }
                         }
                     }
+                    Message::Tx(envelope) => {
+                        if let Some(rpc) = &rpc {
+                            // The receiver re-checks the envelope exactly like a
+                            // client submission; a duplicate or stale frame is
+                            // simply ignored.
+                            rpc.lock()
+                                .expect("rpc lock poisoned")
+                                .admit_gossip(&envelope, unix_now());
+                        } else {
+                            rejected += 1;
+                        }
+                    }
                     Message::Share(share) => {
                         if let Some(finalizer) = finalizer.as_mut() {
                             let certified = finalizer
@@ -2066,6 +2078,15 @@ async fn node_task(
                     store
                         .record_clock(node.round(), unix_now())
                         .map_err(|error| error.to_string())?;
+                }
+                // Gossip is drained every tick and sent on the control plane: one
+                // small frame per submitted envelope, never re-gossiped on receipt.
+                if let Some(rpc) = &rpc {
+                    for envelope in rpc.lock().expect("rpc lock poisoned").take_gossip() {
+                        let bytes = wire::frame(&Message::Tx(envelope), now())
+                            .map_err(|error| error.to_string())?;
+                        broadcast(&outbound, true, &bytes, &mut dropped);
+                    }
                 }
                 if !authoring_stopped && (config.rpc_port > 0 || node.round() <= config.rounds) {
                     let round = node.round();
@@ -2264,9 +2285,13 @@ async fn node_task(
                                 config.verify_threads,
                                 Some(&mut report),
                             );
-                            rpc.lock()
-                                .expect("rpc lock poisoned")
-                                .note_applied(&vertex.payload_hash, applied_cursor, &report);
+                            rpc.lock().expect("rpc lock poisoned").note_applied(
+                                &vertex.payload_hash,
+                                id,
+                                applied_cursor,
+                                batch,
+                                &report,
+                            );
                             count
                         } else {
                             chain::apply_batch_timed(
@@ -2682,6 +2707,9 @@ async fn archive_task(
                     Message::Share(_) => {}
                     // Snapshots need execution state, which an archive does not keep.
                     Message::SnapshotWant | Message::Snapshot(_) => {}
+                    // An archive has no RPC state, so a gossiped envelope has no
+                    // record to attach to. It is ignored rather than stored.
+                    Message::Tx(_) => {}
                     // The accept side consumes the hello before the loop starts.
                     Message::Hello(_) => rejected += 1,
                 }

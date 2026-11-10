@@ -866,9 +866,9 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     in 106 ms, and the commit proof verified. This is a devnet, not a deployment:
     every process runs on loopback under one user, and `peers.json` is
     informational because the live mesh still derives endpoints from
-    `--port-base`. `WIRE_PROTOCOL` is 4 since finding 39, so an old and a new
+    `--port-base`. `WIRE_PROTOCOL` is 5 since finding 41, so an old and a new
     node refuse each other at the handshake. The gate is green on this tree
-    (385 tests default, 386 with all features).
+    (392 tests default, 393 with all features).
 
 39. **A Merkle frontier bounds the checkpoint and the snapshot transfer.**
     A header's `dag_root` commits every entry from genesis, but entries below the
@@ -891,10 +891,59 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     node joined over TCP from a compact snapshot at height 3,986 (floor 4,443, 21
     tail vertices), matched the mesh on commit root `d49f51d7…`, restarted from
     its own compact checkpoint (5,452) with one applied transaction, and audited
-    3 of 3 heights. `WIRE_PROTOCOL` is 4, so an older node is refused at the
-    handshake. This closes the order-prefix cost that findings 34 and 37 carried;
-    the audit still starts above the anchor, and an old leaf below the floor
-    cannot be proven.
+    3 of 3 heights. `WIRE_PROTOCOL` is 5 since finding 41, so an older node is
+    refused at the handshake. This closes the order-prefix cost that findings 34
+    and 37 carried; the audit still starts above the anchor, and an old leaf below
+    the floor cannot be proven.
+
+40. **Account state grows with the genesis account set, not with history.**
+    The state field of every `live.snapshot` on disk was 212 bytes at four
+    accounts, at rounds 147–7,409, in both the v1 full-order files (up to 1.5 MB)
+    and the v2 frontier files (1.4–2.3 KB): the order history grew, the state
+    field did not. A 32-byte account id encodes to 52 bytes, so 0, 4, 64 and
+    1,000 accounts encode to 4, 212, 3,332 and 52,004 bytes. A 16-account state
+    applied 3,200 transfers and encoded to the same 836 bytes before and after.
+    A transaction changes a balance and a sequence in place and cannot add a map
+    entry; `apply_one` rejects an unknown sender and recipient, and only the
+    genesis credit adds accounts. The account set is closed, so the state is
+    `O(accounts)`, not `O(history)`. The remaining per-account costs are the tree
+    rebuild at each applied prefix, the 256-entry state windows, and a tree per
+    account proof; no sparse or reference-counted state is justified until
+    account creation exists. Pinned by
+    `the_state_encoding_grows_only_with_the_account_count` and
+    `the_state_encoding_does_not_grow_with_history`.
+
+41. **Transactions gossip on the peer link, and status is execution-wide.**
+    `Message::Tx` carries one canonical envelope; a local `POST /tx` queues the
+    transaction locally and puts the envelope in a gossip outbox that the node
+    loop drains to every peer each tick. A receiver re-runs the submission checks
+    (chain, policy, signature, replay, slot reservation) before admitting it to
+    its mempool, and never re-gossips a received envelope. Executing the committed
+    order updates records for transactions the node did not author: the id is
+    derived from the batch, the outcome and vertex are recorded, and an applied
+    copy wins over a later duplicate the sequence rule rejects. Finality uses the
+    same pending-order queue, so every node reports the same finalized height and
+    commit proof. `WIRE_PROTOCOL` is 5.
+    - Four-process devnet: a transfer submitted to node 0 finalized in 114 ms; all
+      four nodes reported `finalized` at height 1,293 with the same state root and
+      a verified proof (leaf 5,817 of 5,820). A second transfer submitted to node
+      2 finalized in 180 ms; all four nodes reported height 2,394 with a verified
+      proof. At shutdown: commit root `973718f3…`, state root `2456fc21…`, 2
+      applied, 6 rejected, 0 missing payloads, equal balances and sequences.
+    - The 6 rejects are the duplicate cost: every node authoring from its own
+      mempool can include the same transaction in the same round. The batch digest
+      is content-addressed, so it is one payload, but every vertex naming that
+      digest executes it again and the sequence rule refuses the copy. The applied
+      copy is the one reported and proved.
+    - Restart from checkpoints 2,592–2,692 restored 1 applied transaction and order
+      12,152 with 0 tracked records (they are in memory only); a transfer submitted
+      to node 1 after the restart finalized in 110 ms, all four nodes reported
+      height 4,256 with a proof, and the mesh ended on commit root `42726e73…`,
+      state root `7f33d240…`, applied 2, rejected 3, 0 missing payloads. Gossip is
+      best-effort (no repair for a dropped `Tx`), and a late envelope cannot create
+      a record after its sequence advanced. Pinned by the wire round-trip, the
+      duplicate/foreign-chain gossip tests, the remote-batch finality test, the
+      later-duplicate-keeps-applied test, and the stale-rejection test.
 
 ## Build order
 

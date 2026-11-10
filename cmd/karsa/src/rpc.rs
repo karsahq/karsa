@@ -173,6 +173,10 @@ pub(crate) struct RpcCore {
     mempool: VecDeque<PendingTx>,
     /// Transactions that passed submit, by content id.
     records: HashMap<[u8; 32], TxRecord>,
+    /// Canonical envelopes submitted here, waiting for the node loop to gossip
+    /// them to peers. A received envelope is not put back here, so gossip cannot
+    /// loop between two nodes.
+    gossip: Vec<Vec<u8>>,
     /// Batches this node authored from its own mempool, by digest.
     batches: HashMap<[u8; 32], BatchEntry>,
     /// Per-sender last applied sequence, from the execution state.
@@ -222,6 +226,7 @@ impl RpcCore {
                 .collect(),
             mempool: VecDeque::new(),
             records: HashMap::new(),
+            gossip: Vec::new(),
             batches: HashMap::new(),
             state_sequences: HashMap::new(),
             pending_sequences: HashSet::new(),
@@ -242,6 +247,11 @@ impl RpcCore {
             run: RunView::default(),
             certified_heights: 0,
         }
+    }
+
+    /// Takes the envelopes submitted since the last tick.
+    pub(crate) fn take_gossip(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.gossip)
     }
 
     /// Records the state at `applied` cumulative transactions.
@@ -331,8 +341,37 @@ impl RpcCore {
             )
         })?;
 
-        let id: [u8; 32] = Sha256::digest(envelope).into();
+        // The id is the digest of the canonical encoding, which is also what the
+        // execution path derives from a batch. A client that sends an equivalent
+        // envelope through another encoder still reaches the same record.
+        let canonical = transaction.encode().map_err(|error| {
+            RpcReject::new(
+                StatusCode::BAD_REQUEST,
+                i32::from(error.code()),
+                error.to_string(),
+            )
+        })?;
+        let id: [u8; 32] = Sha256::digest(&canonical).into();
         if self.records.contains_key(&id) {
+            // A gossiped envelope has a record but no local author. A client
+            // submitting it here claims that authoring, so the transaction is not
+            // left waiting for the node that first gossiped it.
+            let queued = self.mempool.iter().any(|pending| pending.id == id);
+            let record = self.records.get(&id).expect("the record was just checked");
+            let terminal = record.outcome.is_some();
+            let batched = record.batch.is_some();
+            let key = (record.sender.clone(), record.sequence);
+            if !queued && !terminal && !batched {
+                if self.mempool.len() >= MAX_MEMPOOL {
+                    return Err(RpcReject::new(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        -1,
+                        format!("mempool holds {MAX_MEMPOOL} transactions"),
+                    ));
+                }
+                self.pending_sequences.insert(key);
+                self.mempool.push_back(PendingTx { id, transaction });
+            }
             return self.record_view(&id).ok_or_else(|| {
                 RpcReject::new(StatusCode::INTERNAL_SERVER_ERROR, -1, "record disappeared")
             });
@@ -382,8 +421,69 @@ impl RpcCore {
             },
         );
         self.mempool.push_back(PendingTx { id, transaction });
+        self.gossip.push(canonical);
         self.record_view(&id)
             .ok_or_else(|| RpcReject::new(StatusCode::INTERNAL_SERVER_ERROR, -1, "record vanished"))
+    }
+
+    /// Admits an envelope a peer gossiped.
+    ///
+    /// The envelope gets the same checks as a submission: chain, policy,
+    /// signature, replay, and slot reservation. A duplicate id is ignored, and
+    /// `now` is the receiver's clock, not the sender's. The transaction joins the
+    /// local mempool, so a live node can author what a client sent to another
+    /// node; if two nodes author it in the same round, the sequence rule rejects
+    /// the later copy and the state changes once.
+    pub(crate) fn admit_gossip(&mut self, envelope: &[u8], now: u64) -> bool {
+        let Ok(transaction) = Transaction::decode(envelope) else {
+            return false;
+        };
+        if transaction.protocol_version != PROTOCOL_VERSION_V1
+            || transaction.chain_id != self.chain_id
+        {
+            return false;
+        }
+        let Some(policy) = self
+            .accounts
+            .iter()
+            .find(|(address, _)| address.as_slice() == transaction.sender.as_slice())
+            .map(|(_, policy)| policy)
+        else {
+            return false;
+        };
+        if transaction.verify(policy, now).is_err() {
+            return false;
+        }
+        let Ok(canonical) = transaction.encode() else {
+            return false;
+        };
+        let id: [u8; 32] = Sha256::digest(&canonical).into();
+        if self.records.contains_key(&id) || self.mempool.len() >= MAX_MEMPOOL {
+            return false;
+        }
+        let sender = transaction.sender.clone();
+        let applied = self.state_sequences.get(&sender).copied().unwrap_or(0);
+        if transaction.sequence <= applied {
+            return false;
+        }
+        let key = (sender.clone(), transaction.sequence);
+        if !self.pending_sequences.insert(key) {
+            return false;
+        }
+        self.records.insert(
+            id,
+            TxRecord {
+                sender,
+                sequence: transaction.sequence,
+                batch: None,
+                vertex: None,
+                outcome: None,
+                order_len_after: None,
+                finalized_height: None,
+            },
+        );
+        self.mempool.push_back(PendingTx { id, transaction });
+        true
     }
 
     /// Takes up to `max` transactions for the next authored batch.
@@ -459,27 +559,61 @@ impl RpcCore {
         }
     }
 
-    /// Records that a tracked batch was executed at `order_index`.
+    /// Records that a batch was executed at `order_index`, whoever authored it.
+    ///
+    /// A gossiped transaction has a record on every node, but only one node may
+    /// have authored the batch that carries it. Executing the committed order is
+    /// what makes the status global: the record is updated from the batch itself,
+    /// and an applied copy wins over a later duplicate the sequence rule rejects.
     pub(crate) fn note_applied(
         &mut self,
         digest: &[u8; 32],
+        vertex: &VertexId,
         order_index: usize,
+        batch: &tx::batch::Batch,
         results: &[TxResult],
     ) {
-        let Some(entry) = self.batches.get(digest) else {
-            return;
-        };
-        let ids = entry.tx_ids.clone();
-        for (offset, id) in ids.iter().enumerate() {
-            let Some(record) = self.records.get_mut(id) else {
+        let order_len = order_index.saturating_add(1);
+        let mut executed: HashSet<[u8; 32]> = HashSet::new();
+        let mut finalized: Vec<[u8; 32]> = Vec::with_capacity(batch.len());
+        for (offset, transaction) in batch.transactions.iter().enumerate() {
+            let Ok(envelope) = transaction.encode() else {
                 continue;
             };
-            record.order_len_after = Some(order_index + 1);
-            record.outcome = results.get(offset).copied();
+            let id: [u8; 32] = Sha256::digest(&envelope).into();
+            executed.insert(id);
+            let Some(result) = results.get(offset).copied() else {
+                continue;
+            };
+            let Some(record) = self.records.get_mut(&id) else {
+                continue;
+            };
+            let merged = match record.outcome {
+                Some(TxResult::Applied) => Some(TxResult::Applied),
+                _ if result == TxResult::Applied => Some(TxResult::Applied),
+                Some(rejected) => Some(rejected),
+                None => Some(result),
+            };
+            if merged != record.outcome {
+                record.outcome = merged;
+                // The applied occurrence is the one a proof must point at, and
+                // an earlier rejection may already have been finalized.
+                record.finalized_height = None;
+                record.order_len_after = Some(order_len);
+                record.batch = Some(*digest);
+                record.vertex = Some(vertex.clone());
+                finalized.push(id);
+            }
             self.pending_sequences
                 .remove(&(record.sender.clone(), record.sequence));
         }
-        self.pending_finality.push_back((order_index + 1, ids));
+        // A peer's copy that is still waiting here must not author a second batch
+        // for a transaction the committed order already executed.
+        self.mempool
+            .retain(|pending| !executed.contains(&pending.id));
+        if !finalized.is_empty() {
+            self.pending_finality.push_back((order_len, finalized));
+        }
     }
 
     /// Extends the local copy from a compact prefix plus its retained tail.
@@ -524,15 +658,22 @@ impl RpcCore {
             if *order_len > covered {
                 break;
             }
-            let Some((_, ids)) = self.pending_finality.pop_front() else {
+            let Some((order_len, ids)) = self.pending_finality.pop_front() else {
                 break;
             };
             for id in ids {
-                if let Some(record) = self.records.get_mut(&id) {
-                    record.finalized_height = Some(header.height);
+                let Some(record) = self.records.get_mut(&id) else {
+                    continue;
+                };
+                // An applied occurrence may have superseded an earlier rejection
+                // for the same transaction. Finality follows the position the
+                // record names now, not the position of a stale queue entry.
+                if record.order_len_after != Some(order_len) {
+                    continue;
                 }
+                record.finalized_height = Some(header.height);
+                finalized = true;
             }
-            finalized = true;
         }
         if finalized {
             self.finalized_headers
@@ -1083,7 +1224,7 @@ mod tests {
             Some(&mut report),
         );
         assert_eq!(applied, 1);
-        core.note_applied(&digest, 0, &report);
+        core.note_applied(&digest, &vertex, 0, &batch, &report);
         core.note_state(1, &state);
 
         let id = body_id(&envelope);
@@ -1127,7 +1268,12 @@ mod tests {
         let state = chain::genesis_state(&accounts).unwrap();
         let mut state = state;
         chain::apply_batch(&mut state, &accounts, &batch, &mut BTreeMap::new());
-        core.note_applied(&digest, 0, &[TxResult::Applied]);
+        let vertex = VertexId {
+            round: 1,
+            author: b"val-0".to_vec(),
+            digest: [8; 32],
+        };
+        core.note_applied(&digest, &vertex, 0, &batch, &[TxResult::Applied]);
         core.note_state(1, &state);
 
         let error = core.submit(&replay, 1_700_000_000).unwrap_err();
@@ -1212,7 +1358,7 @@ mod tests {
             Some(&mut report),
         );
         assert_eq!(applied, 0);
-        core.note_applied(&digest, 0, &report);
+        core.note_applied(&digest, &vertex, 0, &batch, &report);
         core.note_state(0, &state);
         let header = Header {
             chain_id: chain_id.clone(),
@@ -1268,5 +1414,145 @@ mod tests {
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
         });
+    }
+
+    #[test]
+    fn gossip_refuses_a_duplicate_and_a_foreign_chain() {
+        let (mut core, accounts, chain_id) = fixture();
+        let envelope = signed(&chain_id, &accounts[0], &accounts[1].address, 1, 1);
+        assert!(core.admit_gossip(&envelope, 1_700_000_000));
+        assert!(!core.admit_gossip(&envelope, 1_700_000_000));
+
+        let foreign = signed(b"another-chain", &accounts[0], &accounts[1].address, 1, 1);
+        assert!(!core.admit_gossip(&foreign, 1_700_000_000));
+    }
+
+    #[test]
+    fn a_gossiped_transfer_finalizes_from_another_nodes_batch() {
+        let (mut author, accounts, chain_id) = fixture();
+        let envelope = signed(&chain_id, &accounts[0], &accounts[1].address, 1, 10);
+        author.submit(&envelope, 1_700_000_000).unwrap();
+        let gossip = author.take_gossip();
+        assert_eq!(gossip.len(), 1);
+
+        // The receiving node did not author the transaction; it learns the
+        // outcome and the proof from executing the committed batch.
+        let (mut peer, _, _) = fixture();
+        assert!(peer.admit_gossip(&gossip[0], 1_700_000_000));
+        let id = body_id(&envelope);
+        assert_eq!(peer.transaction(id, false).unwrap().status, "mempool");
+
+        let batch = author.take_batch(16).unwrap();
+        let digest = batch.digest().unwrap();
+        let vertex = VertexId {
+            round: 1,
+            author: b"val-0".to_vec(),
+            digest: [3; 32],
+        };
+        let mut state = chain::genesis_state(&accounts).unwrap();
+        let mut report = Vec::new();
+        let applied = chain::apply_batch_timed_report(
+            &mut state,
+            &accounts,
+            &batch,
+            &mut BTreeMap::new(),
+            &mut chain::ApplyTiming::default(),
+            1,
+            Some(&mut report),
+        );
+        assert_eq!(applied, 1);
+        peer.note_order_from(&CommitFrontier::empty(), std::slice::from_ref(&vertex));
+        peer.note_applied(&digest, &vertex, 0, &batch, &report);
+        assert_eq!(peer.transaction(id, false).unwrap().status, "executed");
+
+        let header = Header {
+            chain_id: chain_id.clone(),
+            epoch: 0,
+            height: 1,
+            round: 1,
+            state_root: state.state_root(),
+            dag_root: validator::commit_root(std::slice::from_ref(&vertex)),
+            previous: [0; 32],
+            applied: 1,
+        };
+        peer.note_certified(&header, Some(1));
+        let view = peer.transaction(id, true).unwrap();
+        assert_eq!(view.status, "finalized");
+        assert_eq!(view.finalized_height, Some(1));
+        assert!(view.commit_proof.is_some());
+    }
+
+    #[test]
+    fn a_later_duplicate_does_not_undo_an_applied_outcome() {
+        let (mut core, accounts, chain_id) = fixture();
+        let envelope = signed(&chain_id, &accounts[0], &accounts[1].address, 1, 10);
+        core.submit(&envelope, 1_700_000_000).unwrap();
+        let batch = core.take_batch(16).unwrap();
+        let digest = batch.digest().unwrap();
+        let vertex = VertexId {
+            round: 1,
+            author: b"val-0".to_vec(),
+            digest: [4; 32],
+        };
+        core.note_applied(&digest, &vertex, 0, &batch, &[TxResult::Applied]);
+        core.note_applied(
+            &digest,
+            &vertex,
+            1,
+            &batch,
+            &[TxResult::Rejected("bad sequence")],
+        );
+
+        let view = core.transaction(body_id(&envelope), false).unwrap();
+        assert_eq!(view.status, "executed");
+        assert!(view.finalized_height.is_none());
+    }
+
+    #[test]
+    fn a_stale_rejection_does_not_finalize_a_later_applied_occurrence() {
+        let (mut core, accounts, chain_id) = fixture();
+        let envelope = signed(&chain_id, &accounts[0], &accounts[1].address, 1, 10);
+        core.submit(&envelope, 1_700_000_000).unwrap();
+        let batch = core.take_batch(16).unwrap();
+        let digest = batch.digest().unwrap();
+        let vertex = VertexId {
+            round: 1,
+            author: b"val-0".to_vec(),
+            digest: [5; 32],
+        };
+        core.note_applied(
+            &digest,
+            &vertex,
+            0,
+            &batch,
+            &[TxResult::Rejected("bad sequence")],
+        );
+        core.note_applied(&digest, &vertex, 1, &batch, &[TxResult::Applied]);
+        core.note_order_from(&CommitFrontier::empty(), &[vertex.clone(), vertex.clone()]);
+
+        // The header covers the rejection's order position only. The record now
+        // names the applied position, so this header must not finalize it.
+        let mut header = Header {
+            chain_id: chain_id.clone(),
+            epoch: 0,
+            height: 1,
+            round: 1,
+            state_root: exec::State::new().state_root(),
+            dag_root: validator::commit_root(std::slice::from_ref(&vertex)),
+            previous: [0; 32],
+            applied: 0,
+        };
+        core.note_certified(&header, Some(1));
+        let view = core.transaction(body_id(&envelope), true).unwrap();
+        assert_eq!(view.status, "executed");
+        assert!(view.finalized_height.is_none());
+
+        header.height = 2;
+        header.applied = 1;
+        core.note_certified(&header, Some(2));
+        let view = core.transaction(body_id(&envelope), true).unwrap();
+        assert_eq!(view.status, "finalized");
+        assert_eq!(view.finalized_height, Some(2));
+        assert!(view.commit_proof.is_some());
     }
 }

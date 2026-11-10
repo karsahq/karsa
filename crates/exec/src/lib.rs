@@ -397,6 +397,13 @@ mod tests {
         state
     }
 
+    /// A 32-byte account id that is distinct per index and sorts by index.
+    fn account_id(index: u32) -> Vec<u8> {
+        let mut account = vec![0u8; 32];
+        account[..4].copy_from_slice(&index.to_le_bytes());
+        account
+    }
+
     #[test]
     fn a_transfer_moves_value_and_burns_the_fee() {
         let mut state = genesis();
@@ -550,6 +557,51 @@ mod tests {
         assert_eq!(decoded, state);
         assert_eq!(decoded.state_root(), state.state_root());
         assert_eq!(decoded.sequence(b"alice"), 1);
+    }
+
+    #[test]
+    fn the_state_encoding_grows_only_with_the_account_count() {
+        for count in [0u32, 4, 64, 1_000] {
+            let mut state = State::new();
+            for index in 0..count {
+                state.credit(&account_id(index), 1_000).unwrap();
+            }
+            let encoded = state.encode().unwrap();
+            // A u32 count, then one record per account: u32 id length, a 32-byte
+            // id, the balance, and the sequence.
+            assert_eq!(encoded.len(), 4 + usize::try_from(count).unwrap() * 52);
+            assert_eq!(State::decode(&encoded).unwrap(), state);
+        }
+    }
+
+    #[test]
+    fn the_state_encoding_does_not_grow_with_history() {
+        let accounts: Vec<Vec<u8>> = (0..16).map(account_id).collect();
+        let mut state = State::new();
+        for account in &accounts {
+            state.credit(account, 1_000_000).unwrap();
+        }
+        let genesis_len = state.encode().unwrap().len();
+        assert_eq!(genesis_len, 4 + accounts.len() * 52);
+
+        let mut sequences = vec![0u64; accounts.len()];
+        for _ in 0..200 {
+            let mut transactions = Vec::with_capacity(accounts.len());
+            for (index, account) in accounts.iter().enumerate() {
+                sequences[index] += 1;
+                let recipient = &accounts[(index + 1) % accounts.len()];
+                transactions.push(transaction(account, sequences[index], recipient, 1));
+            }
+            let outcomes = state.apply(&Batch::new(transactions));
+            assert!(outcomes.iter().all(|outcome| outcome.is_applied()));
+        }
+
+        assert_eq!(state.sequence(&accounts[0]), 200);
+        assert_eq!(
+            state.encode().unwrap().len(),
+            genesis_len,
+            "a longer history must not grow the encoded state"
+        );
     }
 
     #[test]
