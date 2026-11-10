@@ -868,7 +868,7 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     informational because the live mesh still derives endpoints from
     `--port-base`. `WIRE_PROTOCOL` is 5 since finding 41, so an old and a new
     node refuse each other at the handshake. The gate is green on this tree
-    (392 tests default, 393 with all features).
+    (393 tests default, 394 with all features).
 
 39. **A Merkle frontier bounds the checkpoint and the snapshot transfer.**
     A header's `dag_root` commits every entry from genesis, but entries below the
@@ -944,6 +944,27 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       a record after its sequence advanced. Pinned by the wire round-trip, the
       duplicate/foreign-chain gossip tests, the remote-batch finality test, the
       later-duplicate-keeps-applied test, and the stale-rejection test.
+
+42. **A finalized transaction carries its commit proof across the pruned prefix.**
+    When a certified header finalizes a tracked transaction, `RpcCore` captures
+    the commit proof while the leaf is still inside the retained order: the
+    vertex, the Merkle path, and the header's `state_root` and `dag_root`.
+    `/tx/{id}?proof=1` returns that witness when the live order can no longer
+    build the proof, so a checkpoint pruning the leaf leaves status, roots, and
+    proof intact. A later applied copy clears the witness because it may point at
+    a different order position.
+    - Four-process devnet, checkpoint every 64: a transfer finalized at height
+      1,389, vertex round 1,560, leaf 6,239 of 6,240, proof verified at finality.
+      After checkpoint round 2,387 (floor 2,385, prefix length 9,542), the leaf and
+      its vertex were below the retained prefix. The same request still returned
+      the 8-step proof, and recomputing the root from the returned vertex and
+      siblings gave `73d1c93b0739…`, equal to `dag_root`. The four nodes ended on
+      commit root `64d1fc13…`, state root `20c162bd…`, 1 applied, 3 rejected.
+    - The witness is memory-only and belongs to the record: a restart loses it with
+      `/tx` history, and it covers transactions this process tracked, not every old
+      leaf. Pinned by `a_finalized_proof_survives_the_order_prefix`, which clears
+      the retained order, the prefix, and the certified-header window before asking
+      for the proof.
 
 ## Build order
 

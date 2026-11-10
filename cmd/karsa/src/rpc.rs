@@ -105,6 +105,18 @@ impl Stage {
     }
 }
 
+/// A commit proof captured when a transaction finalized.
+///
+/// The proof is built while the committed order is still retained. Keeping it on
+/// the record is what lets `/tx/{id}?proof=1` answer after a checkpoint has pruned
+/// the leaf out of the retained prefix.
+#[derive(Debug, Clone)]
+struct Witness {
+    state_root: [u8; 32],
+    dag_root: [u8; 32],
+    proof: CommitProof,
+}
+
 /// One admitted transaction and what happened to it.
 #[derive(Debug, Clone)]
 struct TxRecord {
@@ -115,6 +127,8 @@ struct TxRecord {
     outcome: Option<TxResult>,
     order_len_after: Option<usize>,
     finalized_height: Option<u64>,
+    /// The proof saved at finality, before the order prefix could be pruned.
+    witness: Option<Witness>,
 }
 
 impl TxRecord {
@@ -418,6 +432,7 @@ impl RpcCore {
                 outcome: None,
                 order_len_after: None,
                 finalized_height: None,
+                witness: None,
             },
         );
         self.mempool.push_back(PendingTx { id, transaction });
@@ -480,6 +495,7 @@ impl RpcCore {
                 outcome: None,
                 order_len_after: None,
                 finalized_height: None,
+                witness: None,
             },
         );
         self.mempool.push_back(PendingTx { id, transaction });
@@ -597,8 +613,10 @@ impl RpcCore {
             if merged != record.outcome {
                 record.outcome = merged;
                 // The applied occurrence is the one a proof must point at, and
-                // an earlier rejection may already have been finalized.
+                // an earlier rejection may already have been finalized with a
+                // witness for a different position.
                 record.finalized_height = None;
+                record.witness = None;
                 record.order_len_after = Some(order_len);
                 record.batch = Some(*digest);
                 record.vertex = Some(vertex.clone());
@@ -662,16 +680,20 @@ impl RpcCore {
                 break;
             };
             for id in ids {
-                let Some(record) = self.records.get_mut(&id) else {
-                    continue;
-                };
+                let matches = self
+                    .records
+                    .get(&id)
+                    .is_some_and(|record| record.order_len_after == Some(order_len));
                 // An applied occurrence may have superseded an earlier rejection
                 // for the same transaction. Finality follows the position the
                 // record names now, not the position of a stale queue entry.
-                if record.order_len_after != Some(order_len) {
+                if !matches {
                     continue;
                 }
-                record.finalized_height = Some(header.height);
+                if let Some(record) = self.records.get_mut(&id) {
+                    record.finalized_height = Some(header.height);
+                }
+                self.capture_witness(&id, header, covered);
                 finalized = true;
             }
         }
@@ -685,6 +707,54 @@ impl RpcCore {
                 self.finalized_headers.remove(&oldest);
             }
         }
+    }
+
+    /// Saves the commit proof for one finalized record while its leaf is still
+    /// in the retained order.
+    ///
+    /// A proof cannot be rebuilt from the frontier peaks alone once the leaf is
+    /// below the floor, so a record that may outlive the prefix carries its own
+    /// path. The captured roots also keep `/tx` answerable after the certified
+    /// header context has been evicted from its window.
+    fn capture_witness(&mut self, id: &[u8; 32], header: &Header, covered: usize) {
+        let Some(record) = self.records.get(id) else {
+            return;
+        };
+        if record.witness.is_some() {
+            return;
+        }
+        let Some(index) = record.order_len_after.map(|len| len.saturating_sub(1)) else {
+            return;
+        };
+        let Some(vertex) = record.vertex.clone() else {
+            return;
+        };
+        let Some(tail_index) = index.checked_sub(self.order_base) else {
+            return;
+        };
+        let Some(covered_tail) = covered.checked_sub(self.order_base) else {
+            return;
+        };
+        if tail_index >= covered_tail || covered_tail > self.order.len() {
+            return;
+        }
+        if self.order.get(tail_index) != Some(&vertex) {
+            return;
+        }
+        let Some(proof) = self
+            .order_prefix
+            .proof_for(&self.order[..covered_tail], tail_index)
+        else {
+            return;
+        };
+        let Some(record) = self.records.get_mut(id) else {
+            return;
+        };
+        record.witness = Some(Witness {
+            state_root: header.state_root,
+            dag_root: header.dag_root,
+            proof: CommitProof { vertex, proof },
+        });
     }
 
     /// Counts certified heights reported by the finalizer.
@@ -749,6 +819,14 @@ impl RpcCore {
             dag_root: None,
             commit_proof: None,
         };
+        if let Some(witness) = &record.witness {
+            view.state_root = Some(hex::encode(witness.state_root));
+            view.dag_root = Some(hex::encode(witness.dag_root));
+            if with_proof {
+                view.commit_proof = Some(proof_view(&witness.proof));
+            }
+            return Ok(view);
+        }
         let Some(height) = record.finalized_height else {
             return Ok(view);
         };
@@ -1506,6 +1584,66 @@ mod tests {
         let view = core.transaction(body_id(&envelope), false).unwrap();
         assert_eq!(view.status, "executed");
         assert!(view.finalized_height.is_none());
+    }
+
+    #[test]
+    fn a_finalized_proof_survives_the_order_prefix() {
+        let (mut core, accounts, chain_id) = fixture();
+        let envelope = signed(&chain_id, &accounts[0], &accounts[1].address, 1, 10);
+        core.submit(&envelope, 1_700_000_000).unwrap();
+        let batch = core.take_batch(16).unwrap();
+        let digest = batch.digest().unwrap();
+        let vertex = VertexId {
+            round: 1,
+            author: b"val-0".to_vec(),
+            digest: [6; 32],
+        };
+        let mut state = chain::genesis_state(&accounts).unwrap();
+        let mut report = Vec::new();
+        chain::apply_batch_timed_report(
+            &mut state,
+            &accounts,
+            &batch,
+            &mut BTreeMap::new(),
+            &mut chain::ApplyTiming::default(),
+            1,
+            Some(&mut report),
+        );
+        core.note_order_from(&CommitFrontier::empty(), std::slice::from_ref(&vertex));
+        core.note_applied(&digest, &vertex, 0, &batch, &report);
+        let header = Header {
+            chain_id: chain_id.clone(),
+            epoch: 0,
+            height: 1,
+            round: 1,
+            state_root: state.state_root(),
+            dag_root: validator::commit_root(std::slice::from_ref(&vertex)),
+            previous: [0; 32],
+            applied: 1,
+        };
+        core.note_certified(&header, Some(1));
+
+        let id = body_id(&envelope);
+        let witness = core
+            .records
+            .get(&id)
+            .unwrap()
+            .witness
+            .clone()
+            .expect("a witness is captured at finality");
+        assert!(witness.proof.verify(&witness.dag_root));
+
+        // The checkpoint has now pruned the only leaf out of the retained prefix,
+        // and the certified-header window no longer holds that height.
+        core.order.clear();
+        core.order_base = 1;
+        core.order_prefix = CommitFrontier::empty();
+        core.finalized_headers.clear();
+
+        let view = core.transaction(id, true).unwrap();
+        assert_eq!(view.status, "finalized");
+        assert_eq!(view.dag_root, Some(hex::encode(header.dag_root)));
+        assert!(view.commit_proof.is_some());
     }
 
     #[test]
