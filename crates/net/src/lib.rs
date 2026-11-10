@@ -33,8 +33,9 @@ use crypto::registry::ALG_ED25519;
 use crypto::scheme::Ed25519Scheme;
 use crypto::{CryptoError, CryptoErrorKind};
 use validator::{
-    CommitFrontier, Dag, NO_EXPIRY, Pacemaker, PacemakerConfig, SetChangeError, Step, Transition,
-    TransitionCertificate, ValidatorKey, ValidatorRecord, ValidatorSet, Vertex, VertexId,
+    CommitFrontier, Dag, FenceCertificate, FenceError, NO_EXPIRY, Pacemaker, PacemakerConfig,
+    SetChangeError, Step, Transition, TransitionCertificate, ValidatorKey, ValidatorRecord,
+    ValidatorSet, Vertex, VertexId,
 };
 
 const CHAIN_ID: &[u8] = b"karsa-net-1";
@@ -255,12 +256,22 @@ impl Node {
         self.dag.adopt_set_change(certificate)
     }
 
+    /// Installs a quorum-authorized fence in this node's DAG.
+    ///
+    /// # Errors
+    ///
+    /// Every error from [`Dag::apply_fence`].
+    pub fn apply_fence(&mut self, certificate: &FenceCertificate) -> Result<(), FenceError> {
+        self.dag.apply_fence(&self.chain_id, certificate)
+    }
+
     /// Ids of every vertex this node holds in `round`.
     fn ids(&self, round: u64) -> Vec<VertexId> {
         self.dag
             .set_for_round(round)
             .validators
             .iter()
+            .filter(|record| !self.dag.is_fenced(&record.validator_id, round))
             .filter_map(|record| self.dag.get(round, &record.validator_id))
             .filter_map(|vertex| vertex.id().ok())
             .collect()

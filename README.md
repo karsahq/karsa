@@ -1078,6 +1078,68 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       Permanent failure needs an authorized transition or a view change, which
       remains open. Pinned by three `failure` unit tests over a fixed set.
 
+48. **A set change is a certificate, and activation is deterministic.**
+    A `SetChange` names the chain, the old and new set ids, the activation epoch,
+    and a transition hash; `TransitionCertificate` carries the new set and a
+    bitmap of old-set signatures over that descriptor. A node merges partial
+    certificates until the old-set quorum is present, verifies every signature,
+    and only then installs the new schedule. `Dag::adopt_set_change` keeps the
+    vertices it already holds and switches `set_for_epoch` at the boundary;
+    `Finalizer::adopt_set_change` rebuilds the header chain with the new set and
+    refuses to act if the certified head has already reached the activation
+    epoch. Live nodes propose the transition with
+    `--add-validator-at-epoch`/`--remove-validator-at-epoch`, exchange partial
+    certificates on the mesh, persist the full certificate in `set-change`, and
+    carry it in `LiveSnapshot` and the snapshot wire message. Restart and
+    snapshot join apply the certificate before replaying any vertex, and `karsa
+    audit` verifies it before using the new set for the header chain and DAG
+    replay. `WIRE_PROTOCOL` moved 6 → 7 for the snapshot field.
+    - The in-process four-node test adds a validator at epoch 4 with four-round
+      epochs: all four nodes adopt, 20 of 20 common heights certify, the restart
+      from a checkpoint with the transition succeeds, and the audit prints the
+      transition. A four-process devnet with epoch 32 and the same change reached
+      927 certified heights (head 927/1147, 0 conflicts); a no-checkpoint run
+      reached 409 certified heights and the audit re-derived 409/409 state and
+      dag roots after the boundary.
+    - The prototype installs one transition per schedule. A node that misses the
+      certificate until its own schedule has crossed the activation epoch refuses
+      it rather than applying a boundary it cannot audit; durable repair for that
+      case is part of the view-change work.
+
+49. **A quorum fence frees a leader round without treating local silence as
+    evidence.**
+    `Fence` names a validator and the first round it is failed from.
+    `FenceCertificate` is a supermajority signature over that descriptor, verified
+    against the set active at the fence round. A DAG accepts at most `f` fences.
+    After it is installed, a new vertex from the fenced author at or after the
+    fence round is rejected and authored reference lists omit fenced vertices, so
+    a delayed leader cannot become a vote. Two skip rules use the fence, both
+    after the direct and indirect rules: a missing leader whose author is fenced
+    is skipped at its own round; a live leader is skipped when every missing
+    next-round voter is fenced and the held vote count is at most `f`. In the second case even a late vote from every fenced
+    validator reaches at most `2f`, below the `2f + 1` quorum. The live loop
+    proposes a fence only when the failure detector reports the validator silent,
+    the node has not decided the fence round, and the validator is the missing
+    leader or a missing voter at the cursor. Partial fences travel as
+    `Message::Fence`, the full certificate is stored in `fence`, and
+    `WIRE_PROTOCOL` is 8.
+    - `a_fenced_leader_is_skipped_without_a_vote_or_anchor` and
+      `a_fenced_missing_voter_frees_a_live_leaders_round` pin the two rules; the
+      first also checks that the round is not skipped before the certificate is
+      applied.
+    - The automated four-process devnet test kills validator 0 after two certified
+      heights and requires all three survivors to certify at least five more;
+      they do, with 0 conflicts. The test is the regression for the permanent
+      failure that motivated the fence. It does not assert that a fence was the
+      mechanism, because the surviving quorum can also advance through the
+      existing anchor rules; the fence unit tests are the direct evidence for the
+      skip rule.
+    - The vote-fence rule treats the quorum declaration as authoritative for the
+      missing voters. It is a view-change liveness rule, not a slashing proof; a
+      falsely fenced honest validator that later equivocates remains outside the
+      crash-fault reading the prototype tests. The fence is retained across a
+      restart so a returning node does not have to rediscover the failure.
+
 ## Build order
 
 | Stage | Crate | State |

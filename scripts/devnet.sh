@@ -14,6 +14,8 @@
 #   EPOCH_ROUNDS=32            epoch length when --init writes genesis
 #   ADD_VALIDATOR_AT_EPOCH=4   propose one authorized addition at this epoch
 #   REMOVE_VALIDATOR_AT_EPOCH  propose one authorized removal at this epoch
+#   FENCE_SILENT=1             collect a quorum fence for a silent leader
+#   FAILURE_ROUNDS=20          silence threshold for the failure detector
 #
 # The genesis is the four-validator example `karsa genesis --init` writes; its
 # keys are the demo keys and are public knowledge. peers.json is written for the
@@ -36,6 +38,8 @@ CHECKPOINT_EVERY=${CHECKPOINT_EVERY:-1024}
 EPOCH_ROUNDS=${EPOCH_ROUNDS:-}
 ADD_VALIDATOR_AT_EPOCH=${ADD_VALIDATOR_AT_EPOCH:-}
 REMOVE_VALIDATOR_AT_EPOCH=${REMOVE_VALIDATOR_AT_EPOCH:-}
+FENCE_SILENT=${FENCE_SILENT:-}
+FAILURE_ROUNDS=${FAILURE_ROUNDS:-50}
 BIN=${BIN:-target/release/karsa}
 VALIDATORS=4
 
@@ -45,6 +49,11 @@ if [ -n "$ADD_VALIDATOR_AT_EPOCH" ]; then
 fi
 if [ -n "$REMOVE_VALIDATOR_AT_EPOCH" ]; then
     CHANGE_ARGS="$CHANGE_ARGS --remove-validator-at-epoch $REMOVE_VALIDATOR_AT_EPOCH"
+fi
+
+FENCE_ARGS=""
+if [ -n "$FENCE_SILENT" ]; then
+    FENCE_ARGS="--fence-silent"
 fi
 
 if [ "${RESET:-0}" = 1 ]; then
@@ -87,9 +96,11 @@ while [ "$i" -lt "$VALIDATORS" ]; do
         --txs 0 \
         --timeout-seconds "$LIFETIME" \
         --checkpoint-every "$CHECKPOINT_EVERY" \
+        --failure-rounds "$FAILURE_ROUNDS" \
         --home "$DEVNET" \
         --store "$DEVNET/data" \
         $CHANGE_ARGS \
+        $FENCE_ARGS \
         > "$DEVNET/val-$i.log" 2>&1 &
     pids="$pids $!"
     i=$((i + 1))
@@ -103,6 +114,9 @@ echo "  snapshot  $SNAPSHOT_PORT..$((SNAPSHOT_PORT + VALIDATORS - 1))"
 echo "  checkpoint every $CHECKPOINT_EVERY certified heights (0 disables; each write prunes below its floor)"
 if [ -n "$CHANGE_ARGS" ]; then
     echo "  set change        $CHANGE_ARGS"
+fi
+if [ -n "$FENCE_ARGS" ]; then
+    echo "  fencing           silent leaders after $FAILURE_ROUNDS rounds"
 fi
 echo "  send      $BIN send --home $DEVNET --rpc 127.0.0.1:$RPC_PORT --from 0 --to 1 --amount 1 --wait"
 echo "  logs      $DEVNET/val-*.log"

@@ -30,14 +30,20 @@ impl Devnet {
     /// Starts one `karsa live --node-index i` process per validator.
     ///
     /// `p2p_base` is the consensus port base; `rpc_base` is the first HTTP port.
-    /// The home must already contain a genesis and its keys.
+    /// The home must already contain a genesis and its keys. `extra` is appended
+    /// to every process, so all validators see the same liveness policy.
     fn start(dir: PathBuf, p2p_base: u16, rpc_base: u16) -> Self {
+        Self::start_with(dir, p2p_base, rpc_base, &[])
+    }
+
+    fn start_with(dir: PathBuf, p2p_base: u16, rpc_base: u16, extra: &[&str]) -> Self {
         let mut children = Vec::with_capacity(VALIDATORS);
         for index in 0..VALIDATORS {
             let log =
                 File::create(dir.join(format!("val-{index}.log"))).expect("create a validator log");
             let error = log.try_clone().expect("clone the validator log");
-            let child = Command::new(BIN)
+            let mut command = Command::new(BIN);
+            command
                 .args(["live", "--validators", &VALIDATORS.to_string()])
                 .args(["--node-index", &index.to_string()])
                 .args(["--port-base", &p2p_base.to_string()])
@@ -50,10 +56,10 @@ impl Devnet {
                 .arg(&dir)
                 .arg("--store")
                 .arg(dir.join("data"))
+                .args(extra)
                 .stdout(Stdio::from(log))
-                .stderr(Stdio::from(error))
-                .spawn()
-                .expect("spawn a validator");
+                .stderr(Stdio::from(error));
+            let child = command.spawn().expect("spawn a validator");
             children.push(child);
         }
         Self { dir, children }
@@ -146,6 +152,89 @@ fn wait_for<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Optio
         sleep(Duration::from_millis(100));
     }
     None
+}
+
+#[test]
+fn a_four_process_devnet_keeps_moving_after_one_validator_dies() {
+    let dir = test_home("fence");
+    let genesis = Command::new(BIN)
+        .args(["genesis", "--home"])
+        .arg(&dir)
+        .arg("--init")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run karsa genesis");
+    assert!(
+        genesis.status.success(),
+        "genesis failed: {}",
+        String::from_utf8_lossy(&genesis.stderr)
+    );
+
+    let base = free_port_block(VALIDATORS * 2);
+    let rpc_base = base + u16::try_from(VALIDATORS).expect("four ports fit a u16");
+    let mut devnet = Devnet::start_with(
+        dir.clone(),
+        base,
+        rpc_base,
+        &["--fence-silent", "--failure-rounds", "15"],
+    );
+
+    let ready = wait_for(Duration::from_secs(10), || {
+        for index in 0..VALIDATORS {
+            let port = rpc_base + u16::try_from(index).expect("four ports fit a u16");
+            let status = request(port, "/status")?;
+            if status["head_height"].as_u64().unwrap_or(0) < 2 {
+                return None;
+            }
+        }
+        Some(())
+    });
+    if ready.is_none() {
+        devnet.fail("the four nodes never certified two heights");
+    }
+
+    let before: Vec<u64> = (1..VALIDATORS)
+        .map(|index| {
+            let port = rpc_base + u16::try_from(index).expect("four ports fit a u16");
+            request(port, "/status")
+                .and_then(|status| status["head_height"].as_u64())
+                .unwrap_or(0)
+        })
+        .collect();
+
+    let mut killed = devnet.children.remove(0);
+    killed.kill().expect("kill validator 0");
+    killed.wait().expect("reap validator 0");
+
+    // The survivors must keep certifying. A round whose leader is missing is
+    // skipped once a quorum fence names the failed author; the point of this
+    // test is that the cursor does not stay on that round forever.
+    let advanced = wait_for(Duration::from_secs(15), || {
+        for (offset, index) in (1..VALIDATORS).enumerate() {
+            let port = rpc_base + u16::try_from(index).expect("four ports fit a u16");
+            let status = request(port, "/status")?;
+            let head = status["head_height"].as_u64().unwrap_or(0);
+            if head < before[offset].saturating_add(5) {
+                return None;
+            }
+        }
+        Some(())
+    });
+    if advanced.is_none() {
+        devnet.fail("the survivors stopped certifying after validator 0 died");
+    }
+
+    for index in 1..VALIDATORS {
+        let port = rpc_base + u16::try_from(index).expect("four ports fit a u16");
+        let status = request(port, "/status")
+            .unwrap_or_else(|| devnet.fail(&format!("node {index} lost /status")));
+        assert_eq!(
+            status["conflicts"].as_u64(),
+            Some(0),
+            "node {index} reported a conflict: {status}"
+        );
+    }
 }
 
 #[test]

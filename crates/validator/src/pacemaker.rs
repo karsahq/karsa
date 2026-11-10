@@ -332,6 +332,23 @@ impl Pacemaker {
             Decision::Undecided => {}
         }
 
+        // A fenced leader is failed by a quorum, so no honest quorum can vote
+        // for it at or after the fence. This runs after the direct and indirect
+        // rules: a commit always wins, and a fence only decides a round that is
+        // otherwise stuck.
+        if dag.skip_fenced_leader(round)? {
+            self.cursor = round + 1;
+            return Ok(Advance::Skip);
+        }
+        // A live leader can still be blocked by one failed voter. With at most
+        // `f` held votes, even a late vote from every fenced validator cannot
+        // reach the `2f + 1` quorum, so the skip is safe under the fence's
+        // declaration.
+        if dag.skip_with_fence(round)? {
+            self.cursor = round + 1;
+            return Ok(Advance::Skip);
+        }
+
         // An anchor two or more rounds ahead is what makes an earlier slot
         // decidable at all. Use the *lowest* usable one and never skip over a
         // round whose status is still unknown: a higher anchor can contain a
@@ -498,6 +515,8 @@ impl Pacemaker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::certificate::{bitmap_len, set_bit};
+    use crate::fence::{Fence, FenceCertificate};
     use crate::schedule::{NO_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet};
     use crate::vertex::Vertex;
     use crypto::registry::ALG_ED25519;
@@ -700,6 +719,110 @@ mod tests {
         }
 
         assert_eq!(decided, (1..=7).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_fenced_leader_is_skipped_without_a_vote_or_anchor() {
+        let mut fixture = chain(0, &[]);
+        let leader = fixture.dag.leader_author(1).unwrap().to_vec();
+        let set = fixture.dag.set().clone();
+        let fence = Fence::new(b"karsa-pacemaker-1".to_vec(), 1, leader);
+        let payload = fence.signing_payload().unwrap();
+        let mut signer_bitmap = vec![0u8; bitmap_len(set.validators.len())];
+        let mut signatures = Vec::new();
+        for index in 0..set.quorum_size() {
+            set_bit(&mut signer_bitmap, index);
+            signatures.push(Ed25519Scheme.sign(&fixture.keys[index], &payload).unwrap());
+        }
+        let certificate = FenceCertificate {
+            fence,
+            signer_bitmap,
+            signatures,
+        };
+
+        let mut pacemaker = pacemaker(1);
+        let before = pacemaker.tick(&mut fixture.dag).unwrap();
+        assert!(
+            matches!(
+                before,
+                Step::TimedOut { cursor: 1, .. } | Step::Waiting { cursor: 1, .. }
+            ),
+            "without a fence the missing leader must not be skipped: {before:?}"
+        );
+        assert_eq!(pacemaker.cursor(), 1);
+
+        fixture
+            .dag
+            .apply_fence(b"karsa-pacemaker-1", &certificate)
+            .unwrap();
+        let after = pacemaker.tick(&mut fixture.dag).unwrap();
+        assert!(
+            matches!(after, Step::Advanced { skips: 1, .. }),
+            "the fenced leader must be skipped: {after:?}"
+        );
+        assert_eq!(pacemaker.cursor(), 2);
+        assert_eq!(fixture.dag.skipped().len(), 1);
+    }
+
+    #[test]
+    fn a_fenced_missing_voter_frees_a_live_leaders_round() {
+        let mut fixture = chain(1, &[]);
+        let round1 = fixture.ids(1);
+        let leader = round1[1].clone();
+        let vote = vertex(
+            &fixture,
+            0,
+            2,
+            vec![leader, round1[0].clone(), round1[2].clone()],
+        );
+        fixture.dag.insert(vote).unwrap();
+        for author in [1, 2] {
+            let non_vote = vertex(
+                &fixture,
+                author,
+                2,
+                vec![round1[0].clone(), round1[2].clone(), round1[3].clone()],
+            );
+            fixture.dag.insert(non_vote).unwrap();
+        }
+
+        let mut pacemaker = pacemaker(1);
+        let before = pacemaker.tick(&mut fixture.dag).unwrap();
+        assert!(
+            matches!(
+                before,
+                Step::TimedOut { cursor: 1, .. } | Step::Waiting { cursor: 1, .. }
+            ),
+            "without a fence the live leader must not be skipped: {before:?}"
+        );
+
+        let set = fixture.dag.set().clone();
+        let fence = Fence::new(b"karsa-pacemaker-1".to_vec(), 1, b"val-3".to_vec());
+        let payload = fence.signing_payload().unwrap();
+        let mut signer_bitmap = vec![0u8; bitmap_len(set.validators.len())];
+        let mut signatures = Vec::new();
+        for index in 0..set.quorum_size() {
+            set_bit(&mut signer_bitmap, index);
+            signatures.push(Ed25519Scheme.sign(&fixture.keys[index], &payload).unwrap());
+        }
+        fixture
+            .dag
+            .apply_fence(
+                b"karsa-pacemaker-1",
+                &FenceCertificate {
+                    fence,
+                    signer_bitmap,
+                    signatures,
+                },
+            )
+            .unwrap();
+
+        let after = pacemaker.tick(&mut fixture.dag).unwrap();
+        assert!(
+            matches!(after, Step::Advanced { skips: 1, .. }),
+            "one held vote plus one fenced missing voter is safe to skip: {after:?}"
+        );
+        assert_eq!(pacemaker.cursor(), 2);
     }
 
     #[test]

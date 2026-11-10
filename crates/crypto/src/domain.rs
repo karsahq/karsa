@@ -23,6 +23,8 @@ pub const DOMAIN_VALIDATOR_SET_V1: &str = "KARSA/VALIDATOR/SET/v1";
 pub const DOMAIN_SET_CHANGE_V1: &str = "KARSA/SET/CHANGE/v1";
 /// Validator-set transition identifier domain.
 pub const DOMAIN_SET_TRANSITION_V1: &str = "KARSA/SET/TRANSITION/v1";
+/// Validator-failure fence declaration domain.
+pub const DOMAIN_FENCE_V1: &str = "KARSA/SET/FENCE/v1";
 /// DAG vertex payload domain: one signature per vertex.
 pub const DOMAIN_VERTEX_V1: &str = "KARSA/DAG/VERTEX/v1";
 /// Committed-state header domain: the object a finality certificate names.
@@ -120,6 +122,21 @@ pub struct SetChangeSigningFields<'a> {
     pub activation_epoch: u64,
     /// Domain-separated identifier of the transition.
     pub transition_hash: &'a [u8],
+}
+
+/// The signed content of a validator-failure fence.
+///
+/// A fence is a quorum statement that `validator_id` is failed from
+/// `from_round` onward. It is scoped to the chain and the round whose set
+/// resolves the signing keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FenceSigningFields<'a> {
+    /// Chain identifier, which prevents cross-chain replay.
+    pub chain_id: &'a [u8],
+    /// First round at which the validator is considered failed.
+    pub from_round: u64,
+    /// Validator declared failed.
+    pub validator_id: &'a [u8],
 }
 
 /// A reference to another vertex, as it appears inside a signed vertex payload.
@@ -275,6 +292,21 @@ pub fn encode_set_change_signing_payload(
     wrap_domain(DOMAIN_SET_CHANGE_V1, body.as_slice())
 }
 
+/// Builds the bytes a fence quorum signs.
+///
+/// # Errors
+///
+/// Returns an error only when a field exceeds the encoding limit.
+pub fn encode_fence_signing_payload(
+    fields: &FenceSigningFields<'_>,
+) -> Result<Vec<u8>, CryptoError> {
+    let mut body = Encoder::with_capacity(64 + fields.validator_id.len());
+    body.put_bytes(fields.chain_id)?;
+    body.put_u64(fields.from_round);
+    body.put_bytes(fields.validator_id)?;
+    wrap_domain(DOMAIN_FENCE_V1, body.as_slice())
+}
+
 /// Builds the bytes a DAG vertex signature covers.
 ///
 /// # Errors
@@ -372,6 +404,7 @@ mod tests {
             DOMAIN_VALIDATOR_SET_V1,
             DOMAIN_SET_CHANGE_V1,
             DOMAIN_SET_TRANSITION_V1,
+            DOMAIN_FENCE_V1,
             DOMAIN_VERTEX_V1,
         ];
         for (index, tag) in tags.iter().enumerate() {
@@ -438,6 +471,32 @@ mod tests {
         })
         .unwrap();
         assert_ne!(encoded, other_set);
+    }
+
+    #[test]
+    fn a_fence_payload_binds_the_round_and_the_validator() {
+        let fields = FenceSigningFields {
+            chain_id: b"karsa-testnet-1",
+            from_round: 77,
+            validator_id: b"val-3",
+        };
+        let encoded = encode_fence_signing_payload(&fields).unwrap();
+        let tag_len = u32::from_le_bytes(encoded[0..4].try_into().unwrap()) as usize;
+        assert_eq!(&encoded[4..4 + tag_len], DOMAIN_FENCE_V1.as_bytes());
+
+        let other_round = encode_fence_signing_payload(&FenceSigningFields {
+            from_round: 78,
+            ..fields
+        })
+        .unwrap();
+        assert_ne!(encoded, other_round);
+
+        let other_validator = encode_fence_signing_payload(&FenceSigningFields {
+            validator_id: b"val-2",
+            ..fields
+        })
+        .unwrap();
+        assert_ne!(encoded, other_validator);
     }
 
     #[test]

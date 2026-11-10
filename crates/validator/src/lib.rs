@@ -9,6 +9,7 @@ mod address;
 mod certificate;
 mod dag;
 mod failure;
+mod fence;
 mod finality;
 mod frontier;
 mod header;
@@ -23,6 +24,7 @@ pub use certificate::{
 };
 pub use dag::{CommitProof, Dag, Decision, SkippedRound, commit_leaf, commit_root};
 pub use failure::FailureDetector;
+pub use fence::{FENCE_VERSION_V1, Fence, FenceCertificate, FenceError};
 pub use finality::{Build, Certified, Finalizer, Share, VALIDATOR_SET_ID, signing_payload};
 pub use frontier::CommitFrontier;
 pub use header::{HEADER_VERSION_V1, Header, HeaderChain};

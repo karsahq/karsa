@@ -357,6 +357,9 @@ enum Command {
         /// Remove the last validator at this epoch, authorized by the old-set quorum.
         #[arg(long, conflicts_with = "add_validator_at_epoch")]
         remove_validator_at_epoch: Option<u64>,
+        /// Collect a quorum fence for a validator the failure detector reports silent.
+        #[arg(long)]
+        fence_silent: bool,
     },
     /// Sign a transfer with a committee account and submit it to a live RPC node.
     Send {
@@ -580,6 +583,7 @@ fn main() -> ExitCode {
             failure_rounds,
             add_validator_at_epoch,
             remove_validator_at_epoch,
+            fence_silent,
         } => live::run(live::Config {
             validators,
             port_base,
@@ -610,6 +614,7 @@ fn main() -> ExitCode {
                 .or_else(|| {
                     remove_validator_at_epoch.map(|epoch| (live::SetChangeKind::Remove, epoch))
                 }),
+            fence_silent,
         }),
         Command::Send {
             rpc,

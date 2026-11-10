@@ -51,8 +51,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tx::batch::Batch;
 use validator::{
-    Certificate, FailureDetector, Finalizer, Header, SetChange, SetSchedule, Step,
-    TransitionCertificate, ValidatorSet, VertexId, bitmap_len, commit_root, set_bit,
+    Certificate, FailureDetector, Fence, FenceCertificate, Finalizer, Header, SetChange,
+    SetSchedule, Step, TransitionCertificate, ValidatorSet, VertexId, bitmap_len, commit_root,
+    set_bit,
 };
 
 use crate::chain;
@@ -254,6 +255,12 @@ pub struct Config {
     /// signs the same descriptor; the old-set quorum travels as partial
     /// certificates and the full certificate is adopted before activation.
     pub change: Option<(SetChangeKind, u64)>,
+    /// Collect a quorum fence for a validator the failure detector reports silent.
+    ///
+    /// The fence is only signed when the node has not decided the fence's round
+    /// and the validator is the missing leader of its cursor. It is a liveness
+    /// aid, never a state change.
+    pub fence_silent: bool,
 }
 
 /// Wall time spent in the stages the live loop can name.
@@ -1254,6 +1261,103 @@ fn own_change_share(
     })
 }
 
+/// One empty partial fence, sized to the set that signs it.
+fn empty_fence_certificate(certificate: &FenceCertificate, set: &ValidatorSet) -> FenceCertificate {
+    FenceCertificate {
+        fence: certificate.fence.clone(),
+        signer_bitmap: vec![0u8; bitmap_len(set.validators.len())],
+        signatures: Vec::new(),
+    }
+}
+
+/// This node's own share of a fence declaration.
+fn own_fence_share(
+    fence: &Fence,
+    set: &ValidatorSet,
+    signer: &[u8],
+    private_key: &[u8],
+) -> Result<FenceCertificate, String> {
+    let index = set
+        .validators
+        .iter()
+        .position(|record| record.validator_id == signer)
+        .ok_or("this node is not in the fenced set")?;
+    let payload = fence.signing_payload().map_err(|error| error.to_string())?;
+    let signature = Ed25519Scheme
+        .sign(private_key, &payload)
+        .map_err(|error| error.to_string())?;
+    let mut signer_bitmap = vec![0u8; bitmap_len(set.validators.len())];
+    set_bit(&mut signer_bitmap, index);
+    Ok(FenceCertificate {
+        fence: fence.clone(),
+        signer_bitmap,
+        signatures: vec![signature],
+    })
+}
+
+/// Whether a fence descriptor targets the round this node is stuck on.
+///
+/// A missing leader is fenced at its own round; a missing voter is fenced at the
+/// round its vote belongs to, which is the cursor's next round.
+fn fence_relevant(node: &Node, from_round: u64, validator: &[u8]) -> bool {
+    let cursor = node.cursor();
+    if from_round == cursor && node.dag().leader(cursor).is_none() {
+        return node
+            .dag()
+            .leader_author(cursor)
+            .is_some_and(|author| author == validator);
+    }
+    if from_round == cursor.saturating_add(1) && node.dag().leader(cursor).is_some() {
+        return node
+            .dag()
+            .set_for_round(from_round)
+            .validator(validator)
+            .is_some()
+            && node.dag().get(from_round, validator).is_none();
+    }
+    false
+}
+
+/// Picks the silent validator this node should fence, and the round the fence
+/// starts at. A missing leader uses the cursor round; a missing voter uses the
+/// next round, because that is where the vote would have been.
+fn fence_candidate(node: &Node, silent: &[(Vec<u8>, u64)]) -> Option<(Vec<u8>, u64)> {
+    let cursor = node.cursor();
+    if node.dag().leader(cursor).is_none() {
+        let author = node.dag().leader_author(cursor)?;
+        return silent
+            .iter()
+            .find(|(validator, last_round)| validator.as_slice() == author && *last_round < cursor)
+            .map(|(validator, _)| (validator.clone(), cursor));
+    }
+    let voter_round = cursor.saturating_add(1);
+    let voters = node.dag().set_for_round(voter_round);
+    silent
+        .iter()
+        .find(|(validator, last_round)| {
+            *last_round < voter_round
+                && voters.validator(validator).is_some()
+                && node.dag().get(voter_round, validator).is_none()
+        })
+        .map(|(validator, _)| (validator.clone(), voter_round))
+}
+
+/// Whether this node may sign a fence without contradicting its own view.
+fn may_sign_fence(node: &Node, failures: Option<&FailureDetector>, fence: &Fence) -> bool {
+    if !fence_relevant(node, fence.from_round, &fence.validator_id) {
+        return false;
+    }
+    let Some(failures) = failures else {
+        return false;
+    };
+    failures
+        .silent()
+        .into_iter()
+        .any(|(validator, last_round)| {
+            validator == fence.validator_id && last_round < fence.from_round
+        })
+}
+
 /// Builds the snapshot this node can serve right now.
 ///
 /// It is anchored at the certified head, so the receiver has a quorum statement
@@ -2054,6 +2158,20 @@ async fn node_task(
         pending_dirty = true;
     }
 
+    // A fence is durable: a restart that lost it would wait again on the same
+    // failed leader. One fence is enough for the prototype's fault budget at
+    // four validators, and the store refuses a different one.
+    let mut pending_fence = match &store {
+        Some(store) => store.fence().map_err(|error| error.to_string())?,
+        None => None,
+    };
+    if let Some(certificate) = &pending_fence {
+        node.apply_fence(certificate)
+            .map_err(|error| format!("stored fence is not authorized: {error}"))?;
+    }
+    let mut fence_adopted = pending_fence.is_some();
+    let mut fence_dirty = pending_fence.is_some();
+
     let mut failures = (config.failure_rounds > 0)
         .then(|| FailureDetector::new(node.dag().set(), config.failure_rounds));
     if let Some(failures) = failures.as_mut() {
@@ -2330,6 +2448,77 @@ async fn node_task(
                             }
                         }
                     }
+                    Message::Fence(certificate) => {
+                        if fence_adopted {
+                            let same = pending_fence
+                                .as_ref()
+                                .is_some_and(|current| current.fence == certificate.fence);
+                            if !same {
+                                rejected += 1;
+                            }
+                        } else {
+                            let set = node
+                                .dag()
+                                .set_for_round(certificate.fence.from_round)
+                                .clone();
+                            let ready = {
+                                let pending = pending_fence.get_or_insert_with(|| {
+                                    empty_fence_certificate(&certificate, &set)
+                                });
+                                if may_sign_fence(&node, failures.as_ref(), &certificate.fence) {
+                                    let own = own_fence_share(
+                                        &certificate.fence,
+                                        &set,
+                                        &identity.id,
+                                        &identity.private_key,
+                                    )?;
+                                    if pending
+                                        .merge(&own, &chain_id, &set)
+                                        .is_ok_and(|changed| changed)
+                                    {
+                                        fence_dirty = true;
+                                    }
+                                }
+                                match pending.merge(&certificate, &chain_id, &set) {
+                                    Ok(true) => fence_dirty = true,
+                                    Ok(false) => {}
+                                    Err(_) => rejected += 1,
+                                }
+                                pending
+                                    .verify(&chain_id, &set)
+                                    .ok()
+                                    .map(|_| pending.clone())
+                            };
+                            if let Some(certificate) = ready {
+                                match node.apply_fence(&certificate) {
+                                    Ok(()) => {
+                                        if let Some(store) = &store {
+                                            store
+                                                .put_fence(&certificate)
+                                                .map_err(|error| error.to_string())?;
+                                        }
+                                        let name = hex::encode(
+                                            &certificate.fence.validator_id
+                                                [..certificate.fence.validator_id.len().min(8)],
+                                        );
+                                        println!(
+                                            "node val-{index} fenced {name} from round {}",
+                                            certificate.fence.from_round
+                                        );
+                                        fence_adopted = true;
+                                        pending_fence = Some(certificate);
+                                        fence_dirty = true;
+                                    }
+                                    Err(error) => {
+                                        rejected += 1;
+                                        eprintln!(
+                                            "node {index} refused a fence: {error}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             _ = stop_authoring.changed() => {
@@ -2389,6 +2578,17 @@ async fn node_task(
                     .map_err(|error| error.to_string())?;
                     broadcast(&outbound, true, &bytes, &mut dropped);
                     pending_dirty = false;
+                }
+                if let Some(certificate) = &pending_fence
+                    && (fence_dirty || ticks % SET_CHANGE_TICKS == 0)
+                {
+                    let bytes = wire::frame(
+                        &Message::Fence(Box::new(certificate.clone())),
+                        now(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    broadcast(&outbound, true, &bytes, &mut dropped);
+                    fence_dirty = false;
                 }
                 if !authoring_stopped && (config.rpc_port > 0 || node.round() <= config.rounds) {
                     let round = node.round();
@@ -2738,6 +2938,49 @@ async fn node_task(
                         silent.iter().map(|(validator, _)| validator.clone()).collect();
                     reported_silent.retain(|validator| current.contains(validator));
                 }
+                // A partial fence for a validator that is visible again is stale:
+                // keeping it would block a different proposal and broadcast a
+                // failure claim the local evidence no longer supports.
+                if !fence_adopted
+                    && pending_fence.as_ref().is_some_and(|certificate| {
+                        silent
+                            .iter()
+                            .all(|(validator, _)| validator != &certificate.fence.validator_id)
+                    })
+                {
+                    pending_fence = None;
+                    fence_dirty = false;
+                }
+                // A silent leader is fenced at its own round; a silent missing
+                // voter is fenced at the round its vote belongs to. Every
+                // survivor signs the same pair; the quorum is what authorizes the
+                // skip, not this local report.
+                if config.fence_silent
+                    && pending_fence.is_none()
+                    && let Some((validator, from_round)) = fence_candidate(&node, &silent)
+                {
+                    let set = node.dag().set_for_round(from_round).clone();
+                    if set.validator(&validator).is_some() {
+                        let fence = Fence::new(chain_id.clone(), from_round, validator);
+                        match own_fence_share(
+                            &fence,
+                            &set,
+                            &identity.id,
+                            &identity.private_key,
+                        ) {
+                            Ok(certificate) => {
+                                eprintln!(
+                                    "node {index} proposes a fence for round {from_round}"
+                                );
+                                pending_fence = Some(certificate);
+                                fence_dirty = true;
+                            }
+                            Err(error) => {
+                                eprintln!("node {index} cannot sign a fence: {error}");
+                            }
+                        }
+                    }
+                }
                 if let Some(rpc) = &rpc {
                     let mut core = rpc.lock().expect("rpc lock poisoned");
                     core.note_order_from(node.dag().prefix(), node.dag().order());
@@ -3084,6 +3327,8 @@ async fn archive_task(
                     // An archive has no schedule to activate. The certificate is
                     // stored with the boundary when activation lands.
                     Message::SetChange(_) => {}
+                    // An archive does not decide, so a fence has no local effect.
+                    Message::Fence(_) => {}
                     // The accept side consumes the hello before the loop starts.
                     Message::Hello(_) => rejected += 1,
                 }
@@ -4434,7 +4679,19 @@ mod tests {
             checkpoint_every: 0,
             failure_rounds: 0,
             change: None,
+            fence_silent: false,
         }
+    }
+
+    /// Serializes tests that bind a whole loopback mesh.
+    ///
+    /// Port probing cannot reserve a range: two tests running at once can both
+    /// see the same range free and then race to bind it. The integration devnet
+    /// is a separate test binary and cargo runs the binaries in turn, so this
+    /// lock only has to cover the in-process mesh tests.
+    fn mesh_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().expect("the mesh test lock is poisoned")
     }
 
     /// A temp directory removed when the test ends.
@@ -4512,11 +4769,13 @@ mod tests {
             checkpoint_every,
             failure_rounds: 0,
             change: None,
+            fence_silent: false,
         }
     }
 
     #[test]
     fn a_mesh_authorizes_a_set_change_and_crosses_the_boundary() {
+        let _mesh = mesh_test_lock();
         let dir = TestDir::new("set-change");
         let home = crate::home::Home::resolve(Some(dir.0.clone())).expect("a test home");
         crate::genesis::run(&home, None, true, Some(4)).expect("a four-round genesis");
@@ -4564,6 +4823,7 @@ mod tests {
 
     #[test]
     fn a_mesh_restarts_from_a_checkpoint_and_audits() {
+        let _mesh = mesh_test_lock();
         let dir = TestDir::new("checkpoint-restart");
         let first = run(mesh_config(&dir, a_free_port_base(4), 30, 2));
         assert!(first.is_ok(), "the first run failed: {first:?}");

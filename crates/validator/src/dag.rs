@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, HashSet};
 use crypto::merkle::{MerkleProof, MerkleTree};
 use crypto::{CryptoError, CryptoErrorKind};
 
+use crate::fence::{FenceCertificate, FenceError};
 use crate::frontier::CommitFrontier;
 use crate::schedule::{EpochSchedule, ValidatorSet};
 use crate::set_change::{SetChangeError, SetSchedule, Transition, TransitionCertificate};
@@ -74,6 +75,9 @@ pub struct Dag {
     /// Everything at or below it is already reflected in a state snapshot, so the
     /// node neither stores nor re-decides it.
     floor: Option<u64>,
+    /// Quorum-authorized failures, keyed by validator id. The value is the first
+    /// round at which the validator is fenced, plus the certificate that proved it.
+    fences: BTreeMap<Vec<u8>, (u64, FenceCertificate)>,
 }
 
 impl Dag {
@@ -90,6 +94,7 @@ impl Dag {
             skipped: Vec::new(),
             schedule: EpochSchedule::single(epoch),
             floor: None,
+            fences: BTreeMap::new(),
         }
     }
 
@@ -138,6 +143,7 @@ impl Dag {
             skipped: Vec::new(),
             schedule: EpochSchedule::advancing(base, rounds_per_epoch),
             floor: None,
+            fences: BTreeMap::new(),
         })
     }
 
@@ -180,6 +186,161 @@ impl Dag {
             .clone();
         self.sets = sets;
         Ok(transition)
+    }
+
+    /// Installs a quorum-authorized fence.
+    ///
+    /// The certificate is checked against the set active at its `from_round`.
+    /// At most `f` validators may be fenced; a larger fence would exceed the
+    /// fault budget the set was built for. The earliest `from_round` wins for a
+    /// repeated fence on the same validator.
+    ///
+    /// # Errors
+    ///
+    /// Every error from [`FenceCertificate::verify`], plus
+    /// [`FenceError::TooMany`] when the fence would exceed the fault budget.
+    pub fn apply_fence(
+        &mut self,
+        chain_id: &[u8],
+        certificate: &FenceCertificate,
+    ) -> Result<(), FenceError> {
+        let set = self.set_for_round(certificate.fence.from_round).clone();
+        certificate.verify(chain_id, &set)?;
+        let validator_id = certificate.fence.validator_id.clone();
+        let from_round = certificate.fence.from_round;
+        if self.floor.is_some_and(|floor| from_round <= floor) {
+            return Err(FenceError::Mismatch(
+                "the fence starts at or below the DAG floor".to_string(),
+            ));
+        }
+        if self
+            .order
+            .iter()
+            .any(|id| id.round >= from_round && id.author == validator_id)
+        {
+            return Err(FenceError::Mismatch(
+                "the fenced validator already has a committed vertex at or after the fence round"
+                    .to_string(),
+            ));
+        }
+        if let Some((current, _)) = self.fences.get(&validator_id) {
+            if *current <= from_round {
+                return Ok(());
+            }
+        } else if self.fences.len() >= set.max_faulty() {
+            return Err(FenceError::TooMany {
+                count: self.fences.len() + 1,
+                limit: set.max_faulty(),
+            });
+        }
+        self.fences
+            .insert(validator_id, (from_round, certificate.clone()));
+        Ok(())
+    }
+
+    /// Every fence certificate this DAG adopted.
+    pub fn fences(&self) -> impl Iterator<Item = &FenceCertificate> {
+        self.fences.values().map(|(_, certificate)| certificate)
+    }
+
+    /// Whether `validator_id` is fenced at `round`.
+    #[must_use]
+    pub fn is_fenced(&self, validator_id: &[u8], round: u64) -> bool {
+        self.fences
+            .get(validator_id)
+            .is_some_and(|(from_round, _)| round >= *from_round)
+    }
+
+    /// Whether the leader of `round` is fenced and the round can be skipped.
+    #[must_use]
+    pub fn can_skip_fenced_leader(&self, round: u64) -> bool {
+        self.leader_author(round)
+            .is_some_and(|author| self.is_fenced(author, round))
+    }
+
+    /// Records a skip for a fenced leader.
+    ///
+    /// The direct and indirect rules run first; this only runs when neither can
+    /// decide. A fence quorum is a statement that the validator is failed from
+    /// `from_round`, so an honest signer will not vote for that leader at or after
+    /// the fence. At most `f` Byzantine validators can vote for it, which is below
+    /// the quorum, so no commit can exist.
+    ///
+    /// # Errors
+    ///
+    /// Propagates vertex id encoding when the leader is held.
+    pub fn skip_fenced_leader(&mut self, round: u64) -> Result<bool, CryptoError> {
+        if !self.can_skip_fenced_leader(round) {
+            return Ok(false);
+        }
+        let author = self
+            .leader_author(round)
+            .expect("a skippable leader has an author")
+            .to_vec();
+        let digest = self
+            .leader(round)
+            .map(|vertex| vertex.id())
+            .transpose()?
+            .map(|id| id.digest);
+        Ok(self.record_skip(round, author, digest))
+    }
+
+    /// Whether a held leader can be skipped because its only missing voters are
+    /// fenced and fewer than `f + 1` votes are held.
+    ///
+    /// A missing voter could still vote, so the rule is conservative: every
+    /// voter whose vertex is missing must be fenced, and the held vote count must
+    /// not exceed the fault budget. Then even if every fenced validator voted,
+    /// the total would be at most `2f`, below the `2f + 1` quorum.
+    ///
+    /// # Errors
+    ///
+    /// Propagates vertex id encoding and vote tallying.
+    pub fn can_skip_with_fence(&self, round: u64) -> Result<bool, CryptoError> {
+        let Some(leader) = self.leader(round) else {
+            return Ok(false);
+        };
+        let leader_id = leader.id()?;
+        let candidates: Vec<Vertex> = self
+            .round_vertices(round + 1)
+            .into_iter()
+            .cloned()
+            .collect();
+        let voter_set = self.set_for_round(round + 1);
+        let voters = tally_votes(voter_set, &leader_id, &candidates, &self.schedule)?;
+        if voters.len() > voter_set.max_faulty() {
+            return Ok(false);
+        }
+        let held: HashSet<&[u8]> = candidates
+            .iter()
+            .map(|vertex| vertex.author.as_slice())
+            .collect();
+        let mut missing_fenced = false;
+        for record in &voter_set.validators {
+            if held.contains(record.validator_id.as_slice()) {
+                continue;
+            }
+            if !self.is_fenced(&record.validator_id, round + 1) {
+                return Ok(false);
+            }
+            missing_fenced = true;
+        }
+        Ok(missing_fenced)
+    }
+
+    /// Records a skip allowed by a fence and the held-vote cap.
+    ///
+    /// # Errors
+    ///
+    /// Every error from [`Dag::can_skip_with_fence`] and vertex id encoding.
+    pub fn skip_with_fence(&mut self, round: u64) -> Result<bool, CryptoError> {
+        if !self.can_skip_with_fence(round)? {
+            return Ok(false);
+        }
+        let leader = self.leader(round).expect("a skippable leader is held");
+        let author = leader.author.clone();
+        let digest = Some(leader.id()?.digest);
+        Ok(self.record_skip(round, author, digest))
     }
 
     /// The epoch a round belongs to.
@@ -276,6 +437,15 @@ impl Dag {
             self.set_for_round(vertex.round),
             self.epoch_of(vertex.round),
         )?;
+        // A fence is a quorum statement that the validator is failed from this
+        // round on. Accepting its new vertices would let a delayed vertex become
+        // a vote for a leader the fence quorum already agreed to skip.
+        if self.is_fenced(&vertex.author, vertex.round) {
+            return Err(CryptoError::new(
+                CryptoErrorKind::InvalidVertex,
+                format!("author is fenced at round {}", vertex.round),
+            ));
+        }
         // Below the floor the vertex is already committed and its state is in a
         // snapshot. It is still signature-checked, then dropped.
         if self.is_pruned(vertex.round) {
@@ -515,7 +685,9 @@ impl Dag {
         let mut seen: HashSet<VertexId> = HashSet::new();
         for vertex in self.vertices.values() {
             for reference in &vertex.references {
-                if self.is_pruned(reference.round) {
+                if self.is_pruned(reference.round)
+                    || self.is_fenced(&reference.author, reference.round)
+                {
                     continue;
                 }
                 if self
@@ -922,6 +1094,24 @@ mod tests {
         }
     }
 
+    fn fence_certificate(fixture: &Fixture, from_round: u64, validator: &[u8]) -> FenceCertificate {
+        let set = fixture.dag.set();
+        let fence =
+            crate::fence::Fence::new(b"karsa-dag-1".to_vec(), from_round, validator.to_vec());
+        let payload = fence.signing_payload().unwrap();
+        let mut signer_bitmap = vec![0u8; bitmap_len(set.validators.len())];
+        let mut signatures = Vec::new();
+        for index in 0..set.quorum_size() {
+            set_bit(&mut signer_bitmap, index);
+            signatures.push(Ed25519Scheme.sign(&fixture.keys[index], &payload).unwrap());
+        }
+        FenceCertificate {
+            fence,
+            signer_bitmap,
+            signatures,
+        }
+    }
+
     fn vertex(fixture: &Fixture, author: usize, round: u64, references: Vec<VertexId>) -> Vertex {
         let mut vertex = Vertex {
             chain_id: b"karsa-dag-1".to_vec(),
@@ -987,6 +1177,21 @@ mod tests {
         let genesis = fixture.ids(0);
         fixture.full_round(LEADER_ROUND, &genesis).unwrap();
         fixture
+    }
+
+    #[test]
+    fn a_fenced_author_cannot_insert_a_new_vertex() {
+        let mut fixture = fixture(4);
+        let certificate = fence_certificate(&fixture, 1, b"val-0");
+        fixture
+            .dag
+            .apply_fence(b"karsa-dag-1", &certificate)
+            .unwrap();
+        let error = fixture
+            .dag
+            .insert(vertex(&fixture, 0, 1, Vec::new()))
+            .unwrap_err();
+        assert_eq!(error.kind(), CryptoErrorKind::InvalidVertex);
     }
 
     #[test]

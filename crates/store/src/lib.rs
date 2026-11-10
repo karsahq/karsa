@@ -26,7 +26,9 @@ use std::path::{Path, PathBuf};
 use crypto::CryptoError;
 use crypto::encoding::{Decoder, Encoder};
 use tx::batch::Batch;
-use validator::{Certificate, CommitFrontier, Header, TransitionCertificate, Vertex, VertexId};
+use validator::{
+    Certificate, CommitFrontier, FenceCertificate, Header, TransitionCertificate, Vertex, VertexId,
+};
 
 /// Where the last reported roots are kept.
 const ROOTS_FILE: &str = "roots";
@@ -40,6 +42,8 @@ const SNAPSHOT_FILE: &str = "snapshot";
 const SHARDS_FILE: &str = "shards.log";
 /// The one authorized set change this store has seen.
 const SET_CHANGE_FILE: &str = "set-change";
+/// The one quorum-authorized fence this store has seen.
+const FENCE_FILE: &str = "fence";
 /// The chain this directory belongs to.
 const GENESIS_FILE: &str = "genesis";
 const GENESIS_HEADER_FILE: &str = "genesis.header";
@@ -621,6 +625,51 @@ impl Store {
         }
         let bytes = fs::read(&path)?;
         Ok(Some(TransitionCertificate::decode(&bytes)?))
+    }
+
+    /// Writes the quorum-authorized fence this node adopted.
+    ///
+    /// A restart must keep the fence: without it, a node would wait again on a
+    /// leader that the quorum already declared failed. Rewriting the same
+    /// certificate is a no-op; a different fence is refused.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on write failure, [`StoreError::Decode`] when the
+    /// certificate does not encode, or when a different fence is already stored.
+    pub fn put_fence(&self, certificate: &FenceCertificate) -> Result<(), StoreError> {
+        if let Some(existing) = self.fence()? {
+            if existing != *certificate {
+                return Err(StoreError::Decode(CryptoError::new(
+                    crypto::CryptoErrorKind::InvalidKeySchedule,
+                    "the store already holds a different fence",
+                )));
+            }
+            return Ok(());
+        }
+        let encoded = certificate.encode()?;
+        let temporary = self.path_of("fence.tmp");
+        {
+            let mut file = File::create(&temporary)?;
+            file.write_all(&encoded)?;
+        }
+        fs::rename(&temporary, self.path_of(FENCE_FILE))?;
+        Ok(())
+    }
+
+    /// Reads the fence this store adopted, if any.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on read failure, [`StoreError::Decode`] when the file
+    /// does not decode.
+    pub fn fence(&self) -> Result<Option<FenceCertificate>, StoreError> {
+        let path = self.path_of(FENCE_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path)?;
+        Ok(Some(FenceCertificate::decode(&bytes)?))
     }
 
     /// Writes the snapshot a snapshot join adopted, replacing any previous one.
@@ -1595,7 +1644,9 @@ mod tests {
     use crypto::registry::ALG_ED25519;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tx::envelope::{PROTOCOL_VERSION_V1, Transaction};
-    use validator::{NO_EXPIRY, SetChange, ValidatorKey, ValidatorRecord, ValidatorSet};
+    use validator::{
+        Fence, FenceCertificate, NO_EXPIRY, SetChange, ValidatorKey, ValidatorRecord, ValidatorSet,
+    };
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1641,6 +1692,14 @@ mod tests {
         TransitionCertificate {
             change,
             new_set: new,
+            signer_bitmap: vec![0b1],
+            signatures: vec![vec![9u8; 64]],
+        }
+    }
+
+    fn fence_certificate() -> FenceCertificate {
+        FenceCertificate {
+            fence: Fence::new(b"karsa-store-1".to_vec(), 7, b"val-0".to_vec()),
             signer_bitmap: vec![0b1],
             signatures: vec![vec![9u8; 64]],
         }
@@ -1808,6 +1867,21 @@ mod tests {
         }
         let store = Store::open(&dir.0).unwrap();
         assert_eq!(store.live_snapshot().unwrap(), Some(snapshot));
+    }
+
+    #[test]
+    fn a_fence_round_trips_and_cannot_be_replaced() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        assert_eq!(store.fence().unwrap(), None);
+        let certificate = fence_certificate();
+        store.put_fence(&certificate).unwrap();
+        store.put_fence(&certificate).unwrap();
+        assert_eq!(store.fence().unwrap(), Some(certificate.clone()));
+
+        let mut different = certificate;
+        different.fence.from_round += 1;
+        assert!(store.put_fence(&different).is_err());
     }
 
     #[test]
