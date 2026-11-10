@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use crypto::CryptoError;
 use crypto::encoding::{Decoder, Encoder};
 use tx::batch::Batch;
-use validator::{Certificate, Header, Vertex, VertexId};
+use validator::{Certificate, CommitFrontier, Header, Vertex, VertexId};
 
 /// Where the last reported roots are kept.
 const ROOTS_FILE: &str = "roots";
@@ -129,11 +129,16 @@ pub struct Snapshot {
     pub state: Vec<u8>,
 }
 
-/// The snapshot a live node adopted when it joined from a peer.
+/// The live snapshot a node adopted when it joined from a peer.
 ///
 /// Unlike [`Snapshot`], this carries everything needed to resume consensus: the
 /// certified anchor, the committed order prefix, the decision cursor, and the
 /// DAG floor. It is written once after a snapshot join and read before a replay.
+///
+/// The committed order is split: `prefix` summarizes the leaves at or below the
+/// DAG floor, whose vertices are gone, and `order` holds the tail above it.
+/// `order_len` is the total, so a header's `dag_root` can be rebuilt without the
+/// dropped leaves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveSnapshot {
     /// Round of the certified anchor.
@@ -146,8 +151,12 @@ pub struct LiveSnapshot {
     pub applied: u64,
     /// Encoded execution state at the anchor.
     pub state: Vec<u8>,
-    /// Committed order prefix ending at the anchor.
+    /// Committed order tail above the compact prefix.
     pub order: Vec<VertexId>,
+    /// Total committed entries the anchor covers.
+    pub order_len: usize,
+    /// Peaks of the committed order at or below the floor.
+    pub prefix: CommitFrontier,
     /// The certified header the state belongs to.
     pub header: Header,
     /// Quorum certificate over `header`.
@@ -241,7 +250,9 @@ pub struct StoredShard {
 /// instead of replaying a history it never had.
 const LIVE_SNAPSHOT_FILE: &str = "live.snapshot";
 /// Version of the live snapshot record.
-const LIVE_SNAPSHOT_VERSION: u16 = 1;
+const LIVE_SNAPSHOT_VERSION: u16 = 2;
+/// The legacy version, which stored the full committed order with no frontier.
+const LIVE_SNAPSHOT_VERSION_FULL: u16 = 1;
 
 /// A finalised header together with the quorum certificate that finalised it.
 ///
@@ -562,12 +573,26 @@ impl Store {
 
     /// Writes the snapshot a snapshot join adopted, replacing any previous one.
     ///
+    /// The committed order is written as a compact frontier plus its tail above
+    /// the floor. A snapshot that never split its order writes an empty frontier
+    /// and the full tail, which is byte-compatible with version 1 on read.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Io`] on write failure, [`StoreError::Decode`] when a field
-    /// does not encode.
+    /// does not encode or the order length does not match its parts.
     pub fn put_live_snapshot(&self, snapshot: &LiveSnapshot) -> Result<(), StoreError> {
-        let mut encoder = Encoder::with_capacity(64 + snapshot.state.len());
+        if snapshot.order_len != snapshot.prefix.len().saturating_add(snapshot.order.len()) {
+            return Err(StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::FieldTooLong,
+                "live snapshot order length does not match its prefix and tail",
+            )));
+        }
+        let mut encoder = Encoder::with_capacity(
+            64 + snapshot.state.len()
+                + snapshot.order.len() * 56
+                + snapshot.prefix.peaks().len() * 34,
+        );
         encoder.put_u16(LIVE_SNAPSHOT_VERSION);
         encoder.put_u64(snapshot.round);
         match snapshot.floor {
@@ -580,13 +605,33 @@ impl Store {
         encoder.put_u64(snapshot.cursor);
         encoder.put_u64(snapshot.applied);
         encoder.put_bytes(&snapshot.state)?;
-        let count = u32::try_from(snapshot.order.len()).map_err(|_| {
+        encoder.put_u64(u64::try_from(snapshot.order_len).map_err(|_| {
+            StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::FieldTooLong,
+                "live snapshot order length does not fit a u64",
+            ))
+        })?);
+        encoder.put_u64(u64::try_from(snapshot.prefix.len()).map_err(|_| {
+            StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::FieldTooLong,
+                "live snapshot prefix length does not fit a u64",
+            ))
+        })?);
+        encoder.put_u32(u32::try_from(snapshot.prefix.peaks().len()).map_err(|_| {
+            StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::FieldTooLong,
+                "live snapshot peak count does not fit a u32",
+            ))
+        })?);
+        for peak in snapshot.prefix.peaks() {
+            encoder.put_bytes(peak)?;
+        }
+        encoder.put_u32(u32::try_from(snapshot.order.len()).map_err(|_| {
             StoreError::Decode(CryptoError::new(
                 crypto::CryptoErrorKind::FieldTooLong,
                 "live snapshot order does not fit a u32 count",
             ))
-        })?;
-        encoder.put_u32(count);
+        })?);
         for id in &snapshot.order {
             encoder.put_u64(id.round);
             encoder.put_bytes(&id.author)?;
@@ -606,10 +651,14 @@ impl Store {
 
     /// Reads the snapshot a snapshot join adopted, if one was written.
     ///
+    /// Version 1 stored the whole committed order and is read as an empty
+    /// frontier with that order as the tail. Version 2 reads the compact prefix
+    /// and the tail above it.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Io`] on read failure, [`StoreError::Decode`] when the record
-    /// is short or a field does not decode.
+    /// is short, a field does not decode, or its order parts disagree.
     pub fn live_snapshot(&self) -> Result<Option<LiveSnapshot>, StoreError> {
         let path = self.path_of(LIVE_SNAPSHOT_FILE);
         if !path.exists() {
@@ -618,7 +667,7 @@ impl Store {
         let record = fs::read(&path)?;
         let mut decoder = Decoder::new(&record);
         let version = decoder.read_u16()?;
-        if version != LIVE_SNAPSHOT_VERSION {
+        if version != LIVE_SNAPSHOT_VERSION && version != LIVE_SNAPSHOT_VERSION_FULL {
             return Err(StoreError::Decode(CryptoError::new(
                 crypto::CryptoErrorKind::MalformedCertificate,
                 format!("unsupported live snapshot version {version}"),
@@ -638,29 +687,49 @@ impl Store {
         let cursor = decoder.read_u64()?;
         let applied = decoder.read_u64()?;
         let state = decoder.read_bytes()?.to_vec();
-        let count = decoder.read_u32()? as usize;
-        if count > record.len() {
-            return Err(StoreError::Decode(CryptoError::new(
-                crypto::CryptoErrorKind::FieldTooLong,
-                "live snapshot order count exceeds the record",
-            )));
-        }
-        let mut order = Vec::with_capacity(count.min(1024));
-        for _ in 0..count {
-            let round = decoder.read_u64()?;
-            let author = decoder.read_bytes()?.to_vec();
-            let digest: [u8; 32] = decoder.read_bytes()?.try_into().map_err(|_| {
+        let (order_len, prefix, order) = if version == LIVE_SNAPSHOT_VERSION_FULL {
+            let order = decode_live_order(&mut decoder, record.len())?;
+            (order.len(), CommitFrontier::empty(), order)
+        } else {
+            let order_len = usize::try_from(decoder.read_u64()?).map_err(|_| {
                 StoreError::Decode(CryptoError::new(
-                    crypto::CryptoErrorKind::TruncatedInput,
-                    "live snapshot order digest is not 32 bytes",
+                    crypto::CryptoErrorKind::FieldTooLong,
+                    "live snapshot order length does not fit this host",
                 ))
             })?;
-            order.push(VertexId {
-                round,
-                author,
-                digest,
-            });
-        }
+            let prefix_len = usize::try_from(decoder.read_u64()?).map_err(|_| {
+                StoreError::Decode(CryptoError::new(
+                    crypto::CryptoErrorKind::FieldTooLong,
+                    "live snapshot prefix length does not fit this host",
+                ))
+            })?;
+            let peak_count = decoder.read_u32()? as usize;
+            if peak_count > record.len() {
+                return Err(StoreError::Decode(CryptoError::new(
+                    crypto::CryptoErrorKind::FieldTooLong,
+                    "live snapshot peak count exceeds the record",
+                )));
+            }
+            let mut peaks = Vec::with_capacity(peak_count.min(64));
+            for _ in 0..peak_count {
+                let peak: [u8; 32] = decoder.read_bytes()?.try_into().map_err(|_| {
+                    StoreError::Decode(CryptoError::new(
+                        crypto::CryptoErrorKind::TruncatedInput,
+                        "live snapshot peak is not 32 bytes",
+                    ))
+                })?;
+                peaks.push(peak);
+            }
+            let prefix = CommitFrontier::from_peaks(prefix_len, peaks)?;
+            let order = decode_live_order(&mut decoder, record.len())?;
+            if prefix.len().checked_add(order.len()) != Some(order_len) {
+                return Err(StoreError::Decode(CryptoError::new(
+                    crypto::CryptoErrorKind::InvalidVertex,
+                    "live snapshot order length does not match its prefix and tail",
+                )));
+            }
+            (order_len, prefix, order)
+        };
         let header = Header::decode(decoder.read_bytes()?)?;
         let certificate = Certificate::decode(decoder.read_bytes()?)?;
         decoder.finish()?;
@@ -671,6 +740,8 @@ impl Store {
             applied,
             state,
             order,
+            order_len,
+            prefix,
             header,
             certificate,
         }))
@@ -1338,6 +1409,37 @@ fn decode_header_record(bytes: &[u8]) -> Result<CertifiedHeader, CryptoError> {
     })
 }
 
+/// Decodes the `u32 count || ids` part of a live snapshot order.
+fn decode_live_order(
+    decoder: &mut Decoder<'_>,
+    record_len: usize,
+) -> Result<Vec<VertexId>, StoreError> {
+    let count = decoder.read_u32()? as usize;
+    if count > record_len {
+        return Err(StoreError::Decode(CryptoError::new(
+            crypto::CryptoErrorKind::FieldTooLong,
+            "live snapshot order count exceeds the record",
+        )));
+    }
+    let mut order = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let round = decoder.read_u64()?;
+        let author = decoder.read_bytes()?.to_vec();
+        let digest: [u8; 32] = decoder.read_bytes()?.try_into().map_err(|_| {
+            StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::TruncatedInput,
+                "live snapshot order digest is not 32 bytes",
+            ))
+        })?;
+        order.push(VertexId {
+            round,
+            author,
+            digest,
+        });
+    }
+    Ok(order)
+}
+
 fn rewrite(path: &Path, contents: &[u8]) -> Result<(), StoreError> {
     let temporary = path.with_extension("tmp");
     {
@@ -1563,24 +1665,25 @@ mod tests {
     fn a_live_snapshot_round_trips() {
         let dir = TempDir::new();
         let header = Header::genesis(b"karsa-store-1".to_vec(), 0, [1; 32], [2; 32]);
+        let first = VertexId {
+            round: 1,
+            author: b"val-0".to_vec(),
+            digest: [3; 32],
+        };
+        let second = VertexId {
+            round: 2,
+            author: b"val-1".to_vec(),
+            digest: [4; 32],
+        };
         let snapshot = LiveSnapshot {
             round: 7,
             floor: Some(5),
             cursor: 8,
             applied: 3,
             state: b"encoded state".to_vec(),
-            order: vec![
-                VertexId {
-                    round: 1,
-                    author: b"val-0".to_vec(),
-                    digest: [3; 32],
-                },
-                VertexId {
-                    round: 2,
-                    author: b"val-1".to_vec(),
-                    digest: [4; 32],
-                },
-            ],
+            order: vec![second.clone()],
+            order_len: 2,
+            prefix: CommitFrontier::from_order(&[first]),
             header: header.clone(),
             certificate: Certificate {
                 chain_id: header.chain_id.clone(),
@@ -1598,6 +1701,56 @@ mod tests {
         }
         let store = Store::open(&dir.0).unwrap();
         assert_eq!(store.live_snapshot().unwrap(), Some(snapshot));
+    }
+
+    #[test]
+    fn a_legacy_live_snapshot_is_read_as_a_full_order() {
+        let dir = TempDir::new();
+        let header = Header::genesis(b"karsa-store-1".to_vec(), 0, [1; 32], [2; 32]);
+        let order = [
+            VertexId {
+                round: 1,
+                author: b"val-0".to_vec(),
+                digest: [3; 32],
+            },
+            VertexId {
+                round: 2,
+                author: b"val-1".to_vec(),
+                digest: [4; 32],
+            },
+        ];
+        let certificate = Certificate {
+            chain_id: header.chain_id.clone(),
+            epoch: 0,
+            round: 0,
+            vertex_id: header.id().unwrap().to_vec(),
+            validator_set_id: b"set".to_vec(),
+            signer_bitmap: vec![0b1],
+            signatures: vec![vec![9u8; 64]],
+        };
+        let mut encoder = Encoder::with_capacity(256);
+        encoder.put_u16(LIVE_SNAPSHOT_VERSION_FULL);
+        encoder.put_u64(7);
+        encoder.put_u8(1);
+        encoder.put_u64(5);
+        encoder.put_u64(8);
+        encoder.put_u64(3);
+        encoder.put_bytes(b"encoded state").unwrap();
+        encoder.put_u32(2);
+        for id in &order {
+            encoder.put_u64(id.round);
+            encoder.put_bytes(&id.author).unwrap();
+            encoder.put_bytes(&id.digest).unwrap();
+        }
+        encoder.put_bytes(&header.encode().unwrap()).unwrap();
+        encoder.put_bytes(&certificate.encode().unwrap()).unwrap();
+        fs::write(dir.0.join(LIVE_SNAPSHOT_FILE), encoder.as_slice()).unwrap();
+
+        let store = Store::open(&dir.0).unwrap();
+        let read = store.live_snapshot().unwrap().unwrap();
+        assert_eq!(read.order, order);
+        assert_eq!(read.order_len, 2);
+        assert!(read.prefix.is_empty());
     }
 
     fn vertex(round: u64, batch: &Batch) -> Vertex {
@@ -1713,6 +1866,8 @@ mod tests {
                 applied: 40,
                 state: b"state".to_vec(),
                 order: Vec::new(),
+                order_len: 0,
+                prefix: CommitFrontier::empty(),
                 header: header(4),
                 certificate: certificate(4),
             })
@@ -1768,6 +1923,8 @@ mod tests {
                 applied: 20,
                 state: b"state".to_vec(),
                 order: Vec::new(),
+                order_len: 0,
+                prefix: CommitFrontier::empty(),
                 header: header(2),
                 certificate: certificate(2),
             })

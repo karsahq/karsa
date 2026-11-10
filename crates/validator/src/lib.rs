@@ -9,6 +9,7 @@ mod address;
 mod certificate;
 mod dag;
 mod finality;
+mod frontier;
 mod header;
 mod pacemaker;
 mod schedule;
@@ -21,6 +22,7 @@ pub use certificate::{
 };
 pub use dag::{CommitProof, Dag, Decision, SkippedRound, commit_leaf, commit_root};
 pub use finality::{Build, Certified, Finalizer, Share, VALIDATOR_SET_ID, signing_payload};
+pub use frontier::CommitFrontier;
 pub use header::{HEADER_VERSION_V1, Header, HeaderChain};
 pub use pacemaker::{Pacemaker, PacemakerConfig, Step};
 pub use schedule::{

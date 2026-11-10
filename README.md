@@ -117,7 +117,10 @@ which are still open.
   vertex and payload rule at its DAG floor (whole-payload nodes pass
   `min_shards = 0`, `--shard` nodes pass 1) and also drops certified headers
   below the anchor height; the anchor header itself stays, so a restart and an
-  audit still start where they resume.
+  audit still start where they resume. `live.snapshot` version 2 stores the state,
+  the peaks of the committed prefix below the floor, and only the tail above it;
+  version 1 is still read as an empty prefix with the full order. The frontier and
+  the header root are described in finding 39.
   `karsa persist` saves, prunes, drops the simulation, reopens, replays, and fails
   unless the state root comes back identical. It also records the chain the
   directory belongs to, and refuses to open against another genesis.
@@ -198,10 +201,12 @@ which are still open.
   `VERIFY_THREADS=1` only to reproduce the old serial configuration.
   `--snapshot-port N` serves a state snapshot plus the DAG tail above a floor over
   TCP, and `--sync-from-peers` fetches one from a peer above the stored certified
-  head instead of replaying history it does not have. `--checkpoint-every N`
-  writes `live.snapshot` every N certified heights and prunes vertices, payloads,
-  and headers below its floor; it needs `--execute` and `--store` (findings 36–37).
-  `scripts/devnet.sh` brings up four such processes from one home.
+  head instead of replaying history it does not have. The snapshot carries the
+  committed order as a Merkle frontier plus the tail above the floor, not the full
+  order (finding 39), and `--checkpoint-every N` writes that same compact form to
+  `live.snapshot` every N certified heights while pruning vertices, payloads, and
+  headers below its floor; it needs `--execute` and `--store` (findings 36–37,
+  39). `scripts/devnet.sh` brings up four such processes from one home.
 - `karsa finality`: the client-side metric `live` cannot produce. A closed-loop
   client submits a signed batch to validator 0; a vertex names it, the same
   pacemaker decides it, and the commit is written into a header that the
@@ -266,7 +271,7 @@ which are still open.
   key), and `POST /epoch`. With `--config node.toml` it binds to
   `network.rpc_listen` and writes the file with defaults first if it is missing,
   instead of refusing its own first run.
-- 379 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
+- 385 tests in the default workspace build, including RFC 8032 vectors, ML-DSA-65
   and SLH-DSA roundtrip and context binding, deterministic signing, envelope and
   policy behaviour, validator rotation, validator key registration over HTTP,
   certificate encoding and quorum rejection, vertex encoding and vote tallying,
@@ -765,8 +770,9 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     hash, with its quorum certificate verified when the peer had it. The order
     prefix is the remaining cost: `dag_root` commits every commit from genesis,
     so a Merkle frontier or a different commitment is the next lever, not a
-    larger committee. The floor rule is a prototype (two-round margin, round 0
-    never pruned, whole-DAG fallback when no positive floor is safe). The first
+    larger committee (finding 39 implements the frontier). The floor rule is a
+    prototype (two-round margin, round 0 never pruned, whole-DAG fallback when no
+    positive floor is safe). The first
     measurement counted queued payloads from genesis (42 batches); filtering to
     the payloads the tail executes changed it to 1–4, so the byte model reflects
     the transfer. The full gate is green on the measured tree (355 tests
@@ -801,8 +807,9 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     1,130 on node 0, with commit root `2517def7…` and 0 conflicts. The next restart
     on the old store plus `live.snapshot` had all four nodes at head 2,636, commit
     root `c86d8123…`, 0 conflicts. A peer snapshot below the stored head is refused
-    after 15 s rather than moving the store backwards. The snapshot still carries
-    the full committed order prefix (finding 37), not a Merkle frontier. On the
+    after 15 s rather than moving the store backwards. The snapshot carries a
+    Merkle frontier for the prefix below its floor and only the tail above it
+    (finding 39), so a join no longer transfers the full order. On the
     pruning run, a node that had history to height 1,169 adopted a peer snapshot
     at height 1,862 (floor 1,346), pruned the 24 old vertices and 2 headers it
     still held, and ended on the same commit root `b98f42ae…` as the three nodes
@@ -834,13 +841,14 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     - `karsa audit` re-derived 235 of 235 heights on both `state_root` and `dag_root`
       above a checkpoint 235 heights behind the head; a store checkpointed at the
       head reported 0 of 0 heights and verified the anchor certificate instead.
-    The checkpoint file is still the full committed order prefix, so it grows with
-    height (~1.4 MB at head 3,802 here); pruning bounds the append-only logs,
-    not `live.snapshot`. A Merkle frontier is the next lever. The floor rule is
+    The checkpoint file is now bounded: `live.snapshot` v2 stores the state, the
+    peaks of the prefix below the floor, and only the tail above it (finding 39).
+    At head 3,802 the full-order format was 1.36 MB; the compact snapshot was
+    1.4 KB at head 3,972. The floor rule is
     the snapshot one (two-round margin, round 0 never pruned, whole-DAG fallback).
     Whole-payload nodes prune with `min_shards = 0`; `--shard` nodes pass 1.
     Restart from checkpoint is now covered by an automated in-process test:
-    four nodes author 20 rounds with `checkpoint_every = 2`, drain for a second
+    four nodes author 30 rounds with `checkpoint_every = 2`, drain for two seconds
     so the committed prefix catches up, assert that no vertex below the floor and
     the anchor header survive, restart from the same stores, and audit the pruned
     store. The store prune, the checkpoint cadence, and the two config checks also
@@ -858,9 +866,35 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     in 106 ms, and the commit proof verified. This is a devnet, not a deployment:
     every process runs on loopback under one user, and `peers.json` is
     informational because the live mesh still derives endpoints from
-    `--port-base`. `WIRE_PROTOCOL` is 3, so an old and a new node refuse each
-    other at the handshake. The gate is green on this tree (379 tests default,
-    380 with all features).
+    `--port-base`. `WIRE_PROTOCOL` is 4 since finding 39, so an old and a new
+    node refuse each other at the handshake. The gate is green on this tree
+    (385 tests default, 386 with all features).
+
+39. **A Merkle frontier bounds the checkpoint and the snapshot transfer.**
+    A header's `dag_root` commits every entry from genesis, but entries below the
+    DAG floor are already applied and never replayed. `CommitFrontier` keeps those
+    entries as the perfect-subtree peaks a binary counter would carry; `Dag` holds
+    the prefix peaks plus the committed tail above the floor, and
+    `Finalizer::build_ready_with_prefix` roots each header at
+    `prefix + tail[..len]`. `live.snapshot` v2 and the TCP snapshot carry
+    `order_len`, the prefix peaks, and the tail; a v1 snapshot is still read as an
+    empty prefix with the full order. A tail leaf's commit proof is built from the
+    peaks, so a transaction submitted after a restart still has one; leaves below
+    the retained prefix have none, because the node no longer holds them.
+    Measured on the four-process devnet, checkpoint every 128: `live.snapshot`
+    stayed at 1.3–2.0 KB up to head 1,415 and was 1.4 KB at head 3,972, against
+    1.36 MB for the full-order format at head 3,802; per-node disk ended at
+    8–104 KB. A restart from the compact checkpoints was 4/4 with the same state
+    root and one applied transaction; the transfer sent after the restart
+    finalized in 103 ms and its proof (leaf 11,790 of 11,791) verified against
+    `dag_root`. `karsa audit` re-derived 111 of 111 heights on both roots. A fresh
+    node joined over TCP from a compact snapshot at height 3,986 (floor 4,443, 21
+    tail vertices), matched the mesh on commit root `d49f51d7…`, restarted from
+    its own compact checkpoint (5,452) with one applied transaction, and audited
+    3 of 3 heights. `WIRE_PROTOCOL` is 4, so an older node is refused at the
+    handshake. This closes the order-prefix cost that findings 34 and 37 carried;
+    the audit still starts above the anchor, and an old leaf below the floor
+    cannot be proven.
 
 ## Build order
 

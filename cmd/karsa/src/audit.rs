@@ -147,12 +147,15 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
         if state.state_root() != live.header.state_root {
             return Err("the live snapshot state does not match its anchor root".into());
         }
-        if commit_root(&live.order) != live.header.dag_root {
+        if live.prefix.len().checked_add(live.order.len()) != Some(live.order_len) {
+            return Err("the live snapshot order length does not match its prefix and tail".into());
+        }
+        if live.prefix.root_at(&live.order, live.order.len()) != Some(live.header.dag_root) {
             return Err("the live snapshot order does not reproduce its anchor dag_root".into());
         }
         let applied = usize::try_from(live.applied)
             .map_err(|_| format!("{} applied transactions do not fit", live.applied))?;
-        (state, live.floor, live.order.len(), live.cursor, applied)
+        (state, live.floor, live.order_len, live.cursor, applied)
     } else if full {
         let state = match store.genesis_state()? {
             Some(bytes) => State::decode(&bytes)?,
@@ -191,7 +194,7 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
 
     let mut dag = Dag::with_epoch_length(set, committee.epoch_rounds);
     if let Some(live) = &live {
-        dag.seed_order(live.order.clone());
+        dag.seed_prefix(live.prefix.clone(), live.order.clone());
     }
     if let Some(round) = floor {
         dag.set_floor(round);
@@ -201,7 +204,9 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
     }
     chain::settle(&mut dag, settle_from)?;
 
+    let base = dag.prefix().len();
     let order: Vec<VertexId> = dag.order().to_vec();
+    let order_len = dag.order_len();
     let mut headers_by_round: BTreeMap<u64, &Header> = BTreeMap::new();
     for entry in &certified {
         headers_by_round.insert(entry.header.round, &entry.header);
@@ -225,10 +230,18 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
                 continue;
             }
             let mut cursor = previous;
-            let mut root = commit_root(&order[..cursor]);
-            while root != header.dag_root && cursor < order.len() {
+            let mut root = match dag.commit_root_at(cursor) {
+                Some(root) => root,
+                None => return Err(format!("the committed order has no root at {cursor}").into()),
+            };
+            while root != header.dag_root && cursor < order_len {
                 cursor += 1;
-                root = commit_root(&order[..cursor]);
+                root = match dag.commit_root_at(cursor) {
+                    Some(root) => root,
+                    None => {
+                        return Err(format!("the committed order has no root at {cursor}").into());
+                    }
+                };
             }
             if root != header.dag_root {
                 rows.push(Row {
@@ -242,7 +255,7 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
                 });
                 continue;
             }
-            for id in &order[previous..cursor] {
+            for id in &order[previous - base..cursor - base] {
                 let Some(vertex) = dag.get(id.round, &id.author) else {
                     continue;
                 };
@@ -332,7 +345,7 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
     );
     println!(
         "  replayed order:   {} vertices over {} rounds",
-        order.len(),
+        order_len,
         rows.len()
     );
     if full {

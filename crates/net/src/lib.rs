@@ -33,8 +33,8 @@ use crypto::registry::ALG_ED25519;
 use crypto::scheme::Ed25519Scheme;
 use crypto::{CryptoError, CryptoErrorKind};
 use validator::{
-    Dag, NO_EXPIRY, Pacemaker, PacemakerConfig, Step, ValidatorKey, ValidatorRecord, ValidatorSet,
-    Vertex, VertexId,
+    CommitFrontier, Dag, NO_EXPIRY, Pacemaker, PacemakerConfig, Step, ValidatorKey,
+    ValidatorRecord, ValidatorSet, Vertex, VertexId,
 };
 
 const CHAIN_ID: &[u8] = b"karsa-net-1";
@@ -207,6 +207,16 @@ impl Node {
     /// Adopts a verified committed order prefix from a snapshot.
     pub fn seed_order(&mut self, order: Vec<VertexId>) {
         self.dag.seed_order(order);
+    }
+
+    /// Adopts a compact committed prefix plus the tail above the floor.
+    pub fn seed_prefix(&mut self, prefix: CommitFrontier, order: Vec<VertexId>) {
+        self.dag.seed_prefix(prefix, order);
+    }
+
+    /// Truncates the committed order to `len` entries.
+    pub fn truncate_order(&mut self, len: usize) {
+        self.dag.truncate_order(len);
     }
 
     /// Treats every round at or below `round` as covered by a state snapshot and

@@ -760,13 +760,13 @@ fn credited_genesis(accounts: &[chain::Account]) -> Result<State, String> {
 /// The initial boundary is whatever order the node started with: empty for a full
 /// replay, and the snapshot's committed prefix for a snapshot restart.
 fn replay_to_head(node: &mut Node, head_root: [u8; 32]) -> Result<(), String> {
-    let mut boundaries: Vec<(usize, u64)> = vec![(node.dag().order().len(), node.cursor())];
+    let mut boundaries: Vec<(usize, u64)> = vec![(node.dag().order_len(), node.cursor())];
     loop {
         match node.commit_once() {
             Ok(Step::Advanced {
                 cursor, anchors, ..
             }) => {
-                boundaries.push((node.dag().order().len(), cursor));
+                boundaries.push((node.dag().order_len(), cursor));
                 if anchors > 0 {
                     break;
                 }
@@ -776,16 +776,15 @@ fn replay_to_head(node: &mut Node, head_root: [u8; 32]) -> Result<(), String> {
             Err(error) => return Err(format!("cannot rebuild the committed order: {error}")),
         }
     }
-    let order = node.dag().order().to_vec();
     let Some(index) = boundaries
         .iter()
-        .rposition(|(len, _)| commit_root(&order[..*len]) == head_root)
+        .rposition(|(len, _)| node.dag().commit_root_at(*len) == Some(head_root))
     else {
         return Err("the certified head does not match any committed prefix".into());
     };
     let (head_len, head_cursor) = boundaries[index];
-    if head_len < order.len() {
-        node.seed_order(order[..head_len].to_vec());
+    if head_len < node.dag().order_len() {
+        node.truncate_order(head_len);
         node.set_cursor(head_cursor);
     }
     Ok(())
@@ -885,7 +884,7 @@ fn restore(
     Ok(Some(Restored {
         state_root: live.state.state_root(),
         applied: *live.applied,
-        order_len: node.dag().order().len(),
+        order_len: node.dag().order_len(),
         head_height: live
             .finalizer
             .as_ref()
@@ -911,7 +910,14 @@ fn restore_live(
     if state.state_root() != snapshot.header.state_root {
         return Err("live snapshot state root does not match its header".into());
     }
-    if commit_root(&snapshot.order) != snapshot.header.dag_root {
+    if snapshot.prefix.len().checked_add(snapshot.order.len()) != Some(snapshot.order_len) {
+        return Err("live snapshot order length does not match its prefix and tail".into());
+    }
+    if snapshot
+        .prefix
+        .root_at(&snapshot.order, snapshot.order.len())
+        != Some(snapshot.header.dag_root)
+    {
         return Err("live snapshot order does not reproduce its header dag_root".into());
     }
     let anchor_height = snapshot.header.height;
@@ -923,14 +929,14 @@ fn restore_live(
         .adopt_anchor(
             snapshot.header.clone(),
             &snapshot.certificate,
-            snapshot.order.len(),
+            snapshot.order_len,
         )
         .map_err(|error| format!("live snapshot anchor is not certified: {error}"))?;
     *live.state = state;
     *live.applied = usize::try_from(snapshot.applied)
         .map_err(|_| format!("{} applied transactions do not fit", snapshot.applied))?;
-    *live.applied_cursor = snapshot.order.len();
-    node.seed_order(snapshot.order);
+    *live.applied_cursor = snapshot.order_len;
+    node.seed_prefix(snapshot.prefix, snapshot.order);
     if let Some(floor) = snapshot.floor {
         node.set_floor(floor);
     }
@@ -978,9 +984,15 @@ fn restore_live(
         .map_or(snapshot.header.dag_root, |record| record.header.dag_root);
     replay_to_head(node, head_root)?;
 
+    let base = node.dag().prefix().len();
     let order = node.dag().order().to_vec();
-    while *live.applied_cursor < order.len() {
-        let id = &order[*live.applied_cursor];
+    while *live.applied_cursor < node.dag().order_len() {
+        let Some(index) = (*live.applied_cursor).checked_sub(base) else {
+            break;
+        };
+        let Some(id) = order.get(index) else {
+            break;
+        };
         let Some(vertex) = node.dag().get(id.round, &id.author) else {
             break;
         };
@@ -1013,7 +1025,7 @@ fn restore_live(
     Ok(Restored {
         state_root: live.state.state_root(),
         applied: *live.applied,
-        order_len: node.dag().order().len(),
+        order_len: node.dag().order_len(),
         head_height: finalizer.head().height,
         checkpoint: Some(anchor_height),
     })
@@ -1100,10 +1112,24 @@ fn build_live_snapshot(
         return None;
     }
     let coverage = finalizer.certified_order(head.height)?;
-    let order = node.dag().order();
-    if coverage > order.len() {
+    let dag = node.dag();
+    let base = dag.prefix().len();
+    if coverage > dag.order_len() || coverage < base {
         return None;
     }
+    let tail_coverage = coverage - base;
+    let committed_tail = &dag.order()[..tail_coverage];
+    let proposed = snapshot_floor(node, committed_tail, head.round)?;
+    // The floor only rises: a held prefix below the current floor is already
+    // committed, so a candidate that would go backwards cannot drop it again.
+    let floor = proposed.max(dag.floor().unwrap_or(0));
+    let split = committed_tail
+        .iter()
+        .position(|id| id.round > floor)
+        .unwrap_or(tail_coverage);
+    let mut prefix = dag.prefix().clone();
+    prefix.extend(&committed_tail[..split]);
+    let order = committed_tail[split..].to_vec();
     let state = states
         .iter()
         .rev()
@@ -1113,10 +1139,9 @@ fn build_live_snapshot(
     if state.state_root() != head.state_root {
         return None;
     }
-    let floor = snapshot_floor(node, &order[..coverage], head.round);
     let vertices: Vec<validator::Vertex> = held_vertices(node)
         .into_iter()
-        .filter(|vertex| floor.is_none_or(|floor| vertex.round > floor))
+        .filter(|vertex| vertex.round > floor)
         .collect();
     let mut seen = HashSet::new();
     let mut tail_batches = Vec::new();
@@ -1130,11 +1155,13 @@ fn build_live_snapshot(
     }
     Some(wire::Snapshot {
         state: state.encode().ok()?,
-        order: order[..coverage].to_vec(),
+        order,
+        order_len: coverage,
+        prefix,
         anchor: header.clone(),
         certificate: certificate.clone(),
         cursor: head.round.saturating_add(1),
-        floor,
+        floor: Some(floor),
         vertices,
         batches: tail_batches,
     })
@@ -1278,6 +1305,8 @@ fn adopt_snapshot(
     let wire::Snapshot {
         state,
         order,
+        order_len,
+        prefix,
         anchor,
         certificate,
         cursor,
@@ -1293,14 +1322,17 @@ fn adopt_snapshot(
     if decoded.state_root() != anchor.state_root {
         return Err("snapshot state root does not match the anchor".into());
     }
-    if commit_root(&order) != anchor.dag_root {
+    if prefix.len().checked_add(order.len()) != Some(order_len) {
+        return Err("snapshot order length does not match its prefix and tail".into());
+    }
+    if prefix.root_at(&order, order.len()) != Some(anchor.dag_root) {
         return Err("snapshot order does not reproduce the anchor dag_root".into());
     }
     let finalizer = finalizer
         .as_mut()
         .ok_or("a snapshot join needs execution (--execute)")?;
     finalizer
-        .adopt_anchor(anchor.clone(), &certificate, order.len())
+        .adopt_anchor(anchor.clone(), &certificate, order_len)
         .map_err(|error| format!("snapshot anchor is not certified: {error}"))?;
     if let Some(store) = store {
         store
@@ -1311,13 +1343,14 @@ fn adopt_snapshot(
                 applied: anchor.applied,
                 state: state.clone(),
                 order: order.clone(),
+                order_len,
+                prefix: prefix.clone(),
                 header: anchor.clone(),
                 certificate: certificate.clone(),
             })
             .map_err(|error| error.to_string())?;
     }
-    let order_len = order.len();
-    node.seed_order(order);
+    node.seed_prefix(prefix, order);
     if let Some(floor) = floor {
         node.set_floor(floor);
     }
@@ -1847,13 +1880,13 @@ async fn node_task(
         core.note_state(u64::try_from(applied).unwrap_or(u64::MAX), &state);
         if let Some(finalizer) = &finalizer {
             let head = finalizer.head();
-            core.note_order(node.dag().order());
+            core.note_order_from(node.dag().prefix(), node.dag().order());
             core.note_certified(head, finalizer.certified_order(head.height));
             core.note_certified_heights(finalizer.certified_ids().len());
         }
         core.set_run(
             node.round(),
-            node.dag().order().len(),
+            node.dag().order_len(),
             u64::try_from(applied).unwrap_or(u64::MAX),
             outbound.len(),
             finalizer.as_ref().map_or(0, Finalizer::conflicts),
@@ -1944,7 +1977,14 @@ async fn node_task(
                         let known = node.dag().get(vertex.round, &vertex.author).is_some();
                         match node.receive(vertex.clone()) {
                             Ok(()) => {
-                                if !known && let Some(store) = &store {
+                                // A vertex at or below the floor is already covered by
+                                // the state snapshot; storing it would put back history
+                                // the checkpoint just pruned.
+                                let above_floor = node
+                                    .dag()
+                                    .floor()
+                                    .is_none_or(|floor| vertex.round > floor);
+                                if !known && above_floor && let Some(store) = &store {
                                     store
                                         .append_vertex(&vertex)
                                         .map_err(|error| error.to_string())?;
@@ -1985,7 +2025,7 @@ async fn node_task(
                                 }
                                 if let Some(rpc) = &rpc {
                                     let mut core = rpc.lock().expect("rpc lock poisoned");
-                                    core.note_order(node.dag().order());
+                                    core.note_order_from(node.dag().prefix(), node.dag().order());
                                     core.note_certified(
                                         &certified.header,
                                         finalizer.certified_order(certified.header.height),
@@ -2151,7 +2191,7 @@ async fn node_task(
                             if commits > 0
                                 && let Some(finalizer) = finalizer.as_mut()
                             {
-                                finalizer.record_commit(from, node.dag().order().len());
+                                finalizer.record_commit(from, node.dag().order_len());
                             }
                             if anchors > 0 {
                                 break;
@@ -2173,9 +2213,15 @@ async fn node_task(
                     // Apply in commit order, and stop at the first vertex whose
                     // batch has not arrived: applying past it would put a later
                     // transaction before an earlier one.
+                    let base = node.dag().prefix().len();
                     let order = node.dag().order();
-                    while applied_cursor < order.len() {
-                        let id = &order[applied_cursor];
+                    while applied_cursor < node.dag().order_len() {
+                        let Some(order_index) = applied_cursor.checked_sub(base) else {
+                            break;
+                        };
+                        let Some(id) = order.get(order_index) else {
+                            break;
+                        };
                         let Some(vertex) = node.dag().get(id.round, &id.author) else {
                             break;
                         };
@@ -2265,7 +2311,11 @@ async fn node_task(
                         u64::try_from(applied).unwrap_or(u64::MAX),
                     );
                     let build = finalizer
-                        .build_ready(node.dag().order(), now())
+                        .build_ready_with_prefix(
+                            node.dag().prefix(),
+                            node.dag().order(),
+                            now(),
+                        )
                         .map_err(|error| error.to_string())?;
                     for share in build.shares {
                         let bytes = wire::frame(&Message::Share(share), now())
@@ -2285,7 +2335,7 @@ async fn node_task(
                         }
                         if let Some(rpc) = &rpc {
                             let mut core = rpc.lock().expect("rpc lock poisoned");
-                            core.note_order(node.dag().order());
+                            core.note_order_from(node.dag().prefix(), node.dag().order());
                             core.note_certified(
                                 &certified.header,
                                 finalizer.certified_order(certified.header.height),
@@ -2300,10 +2350,10 @@ async fn node_task(
                 }
                 if let Some(rpc) = &rpc {
                     let mut core = rpc.lock().expect("rpc lock poisoned");
-                    core.note_order(node.dag().order());
+                    core.note_order_from(node.dag().prefix(), node.dag().order());
                     core.set_run(
                         node.round(),
-                        node.dag().order().len(),
+                        node.dag().order_len(),
                         u64::try_from(applied).unwrap_or(u64::MAX),
                         outbound.len(),
                         finalizer.as_ref().map_or(0, Finalizer::conflicts),
@@ -2322,7 +2372,7 @@ async fn node_task(
                 // commit cursor. Report caught-up only once the commit cursor has
                 // itself stopped moving for a while: early in the run both cursors
                 // are small and "caught up" would be trivially true.
-                let order_len = node.dag().order().len();
+                let order_len = node.dag().order_len();
                 if order_len == last_order {
                     stable_ticks = stable_ticks.saturating_add(1);
                 } else {
@@ -2424,6 +2474,8 @@ async fn node_task(
                             applied: snapshot.anchor.applied,
                             state: snapshot.state,
                             order: snapshot.order,
+                            order_len: snapshot.order_len,
+                            prefix: snapshot.prefix,
                             header: snapshot.anchor,
                             certificate: snapshot.certificate,
                         })
@@ -2508,11 +2560,11 @@ async fn node_task(
             .as_ref()
             .map_or(0, |store| directory_bytes(store.path())),
         rejected,
-        committed: node.dag().order().len(),
+        committed: node.dag().order_len(),
         bytes_in: bytes_in.load(Ordering::Relaxed),
         bytes_out: bytes_out.load(Ordering::Relaxed),
         latencies,
-        commit_root: commit_root(node.dag().order()),
+        commit_root: node.dag().commit_root(),
         order: node.dag().order().to_vec(),
         profile,
     })
@@ -4033,7 +4085,7 @@ mod tests {
             execute: true,
             store: dir.0.clone(),
             shard: false,
-            drain: Duration::from_secs(1),
+            drain: Duration::from_secs(2),
             home: None,
             profile: false,
             pre_sign: false,
@@ -4049,7 +4101,7 @@ mod tests {
     #[test]
     fn a_mesh_restarts_from_a_checkpoint_and_audits() {
         let dir = TestDir::new("checkpoint-restart");
-        let first = run(mesh_config(&dir, a_free_port_base(4), 20, 2));
+        let first = run(mesh_config(&dir, a_free_port_base(4), 30, 2));
         assert!(first.is_ok(), "the first run failed: {first:?}");
 
         for index in 0..4 {

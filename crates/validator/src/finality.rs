@@ -26,7 +26,7 @@ use crypto::scheme::Ed25519Scheme;
 use crypto::{CryptoError, CryptoErrorKind};
 
 use crate::certificate::{Certificate, bitmap_len, set_bit};
-use crate::dag::commit_root;
+use crate::frontier::CommitFrontier;
 use crate::header::{Header, HeaderChain};
 use crate::schedule::EpochSchedule;
 use crate::set_change::SetSchedule;
@@ -281,8 +281,8 @@ impl Finalizer {
     /// node may sign, and returns the shares plus any certificates that became
     /// complete.
     ///
-    /// `order` is the full committed order; only its prefix at each pending
-    /// header's `order_len` is read.
+    /// This is the full-order entry point; a restarted live node calls
+    /// [`Finalizer::build_ready_with_prefix`] instead.
     ///
     /// # Errors
     ///
@@ -290,6 +290,27 @@ impl Finalizer {
     /// `order`, and every error from signing, certificate verification, or chain
     /// advance.
     pub fn build_ready(&mut self, order: &[VertexId], at: u64) -> Result<Build, CryptoError> {
+        self.build_ready_with_prefix(&CommitFrontier::empty(), order, at)
+    }
+
+    /// Builds headers from a compact committed prefix plus its retained tail.
+    ///
+    /// `prefix` covers the entries whose leaves are gone and `order` is the
+    /// committed tail above it. A pending header's `order_len` is a total index,
+    /// so the root is taken at `order_len - prefix.len()` off the tail.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoErrorKind::InvalidVertex`] when a pending prefix is longer than
+    /// `prefix + order` or shorter than the retained prefix, and every error from
+    /// signing, certificate verification, or chain advance.
+    pub fn build_ready_with_prefix(
+        &mut self,
+        prefix: &CommitFrontier,
+        order: &[VertexId],
+        at: u64,
+    ) -> Result<Build, CryptoError> {
+        let total = prefix.len().saturating_add(order.len());
         let mut shares = Vec::new();
         while self
             .pending
@@ -303,14 +324,20 @@ impl Finalizer {
             let state_root = pending
                 .state_root
                 .ok_or_else(|| invalid("a pending header lost its state root"))?;
-            if pending.order_len > order.len() {
+            if pending.order_len > total || pending.order_len < prefix.len() {
                 return Err(invalid(format!(
-                    "header {} covers {} commits, but the order has {}",
+                    "header {} covers {} commits, but the order has {total} with a prefix of {}",
                     pending.height,
                     pending.order_len,
-                    order.len()
+                    prefix.len()
                 )));
             }
+            let Some(dag_root) = prefix.root_at(order, pending.order_len - prefix.len()) else {
+                return Err(invalid(format!(
+                    "header {} cannot be rooted at commit {}",
+                    pending.height, pending.order_len
+                )));
+            };
             let epoch = self.schedule.epoch_of(pending.round);
             let header = Header {
                 chain_id: self.chain_id.clone(),
@@ -318,7 +345,7 @@ impl Finalizer {
                 height: pending.height,
                 round: pending.round,
                 state_root,
-                dag_root: commit_root(&order[..pending.order_len]),
+                dag_root,
                 previous: self.last_built.id()?,
                 applied: pending.applied,
             };
@@ -627,6 +654,7 @@ fn invalid(detail: impl Into<String>) -> CryptoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dag::commit_root;
     use crate::schedule::{NO_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet};
     use crypto::registry::ALG_ED25519;
 

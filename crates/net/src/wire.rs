@@ -36,7 +36,7 @@
 use crypto::encoding::{Decoder, Encoder};
 use crypto::{CryptoError, CryptoErrorKind};
 use tx::batch::Batch;
-use validator::{Certificate, Header, Share, Vertex, VertexId};
+use validator::{Certificate, CommitFrontier, Header, Share, Vertex, VertexId};
 
 /// Largest body this parser will accept.
 ///
@@ -61,7 +61,7 @@ const KIND_SNAPSHOT: u8 = 7;
 /// A peer that answers with another number is not necessarily hostile; it may be a
 /// different build. The link is closed rather than parsed optimistically, because
 /// the next frame kind could mean something else there.
-pub const WIRE_PROTOCOL: u16 = 3;
+pub const WIRE_PROTOCOL: u16 = 4;
 
 /// The first frame on every link: which chain the sender is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,15 +87,19 @@ impl Hello {
 ///
 /// The anchor is the certified header the state belongs to. Its certificate is
 /// carried so the receiver can check the quorum rather than trust the sender.
-/// `order` is the committed prefix the anchor commits, which a header's
-/// `dag_root` needs; `floor` is the highest round the state covers, so the DAG
-/// travels only above it.
+/// The committed order is split: `prefix` summarizes the entries at or below the
+/// floor, whose vertices travel only above it, and `order` is the retained tail.
+/// `order_len` is the total, which is what the anchor's `dag_root` commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     /// Encoded `exec::State` at the anchor.
     pub state: Vec<u8>,
-    /// Committed order prefix ending at the anchor.
+    /// Committed order tail above the compact prefix.
     pub order: Vec<VertexId>,
+    /// Total committed entries the anchor covers.
+    pub order_len: usize,
+    /// Peaks of the committed order at or below the floor.
+    pub prefix: CommitFrontier,
     /// The certified header the snapshot is anchored at.
     pub anchor: Header,
     /// Quorum certificate over the anchor.
@@ -214,6 +218,21 @@ fn count(value: usize, what: &str) -> Result<u32, CryptoError> {
 fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>, CryptoError> {
     let mut encoder = Encoder::with_capacity(64 + snapshot.state.len());
     encoder.put_bytes(&snapshot.state)?;
+    encoder.put_u64(
+        u64::try_from(snapshot.order_len)
+            .map_err(|_| invalid("snapshot order length does not fit a u64".to_string()))?,
+    );
+    encoder.put_u64(
+        u64::try_from(snapshot.prefix.len())
+            .map_err(|_| invalid("snapshot prefix length does not fit a u64".to_string()))?,
+    );
+    encoder.put_u32(
+        u32::try_from(snapshot.prefix.peaks().len())
+            .map_err(|_| invalid("snapshot peak count does not fit a u32".to_string()))?,
+    );
+    for peak in snapshot.prefix.peaks() {
+        encoder.put_bytes(peak)?;
+    }
     encoder.put_u32(count(snapshot.order.len(), "order")?);
     for id in &snapshot.order {
         encoder.put_bytes(&encode_id(id)?)?;
@@ -238,10 +257,29 @@ fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>, CryptoError> {
     }
     Ok(encoder.finish())
 }
-
 fn decode_snapshot(payload: &[u8]) -> Result<Snapshot, CryptoError> {
     let mut decoder = Decoder::new(payload);
     let state = decoder.read_bytes()?.to_vec();
+    let order_len = usize::try_from(decoder.read_u64()?)
+        .map_err(|_| invalid("snapshot order length does not fit this host".to_string()))?;
+    let prefix_len = usize::try_from(decoder.read_u64()?)
+        .map_err(|_| invalid("snapshot prefix length does not fit this host".to_string()))?;
+    let peak_count = decoder.read_u32()? as usize;
+    if peak_count > payload.len() {
+        return Err(CryptoError::new(
+            CryptoErrorKind::FieldTooLong,
+            format!("{peak_count} peaks exceed the frame"),
+        ));
+    }
+    let mut peaks = Vec::with_capacity(peak_count.min(64));
+    for _ in 0..peak_count {
+        let peak: [u8; 32] = decoder
+            .read_bytes()?
+            .try_into()
+            .map_err(|_| invalid("snapshot peak is not 32 bytes".to_string()))?;
+        peaks.push(peak);
+    }
+    let prefix = CommitFrontier::from_peaks(prefix_len, peaks)?;
     let order_count = decoder.read_u32()? as usize;
     if order_count > MAX_FRAME {
         return Err(CryptoError::new(
@@ -252,6 +290,11 @@ fn decode_snapshot(payload: &[u8]) -> Result<Snapshot, CryptoError> {
     let mut order = Vec::with_capacity(order_count.min(1024));
     for _ in 0..order_count {
         order.push(decode_id(&mut Decoder::new(decoder.read_bytes()?))?);
+    }
+    if prefix.len().checked_add(order.len()) != Some(order_len) {
+        return Err(invalid(
+            "snapshot order length does not match its prefix and tail".to_string(),
+        ));
     }
     let anchor = Header::decode(decoder.read_bytes()?)?;
     let certificate = Certificate::decode(decoder.read_bytes()?)?;
@@ -287,6 +330,8 @@ fn decode_snapshot(payload: &[u8]) -> Result<Snapshot, CryptoError> {
     Ok(Snapshot {
         state,
         order,
+        order_len,
+        prefix,
         anchor,
         certificate,
         cursor,
@@ -523,6 +568,8 @@ mod tests {
         let snapshot = Snapshot {
             state: b"encoded state".to_vec(),
             order: vec![want(1), want(2)],
+            order_len: 2,
+            prefix: CommitFrontier::empty(),
             anchor: anchor.clone(),
             certificate: Certificate {
                 chain_id: anchor.chain_id.clone(),

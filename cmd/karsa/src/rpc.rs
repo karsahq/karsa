@@ -44,7 +44,7 @@ use sha2::{Digest, Sha256};
 use tx::address;
 use tx::envelope::{PROTOCOL_VERSION_V1, Transaction};
 use tx::policy::AuthPolicy;
-use validator::{CommitProof, Header, VertexId};
+use validator::{CommitFrontier, CommitProof, Header, VertexId};
 
 use crate::chain::{self, TxResult};
 
@@ -183,10 +183,17 @@ pub(crate) struct RpcCore {
     pending_finality: VecDeque<(usize, Vec<[u8; 32]>)>,
     /// State at each cumulative applied transaction count.
     states: BTreeMap<u64, State>,
-    /// The committed order this node has seen. The DAG order is append-only, so
-    /// the node loop extends this by the new suffix instead of copying it each
-    /// tick; a proof over any certified prefix is then built on demand.
+    /// The committed order this node has seen, above `order_prefix`.
+    ///
+    /// The DAG order is append-only, so the node loop extends this by the new
+    /// suffix instead of copying it each tick; a proof over any certified prefix
+    /// is then built on demand. Entries below the floor are summarized by peaks
+    /// rather than held.
     order: Vec<VertexId>,
+    /// Peaks of the committed order at or below the DAG floor.
+    order_prefix: CommitFrontier,
+    /// Number of committed entries before `order`.
+    order_base: usize,
     /// Certified headers that finalized at least one tracked transaction, with
     /// the commit prefix each one covers. Bounded, and only the heights a client
     /// can still ask about need to be here.
@@ -221,6 +228,8 @@ impl RpcCore {
             pending_finality: VecDeque::new(),
             states: BTreeMap::new(),
             order: Vec::new(),
+            order_prefix: CommitFrontier::empty(),
+            order_base: 0,
             finalized_headers: BTreeMap::new(),
             head: HeadView {
                 height: genesis.height,
@@ -473,15 +482,19 @@ impl RpcCore {
         self.pending_finality.push_back((order_index + 1, ids));
     }
 
-    /// Extends the local copy of the committed order.
+    /// Extends the local copy from a compact prefix plus its retained tail.
     ///
-    /// The DAG order only ever grows at the tail, so a call after a commit copies
-    /// just the new entries. A shorter slice would mean the caller rebuilt its DAG
-    /// from scratch, so that is treated as a replacement.
-    pub(crate) fn note_order(&mut self, order: &[VertexId]) {
-        if order.len() >= self.order.len() {
+    /// The prefix is immutable after a checkpoint restart; only the tail grows.
+    /// A changed prefix or a shorter tail is a rebuild and replaces both.
+    pub(crate) fn note_order_from(&mut self, prefix: &CommitFrontier, order: &[VertexId]) {
+        if self.order_base == prefix.len()
+            && self.order_prefix == *prefix
+            && order.len() >= self.order.len()
+        {
             self.order.extend_from_slice(&order[self.order.len()..]);
         } else {
+            self.order_base = prefix.len();
+            self.order_prefix = prefix.clone();
             self.order.clear();
             self.order.extend_from_slice(order);
         }
@@ -610,25 +623,40 @@ impl RpcCore {
             let Some(vertex) = &record.vertex else {
                 return Ok(view);
             };
-            if *covered > self.order.len() {
+            let Some(tail_index) = index.checked_sub(self.order_base) else {
+                // The leaf is below the retained prefix, and the node no longer
+                // holds the data a proof would need. The status stays final.
+                return Ok(view);
+            };
+            let Some(covered_tail) = (*covered).checked_sub(self.order_base) else {
+                return Ok(view);
+            };
+            if covered_tail > self.order.len() {
                 // The header was certified just before the node loop captured the
                 // new order suffix. The status is already final; the proof can be
                 // asked for again once the next tick has extended the copy.
                 return Ok(view);
             }
-            if index >= *covered || self.order.get(index) != Some(vertex) {
+            if tail_index >= covered_tail || self.order.get(tail_index) != Some(vertex) {
                 return Err(RpcReject::new(
                     StatusCode::CONFLICT,
                     -1,
                     "the stored order does not name the transaction's vertex at that prefix",
                 ));
             }
-            let Some(proof) = CommitProof::prove(&self.order[..*covered], index) else {
+            let Some(proof) = self
+                .order_prefix
+                .proof_for(&self.order[..covered_tail], tail_index)
+            else {
                 return Err(RpcReject::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     -1,
                     "cannot build a commit proof",
                 ));
+            };
+            let proof = CommitProof {
+                vertex: vertex.clone(),
+                proof,
             };
             view.commit_proof = Some(proof_view(&proof));
         }
@@ -1071,7 +1099,7 @@ mod tests {
             previous: [0; 32],
             applied: 1,
         };
-        core.note_order(std::slice::from_ref(&vertex));
+        core.note_order_from(&CommitFrontier::empty(), std::slice::from_ref(&vertex));
         core.note_certified(&header, Some(1));
         let view = core.transaction(id, true).unwrap();
         assert_eq!(view.status, "finalized");
@@ -1196,7 +1224,7 @@ mod tests {
             previous: [0; 32],
             applied: 0,
         };
-        core.note_order(std::slice::from_ref(&vertex));
+        core.note_order_from(&CommitFrontier::empty(), std::slice::from_ref(&vertex));
         core.note_certified(&header, Some(1));
         let view = core.transaction(body_id(&envelope), true).unwrap();
         assert_eq!(view.status, "rejected");

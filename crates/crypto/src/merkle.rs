@@ -62,6 +62,16 @@ fn hash_node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Hashes two child nodes under the internal-node domain.
+///
+/// This is the one combining step a caller needs to build a root from a
+/// frontier of subtree peaks. It is the same function the tree uses, so a root
+/// assembled outside [`MerkleTree`] cannot drift from the tree's root.
+#[must_use]
+pub fn combine(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    hash_node(left, right)
+}
+
 fn empty_root() -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update([EMPTY_DOMAIN]);

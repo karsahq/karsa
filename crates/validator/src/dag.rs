@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, HashSet};
 use crypto::merkle::{MerkleProof, MerkleTree};
 use crypto::{CryptoError, CryptoErrorKind};
 
+use crate::frontier::CommitFrontier;
 use crate::schedule::{EpochSchedule, ValidatorSet};
 use crate::set_change::SetSchedule;
 use crate::vertex::{Vertex, VertexId, tally_votes};
@@ -58,6 +59,13 @@ pub struct Dag {
     vertices: BTreeMap<(u64, Vec<u8>), Vertex>,
     committed: HashSet<[u8; 32]>,
     order: Vec<VertexId>,
+    /// Committed entries below the retained tail, summarized by their peaks.
+    ///
+    /// A checkpoint restart drops the leaves at or below the DAG floor but must
+    /// keep contributing them to every later `dag_root`; this is that contribution.
+    /// A run that never seeded a compact prefix has an empty frontier and its
+    /// `order` is the whole committed sequence.
+    prefix: CommitFrontier,
     skipped: Vec<SkippedRound>,
     /// Which epoch each round belongs to.
     schedule: EpochSchedule,
@@ -78,6 +86,7 @@ impl Dag {
             vertices: BTreeMap::new(),
             committed: HashSet::new(),
             order: Vec::new(),
+            prefix: CommitFrontier::empty(),
             skipped: Vec::new(),
             schedule: EpochSchedule::single(epoch),
             floor: None,
@@ -125,6 +134,7 @@ impl Dag {
             vertices: BTreeMap::new(),
             committed: HashSet::new(),
             order: Vec::new(),
+            prefix: CommitFrontier::empty(),
             skipped: Vec::new(),
             schedule: EpochSchedule::advancing(base, rounds_per_epoch),
             floor: None,
@@ -554,10 +564,22 @@ impl Dag {
         Ok(collected)
     }
 
-    /// The committed sequence, in commit order.
+    /// The committed sequence above the retained prefix, in commit order.
     #[must_use]
     pub fn order(&self) -> &[VertexId] {
         &self.order
+    }
+
+    /// The committed prefix whose leaves the store no longer holds.
+    #[must_use]
+    pub fn prefix(&self) -> &CommitFrontier {
+        &self.prefix
+    }
+
+    /// Total committed entries, retained tail included.
+    #[must_use]
+    pub fn order_len(&self) -> usize {
+        self.prefix.len() + self.order.len()
     }
 
     /// Adopts a verified committed prefix from a snapshot.
@@ -565,14 +587,45 @@ impl Dag {
     /// The caller has already verified the vertices and the header that commits
     /// this order. New commits append after the prefix.
     pub fn seed_order(&mut self, order: Vec<VertexId>) {
+        self.prefix = CommitFrontier::empty();
         self.committed = order.iter().map(|id| id.digest).collect();
         self.order = order;
+    }
+
+    /// Adopts a compact prefix plus the committed tail above the floor.
+    ///
+    /// `prefix` covers the entries at or below the DAG floor, whose leaves the
+    /// store dropped; `order` is the committed tail the checkpoint retained. The
+    /// two together must reproduce the anchor's `dag_root`.
+    pub fn seed_prefix(&mut self, prefix: CommitFrontier, order: Vec<VertexId>) {
+        self.committed = order.iter().map(|id| id.digest).collect();
+        self.prefix = prefix;
+        self.order = order;
+    }
+
+    /// Truncates the committed order to `len` entries.
+    ///
+    /// Replay uses this when the stored certified head covers an earlier prefix
+    /// than the decision sequence it just rebuilt. The compact prefix is
+    /// immutable; only the retained tail can rewind.
+    pub fn truncate_order(&mut self, len: usize) {
+        let keep = len.saturating_sub(self.prefix.len()).min(self.order.len());
+        self.order.truncate(keep);
+        self.committed = self.order.iter().map(|id| id.digest).collect();
+    }
+
+    /// The Merkle root over the first `len` committed entries.
+    #[must_use]
+    pub fn commit_root_at(&self, len: usize) -> Option<[u8; 32]> {
+        self.prefix
+            .root_at(&self.order, len.checked_sub(self.prefix.len())?)
     }
 
     /// The Merkle root over everything this node has committed, in commit order.
     #[must_use]
     pub fn commit_root(&self) -> [u8; 32] {
-        commit_root(&self.order)
+        self.commit_root_at(self.order_len())
+            .expect("the retained order length is in range")
     }
 
     /// Slots this node has decided to skip, in decision order.
