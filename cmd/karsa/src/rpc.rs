@@ -31,6 +31,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State as AxumState};
@@ -74,6 +75,14 @@ const MAX_SNAPSHOTS: usize = 256;
 /// The order itself is held once, so this bound is only about headers and their
 /// prefix lengths, not about copying a growing order per height.
 const MAX_PROOF_CONTEXTS: usize = 64;
+
+/// How long a transaction waits for the validator that owns it before any live
+/// node may author it.
+///
+/// Ownership is what keeps every node from putting the same gossiped
+/// transaction in its next batch. The fallback keeps the transaction live when
+/// its owner is down; the rare second author is resolved by the sequence rule.
+const OWNER_FALLBACK: Duration = Duration::from_secs(2);
 
 /// The shared handle the node loop and the HTTP handlers use.
 pub(crate) type SharedRpc = Arc<Mutex<RpcCore>>;
@@ -150,6 +159,8 @@ impl TxRecord {
 struct PendingTx {
     id: [u8; 32],
     transaction: Transaction,
+    /// When this copy entered the local mempool, for the owner fallback.
+    queued_at: Instant,
 }
 
 /// The batch that was taken from the mempool, before it is executed.
@@ -182,6 +193,8 @@ struct RunView {
 /// The mutex-protected state behind every endpoint.
 pub(crate) struct RpcCore {
     node: usize,
+    /// Number of validators that author batches, for the transaction-owner rule.
+    committee: usize,
     chain_id: Vec<u8>,
     accounts: Vec<(Vec<u8>, AuthPolicy)>,
     mempool: VecDeque<PendingTx>,
@@ -230,9 +243,11 @@ impl RpcCore {
         chain_id: Vec<u8>,
         accounts: &[chain::Account],
         genesis: &Header,
+        committee: usize,
     ) -> Self {
         Self {
             node,
+            committee: committee.max(1),
             chain_id,
             accounts: accounts
                 .iter()
@@ -384,7 +399,11 @@ impl RpcCore {
                     ));
                 }
                 self.pending_sequences.insert(key);
-                self.mempool.push_back(PendingTx { id, transaction });
+                self.mempool.push_back(PendingTx {
+                    id,
+                    transaction,
+                    queued_at: Instant::now(),
+                });
             }
             return self.record_view(&id).ok_or_else(|| {
                 RpcReject::new(StatusCode::INTERNAL_SERVER_ERROR, -1, "record disappeared")
@@ -435,7 +454,11 @@ impl RpcCore {
                 witness: None,
             },
         );
-        self.mempool.push_back(PendingTx { id, transaction });
+        self.mempool.push_back(PendingTx {
+            id,
+            transaction,
+            queued_at: Instant::now(),
+        });
         self.gossip.push(canonical);
         self.record_view(&id)
             .ok_or_else(|| RpcReject::new(StatusCode::INTERNAL_SERVER_ERROR, -1, "record vanished"))
@@ -498,32 +521,57 @@ impl RpcCore {
                 witness: None,
             },
         );
-        self.mempool.push_back(PendingTx { id, transaction });
+        self.mempool.push_back(PendingTx {
+            id,
+            transaction,
+            queued_at: Instant::now(),
+        });
         true
     }
 
-    /// Takes up to `max` transactions for the next authored batch.
+    /// The validator that should author one transaction.
+    ///
+    /// The content id is already a hash, so its first eight bytes spread
+    /// transactions over the committee without a second hasher. Every node
+    /// computes the same owner, which is what makes a gossiped transaction have
+    /// exactly one normal author instead of one per node.
+    fn owner(&self, id: &[u8; 32]) -> usize {
+        let seed = u64::from_le_bytes([id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7]]);
+        usize::try_from(seed).unwrap_or(usize::MAX) % self.committee
+    }
+
+    /// Takes up to `max` transactions this node owns, or ones whose owner has
+    /// not authored them within [`OWNER_FALLBACK`].
     ///
     /// The returned batch is removed from the mempool but its transactions are
     /// still tracked; [`RpcCore::return_batch`] puts them back if the DAG refuses
-    /// the authoring attempt.
+    /// the authoring attempt. Unselected entries keep their submission order.
     pub(crate) fn take_batch(&mut self, max: usize) -> Option<tx::batch::Batch> {
         let max = max.clamp(1, tx::batch::MAX_BATCH_TRANSACTIONS);
         if self.mempool.is_empty() {
             return None;
         }
-        let count = self.mempool.len().min(max);
-        let mut transactions = Vec::with_capacity(count);
-        let mut tx_ids = Vec::with_capacity(count);
-        for _ in 0..count {
-            let Some(pending) = self.mempool.pop_front() else {
-                break;
-            };
+        let now = Instant::now();
+        let mut selected = Vec::new();
+        let mut kept = VecDeque::with_capacity(self.mempool.len());
+        for pending in std::mem::take(&mut self.mempool) {
+            let due = self.owner(&pending.id) == self.node
+                || now.saturating_duration_since(pending.queued_at) >= OWNER_FALLBACK;
+            if due && selected.len() < max {
+                selected.push(pending);
+            } else {
+                kept.push_back(pending);
+            }
+        }
+        self.mempool = kept;
+        if selected.is_empty() {
+            return None;
+        }
+        let mut transactions = Vec::with_capacity(selected.len());
+        let mut tx_ids = Vec::with_capacity(selected.len());
+        for pending in selected {
             tx_ids.push(pending.id);
             transactions.push(pending.transaction);
-        }
-        if transactions.is_empty() {
-            return None;
         }
         let batch = tx::batch::Batch::new(transactions);
         let digest = batch.digest().ok()?;
@@ -558,6 +606,7 @@ impl RpcCore {
             self.mempool.push_front(PendingTx {
                 id: *id,
                 transaction,
+                queued_at: Instant::now(),
             });
         }
     }
@@ -1220,6 +1269,10 @@ mod tests {
     use tx::policy::Authorization;
 
     fn fixture() -> (RpcCore, Vec<chain::Account>, Vec<u8>) {
+        fixture_with(1)
+    }
+
+    fn fixture_with(committee: usize) -> (RpcCore, Vec<chain::Account>, Vec<u8>) {
         let accounts = chain::accounts(4).unwrap();
         let chain_id = chain::demo_chain_id();
         let state = chain::genesis_state(&accounts).unwrap();
@@ -1229,7 +1282,7 @@ mod tests {
             state.state_root(),
             validator::commit_root(&[]),
         );
-        let mut core = RpcCore::new(0, chain_id.clone(), &accounts, &genesis);
+        let mut core = RpcCore::new(0, chain_id.clone(), &accounts, &genesis, committee);
         core.note_state(0, &state);
         (core, accounts, chain_id)
     }
@@ -1584,6 +1637,49 @@ mod tests {
         let view = core.transaction(body_id(&envelope), false).unwrap();
         assert_eq!(view.status, "executed");
         assert!(view.finalized_height.is_none());
+    }
+
+    #[test]
+    fn only_the_owner_authors_a_transaction_before_the_fallback() {
+        let (core, accounts, chain_id) = fixture_with(4);
+        let mut owned = None;
+        let mut foreign = None;
+        for amount in 1..=256 {
+            let envelope = signed(&chain_id, &accounts[0], &accounts[1].address, 1, amount);
+            let id = body_id(&envelope);
+            if core.owner(&id) == 0 && owned.is_none() {
+                owned = Some(envelope);
+            } else if core.owner(&id) != 0 && foreign.is_none() {
+                foreign = Some(envelope);
+            }
+            if owned.is_some() && foreign.is_some() {
+                break;
+            }
+        }
+        let owned = owned.expect("an envelope owned by node 0");
+        let foreign = foreign.expect("an envelope owned by another node");
+
+        let (mut core, _, _) = fixture_with(4);
+        core.submit(&owned, 1_700_000_000).unwrap();
+        let batch = core.take_batch(16).expect("the owner authors immediately");
+        assert_eq!(batch.len(), 1);
+
+        // The same mempool on a node that does not own the transaction must not
+        // author it, or every node would produce a duplicate batch.
+        let (mut core, _, _) = fixture_with(4);
+        core.submit(&foreign, 1_700_000_000).unwrap();
+        assert!(
+            core.take_batch(16).is_none(),
+            "node 0 authored a transaction owned by another node"
+        );
+        assert_eq!(core.mempool.len(), 1);
+
+        // Once the owner has had its window, a live node takes over.
+        core.mempool[0].queued_at = Instant::now() - OWNER_FALLBACK - Duration::from_millis(1);
+        let batch = core
+            .take_batch(16)
+            .expect("the fallback releases the transaction");
+        assert_eq!(batch.len(), 1);
     }
 
     #[test]

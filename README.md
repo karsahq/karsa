@@ -868,7 +868,7 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     informational because the live mesh still derives endpoints from
     `--port-base`. `WIRE_PROTOCOL` is 5 since finding 41, so an old and a new
     node refuse each other at the handshake. The gate is green on this tree
-    (394 tests default, 395 with all features).
+    (395 tests default, 396 with all features).
 
 39. **A Merkle frontier bounds the checkpoint and the snapshot transfer.**
     A header's `dag_root` commits every entry from genesis, but entries below the
@@ -987,6 +987,28 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       so a port stolen in that window fails the test. This is the cold devnet;
       fault and restart probes remain manual, while the in-process restart test
       covers the checkpoint path.
+
+44. **One validator authors each transaction, with a fallback lease.**
+    `RpcCore` maps a content id to an owner by reading its first eight bytes as a
+    little-endian `u64` modulo the validator count. `take_batch` selects only the
+    transactions this node owns; every node computes the same owner, so a gossiped
+    transaction gets one normal author and the duplicate batches of finding 41
+    disappear. If the owner has not authored within 2 s
+    (`OWNER_FALLBACK`), any node may take the transaction, so a dead owner cannot
+    strand it; a returned batch restarts the clock, and each mempool copy carries
+    its own `queued_at`.
+    - Four-process devnet, checkpoint every 64, two transfers submitted to nodes 0
+      and 2: both finalized (100 ms and 180 ms), and the owner was node 3 for both.
+      At shutdown all four nodes ended on commit root `f0fe5fa8…`, state root
+      `2456fc21…`, applied 2, **0 rejected**, 0 missing payloads. The same two
+      transfers under finding 41 cost 3 rejected each.
+    - The fallback is covered by
+      `only_the_owner_authors_a_transaction_before_the_fallback`. A live attempt
+      that killed node 0 before submitting (the transaction owner was node 3)
+      never certified a new height after the kill: head stayed at 1,559, because
+      the dead node's last vertices were missing from the survivors and no new
+      share reached a quorum. That is a vertex-delivery gap, not ownership; testing
+      the takeover live needs a kill that leaves the mesh certifying.
 
 ## Build order
 

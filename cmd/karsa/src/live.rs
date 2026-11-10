@@ -1684,6 +1684,7 @@ async fn node_task(
             chain_id.clone(),
             &accounts,
             &genesis,
+            config.validators,
         )));
         let mut rpc_shutdown = shutdown.clone();
         let app = rpc::router(Arc::clone(&shared));
