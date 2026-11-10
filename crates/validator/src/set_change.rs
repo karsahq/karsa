@@ -1,11 +1,13 @@
-//! Checked validator-set transitions.
+//! Checked validator-set transitions and the certificate that authorizes them.
 //!
 //! A key rotation keeps the validator identities and moves only their active
 //! keys. A set change moves identities, which is a different safety problem: an
 //! old quorum and a new quorum can decide conflicting prefixes unless they
-//! still overlap by more than the fault budget. This module checks that
-//! condition without touching the DAG or the certificate code; the transition
-//! mechanics are a separate step.
+//! still overlap by more than the fault budget. [`check_transition`] checks that
+//! condition, [`SetChange`] names the checked boundary, and
+//! [`TransitionCertificate`] carries a quorum of the old set over that
+//! descriptor. Activating the new set in the DAG and the finalizer is a separate
+//! step; this module decides only whether the change is authorized.
 //!
 //! The first implementation is deliberately conservative: exactly one identity
 //! is added or removed per epoch, and the new set must keep the old fault
@@ -13,10 +15,18 @@
 //! intersection and the fault-budget checks.
 
 use std::collections::HashSet;
+use std::fmt;
 
+use crypto::domain::{
+    DOMAIN_SET_TRANSITION_V1, SetChangeSigningFields, encode_set_change_signing_payload,
+};
+use crypto::encoding::Encoder;
+use crypto::scheme::verify_signature;
 use crypto::{CryptoError, CryptoErrorKind};
+use sha2::{Digest, Sha256};
 
-use crate::schedule::{EpochSchedule, ValidatorSet};
+use crate::certificate::{bit_is_set, bitmap_len};
+use crate::schedule::{EpochSchedule, ValidatorKey, ValidatorRecord, ValidatorSet};
 
 /// The arithmetic of one checked transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +58,267 @@ impl Transition {
     #[must_use]
     pub fn changes(&self) -> usize {
         self.old_size + self.new_size - 2 * self.shared
+    }
+}
+
+/// The signed descriptor of one checked validator-set transition.
+///
+/// The descriptor names the old and new sets by content id, the epoch the new
+/// set activates, and a digest of the transition itself. A
+/// [`TransitionCertificate`] is a quorum of old-set signatures over
+/// [`SetChange::signing_payload`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetChange {
+    /// Chain identifier, which prevents cross-chain replay.
+    pub chain_id: Vec<u8>,
+    /// Content identifier of the set whose quorum signs the change.
+    pub old_set_id: [u8; 32],
+    /// Content identifier of the set that becomes active.
+    pub new_set_id: [u8; 32],
+    /// First epoch at which the new set is active.
+    pub activation_epoch: u64,
+    /// Domain-separated identifier of this transition.
+    pub transition_hash: [u8; 32],
+}
+
+impl SetChange {
+    /// Builds the descriptor for a checked transition.
+    ///
+    /// # Errors
+    ///
+    /// [`SetChangeError::Transition`] when [`check_transition`] rejects the
+    /// transition, and [`SetChangeError::Encoding`] when a set identifier cannot
+    /// be encoded.
+    pub fn new(
+        chain_id: impl Into<Vec<u8>>,
+        old: &ValidatorSet,
+        new: &ValidatorSet,
+    ) -> Result<Self, SetChangeError> {
+        check_transition(old, new).map_err(SetChangeError::Transition)?;
+        let old_set_id = old.id().map_err(SetChangeError::Encoding)?;
+        let new_set_id = new.id().map_err(SetChangeError::Encoding)?;
+        let activation_epoch = new.epoch;
+        let transition_hash = transition_hash(&old_set_id, &new_set_id, activation_epoch)
+            .map_err(SetChangeError::Encoding)?;
+        Ok(Self {
+            chain_id: chain_id.into(),
+            old_set_id,
+            new_set_id,
+            activation_epoch,
+            transition_hash,
+        })
+    }
+
+    /// The bytes an old-set quorum signs.
+    ///
+    /// # Errors
+    ///
+    /// [`SetChangeError::Encoding`] when a field exceeds the encoding limit.
+    pub fn signing_payload(&self) -> Result<Vec<u8>, SetChangeError> {
+        encode_set_change_signing_payload(&SetChangeSigningFields {
+            chain_id: &self.chain_id,
+            old_set_id: &self.old_set_id,
+            new_set_id: &self.new_set_id,
+            activation_epoch: self.activation_epoch,
+            transition_hash: &self.transition_hash,
+        })
+        .map_err(SetChangeError::Encoding)
+    }
+
+    /// Checks that the descriptor names exactly the supplied old and new sets.
+    fn check_against(&self, old: &ValidatorSet, new: &ValidatorSet) -> Result<(), SetChangeError> {
+        let old_set_id = old.id().map_err(SetChangeError::Encoding)?;
+        let new_set_id = new.id().map_err(SetChangeError::Encoding)?;
+        if self.old_set_id != old_set_id {
+            return Err(mismatch("the certificate names a different old set"));
+        }
+        if self.new_set_id != new_set_id {
+            return Err(mismatch("the certificate names a different new set"));
+        }
+        if self.activation_epoch != new.epoch {
+            return Err(mismatch(format!(
+                "activation epoch {} does not match the new set epoch {}",
+                self.activation_epoch, new.epoch
+            )));
+        }
+        let expected = transition_hash(&old_set_id, &new_set_id, self.activation_epoch)
+            .map_err(SetChangeError::Encoding)?;
+        if self.transition_hash != expected {
+            return Err(mismatch("the transition hash does not match its fields"));
+        }
+        Ok(())
+    }
+}
+
+/// A validator-set change signed by a quorum of the old set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionCertificate {
+    /// The signed transition descriptor.
+    pub change: SetChange,
+    /// The set that becomes active at [`SetChange::activation_epoch`].
+    pub new_set: ValidatorSet,
+    /// Bitmap of old-set validators that signed, indexed like a finality
+    /// certificate.
+    pub signer_bitmap: Vec<u8>,
+    /// One signature per set bit, in old-set order.
+    pub signatures: Vec<Vec<u8>>,
+}
+
+impl TransitionCertificate {
+    /// Number of old-set validators marked as signers.
+    #[must_use]
+    pub fn signer_count(&self) -> usize {
+        self.signer_bitmap
+            .iter()
+            .map(|byte| byte.count_ones() as usize)
+            .sum()
+    }
+
+    /// Verifies the old-set quorum and the checked transition.
+    ///
+    /// The certificate is self-contained apart from the old set: the verifier
+    /// already holds the set that is active when the change is made. The new set
+    /// travels with the certificate and its content id is covered by the
+    /// signatures.
+    ///
+    /// # Errors
+    ///
+    /// [`SetChangeError::Mismatch`] when the descriptor does not name the
+    /// supplied sets, [`SetChangeError::Malformed`] when the bitmap and the
+    /// signature list disagree, [`SetChangeError::Transition`] when
+    /// [`check_transition`] rejects the change, [`SetChangeError::NoQuorum`]
+    /// when fewer than a supermajority of the old set signed, and
+    /// [`SetChangeError::Signer`] when a key cannot be resolved or a signature
+    /// does not verify.
+    pub fn verify(&self, old: &ValidatorSet) -> Result<Transition, SetChangeError> {
+        self.change.check_against(old, &self.new_set)?;
+        self.check_shape(old)?;
+        let transition =
+            check_transition(old, &self.new_set).map_err(SetChangeError::Transition)?;
+        let signers = self.resolve_signers(old)?;
+        if !old.has_supermajority(signers.len()) {
+            return Err(SetChangeError::NoQuorum {
+                signers: signers.len(),
+                required: old.quorum_size(),
+            });
+        }
+
+        let payload = self.change.signing_payload()?;
+        for (_, key, signature) in signers {
+            verify_signature(key.algorithm_id, &key.public_key, &payload, signature)
+                .map_err(SetChangeError::Signer)?;
+        }
+        Ok(transition)
+    }
+
+    /// Checks the bitmap and signature count against the old set.
+    fn check_shape(&self, old: &ValidatorSet) -> Result<(), SetChangeError> {
+        let signers = self.signer_count();
+        if signers != self.signatures.len() {
+            return Err(malformed(format!(
+                "bitmap marks {signers} signers but {} signatures are present",
+                self.signatures.len()
+            )));
+        }
+
+        let validators = old.validators.len();
+        if self.signer_bitmap.len() != bitmap_len(validators) {
+            return Err(malformed(format!(
+                "bitmap is {} bytes for {validators} validators, expected {}",
+                self.signer_bitmap.len(),
+                bitmap_len(validators)
+            )));
+        }
+
+        let used_in_last_byte = validators % 8;
+        if used_in_last_byte != 0
+            && let Some(last) = self.signer_bitmap.last()
+            && last >> used_in_last_byte != 0
+        {
+            return Err(malformed(format!(
+                "bitmap sets bits above validator {validators}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resolves each marked signer to the key active at the old set's epoch.
+    fn resolve_signers<'a>(
+        &'a self,
+        old: &'a ValidatorSet,
+    ) -> Result<Vec<SignedEntry<'a>>, SetChangeError> {
+        let mut signers = Vec::with_capacity(self.signatures.len());
+        let mut signature_index = 0;
+        for (index, record) in old.validators.iter().enumerate() {
+            if !bit_is_set(&self.signer_bitmap, index) {
+                continue;
+            }
+            let key = record
+                .active_key(old.epoch)
+                .map_err(SetChangeError::Signer)?;
+            let signature = self.signatures.get(signature_index).ok_or_else(|| {
+                malformed(format!(
+                    "bitmap marks {} signers but only {} signatures are present",
+                    self.signer_count(),
+                    self.signatures.len()
+                ))
+            })?;
+            signature_index += 1;
+            signers.push((record, key, signature.as_slice()));
+        }
+        Ok(signers)
+    }
+}
+
+/// One resolved old-set signer: record, active key, and signature bytes.
+type SignedEntry<'a> = (&'a ValidatorRecord, &'a ValidatorKey, &'a [u8]);
+
+/// A transition certificate or descriptor that does not verify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetChangeError {
+    /// A set identifier or signing payload could not be encoded.
+    Encoding(CryptoError),
+    /// The transition failed the checked boundary rules.
+    Transition(CryptoError),
+    /// A signer's key could not be resolved or its signature did not verify.
+    Signer(CryptoError),
+    /// The certificate's bitmap or signature list is inconsistent.
+    Malformed(String),
+    /// The certificate does not describe the supplied sets.
+    Mismatch(String),
+    /// Fewer than a supermajority of the old set signed.
+    NoQuorum {
+        /// Distinct old-set validators that signed.
+        signers: usize,
+        /// Smallest signer count that is a supermajority.
+        required: usize,
+    },
+}
+
+impl fmt::Display for SetChangeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Encoding(error) => write!(f, "set change encoding: {error}"),
+            Self::Transition(error) => write!(f, "set change transition: {error}"),
+            Self::Signer(error) => write!(f, "set change signer: {error}"),
+            Self::Malformed(detail) => write!(f, "malformed set-change certificate: {detail}"),
+            Self::Mismatch(detail) => write!(f, "set-change mismatch: {detail}"),
+            Self::NoQuorum { signers, required } => {
+                write!(
+                    f,
+                    "{signers} old-set validators signed; {required} required"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SetChangeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Encoding(error) | Self::Transition(error) | Self::Signer(error) => Some(error),
+            Self::Malformed(_) | Self::Mismatch(_) | Self::NoQuorum { .. } => None,
+        }
     }
 }
 
@@ -258,6 +529,27 @@ pub fn check_transition(old: &ValidatorSet, new: &ValidatorSet) -> Result<Transi
     })
 }
 
+fn transition_hash(
+    old_set_id: &[u8; 32],
+    new_set_id: &[u8; 32],
+    activation_epoch: u64,
+) -> Result<[u8; 32], CryptoError> {
+    let mut encoder = Encoder::with_capacity(80);
+    encoder.put_bytes(DOMAIN_SET_TRANSITION_V1.as_bytes())?;
+    encoder.put_bytes(old_set_id)?;
+    encoder.put_bytes(new_set_id)?;
+    encoder.put_u64(activation_epoch);
+    Ok(Sha256::digest(encoder.finish()).into())
+}
+
+fn malformed(detail: impl Into<String>) -> SetChangeError {
+    SetChangeError::Malformed(detail.into())
+}
+
+fn mismatch(detail: impl Into<String>) -> SetChangeError {
+    SetChangeError::Mismatch(detail.into())
+}
+
 fn invalid(detail: String) -> CryptoError {
     CryptoError::new(CryptoErrorKind::InvalidKeySchedule, detail)
 }
@@ -269,8 +561,10 @@ fn policy(detail: String) -> CryptoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::certificate::bitmap_of;
     use crate::schedule::{NO_EXPIRY, ValidatorKey, ValidatorRecord};
     use crypto::registry::ALG_ED25519;
+    use crypto::scheme::Ed25519Scheme;
 
     fn ids(count: usize) -> Vec<String> {
         (0..count).map(|index| format!("val-{index}")).collect()
@@ -408,5 +702,262 @@ mod tests {
         let old_quorum = 10 * 2 / 3 + 1;
         let new_quorum = 8 * 2 / 3 + 1;
         assert_eq!(min_intersection(10, 8, 8, old_quorum, new_quorum), 3);
+    }
+
+    const CHAIN: &[u8] = b"karsa-set-change-1";
+
+    struct Signer {
+        public_key: Vec<u8>,
+        private_key: Vec<u8>,
+    }
+
+    fn signer(index: usize) -> Signer {
+        let seed = [u8::try_from(index + 1).expect("the fixture has fewer than 255 signers"); 32];
+        let public_key = Ed25519Scheme::public_key_from_seed(&seed).expect("a seed is a key");
+        let mut private_key = seed.to_vec();
+        private_key.extend_from_slice(&public_key);
+        Signer {
+            public_key: public_key.to_vec(),
+            private_key,
+        }
+    }
+
+    fn signed_record(index: usize, signer: &Signer) -> ValidatorRecord {
+        ValidatorRecord {
+            validator_id: format!("val-{index}").into_bytes(),
+            keys: vec![ValidatorKey {
+                key_id: format!("val-{index}-k0").into_bytes(),
+                algorithm_id: ALG_ED25519,
+                public_key: signer.public_key.clone(),
+                activation_epoch: 0,
+                retirement_epoch: NO_EXPIRY,
+            }],
+        }
+    }
+
+    fn signed_set(epoch: u64, signers: &[Signer]) -> ValidatorSet {
+        ValidatorSet {
+            epoch,
+            validators: signers
+                .iter()
+                .enumerate()
+                .map(|(index, signer)| signed_record(index, signer))
+                .collect(),
+        }
+    }
+
+    fn fixture(old_count: usize, new_count: usize) -> (ValidatorSet, ValidatorSet, Vec<Signer>) {
+        let count = old_count.max(new_count);
+        let signers: Vec<Signer> = (0..count).map(signer).collect();
+        let old = signed_set(1, &signers[..old_count]);
+        let new = signed_set(2, &signers[..new_count]);
+        (old, new, signers)
+    }
+
+    fn propose(old: &ValidatorSet, new: &ValidatorSet) -> SetChange {
+        SetChange::new(CHAIN.to_vec(), old, new).expect("the fixture transition is safe")
+    }
+
+    fn certificate(
+        change: SetChange,
+        new: ValidatorSet,
+        old_count: usize,
+        signers: &[Signer],
+        signed: usize,
+    ) -> TransitionCertificate {
+        let payload = change
+            .signing_payload()
+            .expect("the fixture payload is encodable");
+        TransitionCertificate {
+            change,
+            new_set: new,
+            signer_bitmap: bitmap_of(old_count, signed),
+            signatures: signers
+                .iter()
+                .take(signed)
+                .map(|signer| {
+                    Ed25519Scheme
+                        .sign(&signer.private_key, &payload)
+                        .expect("the fixture key signs")
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_quorum_of_the_old_set_certifies_the_transition() {
+        let (old, new, signers) = fixture(4, 5);
+        let certificate = certificate(propose(&old, &new), new, 4, &signers, 3);
+        let transition = certificate
+            .verify(&old)
+            .expect("three of four old validators are a quorum");
+        assert_eq!(transition.old_epoch, 1);
+        assert_eq!(transition.new_epoch, 2);
+        assert_eq!(transition.old_size, 4);
+        assert_eq!(transition.new_size, 5);
+        assert_eq!(transition.shared, 4);
+        assert_eq!(transition.old_quorum, 3);
+        assert_eq!(transition.new_quorum, 4);
+        assert_eq!(transition.min_intersection, 2);
+        assert_eq!(transition.fault_budget, 1);
+        assert_eq!(transition.new_fault_budget, 1);
+        assert!(transition.min_intersection > transition.fault_budget);
+    }
+
+    #[test]
+    fn a_removal_is_certified_by_the_old_quorum() {
+        let (old, new, signers) = fixture(5, 4);
+        assert_eq!(old.quorum_size(), 4);
+        let certificate = certificate(propose(&old, &new), new, 5, &signers, 4);
+        let transition = certificate
+            .verify(&old)
+            .expect("four of five old validators are a quorum");
+        assert_eq!(transition.new_size, 4);
+        assert_eq!(transition.min_intersection, 2);
+        assert!(transition.min_intersection > transition.fault_budget);
+    }
+
+    #[test]
+    fn fewer_than_a_quorum_of_the_old_set_is_rejected() {
+        let (old, new, signers) = fixture(4, 5);
+        let certificate = certificate(propose(&old, &new), new, 4, &signers, 2);
+        let error = certificate
+            .verify(&old)
+            .expect_err("two of four is not a quorum");
+        assert!(
+            matches!(
+                error,
+                SetChangeError::NoQuorum {
+                    signers: 2,
+                    required: 3
+                }
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_tampered_signature_is_rejected() {
+        let (old, new, signers) = fixture(4, 5);
+        let mut certificate = certificate(propose(&old, &new), new, 4, &signers, 3);
+        certificate.signatures[0][0] ^= 0xff;
+        let error = certificate
+            .verify(&old)
+            .expect_err("a changed signature must not verify");
+        assert!(
+            matches!(
+                error,
+                SetChangeError::Signer(ref error)
+                    if error.kind() == CryptoErrorKind::InvalidSignature
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_signature_for_another_chain_is_rejected() {
+        let (old, new, signers) = fixture(4, 5);
+        let mut certificate = certificate(propose(&old, &new), new, 4, &signers, 3);
+        certificate.change.chain_id = b"karsa-other-chain".to_vec();
+        let error = certificate
+            .verify(&old)
+            .expect_err("the signatures cover the original chain id");
+        assert!(
+            matches!(
+                error,
+                SetChangeError::Signer(ref error)
+                    if error.kind() == CryptoErrorKind::InvalidSignature
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_certificate_for_a_different_old_set_is_rejected() {
+        let (old, new, signers) = fixture(4, 5);
+        let certificate = certificate(propose(&old, &new), new, 4, &signers, 3);
+        let mut other_old = old.clone();
+        other_old.validators[0].keys[0].public_key = vec![9u8; 32];
+        let error = certificate
+            .verify(&other_old)
+            .expect_err("the old set id is bound");
+        assert!(
+            matches!(error, SetChangeError::Mismatch(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_certificate_for_a_different_new_set_is_rejected() {
+        let (old, new, signers) = fixture(4, 5);
+        let mut certificate = certificate(propose(&old, &new), new, 4, &signers, 3);
+        certificate.new_set.validators[4].keys[0].public_key = vec![9u8; 32];
+        let error = certificate
+            .verify(&old)
+            .expect_err("the new set id is bound");
+        assert!(
+            matches!(error, SetChangeError::Mismatch(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn an_activation_epoch_that_does_not_match_the_new_set_is_rejected() {
+        let (old, new, signers) = fixture(4, 5);
+        let mut certificate = certificate(propose(&old, &new), new, 4, &signers, 3);
+        certificate.change.activation_epoch = 3;
+        let error = certificate
+            .verify(&old)
+            .expect_err("the activation epoch is signed");
+        assert!(
+            matches!(error, SetChangeError::Mismatch(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_bitmap_is_rejected() {
+        let (old, new, signers) = fixture(4, 5);
+        let mut certificate = certificate(propose(&old, &new), new, 4, &signers, 3);
+        certificate.signatures.pop();
+        let error = certificate
+            .verify(&old)
+            .expect_err("the bitmap marks one more signer than the list holds");
+        assert!(
+            matches!(error, SetChangeError::Malformed(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn an_unsafe_transition_cannot_be_proposed() {
+        let (old, new, _signers) = fixture(10, 9);
+        let error = SetChange::new(CHAIN.to_vec(), &old, &new)
+            .expect_err("nine validators cannot keep the old fault budget");
+        assert!(
+            matches!(
+                error,
+                SetChangeError::Transition(ref error)
+                    if error.kind() == CryptoErrorKind::PolicyUnsatisfied
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn duplicate_validator_identities_are_rejected() {
+        let (old, new, _signers) = fixture(4, 5);
+        let mut duplicate = new;
+        duplicate.validators.push(duplicate.validators[0].clone());
+        let error = SetChange::new(CHAIN.to_vec(), &old, &duplicate)
+            .expect_err("a set cannot contain one identity twice");
+        assert!(
+            matches!(
+                error,
+                SetChangeError::Transition(ref error)
+                    if error.kind() == CryptoErrorKind::DuplicateValidatorId
+            ),
+            "unexpected error: {error}"
+        );
     }
 }

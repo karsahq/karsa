@@ -30,5 +30,8 @@ pub use pacemaker::{Pacemaker, PacemakerConfig, Step};
 pub use schedule::{
     EpochSchedule, NO_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet, ValidatorSignature,
 };
-pub use set_change::{SetSchedule, Transition, check_transition, min_intersection};
+pub use set_change::{
+    SetChange, SetChangeError, SetSchedule, Transition, TransitionCertificate, check_transition,
+    min_intersection,
+};
 pub use vertex::{VERTEX_VERSION_V1, Vertex, VertexId, tally_votes};

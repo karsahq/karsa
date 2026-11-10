@@ -17,6 +17,12 @@ pub const DOMAIN_DAG_PROPOSE_V1: &str = "KARSA/DAG/PROPOSE/v1";
 pub const DOMAIN_IBC_CLIENT_V1: &str = "KARSA/IBC/CLIENT/v1";
 /// Validator key registration payload domain.
 pub const DOMAIN_VALIDATOR_KEY_V1: &str = "KARSA/VALIDATOR/KEY/v1";
+/// Validator-set identifier domain: binds a set's epoch, order, and keys.
+pub const DOMAIN_VALIDATOR_SET_V1: &str = "KARSA/VALIDATOR/SET/v1";
+/// Validator-set transition descriptor domain.
+pub const DOMAIN_SET_CHANGE_V1: &str = "KARSA/SET/CHANGE/v1";
+/// Validator-set transition identifier domain.
+pub const DOMAIN_SET_TRANSITION_V1: &str = "KARSA/SET/TRANSITION/v1";
 /// DAG vertex payload domain: one signature per vertex.
 pub const DOMAIN_VERTEX_V1: &str = "KARSA/DAG/VERTEX/v1";
 /// Committed-state header domain: the object a finality certificate names.
@@ -96,6 +102,24 @@ pub struct KeyRegistrationSigningFields<'a> {
     pub retirement_epoch: u64,
     /// Epoch the authorizing key claims at signing time.
     pub signed_at_epoch: u64,
+}
+
+/// The signed content of a validator-set change.
+///
+/// The transition itself is identified by `transition_hash`; the other fields
+/// let a verifier find the old set and check which set becomes active, when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetChangeSigningFields<'a> {
+    /// Chain identifier, which prevents cross-chain replay.
+    pub chain_id: &'a [u8],
+    /// Content identifier of the set that signs the change.
+    pub old_set_id: &'a [u8],
+    /// Content identifier of the set that becomes active.
+    pub new_set_id: &'a [u8],
+    /// First epoch at which the new set is active.
+    pub activation_epoch: u64,
+    /// Domain-separated identifier of the transition.
+    pub transition_hash: &'a [u8],
 }
 
 /// A reference to another vertex, as it appears inside a signed vertex payload.
@@ -234,6 +258,23 @@ pub fn encode_key_registration_payload(
     wrap_domain(DOMAIN_VALIDATOR_KEY_V1, body.as_slice())
 }
 
+/// Builds the bytes an old-set quorum signs to authorize a validator-set change.
+///
+/// # Errors
+///
+/// Returns an error only when a field exceeds the encoding limit.
+pub fn encode_set_change_signing_payload(
+    fields: &SetChangeSigningFields<'_>,
+) -> Result<Vec<u8>, CryptoError> {
+    let mut body = Encoder::with_capacity(128);
+    body.put_bytes(fields.chain_id)?;
+    body.put_bytes(fields.old_set_id)?;
+    body.put_bytes(fields.new_set_id)?;
+    body.put_u64(fields.activation_epoch);
+    body.put_bytes(fields.transition_hash)?;
+    wrap_domain(DOMAIN_SET_CHANGE_V1, body.as_slice())
+}
+
 /// Builds the bytes a DAG vertex signature covers.
 ///
 /// # Errors
@@ -328,6 +369,9 @@ mod tests {
             DOMAIN_DAG_PROPOSE_V1,
             DOMAIN_IBC_CLIENT_V1,
             DOMAIN_VALIDATOR_KEY_V1,
+            DOMAIN_VALIDATOR_SET_V1,
+            DOMAIN_SET_CHANGE_V1,
+            DOMAIN_SET_TRANSITION_V1,
             DOMAIN_VERTEX_V1,
         ];
         for (index, tag) in tags.iter().enumerate() {
@@ -366,6 +410,34 @@ mod tests {
         })
         .unwrap();
         assert_ne!(encoded, rescheduled);
+    }
+
+    #[test]
+    fn a_set_change_payload_binds_every_activation_field() {
+        let fields = SetChangeSigningFields {
+            chain_id: b"karsa-testnet-1",
+            old_set_id: &[1u8; 32],
+            new_set_id: &[2u8; 32],
+            activation_epoch: 9,
+            transition_hash: &[3u8; 32],
+        };
+        let encoded = encode_set_change_signing_payload(&fields).unwrap();
+        let tag_len = u32::from_le_bytes(encoded[0..4].try_into().unwrap()) as usize;
+        assert_eq!(&encoded[4..4 + tag_len], DOMAIN_SET_CHANGE_V1.as_bytes());
+
+        let other_epoch = encode_set_change_signing_payload(&SetChangeSigningFields {
+            activation_epoch: 10,
+            ..fields
+        })
+        .unwrap();
+        assert_ne!(encoded, other_epoch);
+
+        let other_set = encode_set_change_signing_payload(&SetChangeSigningFields {
+            new_set_id: &[4u8; 32],
+            ..fields
+        })
+        .unwrap();
+        assert_ne!(encoded, other_set);
     }
 
     #[test]

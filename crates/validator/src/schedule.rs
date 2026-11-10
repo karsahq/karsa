@@ -7,8 +7,11 @@
 
 use std::collections::HashSet;
 
+use crypto::domain::DOMAIN_VALIDATOR_SET_V1;
+use crypto::encoding::Encoder;
 use crypto::scheme::verify_signature;
 use crypto::{CryptoError, CryptoErrorKind};
+use sha2::{Digest, Sha256};
 
 /// Sentinel for a key with no planned retirement.
 ///
@@ -186,6 +189,15 @@ pub struct ValidatorSignature {
     pub signature: Vec<u8>,
 }
 
+fn count_field(count: usize, name: &str) -> Result<u32, CryptoError> {
+    u32::try_from(count).map_err(|_| {
+        CryptoError::new(
+            CryptoErrorKind::FieldTooLong,
+            format!("{count} {name} do not fit a u32"),
+        )
+    })
+}
+
 /// The validator set as seen at one epoch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatorSet {
@@ -214,6 +226,39 @@ impl ValidatorSet {
             record.validate_schedule()?;
         }
         Ok(())
+    }
+
+    /// A content identifier for this set at its epoch.
+    ///
+    /// The digest covers the epoch, the validator order, every validator id, and
+    /// every key schedule. Order is part of the identity because a certificate
+    /// bitmap is indexed by it; two sets with the same members in a different
+    /// order therefore have different identifiers.
+    ///
+    /// This does not validate the set. Call [`ValidatorSet::validate`] before
+    /// treating an identifier as a statement about a usable set.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoErrorKind::FieldTooLong`] when a field or count exceeds the
+    /// canonical encoding limit.
+    pub fn id(&self) -> Result<[u8; 32], CryptoError> {
+        let mut encoder = Encoder::with_capacity(64 + self.validators.len() * 64);
+        encoder.put_bytes(DOMAIN_VALIDATOR_SET_V1.as_bytes())?;
+        encoder.put_u64(self.epoch);
+        encoder.put_u32(count_field(self.validators.len(), "validators")?);
+        for record in &self.validators {
+            encoder.put_bytes(&record.validator_id)?;
+            encoder.put_u32(count_field(record.keys.len(), "keys")?);
+            for key in &record.keys {
+                encoder.put_bytes(&key.key_id)?;
+                encoder.put_u16(key.algorithm_id);
+                encoder.put_bytes(&key.public_key)?;
+                encoder.put_u64(key.activation_epoch);
+                encoder.put_u64(key.retirement_epoch);
+            }
+        }
+        Ok(Sha256::digest(encoder.finish()).into())
     }
 
     /// Returns the record for `validator_id`.
@@ -599,5 +644,31 @@ mod tests {
         };
         let signers = set.verify_signatures(&message, 100, &[entry]).unwrap();
         assert_eq!(signers, vec![b"v1".to_vec()]);
+    }
+
+    #[test]
+    fn a_set_id_binds_the_epoch_order_members_and_keys() {
+        let record = |id: &[u8], key_id: &[u8]| ValidatorRecord {
+            validator_id: id.to_vec(),
+            keys: vec![dummy_key(key_id, 0, NO_EXPIRY)],
+        };
+        let set = ValidatorSet {
+            epoch: 5,
+            validators: vec![record(b"v1", b"v1-k0"), record(b"v2", b"v2-k0")],
+        };
+        let id = set.id().unwrap();
+        assert_eq!(id, set.clone().id().unwrap(), "the identifier is stable");
+
+        let mut later = set.clone();
+        later.epoch = 6;
+        assert_ne!(id, later.id().unwrap(), "the epoch is bound");
+
+        let mut reordered = set.clone();
+        reordered.validators.swap(0, 1);
+        assert_ne!(id, reordered.id().unwrap(), "the signer order is bound");
+
+        let mut rekeyed = set.clone();
+        rekeyed.validators[0].keys[0].public_key = vec![7u8; 32];
+        assert_ne!(id, rekeyed.id().unwrap(), "the key material is bound");
     }
 }
