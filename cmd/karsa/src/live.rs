@@ -51,9 +51,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tx::batch::Batch;
 use validator::{
-    Certificate, FailureDetector, Fence, FenceCertificate, Finalizer, Header, SetChange,
-    SetSchedule, Step, TransitionCertificate, ValidatorSet, VertexId, bitmap_len, commit_root,
-    set_bit,
+    Certificate, FailureDetector, Fence, FenceCertificate, Finalizer, Header, NoVoteAttestation,
+    RoundSkip, RoundSkipError, RoundSkipProof, SetChange, SetSchedule, Step, TransitionCertificate,
+    ValidatorSet, VertexId, bitmap_len, commit_root, set_bit,
 };
 
 use crate::chain;
@@ -269,6 +269,13 @@ pub struct Config {
     /// and the validator is the missing leader of its cursor. It is a liveness
     /// aid, never a state change.
     pub fence_silent: bool,
+    /// Build and adopt round-skip proofs when the cursor's leader cannot reach a
+    /// quorum from the vertices this node holds.
+    ///
+    /// The proof partitions the voter set and is verified before it is applied;
+    /// it is a liveness aid and is off by default while the dissemination path is
+    /// still experimental.
+    pub round_skip: bool,
 }
 
 /// Wall time spent in the stages the live loop can name.
@@ -926,6 +933,13 @@ fn restore(
         });
     }
 
+    // Round skips are decision inputs: replaying the same vertices without them
+    // could choose a different order and fail the stored head root.
+    for proof in store.round_skips().map_err(|error| error.to_string())? {
+        node.apply_round_skip(proof)
+            .map_err(|error| format!("stored round skip is not authorized: {error}"))?;
+    }
+
     let head_root = headers
         .last()
         .map_or_else(|| commit_root(&[]), |record| record.header.dag_root);
@@ -1071,6 +1085,13 @@ fn restore_live(
     for batch in store.batches().map_err(|error| error.to_string())? {
         let digest = batch.digest().map_err(|error| error.to_string())?;
         live.batches.insert(digest, batch);
+    }
+
+    // Round skips above the snapshot floor are decision inputs for the tail
+    // replay; the ones below it are already part of the adopted prefix.
+    for proof in store.round_skips().map_err(|error| error.to_string())? {
+        node.apply_round_skip(proof)
+            .map_err(|error| format!("stored round skip is not authorized: {error}"))?;
     }
 
     // Rebuild the order above the anchor, exactly as the live loop would, and
@@ -1354,6 +1375,77 @@ fn fence_candidate(node: &Node, silent: &[(Vec<u8>, u64)]) -> Option<(Vec<u8>, u
         return None;
     }
     Some((validator.clone(), from_round))
+}
+
+/// Builds the round-skip proof the cursor's leader allows, if any.
+///
+/// Every voter this node holds at the voting round is a vote or a non-vote; the
+/// rest are missing. A missing voter whose fence covers the voting round is
+/// carried as that fence instead. The proof is verified with the same function a
+/// receiver uses, so a locally built proof is never weaker than a gossiped one.
+fn round_skip_candidate(node: &Node, chain_id: &[u8]) -> Option<RoundSkipProof> {
+    let round = node.cursor();
+    let leader = node.dag().leader(round)?;
+    let leader_id = leader.id().ok()?;
+    let voting_round = round.saturating_add(1);
+    let voter_set = node.dag().set_for_round(voting_round).clone();
+    let mut votes = Vec::new();
+    let mut non_votes = Vec::new();
+    let mut missing = Vec::new();
+    for record in &voter_set.validators {
+        match node.dag().get(voting_round, &record.validator_id) {
+            Some(vertex) => {
+                let id = vertex.id().ok()?;
+                if vertex
+                    .references
+                    .iter()
+                    .any(|reference| reference == &leader_id)
+                {
+                    votes.push(id);
+                } else {
+                    non_votes.push(id);
+                }
+            }
+            None => missing.push(record.validator_id.clone()),
+        }
+    }
+    let fenced_absent: Vec<FenceCertificate> = node
+        .dag()
+        .fences()
+        .filter(|certificate| {
+            certificate.fence.from_round <= voting_round
+                && missing
+                    .iter()
+                    .any(|validator| validator == &certificate.fence.validator_id)
+        })
+        .cloned()
+        .collect();
+    missing.retain(|validator| {
+        !fenced_absent
+            .iter()
+            .any(|certificate| &certificate.fence.validator_id == validator)
+    });
+    let proof = RoundSkipProof {
+        attestation: NoVoteAttestation {
+            skip: RoundSkip::new(chain_id.to_vec(), leader_id.clone()),
+            signer_bitmap: vec![0u8; bitmap_len(voter_set.validators.len())],
+            signatures: Vec::new(),
+        },
+        votes,
+        non_votes,
+        fenced_absent,
+        missing,
+    };
+    proof
+        .verify(
+            chain_id,
+            &voter_set,
+            &leader_id,
+            |fence_round| node.dag().set_for_round(fence_round).clone(),
+            |id| node.dag().get(id.round, &id.author).cloned(),
+        )
+        .ok()?;
+    Some(proof)
 }
 
 /// Whether this node may sign a fence without contradicting its own view.
@@ -2311,6 +2403,19 @@ async fn node_task(
         }
     }
 
+    // Round-skip proofs are durable decision inputs. The restore replay already
+    // used them; keep them for rebroadcast and for the local builder's dedupe.
+    let mut round_skips: BTreeMap<u64, RoundSkipProof> = match &store {
+        Some(store) => store
+            .round_skips()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|proof| (proof.attestation.skip.round(), proof))
+            .collect(),
+        None => BTreeMap::new(),
+    };
+    let mut round_skip_dirty = !round_skips.is_empty();
+
     let mut failure_epoch = node.dag().set_for_round(node.round()).epoch;
     let mut failures = (config.failure_rounds > 0).then(|| {
         FailureDetector::new(
@@ -2377,6 +2482,10 @@ async fn node_task(
     let mut gave_up = 0u64;
     let mut ticks: u32 = 0;
     let mut cursor: u64 = node.cursor();
+    // Committed order length already turned into a pending header. A header's
+    // round is the highest round in the slice it covers, which is a function of
+    // the committed prefix rather than of the local decision slot.
+    let mut recorded_order = node.dag().order_len();
     let mut cursor_since = Instant::now();
     let mut reported_stall: Option<u64> = None;
     // The interval is measured from the checkpoint or head this run resumed at,
@@ -2695,6 +2804,59 @@ async fn node_task(
                             }
                         }
                     }
+                    Message::RoundSkip(proof) => {
+                        let proof = *proof;
+                        let round = proof.attestation.skip.round();
+                        if let Some(existing) = round_skips.get(&round) {
+                            if existing != &proof {
+                                rejected += 1;
+                            }
+                        } else {
+                            match node.apply_round_skip(proof.clone()) {
+                                Ok(check) => {
+                                    if let Some(store) = &store {
+                                        store
+                                            .put_round_skip(&proof)
+                                            .map_err(|error| error.to_string())?;
+                                    }
+                                    println!(
+                                        "node val-{index} adopted a round skip at round {round} \
+                                         ({} votes, {} non-votes, {} missing)",
+                                        check.votes, check.non_votes, check.missing
+                                    );
+                                    round_skips.insert(round, proof);
+                                    round_skip_dirty = true;
+                                }
+                                Err(RoundSkipError::MissingEvidence(id)) => {
+                                    // The proof is evidence, not a command: ask for
+                                    // the missing vertex and let the sender
+                                    // rebroadcast rather than accepting less.
+                                    rejected += 1;
+                                    if wanted.len() < WANT_LIMIT
+                                        && !wanted.contains_key(&id)
+                                        && let Ok(bytes) =
+                                            wire::frame(&Message::Want(id.clone()), now())
+                                    {
+                                        broadcast(&outbound, true, &bytes, &mut dropped);
+                                        wanted.insert(
+                                            id,
+                                            Want {
+                                                at: Instant::now(),
+                                                tries: 0,
+                                            },
+                                        );
+                                        wanted_total += 1;
+                                    }
+                                }
+                                Err(error) => {
+                                    rejected += 1;
+                                    eprintln!(
+                                        "node {index} refused a round skip at round {round}: {error}"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
             _ = stop_authoring.changed() => {
@@ -2765,6 +2927,15 @@ async fn node_task(
                         broadcast(&outbound, true, &bytes, &mut dropped);
                     }
                     fence_dirty = false;
+                }
+                if round_skip_dirty || ticks % SET_CHANGE_TICKS == 0 {
+                    for proof in round_skips.values() {
+                        let bytes =
+                            wire::frame(&Message::RoundSkip(Box::new(proof.clone())), now())
+                                .map_err(|error| error.to_string())?;
+                        broadcast(&outbound, true, &bytes, &mut dropped);
+                    }
+                    round_skip_dirty = false;
                 }
                 if !authoring_stopped && (config.rpc_port > 0 || node.round() <= config.rounds) {
                     let round = node.round();
@@ -2898,7 +3069,23 @@ async fn node_task(
                             if commits > 0
                                 && let Some(finalizer) = finalizer.as_mut()
                             {
-                                finalizer.record_commit(from, node.dag().order_len());
+                                let order = node.dag().order();
+                                let order_len = node.dag().order_len();
+                                let prefix = node.dag().prefix().len();
+                                let start = recorded_order.max(prefix).saturating_sub(prefix);
+                                let end = order_len.saturating_sub(prefix).min(order.len());
+                                let start = start.min(end);
+                                // The decision slot is not deterministic across
+                                // nodes: two nodes can commit the same prefix at
+                                // different cursor rounds when one adopts a skip
+                                // proof first. The covered slice is.
+                                let round = order[start..end]
+                                    .iter()
+                                    .map(|id| id.round)
+                                    .max()
+                                    .unwrap_or(from);
+                                recorded_order = order_len;
+                                finalizer.record_commit(round, order_len);
                             }
                             if anchors > 0 {
                                 break;
@@ -3184,6 +3371,38 @@ async fn node_task(
                                     eprintln!("node {index} cannot sign a fence: {error}");
                                 }
                             }
+                        }
+                    }
+                }
+                // The proof is built from what this node holds: held votes and
+                // non-votes, fences covering absent voters, and the rest as
+                // missing. It is verified with the same function a receiver uses,
+                // and it can fire only when more than `f` voters are held as
+                // non-votes, so a live vote quorum is already impossible.
+                if config.round_skip
+                    && !round_skips.contains_key(&node.cursor())
+                    && let Some(proof) = round_skip_candidate(&node, &chain_id)
+                {
+                    let round = proof.attestation.skip.round();
+                    match node.apply_round_skip(proof.clone()) {
+                        Ok(check) => {
+                            if let Some(store) = &store {
+                                store
+                                    .put_round_skip(&proof)
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            eprintln!(
+                                "node {index} proved round {round} cannot reach a quorum \
+                                 ({} votes, {} non-votes, {} missing)",
+                                check.votes, check.non_votes, check.missing
+                            );
+                            round_skips.insert(round, proof);
+                            round_skip_dirty = true;
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "node {index} built a round skip that did not verify: {error}"
+                            );
                         }
                     }
                 }
@@ -3537,6 +3756,8 @@ async fn archive_task(
                     Message::SetChange(_) => {}
                     // An archive does not decide, so a fence has no local effect.
                     Message::Fence(_) => {}
+                    // A round skip is a decision input; an archive keeps no DAG.
+                    Message::RoundSkip(_) => {}
                     // The accept side consumes the hello before the loop starts.
                     Message::Hello(_) => rejected += 1,
                 }
@@ -5089,6 +5310,7 @@ mod tests {
             failure_rounds: 0,
             change: None,
             fence_silent: false,
+            round_skip: false,
         }
     }
 
@@ -5179,6 +5401,7 @@ mod tests {
             failure_rounds: 0,
             change: None,
             fence_silent: false,
+            round_skip: false,
         }
     }
 

@@ -696,7 +696,7 @@ impl RoundSkipProof {
 }
 
 /// How much evidence a verified proof used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RoundSkipCheck {
     /// Validators that signed the no-vote attestation.
     pub attested: usize,

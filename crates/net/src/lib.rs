@@ -34,8 +34,9 @@ use crypto::scheme::Ed25519Scheme;
 use crypto::{CryptoError, CryptoErrorKind};
 use validator::{
     CommitFrontier, Dag, Fence, FenceCertificate, FenceError, NO_EXPIRY, Pacemaker,
-    PacemakerConfig, SetChangeError, Step, Transition, TransitionCertificate, ValidatorKey,
-    ValidatorRecord, ValidatorSet, Vertex, VertexId,
+    PacemakerConfig, RoundSkipCheck, RoundSkipError, RoundSkipProof, SetChangeError, Step,
+    Transition, TransitionCertificate, ValidatorKey, ValidatorRecord, ValidatorSet, Vertex,
+    VertexId,
 };
 
 const CHAIN_ID: &[u8] = b"karsa-net-1";
@@ -269,6 +270,24 @@ impl Node {
     /// Every error from [`Dag::apply_fence`].
     pub fn apply_fence(&mut self, certificate: &FenceCertificate) -> Result<(), FenceError> {
         self.dag.apply_fence(&self.chain_id, certificate)
+    }
+
+    /// Installs a verified round-skip proof in this node's DAG.
+    ///
+    /// # Errors
+    ///
+    /// Every error from [`Dag::apply_round_skip`].
+    pub fn apply_round_skip(
+        &mut self,
+        proof: RoundSkipProof,
+    ) -> Result<RoundSkipCheck, RoundSkipError> {
+        self.dag.apply_round_skip(&self.chain_id, proof)
+    }
+
+    /// The round-skip proof this node adopted for `round`, if any.
+    #[must_use]
+    pub fn round_skip(&self, round: u64) -> Option<&RoundSkipProof> {
+        self.dag.round_skip(round)
     }
 
     /// Records a fence share this node signed.

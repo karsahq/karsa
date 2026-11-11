@@ -42,8 +42,8 @@ use crypto::encoding::{Decoder, Encoder};
 use crypto::{CryptoError, CryptoErrorKind};
 use tx::batch::Batch;
 use validator::{
-    Certificate, CommitFrontier, FenceCertificate, Header, Share, TransitionCertificate, Vertex,
-    VertexId,
+    Certificate, CommitFrontier, FenceCertificate, Header, RoundSkipProof, Share,
+    TransitionCertificate, Vertex, VertexId,
 };
 
 /// Largest body this parser will accept.
@@ -66,13 +66,14 @@ const KIND_SNAPSHOT: u8 = 7;
 const KIND_TX: u8 = 8;
 const KIND_SET_CHANGE: u8 = 9;
 const KIND_FENCE: u8 = 10;
+const KIND_ROUND_SKIP: u8 = 11;
 
 /// The framing and message layout this build speaks.
 ///
 /// A peer that answers with another number is not necessarily hostile; it may be a
 /// different build. The link is closed rather than parsed optimistically, because
 /// the next frame kind could mean something else there.
-pub const WIRE_PROTOCOL: u16 = 9;
+pub const WIRE_PROTOCOL: u16 = 10;
 
 /// The first frame on every link: which chain the sender is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +164,13 @@ pub enum Message {
     SetChange(Box<TransitionCertificate>),
     /// A quorum declaration that one validator is failed from a round onward.
     Fence(Box<FenceCertificate>),
+    /// Evidence that a leader round cannot reach a vote quorum.
+    ///
+    /// The proof partitions the voter set into held votes, held non-votes,
+    /// promises, fenced absent voters, and missing voters. A receiver verifies
+    /// it against its own DAG and rebroadcasts it, so a node that missed the
+    /// original frame can still adopt the same decision.
+    RoundSkip(Box<RoundSkipProof>),
 }
 
 /// One decoded frame.
@@ -429,6 +437,7 @@ pub fn frame(message: &Message, sent_at_nanos: u64) -> Result<Vec<u8>, CryptoErr
         }),
         Message::SetChange(certificate) => (KIND_SET_CHANGE, certificate.encode()?),
         Message::Fence(certificate) => (KIND_FENCE, certificate.encode()?),
+        Message::RoundSkip(proof) => (KIND_ROUND_SKIP, proof.encode()?),
     };
     let length = u32::try_from(8 + 1 + payload.len()).map_err(|_| {
         CryptoError::new(
@@ -510,6 +519,7 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
         }
         KIND_SET_CHANGE => Message::SetChange(Box::new(TransitionCertificate::decode(payload)?)),
         KIND_FENCE => Message::Fence(Box::new(FenceCertificate::decode(payload)?)),
+        KIND_ROUND_SKIP => Message::RoundSkip(Box::new(RoundSkipProof::decode(payload)?)),
         other => return Err(invalid(format!("unknown frame kind {other}"))),
     };
     buffer.drain(..total);
@@ -525,7 +535,8 @@ mod tests {
     use super::*;
     use crypto::registry::ALG_ED25519;
     use validator::{
-        Fence, FenceCertificate, NO_EXPIRY, SetChange, ValidatorKey, ValidatorRecord, ValidatorSet,
+        Fence, FenceCertificate, NO_EXPIRY, NoVoteAttestation, RoundSkip, SetChange, ValidatorKey,
+        ValidatorRecord, ValidatorSet,
     };
 
     fn vertex(round: u64) -> Vertex {
@@ -732,6 +743,34 @@ mod tests {
         let frame = take_frame(&mut buffer).unwrap().unwrap();
         assert_eq!(frame.message, Message::Fence(Box::new(certificate)));
         assert_eq!(frame.sent_at_nanos, 18);
+    }
+
+    fn round_skip_proof() -> validator::RoundSkipProof {
+        let leader = want(7);
+        let mut vote = want(8);
+        vote.round = 8;
+        let mut non_vote = want(9);
+        non_vote.round = 8;
+        validator::RoundSkipProof {
+            attestation: NoVoteAttestation {
+                skip: RoundSkip::new(b"karsa-wire-1".to_vec(), leader),
+                signer_bitmap: vec![0b1],
+                signatures: vec![vec![9u8; 64]],
+            },
+            votes: vec![vote],
+            non_votes: vec![non_vote],
+            fenced_absent: vec![fence_certificate()],
+            missing: vec![b"val-2".to_vec()],
+        }
+    }
+
+    #[test]
+    fn a_round_skip_frame_round_trips() {
+        let proof = round_skip_proof();
+        let mut buffer = frame(&Message::RoundSkip(Box::new(proof.clone())), 19).unwrap();
+        let frame = take_frame(&mut buffer).unwrap().unwrap();
+        assert_eq!(frame.message, Message::RoundSkip(Box::new(proof)));
+        assert_eq!(frame.sent_at_nanos, 19);
     }
 
     #[test]

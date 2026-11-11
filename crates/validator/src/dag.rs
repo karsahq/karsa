@@ -405,6 +405,12 @@ impl Dag {
         proof: RoundSkipProof,
     ) -> Result<RoundSkipCheck, RoundSkipError> {
         let round = proof.attestation.skip.round();
+        if self.is_pruned(round) {
+            // The round is already covered by a checkpoint, so the decision is
+            // part of the adopted prefix. A restart that replays the proof must
+            // not fail because the leader's vertex is gone.
+            return Ok(RoundSkipCheck::default());
+        }
         let leader_id = self
             .leader(round)
             .ok_or_else(|| RoundSkipError::Mismatch("the skipped leader is not held".to_string()))?

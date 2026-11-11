@@ -363,6 +363,10 @@ enum Command {
         /// Collect a quorum fence for a validator the failure detector reports silent.
         #[arg(long)]
         fence_silent: bool,
+        /// Build and adopt round-skip proofs when the held non-votes and missing
+        /// voters prove that the cursor's leader cannot reach a quorum.
+        #[arg(long)]
+        round_skip: bool,
     },
     /// Sign a transfer with a committee account and submit it to a live RPC node.
     Send {
@@ -588,6 +592,7 @@ fn main() -> ExitCode {
             add_validator_at_epoch,
             remove_validator_at_epoch,
             fence_silent,
+            round_skip,
         } => live::run(live::Config {
             validators,
             port_base,
@@ -619,6 +624,7 @@ fn main() -> ExitCode {
                     remove_validator_at_epoch.map(|epoch| (live::SetChangeKind::Remove, epoch))
                 }),
             fence_silent,
+            round_skip,
         }),
         Command::Send {
             rpc,

@@ -92,6 +92,7 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
             .and_then(|snapshot| snapshot.transition.clone())
     });
     let fences = store.fences()?;
+    let round_skips = store.round_skips()?;
 
     let set = committee.set.clone();
     let accounts = committee.accounts.clone();
@@ -247,6 +248,12 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
     }
     for certificate in &fences {
         dag.apply_fence(&chain_id, certificate)?;
+    }
+    // A round skip changes which round the pacemaker releases. Replaying the
+    // stored vertices without the proofs would let the audit choose a different
+    // order than the node that wrote the store.
+    for proof in &round_skips {
+        dag.apply_round_skip(&chain_id, proof.clone())?;
     }
     chain::settle(&mut dag, settle_from)?;
 
@@ -407,6 +414,17 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
             "  fences:           {} ({})",
             fences.len(),
             names.join(", ")
+        );
+    }
+    if !round_skips.is_empty() {
+        let rounds: Vec<String> = round_skips
+            .iter()
+            .map(|proof| proof.attestation.skip.round().to_string())
+            .collect();
+        println!(
+            "  round skips:      {} (rounds {})",
+            round_skips.len(),
+            rounds.join(", ")
         );
     }
     println!(

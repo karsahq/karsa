@@ -28,7 +28,8 @@ use crypto::CryptoError;
 use crypto::encoding::{Decoder, Encoder};
 use tx::batch::Batch;
 use validator::{
-    Certificate, CommitFrontier, FenceCertificate, Header, TransitionCertificate, Vertex, VertexId,
+    Certificate, CommitFrontier, FenceCertificate, Header, RoundSkipProof, TransitionCertificate,
+    Vertex, VertexId,
 };
 
 /// Where the last reported roots are kept.
@@ -45,6 +46,8 @@ const SHARDS_FILE: &str = "shards.log";
 const SET_CHANGE_FILE: &str = "set-change";
 /// The fences this store has adopted.
 const FENCES_FILE: &str = "fences";
+/// Round-skip proofs this store has adopted, one per leader round.
+const ROUND_SKIPS_FILE: &str = "round-skips";
 /// Fence shares this node signed but has not completed into a certificate.
 const FENCE_SHARES_FILE: &str = "fence-shares";
 /// Version of one local fence-share record.
@@ -689,6 +692,52 @@ impl Store {
             records.push(FenceCertificate::decode(&bytes)?);
         }
         Ok(lowest_fences(records))
+    }
+
+    /// Writes a round-skip proof this node verified.
+    ///
+    /// The proof is a decision input: a restart that lost it would replay the
+    /// same vertices and might decide a round the original run skipped. The log
+    /// keeps one proof per leader round; re-writing the same proof is a no-op and
+    /// a different proof for the same round is refused, because the round can
+    /// name only one leader.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on write failure, [`StoreError::Decode`] when the proof
+    /// does not encode or a different proof is already stored for the round.
+    pub fn put_round_skip(&self, proof: &RoundSkipProof) -> Result<(), StoreError> {
+        let round = proof.attestation.skip.round();
+        if let Some(existing) = self
+            .round_skips()?
+            .into_iter()
+            .find(|existing| existing.attestation.skip.round() == round)
+        {
+            if existing == *proof {
+                return Ok(());
+            }
+            return Err(StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::InvalidVertex,
+                format!("the store already holds a different round skip at {round}"),
+            )));
+        }
+        append_record(&self.path_of(ROUND_SKIPS_FILE), &proof.encode()?)
+    }
+
+    /// Reads the round-skip proofs this store adopted, one per leader round.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on read failure, [`StoreError::Decode`] when a record
+    /// does not decode.
+    pub fn round_skips(&self) -> Result<Vec<RoundSkipProof>, StoreError> {
+        let mut by_round: BTreeMap<u64, RoundSkipProof> = BTreeMap::new();
+        for proof in read_records(&self.path_of(ROUND_SKIPS_FILE), RoundSkipProof::decode)? {
+            by_round
+                .entry(proof.attestation.skip.round())
+                .or_insert(proof);
+        }
+        Ok(by_round.into_values().collect())
     }
 
     /// Writes one fence share this node signed, before a quorum completes it.
@@ -1836,7 +1885,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use tx::envelope::{PROTOCOL_VERSION_V1, Transaction};
     use validator::{
-        Fence, FenceCertificate, NO_EXPIRY, SetChange, ValidatorKey, ValidatorRecord, ValidatorSet,
+        Fence, FenceCertificate, NO_EXPIRY, NoVoteAttestation, RoundSkip, RoundSkipProof,
+        SetChange, ValidatorKey, ValidatorRecord, ValidatorSet, VertexId,
     };
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2096,6 +2146,47 @@ mod tests {
         let read = store.live_snapshot().unwrap().unwrap();
         assert_eq!(read.transition, Some(transition));
         assert!(read.fences.is_empty());
+    }
+
+    fn round_skip_proof(round: u64, digest: u8) -> RoundSkipProof {
+        let leader = VertexId {
+            round,
+            author: b"val-0".to_vec(),
+            digest: [digest; 32],
+        };
+        RoundSkipProof {
+            attestation: NoVoteAttestation {
+                skip: RoundSkip::new(b"karsa-store-1".to_vec(), leader),
+                signer_bitmap: vec![0u8; 1],
+                signatures: Vec::new(),
+            },
+            votes: Vec::new(),
+            non_votes: Vec::new(),
+            fenced_absent: Vec::new(),
+            missing: vec![b"val-1".to_vec()],
+        }
+    }
+
+    #[test]
+    fn round_skips_round_trip_and_keep_one_proof_per_round() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        assert!(store.round_skips().unwrap().is_empty());
+
+        let proof = round_skip_proof(7, 1);
+        store.put_round_skip(&proof).unwrap();
+        store.put_round_skip(&proof).unwrap();
+        assert_eq!(store.round_skips().unwrap(), vec![proof.clone()]);
+
+        let later = round_skip_proof(9, 2);
+        store.put_round_skip(&later).unwrap();
+        let proofs = store.round_skips().unwrap();
+        assert_eq!(proofs.len(), 2);
+        assert!(proofs.contains(&later));
+
+        // A second, different proof for the same round would name another leader.
+        let conflicting = round_skip_proof(7, 3);
+        assert!(store.put_round_skip(&conflicting).is_err());
     }
 
     #[test]

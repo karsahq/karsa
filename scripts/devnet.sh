@@ -40,6 +40,7 @@ EPOCH_ROUNDS=${EPOCH_ROUNDS:-}
 ADD_VALIDATOR_AT_EPOCH=${ADD_VALIDATOR_AT_EPOCH:-}
 REMOVE_VALIDATOR_AT_EPOCH=${REMOVE_VALIDATOR_AT_EPOCH:-}
 FENCE_SILENT=${FENCE_SILENT:-}
+ROUND_SKIP=${ROUND_SKIP:-}
 FAILURE_ROUNDS=${FAILURE_ROUNDS:-50}
 BIN=${BIN:-target/release/karsa}
 VALIDATORS=${VALIDATORS:-4}
@@ -55,6 +56,11 @@ fi
 FENCE_ARGS=""
 if [ -n "$FENCE_SILENT" ]; then
     FENCE_ARGS="--fence-silent"
+fi
+
+ROUND_SKIP_ARGS=""
+if [ -n "$ROUND_SKIP" ]; then
+    ROUND_SKIP_ARGS="--round-skip"
 fi
 
 if [ "${RESET:-0}" = 1 ]; then
@@ -102,6 +108,7 @@ while [ "$i" -lt "$VALIDATORS" ]; do
         --store "$DEVNET/data" \
         $CHANGE_ARGS \
         $FENCE_ARGS \
+        $ROUND_SKIP_ARGS \
         > "$DEVNET/val-$i.log" 2>&1 &
     pids="$pids $!"
     i=$((i + 1))
