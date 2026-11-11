@@ -2068,8 +2068,10 @@ default chain does not use the rule.
 
 *Measured (functional, failing).* A four-validator release devnet with
 `ROUND_SKIP=1 FENCE_SILENT=1 FAILURE_ROUNDS=15 CHECKPOINT_EVERY=64` reached
-rounds near 2,500 and all four nodes agreed on the committed order (9,706
-entries) and on one certified head, but finality stopped at height 16. Each node
+rounds near 2,500 and all four nodes reported the same committed length (9,706
+entries) and one certified head, but finality stopped at height 16. The tip
+order root was not compared, so this run proves the finality grouping
+diverges; it does not prove the committed order is identical. Each node
 records one header per local commit decision; a node that adopts a skip proof
 first skips a round another node still commits through an anchor, so the same
 prefix is split into headers at different heights. The shares then name
