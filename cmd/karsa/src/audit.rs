@@ -91,6 +91,7 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
         live.as_ref()
             .and_then(|snapshot| snapshot.transition.clone())
     });
+    let fences = store.fences()?;
 
     let set = committee.set.clone();
     let accounts = committee.accounts.clone();
@@ -229,6 +230,11 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
     let mut dag = Dag::with_epoch_length(set, committee.epoch_rounds);
     if let Some(certificate) = &transition_certificate {
         dag.adopt_set_change(certificate)?;
+    }
+    // Fences change which vertices are votes and which rounds the pacemaker
+    // skips. Replaying without them would re-derive a different order.
+    for certificate in &fences {
+        dag.apply_fence(&chain_id, certificate)?;
     }
     if let Some(live) = &live {
         dag.seed_prefix(live.prefix.clone(), live.order.clone());
@@ -384,6 +390,20 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
         println!(
             "  set change:       epoch {} -> {}, {} -> {} validators (old-set quorum)",
             transition.old_epoch, transition.new_epoch, transition.old_size, transition.new_size
+        );
+    }
+    if !fences.is_empty() {
+        let names: Vec<String> = fences
+            .iter()
+            .map(|certificate| {
+                let id = &certificate.fence.validator_id;
+                hex::encode(&id[..id.len().min(8)])
+            })
+            .collect();
+        println!(
+            "  fences:           {} ({})",
+            fences.len(),
+            names.join(", ")
         );
     }
     println!(

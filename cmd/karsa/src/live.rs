@@ -2187,19 +2187,25 @@ async fn node_task(
         pending_dirty = true;
     }
 
-    // A fence is durable: a restart that lost it would wait again on the same
-    // failed leader. One fence is enough for the prototype's fault budget at
-    // four validators, and the store refuses a different one.
-    let mut pending_fence = match &store {
-        Some(store) => store.fence().map_err(|error| error.to_string())?,
-        None => None,
+    // Fences are durable: a restart that lost them would wait again on the same
+    // failed leaders. The store keeps one entry per validator, up to the DAG's
+    // fault budget.
+    let mut fences: BTreeMap<Vec<u8>, FenceCertificate> = match &store {
+        Some(store) => store
+            .fences()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|certificate| (certificate.fence.validator_id.clone(), certificate))
+            .collect(),
+        None => BTreeMap::new(),
     };
-    if let Some(certificate) = &pending_fence {
+    let mut fence_adopted: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for certificate in fences.values() {
         node.apply_fence(certificate)
             .map_err(|error| format!("stored fence is not authorized: {error}"))?;
+        fence_adopted.insert(certificate.fence.validator_id.clone());
     }
-    let mut fence_adopted = pending_fence.is_some();
-    let mut fence_dirty = pending_fence.is_some();
+    let mut fence_dirty = !fences.is_empty();
 
     let mut failure_epoch = node.dag().set_for_round(node.round()).epoch;
     let mut failures = (config.failure_rounds > 0).then(|| {
@@ -2484,18 +2490,19 @@ async fn node_task(
                         }
                     }
                     Message::Fence(certificate) => {
-                        if fence_adopted {
-                            let same = pending_fence
-                                .as_ref()
+                        let validator = certificate.fence.validator_id.clone();
+                        let set = node
+                            .dag()
+                            .set_for_round(certificate.fence.from_round)
+                            .clone();
+                        if fence_adopted.contains(&validator) {
+                            let same = fences
+                                .get(&validator)
                                 .is_some_and(|current| current.fence == certificate.fence);
                             if !same {
                                 rejected += 1;
                             }
                         } else {
-                            let set = node
-                                .dag()
-                                .set_for_round(certificate.fence.from_round)
-                                .clone();
                             let ready = if certificate.verify(&chain_id, &set).is_ok() {
                                 // A completed certificate needs no local share, and
                                 // taking it even when a different partial is pending
@@ -2508,17 +2515,14 @@ async fn node_task(
                                 // the validator below the fence round. Converging on
                                 // the highest proposal is therefore safe and lets
                                 // diverged cursors still combine.
-                                if pending_fence.as_ref().is_some_and(|pending| {
-                                    pending.fence.validator_id == certificate.fence.validator_id
-                                        && certificate.fence.from_round
-                                            > pending.fence.from_round
+                                if fences.get(&validator).is_some_and(|pending| {
+                                    certificate.fence.from_round > pending.fence.from_round
                                 }) {
-                                    pending_fence = None;
-                                    fence_dirty = false;
+                                    fences.remove(&validator);
                                 }
-                                let pending = pending_fence.get_or_insert_with(|| {
-                                    empty_fence_certificate(&certificate, &set)
-                                });
+                                let pending = fences
+                                    .entry(validator.clone())
+                                    .or_insert_with(|| empty_fence_certificate(&certificate, &set));
                                 if started.elapsed() >= FENCE_STARTUP_GRACE
                                     && may_sign_fence(&node, failures.as_ref(), &certificate.fence)
                                 {
@@ -2562,8 +2566,8 @@ async fn node_task(
                                             "node val-{index} fenced {name} from round {}",
                                             certificate.fence.from_round
                                         );
-                                        fence_adopted = true;
-                                        pending_fence = Some(certificate);
+                                        fence_adopted.insert(validator.clone());
+                                        fences.insert(validator, certificate);
                                         fence_dirty = true;
                                     }
                                     Err(error) => {
@@ -2636,15 +2640,15 @@ async fn node_task(
                     broadcast(&outbound, true, &bytes, &mut dropped);
                     pending_dirty = false;
                 }
-                if let Some(certificate) = &pending_fence
-                    && (fence_dirty || ticks % SET_CHANGE_TICKS == 0)
-                {
-                    let bytes = wire::frame(
-                        &Message::Fence(Box::new(certificate.clone())),
-                        now(),
-                    )
-                    .map_err(|error| error.to_string())?;
-                    broadcast(&outbound, true, &bytes, &mut dropped);
+                if fence_dirty || ticks % SET_CHANGE_TICKS == 0 {
+                    for certificate in fences.values() {
+                        let bytes = wire::frame(
+                            &Message::Fence(Box::new(certificate.clone())),
+                            now(),
+                        )
+                        .map_err(|error| error.to_string())?;
+                        broadcast(&outbound, true, &bytes, &mut dropped);
+                    }
                     fence_dirty = false;
                 }
                 if !authoring_stopped && (config.rpc_port > 0 || node.round() <= config.rounds) {
@@ -3008,48 +3012,52 @@ async fn node_task(
                         silent.iter().map(|(validator, _)| validator.clone()).collect();
                     reported_silent.retain(|validator| current.contains(validator));
                 }
-                // A partial fence for a validator that is visible again is stale:
+                // A pending fence for a validator that is visible again is stale:
                 // keeping it would block a different proposal and broadcast a
-                // failure claim the local evidence no longer supports.
-                if !fence_adopted
-                    && let Some(validator) = pending_fence.as_ref().and_then(|certificate| {
-                        silent
-                            .iter()
-                            .all(|(validator, _)| validator != &certificate.fence.validator_id)
-                            .then(|| certificate.fence.validator_id.clone())
-                    })
-                {
-                    pending_fence = None;
-                    fence_dirty = false;
+                // failure claim the local evidence no longer supports. Adopted
+                // certificates stay; the quorum already declared the failure.
+                let stale: Vec<Vec<u8>> = fences
+                    .iter()
+                    .filter(|(validator, _)| !fence_adopted.contains(*validator))
+                    .filter(|(validator, _)| silent.iter().all(|(seen, _)| seen != *validator))
+                    .map(|(validator, _)| validator.clone())
+                    .collect();
+                for validator in stale {
+                    fences.remove(&validator);
                     node.clear_local_fence(&validator);
+                    fence_dirty = true;
                 }
                 // A silent leader or missing voter is fenced at the validator's
                 // last observed round plus one, so survivors with different
                 // cursors still name the same round; the quorum is what authorizes
                 // the skip, not this local report.
-                if config.fence_silent
-                    && pending_fence.is_none()
-                    && let Some((validator, from_round)) = fence_candidate(&node, &silent)
-                {
-                    let set = node.dag().set_for_round(from_round).clone();
-                    if set.validator(&validator).is_some() {
-                        let fence = Fence::new(chain_id.clone(), from_round, validator);
-                        match own_fence_share(
-                            &fence,
-                            &set,
-                            &identity.id,
-                            &identity.private_key,
-                        ) {
-                            Ok(certificate) => {
-                                eprintln!(
-                                    "node {index} proposes a fence for round {from_round}"
-                                );
-                                node.note_local_fence(&fence);
-                                pending_fence = Some(certificate);
-                                fence_dirty = true;
-                            }
-                            Err(error) => {
-                                eprintln!("node {index} cannot sign a fence: {error}");
+                if config.fence_silent {
+                    let candidates: Vec<(Vec<u8>, u64)> = silent
+                        .iter()
+                        .filter(|(validator, _)| !fences.contains_key(validator))
+                        .cloned()
+                        .collect();
+                    if let Some((validator, from_round)) = fence_candidate(&node, &candidates) {
+                        let set = node.dag().set_for_round(from_round).clone();
+                        if fences.len() < set.max_faulty() && set.validator(&validator).is_some() {
+                            let fence = Fence::new(chain_id.clone(), from_round, validator.clone());
+                            match own_fence_share(
+                                &fence,
+                                &set,
+                                &identity.id,
+                                &identity.private_key,
+                            ) {
+                                Ok(certificate) => {
+                                    eprintln!(
+                                        "node {index} proposes a fence for round {from_round}"
+                                    );
+                                    node.note_local_fence(&fence);
+                                    fences.insert(validator, certificate);
+                                    fence_dirty = true;
+                                }
+                                Err(error) => {
+                                    eprintln!("node {index} cannot sign a fence: {error}");
+                                }
                             }
                         }
                     }

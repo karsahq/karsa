@@ -11,6 +11,11 @@ CARGO=${CARGO:-cargo}
 # sccache cannot reuse incremental artifacts, so keep incremental off.
 export CARGO_INCREMENTAL=0
 
+# The mesh tests start four real processes and the finality harness has
+# wall-clock windows. On a four-core machine, running those tests in parallel
+# makes scheduler gaps look like consensus stalls, so the gate serializes them.
+export RUST_TEST_THREADS=1
+
 echo "+ ${CARGO} fmt --all --check"
 "${CARGO}" fmt --all --check
 

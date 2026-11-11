@@ -19,6 +19,7 @@
 //! Nothing here fsyncs on every append: durability of the last record is the
 //! caller's tradeoff, and `Store::sync` exists for callers that want it.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -42,7 +43,9 @@ const SNAPSHOT_FILE: &str = "snapshot";
 const SHARDS_FILE: &str = "shards.log";
 /// The one authorized set change this store has seen.
 const SET_CHANGE_FILE: &str = "set-change";
-/// The one quorum-authorized fence this store has seen.
+/// The fences this store has adopted.
+const FENCES_FILE: &str = "fences";
+/// The legacy single-fence file, still read for an older store.
 const FENCE_FILE: &str = "fence";
 /// The chain this directory belongs to.
 const GENESIS_FILE: &str = "genesis";
@@ -627,49 +630,51 @@ impl Store {
         Ok(Some(TransitionCertificate::decode(&bytes)?))
     }
 
-    /// Writes the quorum-authorized fence this node adopted.
+    /// Writes a quorum-authorized fence this node adopted.
     ///
     /// A restart must keep the fence: without it, a node would wait again on a
-    /// leader that the quorum already declared failed. Rewriting the same
-    /// certificate is a no-op; a different fence is refused.
+    /// leader that the quorum already declared failed. The record is a list keyed
+    /// by validator; the same certificate is a no-op, a lower starting round
+    /// replaces the entry (the DAG's rule), and a higher one is ignored.
     ///
     /// # Errors
     ///
     /// [`StoreError::Io`] on write failure, [`StoreError::Decode`] when the
-    /// certificate does not encode, or when a different fence is already stored.
+    /// certificate does not encode or the existing record cannot be read.
     pub fn put_fence(&self, certificate: &FenceCertificate) -> Result<(), StoreError> {
-        if let Some(existing) = self.fence()? {
-            if existing != *certificate {
-                return Err(StoreError::Decode(CryptoError::new(
-                    crypto::CryptoErrorKind::InvalidKeySchedule,
-                    "the store already holds a different fence",
-                )));
-            }
+        if let Some(existing) = self
+            .fences()?
+            .iter()
+            .find(|existing| existing.fence.validator_id == certificate.fence.validator_id)
+            && existing.fence.from_round <= certificate.fence.from_round
+        {
             return Ok(());
         }
-        let encoded = certificate.encode()?;
-        let temporary = self.path_of("fence.tmp");
-        {
-            let mut file = File::create(&temporary)?;
-            file.write_all(&encoded)?;
-        }
-        fs::rename(&temporary, self.path_of(FENCE_FILE))?;
-        Ok(())
+        // The log keeps both records; `fences` reduces each validator to its
+        // lowest starting round, which is the promise the DAG enforces.
+        append_record(&self.path_of(FENCES_FILE), &certificate.encode()?)
     }
 
-    /// Reads the fence this store adopted, if any.
+    /// Reads the fences this store adopted, oldest record format included.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Io`] on read failure, [`StoreError::Decode`] when the file
+    /// [`StoreError::Io`] on read failure, [`StoreError::Decode`] when a record
     /// does not decode.
-    pub fn fence(&self) -> Result<Option<FenceCertificate>, StoreError> {
-        let path = self.path_of(FENCE_FILE);
-        if !path.exists() {
-            return Ok(None);
+    pub fn fences(&self) -> Result<Vec<FenceCertificate>, StoreError> {
+        let mut records = Vec::new();
+        let path = self.path_of(FENCES_FILE);
+        if path.exists() {
+            records.extend(read_records(&path, FenceCertificate::decode)?);
         }
-        let bytes = fs::read(&path)?;
-        Ok(Some(FenceCertificate::decode(&bytes)?))
+        // A store written before the list existed holds one bare certificate.
+        // Read both when both exist, so appending to the list never hides it.
+        let legacy = self.path_of(FENCE_FILE);
+        if legacy.exists() {
+            let bytes = fs::read(&legacy)?;
+            records.push(FenceCertificate::decode(&bytes)?);
+        }
+        Ok(lowest_fences(records))
     }
 
     /// Writes the snapshot a snapshot join adopted, replacing any previous one.
@@ -1638,6 +1643,22 @@ fn read_records<T>(
     Ok(records)
 }
 
+/// Reduces a fence log to one certificate per validator, keeping the lowest
+/// starting round (the promise the DAG enforces).
+fn lowest_fences(records: Vec<FenceCertificate>) -> Vec<FenceCertificate> {
+    let mut by_validator: BTreeMap<Vec<u8>, FenceCertificate> = BTreeMap::new();
+    for certificate in records {
+        let validator = certificate.fence.validator_id.clone();
+        match by_validator.get(&validator) {
+            Some(existing) if existing.fence.from_round <= certificate.fence.from_round => {}
+            _ => {
+                by_validator.insert(validator, certificate);
+            }
+        }
+    }
+    by_validator.into_values().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1870,18 +1891,61 @@ mod tests {
     }
 
     #[test]
-    fn a_fence_round_trips_and_cannot_be_replaced() {
+    fn fences_round_trip_and_keep_the_lowest_round() {
         let dir = TempDir::new();
         let store = Store::open(&dir.0).unwrap();
-        assert_eq!(store.fence().unwrap(), None);
+        assert!(store.fences().unwrap().is_empty());
         let certificate = fence_certificate();
         store.put_fence(&certificate).unwrap();
         store.put_fence(&certificate).unwrap();
-        assert_eq!(store.fence().unwrap(), Some(certificate.clone()));
+        assert_eq!(store.fences().unwrap(), vec![certificate.clone()]);
 
-        let mut different = certificate;
-        different.fence.from_round += 1;
-        assert!(store.put_fence(&different).is_err());
+        let mut second = fence_certificate();
+        second.fence.validator_id = b"val-1".to_vec();
+        second.fence.from_round = 9;
+        store.put_fence(&second).unwrap();
+        let fences = store.fences().unwrap();
+        assert_eq!(fences.len(), 2);
+        assert!(fences.contains(&second));
+
+        // A lower starting round is the stricter promise and replaces the entry.
+        let mut lower = fence_certificate();
+        lower.fence.from_round = 5;
+        store.put_fence(&lower).unwrap();
+        let fences = store.fences().unwrap();
+        assert_eq!(fences.len(), 2);
+        assert!(fences.iter().any(|fence| fence.fence.from_round == 5));
+        assert!(fences.iter().all(|fence| fence.fence.from_round != 7));
+
+        // A higher round is weaker, so it is ignored rather than appended forever.
+        let mut higher = fence_certificate();
+        higher.fence.from_round = 99;
+        store.put_fence(&higher).unwrap();
+        assert!(
+            store
+                .fences()
+                .unwrap()
+                .iter()
+                .any(|fence| fence.fence.from_round == 5)
+        );
+    }
+
+    #[test]
+    fn a_legacy_single_fence_is_read() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let certificate = fence_certificate();
+        fs::write(dir.0.join("fence"), certificate.encode().unwrap()).unwrap();
+        assert_eq!(store.fences().unwrap(), vec![certificate.clone()]);
+
+        // Appending a second validator must not hide the legacy record.
+        let mut second = fence_certificate();
+        second.fence.validator_id = b"val-1".to_vec();
+        store.put_fence(&second).unwrap();
+        let fences = store.fences().unwrap();
+        assert_eq!(fences.len(), 2);
+        assert!(fences.contains(&certificate));
+        assert!(fences.contains(&second));
     }
 
     #[test]

@@ -339,6 +339,10 @@ cargo run -p karsa -- live --validators 5 --rounds 20
 ./scripts/acvp-rust.sh       # downloads vectors on first use
 ```
 
+The gate runs the test suites with `RUST_TEST_THREADS=1`. The mesh tests start
+four real processes and the finality harness has wall-clock windows, so on a
+four-core machine parallel tests turn scheduler gaps into false stalls.
+
 Rotating a consensus key against a running node:
 
 ```bash
@@ -1165,10 +1169,17 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       `a_signed_fence_share_stops_this_node_referencing_the_author`. The local
       promise is in memory only; a restart forgets a partial certificate that was
       never completed.
+    - Fences are retained across a restart as a list keyed by validator, up to the
+      DAG's fault budget; the legacy single `fence` file is still read. `karsa
+      audit` applies every stored fence before replaying vertices, so the replayed
+      order matches the live one. A four-process devnet with fencing enabled
+      (threshold 15, validator 0 killed) wrote `fences` on the survivors; the audit
+      printed `fences: 1 (...)` and re-derived every height.
     - The vote-fence rule treats the quorum declaration as authoritative for the
       missing voters. It is a view-change liveness rule, not a slashing proof; a
       falsely fenced honest validator that later equivocates remains outside the
-      crash-fault reading the prototype tests. The fence is retained across a
+      crash-fault reading the prototype tests. A fence is stored as one record in
+      a `fences` log and reduced to the lowest starting round per validator. The fence is retained across a
       restart so a returning node does not have to rediscover the failure.
 
 ## Build order
