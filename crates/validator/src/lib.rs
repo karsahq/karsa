@@ -14,6 +14,7 @@ mod finality;
 mod frontier;
 mod header;
 mod pacemaker;
+mod round_skip;
 mod schedule;
 mod set_change;
 mod vertex;
@@ -29,6 +30,10 @@ pub use finality::{Build, Certified, Finalizer, Share, VALIDATOR_SET_ID, signing
 pub use frontier::CommitFrontier;
 pub use header::{HEADER_VERSION_V1, Header, HeaderChain};
 pub use pacemaker::{Pacemaker, PacemakerConfig, SkipCounts, Step};
+pub use round_skip::{
+    NO_VOTE_ATTESTATION_VERSION_V1, NoVoteAttestation, ROUND_SKIP_PROOF_VERSION_V1,
+    ROUND_SKIP_VERSION_V1, RoundSkip, RoundSkipCheck, RoundSkipError, RoundSkipProof,
+};
 pub use schedule::{
     EpochSchedule, NO_EXPIRY, VALIDATOR_SET_VERSION_V1, ValidatorKey, ValidatorRecord,
     ValidatorSet, ValidatorSignature,

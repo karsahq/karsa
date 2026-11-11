@@ -1996,6 +1996,40 @@ dissemination and persistence treatment as a fence, and a safety argument that
 covers a node that already voted (it cannot sign the attestation). This is the
 next view-change step; the complete-round shortcut must not be reintroduced.
 
+## D69 — A round skip needs evidence that no vote quorum can exist
+
+**Decided (prototype).** `RoundSkip` pins the leader vertex a set of validators
+refuses (`round`, `author`, `digest`); `NoVoteAttestation` carries a bitmap and
+one signature per signer over a domain-separated payload
+(`KARSA/DAG/ROUND-SKIP/v1`). A signer may sign only when it has not voted:
+`RoundSkip::may_sign` accepts a missing voting-round vertex (the signature then
+promises to abstain) or an authored one that does not reference the leader, and
+rejects one that does. `RoundSkipProof` partitions the voter set active at the
+voting round into held votes, held non-votes, attested non-voters, absent voters
+covered by a quorum fence, and explicit missing voters. Verification requires an
+exact partition, verifies every attestation signature against the voter set and
+every carried fence against the set at its own round, resolves every listed vote
+and non-vote through a caller-supplied lookup, and admits the proof only when
+`votes + fenced_absent + missing` plus the fault budget charged for an
+attestation stays below the quorum. A listed id this node does not hold is
+`MissingEvidence`, so a node with less history waits instead of accepting a
+weaker proof.
+
+*Measured (unit).* Fourteen unit tests pin the primitive: a quorum attestation
+verifies and a short one is rejected; chain and leader are bound; partial
+attestations merge until quorum; a validator that already voted cannot sign; a
+held non-vote plus one missing voter bounds two votes at three of four; an
+attestation charges the fault budget; an uncovered voter, an overlapping voter,
+two votes plus two missing voters, a non-vote listed as a vote, an unheld id, and
+a fence starting after the voting round are rejected; the attestation and the
+proof round-trip.
+
+*Cost and open.* This is the evidence primitive only. Nothing is on the wire and
+the DAG does not consume a proof yet, so the `cursor 73` stall is not released by
+this change. The next stage must decide where the certificate is recorded: a
+control frame alone lets a node that misses it diverge, and D68 showed that the
+skip decision changes the commit order when nodes decide at different times.
+
 ## Open decisions
 
 1. **Does a node serve history it does not hold?** Model B says no beyond the

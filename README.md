@@ -1279,6 +1279,21 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     - Any such certificate would need the same dissemination and persistence
       treatment as a fence, plus a safety argument for nodes that already voted.
 
+55. **A round skip is evidence, not a timeout.**
+    `RoundSkip` pins the leader vertex; `NoVoteAttestation` carries
+    domain-separated no-vote signatures, and `RoundSkipProof` partitions the
+    voter set into held votes, held non-votes, attested non-voters, fenced-absent
+    voters, and explicit missing voters. A proof is admissible only when
+    `votes + fenced_absent + missing` plus the fault budget charged for an
+    attestation stays below the quorum. `RoundSkip::may_sign` refuses a validator
+    that already voted, and a listed vertex this node does not hold is reported
+    as missing evidence instead of being trusted.
+    - Fourteen unit tests cover the quorum, the exact partition, the vote cap,
+      the fence-round boundary, the signing rule, the held-non-vote and
+      missing-voter arithmetic, and both round trips.
+    - The proof is not on the wire and the DAG does not consume it yet. The
+      `cursor 73` stall and deterministic dissemination remain open.
+
 ## Build order
 
 | Stage | Crate | State |

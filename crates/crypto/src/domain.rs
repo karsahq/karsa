@@ -25,6 +25,8 @@ pub const DOMAIN_SET_CHANGE_V1: &str = "KARSA/SET/CHANGE/v1";
 pub const DOMAIN_SET_TRANSITION_V1: &str = "KARSA/SET/TRANSITION/v1";
 /// Validator-failure fence declaration domain.
 pub const DOMAIN_FENCE_V1: &str = "KARSA/SET/FENCE/v1";
+/// Round-skip no-vote attestation domain.
+pub const DOMAIN_ROUND_SKIP_V1: &str = "KARSA/DAG/ROUND-SKIP/v1";
 /// DAG vertex payload domain: one signature per vertex.
 pub const DOMAIN_VERTEX_V1: &str = "KARSA/DAG/VERTEX/v1";
 /// Committed-state header domain: the object a finality certificate names.
@@ -122,6 +124,23 @@ pub struct SetChangeSigningFields<'a> {
     pub activation_epoch: u64,
     /// Domain-separated identifier of the transition.
     pub transition_hash: &'a [u8],
+}
+
+/// The signed content of a round-skip no-vote attestation.
+///
+/// A signer states that it did not vote for the named leader and will not. The
+/// leader is pinned by round, author, and digest so an attestation can never be
+/// replayed for a different vertex elected at the same round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundSkipSigningFields<'a> {
+    /// Chain identifier, which prevents cross-chain replay.
+    pub chain_id: &'a [u8],
+    /// Round whose leader the signer refuses to vote for.
+    pub round: u64,
+    /// Elected author of that round.
+    pub leader_author: &'a [u8],
+    /// Digest of the leader vertex the signer refuses to vote for.
+    pub leader_digest: &'a [u8],
 }
 
 /// The signed content of a validator-failure fence.
@@ -292,6 +311,22 @@ pub fn encode_set_change_signing_payload(
     wrap_domain(DOMAIN_SET_CHANGE_V1, body.as_slice())
 }
 
+/// Builds the bytes a no-vote attestation signs.
+///
+/// # Errors
+///
+/// Returns an error only when a field exceeds the encoding limit.
+pub fn encode_round_skip_signing_payload(
+    fields: &RoundSkipSigningFields<'_>,
+) -> Result<Vec<u8>, CryptoError> {
+    let mut body = Encoder::with_capacity(96 + fields.leader_author.len());
+    body.put_bytes(fields.chain_id)?;
+    body.put_u64(fields.round);
+    body.put_bytes(fields.leader_author)?;
+    body.put_bytes(fields.leader_digest)?;
+    wrap_domain(DOMAIN_ROUND_SKIP_V1, body.as_slice())
+}
+
 /// Builds the bytes a fence quorum signs.
 ///
 /// # Errors
@@ -405,6 +440,7 @@ mod tests {
             DOMAIN_SET_CHANGE_V1,
             DOMAIN_SET_TRANSITION_V1,
             DOMAIN_FENCE_V1,
+            DOMAIN_ROUND_SKIP_V1,
             DOMAIN_VERTEX_V1,
         ];
         for (index, tag) in tags.iter().enumerate() {
@@ -497,6 +533,40 @@ mod tests {
         })
         .unwrap();
         assert_ne!(encoded, other_validator);
+    }
+
+    #[test]
+    fn a_round_skip_payload_binds_the_leader() {
+        let fields = RoundSkipSigningFields {
+            chain_id: b"karsa-testnet-1",
+            round: 73,
+            leader_author: b"val-3",
+            leader_digest: &PAYLOAD_HASH,
+        };
+        let encoded = encode_round_skip_signing_payload(&fields).unwrap();
+        let tag_len = u32::from_le_bytes(encoded[0..4].try_into().unwrap()) as usize;
+        assert_eq!(&encoded[4..4 + tag_len], DOMAIN_ROUND_SKIP_V1.as_bytes());
+
+        let other_round = encode_round_skip_signing_payload(&RoundSkipSigningFields {
+            round: 74,
+            ..fields
+        })
+        .unwrap();
+        assert_ne!(encoded, other_round);
+
+        let other_leader = encode_round_skip_signing_payload(&RoundSkipSigningFields {
+            leader_author: b"val-2",
+            ..fields
+        })
+        .unwrap();
+        assert_ne!(encoded, other_leader);
+
+        let other_digest = encode_round_skip_signing_payload(&RoundSkipSigningFields {
+            leader_digest: &[9u8; 32],
+            ..fields
+        })
+        .unwrap();
+        assert_ne!(encoded, other_digest);
     }
 
     #[test]
