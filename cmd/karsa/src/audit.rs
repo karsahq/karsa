@@ -232,10 +232,10 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
         dag.adopt_set_change(certificate)?;
     }
     // Fences change which vertices are votes and which rounds the pacemaker
-    // skips. Replaying without them would re-derive a different order.
-    for certificate in &fences {
-        dag.apply_fence(&chain_id, certificate)?;
-    }
+    // skips. They are installed after the stored vertices are replayed, exactly
+    // as a live restart does: a vertex that arrived before the fence is held but
+    // can no longer win a vote, and rejecting it here would make the audit
+    // disagree with the node that produced the store.
     if let Some(live) = &live {
         dag.seed_prefix(live.prefix.clone(), live.order.clone());
     }
@@ -244,6 +244,9 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
     }
     for vertex in &vertices {
         dag.insert(vertex.clone())?;
+    }
+    for certificate in &fences {
+        dag.apply_fence(&chain_id, certificate)?;
     }
     chain::settle(&mut dag, settle_from)?;
 

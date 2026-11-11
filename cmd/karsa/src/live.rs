@@ -1033,6 +1033,10 @@ fn restore_live(
         node.set_floor(floor);
     }
     node.set_cursor(snapshot.cursor);
+    // The snapshot's fences are installed before the stored tail so the replay
+    // uses the same rules the node used when it wrote that tail. A tail vertex
+    // that arrived before the fence is inert and cannot be inserted again.
+    apply_snapshot_fences(node, Some(store), &snapshot.fences)?;
 
     let mut vertices = store.vertices().map_err(|error| error.to_string())?;
     vertices.sort_by(|left, right| {
@@ -1041,6 +1045,9 @@ fn restore_live(
             .then_with(|| left.author.cmp(&right.author))
     });
     for vertex in &vertices {
+        if inert_under_fences(vertex, &snapshot.fences) {
+            continue;
+        }
         node.receive(vertex.clone()).map_err(|error| {
             format!(
                 "cannot replay a stored tail vertex at round {}: {error}",
@@ -1433,9 +1440,14 @@ fn build_live_snapshot(
     if state.state_root() != header.state_root {
         return None;
     }
+    // Only certificates the DAG adopted travel: a partial promise has no quorum
+    // and a joiner would have to reject the whole snapshot. A fence below the
+    // snapshot floor still travels, because it governs every round above it.
+    let fences: Vec<FenceCertificate> = node.dag().fences().cloned().collect();
     let vertices: Vec<validator::Vertex> = held_vertices(node)
         .into_iter()
         .filter(|vertex| vertex.round > floor)
+        .filter(|vertex| !inert_under_fences(vertex, &fences))
         .collect();
     let mut seen = HashSet::new();
     let mut tail_batches = Vec::new();
@@ -1455,6 +1467,7 @@ fn build_live_snapshot(
         anchor: header.clone(),
         certificate: certificate.clone(),
         transition: node.dag().set_schedule().certificate().cloned(),
+        fences,
         cursor: header.round.saturating_add(1),
         floor: Some(floor),
         vertices,
@@ -1584,11 +1597,47 @@ struct Adopted {
     batches: usize,
 }
 
+/// Whether `vertex` can no longer be inserted once `fences` are installed.
+///
+/// A node may hold such a vertex when it arrived before the quorum fence did.
+/// The fence makes it inert: it cannot become a vote, and a fresh DAG would
+/// reject it on insert. Snapshot tails skip it for that reason.
+fn inert_under_fences(vertex: &validator::Vertex, fences: &[FenceCertificate]) -> bool {
+    fences.iter().any(|certificate| {
+        certificate.fence.validator_id == vertex.author
+            && vertex.round >= certificate.fence.from_round
+    })
+}
+
+/// Installs the fences a snapshot carries before any tail vertex is replayed.
+///
+/// The certificates are checked against the set active at their round and
+/// persisted, so a restart does not wait again on a leader the quorum already
+/// declared failed. A fence whose round a checkpoint has pruned is still
+/// installed: it governs every round above the floor.
+fn apply_snapshot_fences(
+    node: &mut Node,
+    store: Option<&Store>,
+    fences: &[FenceCertificate],
+) -> Result<(), String> {
+    for certificate in fences {
+        node.apply_fence(certificate)
+            .map_err(|error| format!("snapshot fence is not authorized: {error}"))?;
+        if let Some(store) = store {
+            store
+                .put_fence(certificate)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 /// Verifies a received snapshot and starts the node from its anchor.
 ///
 /// Nothing is trusted because it arrived: the state root must match the anchor,
 /// the order must reproduce its `dag_root`, and the certificate must carry a
-/// quorum for the anchor's epoch before the anchor replaces genesis.
+/// quorum for the anchor's epoch before the anchor replaces genesis. The fences
+/// are verified separately against the set active at each fence round.
 fn adopt_snapshot(
     snapshot: wire::Snapshot,
     node: &mut Node,
@@ -1605,6 +1654,7 @@ fn adopt_snapshot(
         anchor,
         certificate,
         transition,
+        fences,
         cursor,
         floor,
         vertices,
@@ -1642,6 +1692,25 @@ fn adopt_snapshot(
     finalizer
         .adopt_anchor(anchor.clone(), &certificate, order_len)
         .map_err(|error| format!("snapshot anchor is not certified: {error}"))?;
+    let stored_order = order.clone();
+    let stored_prefix = prefix.clone();
+    node.seed_prefix(prefix, order);
+    if let Some(floor) = floor {
+        node.set_floor(floor);
+    }
+    node.set_cursor(cursor);
+    // Installed before the tail so every replayed vertex is judged by the same
+    // rules the live sender applied. A tail vertex that arrived before the
+    // fence is inert, and a fresh DAG would reject it on insert.
+    apply_snapshot_fences(node, store, &fences)?;
+    let vertices: Vec<validator::Vertex> = vertices
+        .into_iter()
+        .filter(|vertex| !inert_under_fences(vertex, &fences))
+        .collect();
+    for vertex in &vertices {
+        node.receive(vertex.clone())
+            .map_err(|error| format!("cannot replay a snapshot tail vertex: {error}"))?;
+    }
     if let Some(store) = store {
         store
             .put_live_snapshot(&store::LiveSnapshot {
@@ -1650,23 +1719,15 @@ fn adopt_snapshot(
                 cursor,
                 applied: anchor.applied,
                 state: state.clone(),
-                order: order.clone(),
+                order: stored_order,
                 order_len,
-                prefix: prefix.clone(),
+                prefix: stored_prefix,
                 header: anchor.clone(),
                 certificate: certificate.clone(),
                 transition: transition.clone(),
+                fences: fences.clone(),
             })
             .map_err(|error| error.to_string())?;
-    }
-    node.seed_prefix(prefix, order);
-    if let Some(floor) = floor {
-        node.set_floor(floor);
-    }
-    node.set_cursor(cursor);
-    for vertex in &vertices {
-        node.receive(vertex.clone())
-            .map_err(|error| format!("cannot replay a snapshot tail vertex: {error}"))?;
     }
     let batch_count = incoming.len();
     if let Some(store) = store {
@@ -3195,6 +3256,7 @@ async fn node_task(
                             header: snapshot.anchor,
                             certificate: snapshot.certificate,
                             transition: snapshot.transition,
+                            fences: snapshot.fences,
                         })
                         .map_err(|error| error.to_string())?;
                     // The checkpoint is also the licence to prune: its floor is
@@ -4585,6 +4647,169 @@ mod tests {
         };
         let error = check_hello(b"chain-a", &hello).unwrap_err();
         assert!(error.contains("wire protocol"), "{error}");
+    }
+
+    #[test]
+    fn a_snapshot_join_installs_fences_and_drops_inert_tail_vertices() {
+        use validator::{CommitFrontier, Vertex};
+
+        fn signed_vertex(
+            membership: &chain::Membership,
+            chain_id: &[u8],
+            author: usize,
+            round: u64,
+            references: Vec<VertexId>,
+        ) -> Vertex {
+            let mut vertex = Vertex {
+                chain_id: chain_id.to_vec(),
+                epoch: membership.set.epoch,
+                round,
+                author: membership.consensus[author].id.clone(),
+                payload_hash: [0u8; 32],
+                references,
+                signature: Vec::new(),
+            };
+            let payload = vertex.signing_payload().unwrap();
+            vertex.signature = Ed25519Scheme
+                .sign(&membership.consensus[author].private_key, &payload)
+                .unwrap();
+            vertex
+        }
+
+        let membership = chain::membership(4, None).expect("a demo committee");
+        let set = membership.set.clone();
+        let chain_id = b"karsa-snapshot-fence".to_vec();
+        let state = State::new();
+        let state_root = state.state_root();
+        let dag_root = commit_root(&[]);
+        let genesis = Header::genesis(chain_id.clone(), set.epoch, state_root, dag_root);
+        let anchor = Header {
+            chain_id: chain_id.clone(),
+            epoch: set.epoch,
+            height: 1,
+            round: 3,
+            state_root,
+            dag_root,
+            previous: genesis.id().unwrap(),
+            applied: 0,
+        };
+        let mut certificate = Certificate {
+            chain_id: chain_id.clone(),
+            epoch: anchor.epoch,
+            round: anchor.round,
+            vertex_id: anchor.id().unwrap().to_vec(),
+            validator_set_id: set.id().unwrap().to_vec(),
+            signer_bitmap: vec![0u8; bitmap_len(set.validators.len())],
+            signatures: Vec::new(),
+        };
+        let payload = certificate.signing_payload().unwrap();
+        for index in 0..set.quorum_size() {
+            set_bit(&mut certificate.signer_bitmap, index);
+            certificate.signatures.push(
+                Ed25519Scheme
+                    .sign(&membership.consensus[index].private_key, &payload)
+                    .unwrap(),
+            );
+        }
+
+        let fenced = set.validators[0].validator_id.clone();
+        let fence = Fence::new(chain_id.clone(), 1, fenced.clone());
+        let fence_payload = fence.signing_payload().unwrap();
+        let mut fence_certificate = FenceCertificate {
+            fence,
+            signer_bitmap: vec![0u8; bitmap_len(set.validators.len())],
+            signatures: Vec::new(),
+        };
+        for index in 0..set.quorum_size() {
+            set_bit(&mut fence_certificate.signer_bitmap, index);
+            fence_certificate.signatures.push(
+                Ed25519Scheme
+                    .sign(&membership.consensus[index].private_key, &fence_payload)
+                    .unwrap(),
+            );
+        }
+
+        let mut vertices: Vec<Vertex> = (0..4)
+            .map(|author| signed_vertex(&membership, &chain_id, author, 0, Vec::new()))
+            .collect();
+        let genesis_ids: Vec<VertexId> =
+            vertices.iter().map(|vertex| vertex.id().unwrap()).collect();
+        // The fenced author's round-one vertex arrived before the fence. It is
+        // not a vote and a fresh DAG cannot insert it, so the join drops it.
+        vertices.push(signed_vertex(
+            &membership,
+            &chain_id,
+            0,
+            1,
+            genesis_ids[..set.quorum_size()].to_vec(),
+        ));
+        vertices.push(signed_vertex(
+            &membership,
+            &chain_id,
+            1,
+            1,
+            genesis_ids[..set.quorum_size()].to_vec(),
+        ));
+
+        let snapshot = wire::Snapshot {
+            state: state.encode().unwrap(),
+            order: Vec::new(),
+            order_len: 0,
+            prefix: CommitFrontier::empty(),
+            anchor,
+            certificate,
+            transition: None,
+            fences: vec![fence_certificate.clone()],
+            cursor: 4,
+            floor: None,
+            vertices,
+            batches: Vec::new(),
+        };
+        let dir = TestDir::new("snapshot-fence");
+        let store = Store::open(&dir.0).unwrap();
+        let signer = 1;
+        let mut node = Node::with_chain_id_and_epoch_length(
+            set.clone(),
+            0,
+            membership.consensus[signer].id.clone(),
+            membership.consensus[signer].private_key.clone(),
+            chain_id.clone(),
+        );
+        let mut finalizer = Some(
+            Finalizer::new(
+                SetSchedule::single(set.clone()),
+                node.dag().epoch_schedule(),
+                chain_id.clone(),
+                membership.consensus[signer].id.clone(),
+                membership.consensus[signer].private_key.clone(),
+                genesis,
+                0,
+            )
+            .unwrap(),
+        );
+        let adopted = adopt_snapshot(
+            snapshot,
+            &mut node,
+            &mut finalizer,
+            &mut HashMap::new(),
+            &chain_id,
+            Some(&store),
+        )
+        .expect("the fenced snapshot must be adopted");
+
+        assert_eq!(adopted.vertices, 5, "four genesis vertices and one vote");
+        assert!(node.dag().is_fenced(&fenced, 1));
+        assert!(node.dag().is_fenced(&fenced, 99));
+        assert!(node.dag().get(1, &fenced).is_none());
+        assert!(
+            node.dag().get(1, &set.validators[1].validator_id).is_some(),
+            "a live author's tail vertex must survive"
+        );
+        assert_eq!(store.fences().unwrap(), vec![fence_certificate.clone()]);
+        assert_eq!(
+            store.live_snapshot().unwrap().unwrap().fences,
+            vec![fence_certificate]
+        );
     }
 
     #[tokio::test]

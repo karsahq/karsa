@@ -72,7 +72,7 @@ const KIND_FENCE: u8 = 10;
 /// A peer that answers with another number is not necessarily hostile; it may be a
 /// different build. The link is closed rather than parsed optimistically, because
 /// the next frame kind could mean something else there.
-pub const WIRE_PROTOCOL: u16 = 8;
+pub const WIRE_PROTOCOL: u16 = 9;
 
 /// The first frame on every link: which chain the sender is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +117,12 @@ pub struct Snapshot {
     pub certificate: Certificate,
     /// Authorized set change that applies above the anchor, if any.
     pub transition: Option<TransitionCertificate>,
+    /// Quorum fences adopted by the sender, including those below its floor.
+    ///
+    /// A joiner that lost a fence would wait again on a leader the quorum
+    /// already declared failed, so the certificates travel with the state they
+    /// apply to. Each is verified against the set active at its round.
+    pub fences: Vec<FenceCertificate>,
     /// Decision round the joiner resumes from.
     pub cursor: u64,
     /// Rounds at or below this are covered by `state` and are not transferred.
@@ -272,6 +278,10 @@ fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>, CryptoError> {
             encoder.put_bytes(&transition.encode()?)?;
         }
     }
+    encoder.put_u32(count(snapshot.fences.len(), "fence")?);
+    for certificate in &snapshot.fences {
+        encoder.put_bytes(&certificate.encode()?)?;
+    }
     encoder.put_u64(snapshot.cursor);
     match snapshot.floor {
         None => encoder.put_u8(0),
@@ -336,6 +346,17 @@ fn decode_snapshot(payload: &[u8]) -> Result<Snapshot, CryptoError> {
         1 => Some(TransitionCertificate::decode(decoder.read_bytes()?)?),
         other => return Err(invalid(format!("unknown snapshot transition flag {other}"))),
     };
+    let fence_count = decoder.read_u32()? as usize;
+    if fence_count > MAX_FRAME {
+        return Err(CryptoError::new(
+            CryptoErrorKind::FieldTooLong,
+            format!("{fence_count} fences exceed the frame cap"),
+        ));
+    }
+    let mut fences = Vec::with_capacity(fence_count.min(64));
+    for _ in 0..fence_count {
+        fences.push(FenceCertificate::decode(decoder.read_bytes()?)?);
+    }
     let cursor = decoder.read_u64()?;
     let floor = match decoder.read_u8()? {
         0 => None,
@@ -373,6 +394,7 @@ fn decode_snapshot(payload: &[u8]) -> Result<Snapshot, CryptoError> {
         anchor,
         certificate,
         transition,
+        fences,
         cursor,
         floor,
         vertices,
@@ -647,6 +669,7 @@ mod tests {
                 signatures: vec![vec![9u8; 64]],
             },
             transition: Some(transition_certificate()),
+            fences: vec![fence_certificate()],
             cursor: 5,
             floor: Some(2),
             vertices: vec![vertex(4)],

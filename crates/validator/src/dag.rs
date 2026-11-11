@@ -217,11 +217,11 @@ impl Dag {
         certificate.verify(chain_id, &set)?;
         let validator_id = certificate.fence.validator_id.clone();
         let from_round = certificate.fence.from_round;
-        if self.floor.is_some_and(|floor| from_round <= floor) {
-            return Err(FenceError::Mismatch(
-                "the fence starts at or below the DAG floor".to_string(),
-            ));
-        }
+        // A fence may start at or below the floor. The rounds below it are
+        // already decided, but the declaration still governs every later round;
+        // rejecting it would make a restart forget a fence whose round a
+        // checkpoint has since pruned. The retained order above the floor is
+        // still checked against the declaration below.
         if self
             .order
             .iter()
@@ -1211,6 +1211,22 @@ mod tests {
         let genesis = fixture.ids(0);
         fixture.full_round(LEADER_ROUND, &genesis).unwrap();
         fixture
+    }
+
+    #[test]
+    fn a_fence_below_the_floor_still_applies_to_later_rounds() {
+        let mut fixture = fixture(4);
+        let certificate = fence_certificate(&fixture, 1, b"val-0");
+        // A checkpoint above the declared round must not make the certificate
+        // unusable: the promise still covers every round this DAG will decide.
+        fixture.dag.set_floor(5);
+        fixture
+            .dag
+            .apply_fence(b"karsa-dag-1", &certificate)
+            .unwrap();
+        assert!(fixture.dag.is_fenced(b"val-0", 5));
+        assert!(fixture.dag.is_fenced(b"val-0", 9));
+        assert!(!fixture.dag.is_fenced(b"val-0", 0));
     }
 
     #[test]

@@ -172,6 +172,8 @@ pub struct LiveSnapshot {
     pub certificate: Certificate,
     /// The authorized set change that applies above this snapshot, if any.
     pub transition: Option<TransitionCertificate>,
+    /// Quorum fences the snapshot sender adopted, including below its floor.
+    pub fences: Vec<FenceCertificate>,
 }
 
 /// What one pruning pass did.
@@ -262,9 +264,11 @@ pub struct StoredShard {
 const LIVE_SNAPSHOT_FILE: &str = "live.snapshot";
 /// Version of the live snapshot record.
 ///
-/// Version 3 adds the optional set-change certificate. Version 2 stored the
-/// compact prefix and tail; version 1 stored the full committed order.
-const LIVE_SNAPSHOT_VERSION: u16 = 3;
+/// Version 4 adds the quorum fences. Version 3 added the optional set-change
+/// certificate. Version 2 stored the compact prefix and tail; version 1 stored
+/// the full committed order.
+const LIVE_SNAPSHOT_VERSION: u16 = 4;
+const LIVE_SNAPSHOT_VERSION_TRANSITION: u16 = 3;
 const LIVE_SNAPSHOT_VERSION_PREFIX: u16 = 2;
 const LIVE_SNAPSHOT_VERSION_FULL: u16 = 1;
 
@@ -752,6 +756,15 @@ impl Store {
                 encoder.put_bytes(&transition.encode()?)?;
             }
         }
+        encoder.put_u32(u32::try_from(snapshot.fences.len()).map_err(|_| {
+            StoreError::Decode(CryptoError::new(
+                crypto::CryptoErrorKind::FieldTooLong,
+                "live snapshot fences do not fit a u32 count",
+            ))
+        })?);
+        for certificate in &snapshot.fences {
+            encoder.put_bytes(&certificate.encode()?)?;
+        }
 
         let temporary = self.path_of("live.snapshot.tmp");
         {
@@ -781,6 +794,7 @@ impl Store {
         let mut decoder = Decoder::new(&record);
         let version = decoder.read_u16()?;
         if version != LIVE_SNAPSHOT_VERSION
+            && version != LIVE_SNAPSHOT_VERSION_TRANSITION
             && version != LIVE_SNAPSHOT_VERSION_PREFIX
             && version != LIVE_SNAPSHOT_VERSION_FULL
         {
@@ -848,7 +862,7 @@ impl Store {
         };
         let header = Header::decode(decoder.read_bytes()?)?;
         let certificate = Certificate::decode(decoder.read_bytes()?)?;
-        let transition = if version == LIVE_SNAPSHOT_VERSION {
+        let transition = if version >= LIVE_SNAPSHOT_VERSION_TRANSITION {
             match decoder.read_u8()? {
                 0 => None,
                 1 => Some(TransitionCertificate::decode(decoder.read_bytes()?)?),
@@ -861,6 +875,22 @@ impl Store {
             }
         } else {
             None
+        };
+        let fences = if version >= LIVE_SNAPSHOT_VERSION {
+            let fence_count = decoder.read_u32()? as usize;
+            if fence_count > record.len() {
+                return Err(StoreError::Decode(CryptoError::new(
+                    crypto::CryptoErrorKind::FieldTooLong,
+                    "live snapshot fence count exceeds the record",
+                )));
+            }
+            let mut fences = Vec::with_capacity(fence_count.min(64));
+            for _ in 0..fence_count {
+                fences.push(FenceCertificate::decode(decoder.read_bytes()?)?);
+            }
+            fences
+        } else {
+            Vec::new()
         };
         decoder.finish()?;
         Ok(Some(LiveSnapshot {
@@ -875,6 +905,7 @@ impl Store {
             header,
             certificate,
             transition,
+            fences,
         }))
     }
 
@@ -1881,6 +1912,7 @@ mod tests {
                 signatures: vec![vec![9u8; 64]],
             },
             transition: Some(transition_certificate()),
+            fences: vec![fence_certificate()],
         };
         {
             let store = Store::open(&dir.0).unwrap();
@@ -1888,6 +1920,43 @@ mod tests {
         }
         let store = Store::open(&dir.0).unwrap();
         assert_eq!(store.live_snapshot().unwrap(), Some(snapshot));
+    }
+
+    #[test]
+    fn a_version_three_live_snapshot_keeps_its_transition_and_has_no_fences() {
+        let dir = TempDir::new();
+        let header = Header::genesis(b"karsa-store-1".to_vec(), 0, [1; 32], [2; 32]);
+        let certificate = Certificate {
+            chain_id: header.chain_id.clone(),
+            epoch: 0,
+            round: 0,
+            vertex_id: header.id().unwrap().to_vec(),
+            validator_set_id: b"set".to_vec(),
+            signer_bitmap: vec![0b1],
+            signatures: vec![vec![9u8; 64]],
+        };
+        let transition = transition_certificate();
+        let mut encoder = Encoder::with_capacity(256);
+        encoder.put_u16(LIVE_SNAPSHOT_VERSION_TRANSITION);
+        encoder.put_u64(7);
+        encoder.put_u8(0);
+        encoder.put_u64(8);
+        encoder.put_u64(3);
+        encoder.put_bytes(b"encoded state").unwrap();
+        encoder.put_u64(0);
+        encoder.put_u64(0);
+        encoder.put_u32(0);
+        encoder.put_u32(0);
+        encoder.put_bytes(&header.encode().unwrap()).unwrap();
+        encoder.put_bytes(&certificate.encode().unwrap()).unwrap();
+        encoder.put_u8(1);
+        encoder.put_bytes(&transition.encode().unwrap()).unwrap();
+        fs::write(dir.0.join(LIVE_SNAPSHOT_FILE), encoder.as_slice()).unwrap();
+
+        let store = Store::open(&dir.0).unwrap();
+        let read = store.live_snapshot().unwrap().unwrap();
+        assert_eq!(read.transition, Some(transition));
+        assert!(read.fences.is_empty());
     }
 
     #[test]
@@ -2131,6 +2200,7 @@ mod tests {
                 header: header(4),
                 certificate: certificate(4),
                 transition: None,
+                fences: Vec::new(),
             })
             .unwrap();
 
@@ -2189,6 +2259,7 @@ mod tests {
                 header: header(2),
                 certificate: certificate(2),
                 transition: None,
+                fences: Vec::new(),
             })
             .unwrap();
 

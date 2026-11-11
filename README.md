@@ -1182,6 +1182,32 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       a `fences` log and reduced to the lowest starting round per validator. The fence is retained across a
       restart so a returning node does not have to rediscover the failure.
 
+50. **A quorum fence travels in the snapshot and survives the checkpoint floor.**
+    A snapshot now carries every fence its sender's DAG adopted, including a
+    fence whose round is at or below the snapshot floor: that declaration
+    excludes the validator from every later round, so dropping it at a
+    checkpoint would let a joiner wait on a leader the quorum already declared
+    failed. The joiner seeds the committed prefix and floor, verifies and
+    installs the certificates against the set active at each fence round, and
+    persists them in its own `fences` log. A tail vertex from a fenced author at
+    or after its round is dropped: it arrived before the fence, is not a vote,
+    and a fresh DAG rejects it on insert. `Dag::apply_fence` also accepts a
+    fence below the DAG floor now; the rounds below it are decided, but the
+    declaration still governs the future, and rejecting it made a restart fail
+    after a checkpoint advanced the floor past a stored fence. `karsa audit`
+    replays the stored vertices before applying the fences, so it matches a live
+    restart. `wire::Snapshot` carries the list and `WIRE_PROTOCOL` is 9;
+    `LiveSnapshot` is version 4 and version 3 records still read.
+    - `a_snapshot_join_installs_fences_and_drops_inert_tail_vertices` adopts a
+      snapshot with an inert fenced vertex and a live one, checks that only the
+      live one is inserted, and verifies the fence in both the `fences` log and
+      the live snapshot.
+    - `a_fence_below_the_floor_still_applies_to_later_rounds` pins the floor
+      rule; the wire and store round-trip tests carry a fence.
+    - Partial promises remain in memory. A restart still forgets a share that
+      never reached a quorum; cold joins learn new fences from the snapshot or
+      from the periodic rebroadcast.
+
 ## Build order
 
 | Stage | Crate | State |
