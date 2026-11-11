@@ -1208,6 +1208,25 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       never reached a quorum; cold joins learn new fences from the snapshot or
       from the periodic rebroadcast.
 
+51. **A signed fence share is a durable promise.**
+    Before a quorum completes, the node writes the share it signed to a
+    `fence-shares` log: the signed one-signer certificate, plus a tombstone when
+    the proposal is abandoned. Reading reduces the log to the lowest round per
+    validator; a later share after a tombstone takes effect again. On startup the
+    shares are loaded after the set schedule is installed, checked against the
+    set active at each fence round, noted as local promises before the node
+    authors anything, and seeded into the pending map so it keeps collecting the
+    same quorum. The record is cleared once the full certificate is adopted, or
+    when the validator is visible again and the partial is stale.
+    - `a_local_fence_share_round_trips_and_a_clear_removes_it` pins the log,
+      the lowest-round rule, and re-adding after a tombstone.
+    - `a_restarted_node_reloads_its_signed_fence_promise` signs a share, drops
+      the node, and requires the reloaded DAG to report the author locally
+      fenced from the declared round.
+    - The share is re-verified against its epoch's keys at startup. A crash
+      between adopting a certificate and clearing the share leaves one redundant
+      record; the loader skips it because the adopted certificate wins.
+
 ## Build order
 
 | Stage | Crate | State |

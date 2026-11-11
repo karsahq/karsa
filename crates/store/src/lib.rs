@@ -45,6 +45,16 @@ const SHARDS_FILE: &str = "shards.log";
 const SET_CHANGE_FILE: &str = "set-change";
 /// The fences this store has adopted.
 const FENCES_FILE: &str = "fences";
+/// Fence shares this node signed but has not completed into a certificate.
+const FENCE_SHARES_FILE: &str = "fence-shares";
+/// Version of one local fence-share record.
+///
+/// The log carries both a signed share and a tombstone, so clearing a stale
+/// proposal survives a restart instead of resurrecting a promise the node no
+/// longer stands behind.
+const FENCE_SHARES_VERSION: u16 = 1;
+const FENCE_SHARE_SIGNED: u8 = 0;
+const FENCE_SHARE_CLEARED: u8 = 1;
 /// The legacy single-fence file, still read for an older store.
 const FENCE_FILE: &str = "fence";
 /// The chain this directory belongs to.
@@ -679,6 +689,85 @@ impl Store {
             records.push(FenceCertificate::decode(&bytes)?);
         }
         Ok(lowest_fences(records))
+    }
+
+    /// Writes one fence share this node signed, before a quorum completes it.
+    ///
+    /// The promise is durable: a node that forgets a share on restart would be
+    /// free to vote for an author it already declared failed. The same share is
+    /// a no-op and a lower starting round replaces the entry, matching the DAG.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on write failure, [`StoreError::Decode`] when the
+    /// certificate does not encode or the existing log cannot be read.
+    pub fn put_fence_share(&self, certificate: &FenceCertificate) -> Result<(), StoreError> {
+        if let Some(existing) = self
+            .fence_shares()?
+            .iter()
+            .find(|existing| existing.fence.validator_id == certificate.fence.validator_id)
+            && existing.fence.from_round <= certificate.fence.from_round
+        {
+            return Ok(());
+        }
+        append_record(
+            &self.path_of(FENCE_SHARES_FILE),
+            &encode_fence_share(&FenceShareRecord::Signed(certificate.clone()))?,
+        )
+    }
+
+    /// Forgets a local fence share whose proposal the node abandoned.
+    ///
+    /// A tombstone is appended rather than rewriting the log, so a later share
+    /// for the same validator is ordered after it and takes effect again.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on write failure, [`StoreError::Decode`] when the
+    /// existing log cannot be read.
+    pub fn clear_fence_share(&self, validator_id: &[u8]) -> Result<(), StoreError> {
+        if self
+            .fence_shares()?
+            .iter()
+            .all(|certificate| certificate.fence.validator_id != validator_id)
+        {
+            return Ok(());
+        }
+        append_record(
+            &self.path_of(FENCE_SHARES_FILE),
+            &encode_fence_share(&FenceShareRecord::Cleared(validator_id.to_vec()))?,
+        )
+    }
+
+    /// Reads the fence shares this node signed and has not cleared.
+    ///
+    /// The log is reduced per validator to the lowest starting round; a
+    /// tombstone removes the validator until a later share re-adds it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on read failure, [`StoreError::Decode`] when a record
+    /// does not decode.
+    pub fn fence_shares(&self) -> Result<Vec<FenceCertificate>, StoreError> {
+        let mut by_validator: BTreeMap<Vec<u8>, FenceCertificate> = BTreeMap::new();
+        for record in read_records(&self.path_of(FENCE_SHARES_FILE), decode_fence_share)? {
+            match record {
+                FenceShareRecord::Signed(certificate) => {
+                    let validator = certificate.fence.validator_id.clone();
+                    match by_validator.get(&validator) {
+                        Some(existing)
+                            if existing.fence.from_round <= certificate.fence.from_round => {}
+                        _ => {
+                            by_validator.insert(validator, certificate);
+                        }
+                    }
+                }
+                FenceShareRecord::Cleared(validator) => {
+                    by_validator.remove(&validator);
+                }
+            }
+        }
+        Ok(by_validator.into_values().collect())
     }
 
     /// Writes the snapshot a snapshot join adopted, replacing any previous one.
@@ -1674,6 +1763,56 @@ fn read_records<T>(
     Ok(records)
 }
 
+/// One record in the local fence-share log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FenceShareRecord {
+    /// A share this node signed for a proposed fence.
+    Signed(FenceCertificate),
+    /// A tombstone for a proposal the node abandoned.
+    Cleared(Vec<u8>),
+}
+
+fn encode_fence_share(record: &FenceShareRecord) -> Result<Vec<u8>, StoreError> {
+    let mut encoder = Encoder::with_capacity(64);
+    encoder.put_u16(FENCE_SHARES_VERSION);
+    match record {
+        FenceShareRecord::Signed(certificate) => {
+            encoder.put_u8(FENCE_SHARE_SIGNED);
+            encoder.put_bytes(&certificate.encode()?)?;
+        }
+        FenceShareRecord::Cleared(validator) => {
+            encoder.put_u8(FENCE_SHARE_CLEARED);
+            encoder.put_bytes(validator)?;
+        }
+    }
+    Ok(encoder.finish())
+}
+
+fn decode_fence_share(bytes: &[u8]) -> Result<FenceShareRecord, CryptoError> {
+    let mut decoder = Decoder::new(bytes);
+    let version = decoder.read_u16()?;
+    if version != FENCE_SHARES_VERSION {
+        return Err(CryptoError::new(
+            crypto::CryptoErrorKind::MalformedCertificate,
+            format!("unsupported fence share version {version}"),
+        ));
+    }
+    let record = match decoder.read_u8()? {
+        FENCE_SHARE_SIGNED => {
+            FenceShareRecord::Signed(FenceCertificate::decode(decoder.read_bytes()?)?)
+        }
+        FENCE_SHARE_CLEARED => FenceShareRecord::Cleared(decoder.read_bytes()?.to_vec()),
+        other => {
+            return Err(CryptoError::new(
+                crypto::CryptoErrorKind::MalformedCertificate,
+                format!("unknown fence share record {other}"),
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(record)
+}
+
 /// Reduces a fence log to one certificate per validator, keeping the lowest
 /// starting round (the promise the DAG enforces).
 fn lowest_fences(records: Vec<FenceCertificate>) -> Vec<FenceCertificate> {
@@ -2015,6 +2154,43 @@ mod tests {
         assert_eq!(fences.len(), 2);
         assert!(fences.contains(&certificate));
         assert!(fences.contains(&second));
+    }
+
+    #[test]
+    fn a_local_fence_share_round_trips_and_a_clear_removes_it() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        assert!(store.fence_shares().unwrap().is_empty());
+
+        let certificate = fence_certificate();
+        store.put_fence_share(&certificate).unwrap();
+        store.put_fence_share(&certificate).unwrap();
+        assert_eq!(store.fence_shares().unwrap(), vec![certificate.clone()]);
+
+        // A lower starting round is the stricter promise and replaces the entry.
+        let mut lower = fence_certificate();
+        lower.fence.from_round = 5;
+        store.put_fence_share(&lower).unwrap();
+        assert_eq!(store.fence_shares().unwrap(), vec![lower.clone()]);
+
+        // A higher one is weaker, so it is ignored rather than appended forever.
+        let mut higher = fence_certificate();
+        higher.fence.from_round = 99;
+        store.put_fence_share(&higher).unwrap();
+        assert_eq!(store.fence_shares().unwrap(), vec![lower.clone()]);
+
+        let mut second = fence_certificate();
+        second.fence.validator_id = b"val-1".to_vec();
+        second.fence.from_round = 9;
+        store.put_fence_share(&second).unwrap();
+        assert_eq!(store.fence_shares().unwrap().len(), 2);
+
+        store.clear_fence_share(b"val-0").unwrap();
+        assert_eq!(store.fence_shares().unwrap(), vec![second.clone()]);
+
+        // A later proposal for the same validator re-adds it after the tombstone.
+        store.put_fence_share(&certificate).unwrap();
+        assert_eq!(store.fence_shares().unwrap().len(), 2);
     }
 
     #[test]

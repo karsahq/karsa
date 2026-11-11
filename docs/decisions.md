@@ -1869,10 +1869,36 @@ snapshot whose tail holds both an inert fenced vertex and a live one, and
 store compatibility. The wire and store round-trip tests carry a fence.
 
 *Cost and open.* A snapshot repeats the full certificate list (one bitmap and
-one signature per signer per fence), bounded by `f`. Partial promises are still
-in memory only, so a restart forgets a share that never reached a quorum. Cold
-joins still learn new fences from the snapshot or rebroadcast, not from a
-separate fence-sync request.
+one signature per signer per fence), bounded by `f`. Cold joins still learn new
+fences from the snapshot or rebroadcast, not from a separate fence-sync request.
+*Resolved by D65:* a signed share is persisted, so a restart no longer forgets a
+proposal that never reached a quorum.
+
+## D65 — A signed fence share is a durable promise
+
+**Decided (prototype).** A node that signs a fence share before the quorum
+completes stores it in a `fence-shares` log. The record is the signed
+`FenceCertificate` with one signer; the log also carries a tombstone for a
+proposal the node abandons. Reading reduces the log per validator to the lowest
+starting round, and a later share after a tombstone takes effect again. On
+startup the shares are loaded after the set schedule (snapshot transition
+included) is installed, checked against the set active at each fence round, noted
+as local promises before the loop authors anything, and seeded into the pending
+map so the node keeps collecting the same quorum and rebroadcasts the share. The
+record is cleared when the full certificate is adopted (the certified fence then
+carries the promise) or when the validator is visible again and the partial is
+stale.
+
+*Measured (functional).* `a_local_fence_share_round_trips_and_a_clear_removes_it`
+keeps the lowest round, ignores a higher one, and re-adds a validator after a
+tombstone. `a_restarted_node_reloads_its_signed_fence_promise` signs a share,
+drops the node, and requires the reloaded DAG to report the author locally
+fenced from the declared round.
+
+*Cost and open.* The share is re-verified with every signature at startup; for a
+large set and PQ keys this is bounded by `f` shares. A node that crashes between
+adopting a certificate and clearing its share leaves one redundant record, which
+the loader skips because the adopted certificate wins.
 
 ## Open decisions
 

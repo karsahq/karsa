@@ -1632,6 +1632,32 @@ fn apply_snapshot_fences(
     Ok(())
 }
 
+/// Restores the fence shares this node signed before it stopped.
+///
+/// The signature is the promise: a restart that forgot it could vote for an
+/// author it already declared failed. Each stored share is checked against the
+/// set active at its round and noted in the DAG; the returned certificates let
+/// the live loop keep collecting the quorum and rebroadcast the proposal.
+fn load_local_fence_shares(
+    node: &mut Node,
+    store: &Store,
+    chain_id: &[u8],
+) -> Result<Vec<FenceCertificate>, String> {
+    let mut shares = Vec::new();
+    for certificate in store.fence_shares().map_err(|error| error.to_string())? {
+        let set = node
+            .dag()
+            .set_for_round(certificate.fence.from_round)
+            .clone();
+        certificate
+            .check(chain_id, &set)
+            .map_err(|error| format!("stored fence share is not authorized: {error}"))?;
+        node.note_local_fence(&certificate.fence);
+        shares.push(certificate);
+    }
+    Ok(shares)
+}
+
 /// Verifies a received snapshot and starts the node from its anchor.
 ///
 /// Nothing is trusted because it arrived: the state root must match the anchor,
@@ -2267,6 +2293,23 @@ async fn node_task(
         fence_adopted.insert(certificate.fence.validator_id.clone());
     }
     let mut fence_dirty = !fences.is_empty();
+    // A share this node signed is a promise, not just a pending message. Load it
+    // before the live loop authors anything, and seed the pending map so a
+    // restart keeps collecting the same quorum and rebroadcasting the proposal.
+    if let Some(store) = &store {
+        for certificate in load_local_fence_shares(&mut node, store, &chain_id)? {
+            let validator = certificate.fence.validator_id.clone();
+            let active = node
+                .dag()
+                .set_for_round(node.round())
+                .validator(&validator)
+                .is_some();
+            if active && !fence_adopted.contains(&validator) && !fences.contains_key(&validator) {
+                fences.insert(validator, certificate);
+                fence_dirty = true;
+            }
+        }
+    }
 
     let mut failure_epoch = node.dag().set_for_round(node.round()).epoch;
     let mut failures = (config.failure_rounds > 0).then(|| {
@@ -2594,6 +2637,11 @@ async fn node_task(
                                         &identity.private_key,
                                     )?;
                                     node.note_local_fence(&certificate.fence);
+                                    if let Some(store) = &store {
+                                        store
+                                            .put_fence_share(&own)
+                                            .map_err(|error| error.to_string())?;
+                                    }
                                     if pending
                                         .merge(&own, &chain_id, &set)
                                         .is_ok_and(|changed| changed)
@@ -2617,6 +2665,12 @@ async fn node_task(
                                         if let Some(store) = &store {
                                             store
                                                 .put_fence(&certificate)
+                                                .map_err(|error| error.to_string())?;
+                                            // The adopted certificate now carries the
+                                            // promise; the partial share is no longer
+                                            // needed to rebuild a quorum.
+                                            store
+                                                .clear_fence_share(&validator)
                                                 .map_err(|error| error.to_string())?;
                                         }
                                         let name = hex::encode(
@@ -3086,6 +3140,11 @@ async fn node_task(
                 for validator in stale {
                     fences.remove(&validator);
                     node.clear_local_fence(&validator);
+                    if let Some(store) = &store {
+                        store
+                            .clear_fence_share(&validator)
+                            .map_err(|error| error.to_string())?;
+                    }
                     fence_dirty = true;
                 }
                 // A silent leader or missing voter is fenced at the validator's
@@ -3113,6 +3172,11 @@ async fn node_task(
                                         "node {index} proposes a fence for round {from_round}"
                                     );
                                     node.note_local_fence(&fence);
+                                    if let Some(store) = &store {
+                                        store
+                                            .put_fence_share(&certificate)
+                                            .map_err(|error| error.to_string())?;
+                                    }
                                     fences.insert(validator, certificate);
                                     fence_dirty = true;
                                 }
@@ -4809,6 +4873,44 @@ mod tests {
         assert_eq!(
             store.live_snapshot().unwrap().unwrap().fences,
             vec![fence_certificate]
+        );
+    }
+
+    #[test]
+    fn a_restarted_node_reloads_its_signed_fence_promise() {
+        let membership = chain::membership(4, None).expect("a demo committee");
+        let set = membership.set.clone();
+        let chain_id = b"karsa-local-fence".to_vec();
+        let dir = TestDir::new("local-fence");
+        let store = Store::open(&dir.0).unwrap();
+        let signer = 1;
+        let fence = Fence::new(chain_id.clone(), 4, set.validators[0].validator_id.clone());
+        let share = own_fence_share(
+            &fence,
+            &set,
+            &membership.consensus[signer].id,
+            &membership.consensus[signer].private_key,
+        )
+        .unwrap();
+        store.put_fence_share(&share).unwrap();
+
+        let mut node = Node::with_chain_id_and_epoch_length(
+            set.clone(),
+            0,
+            membership.consensus[signer].id.clone(),
+            membership.consensus[signer].private_key.clone(),
+            chain_id.clone(),
+        );
+        let loaded = load_local_fence_shares(&mut node, &store, &chain_id).unwrap();
+        assert_eq!(loaded, vec![share]);
+        assert!(
+            !node
+                .dag()
+                .is_locally_fenced(&set.validators[0].validator_id, 3)
+        );
+        assert!(
+            node.dag()
+                .is_locally_fenced(&set.validators[0].validator_id, 4)
         );
     }
 
