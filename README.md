@@ -1264,6 +1264,21 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     - A permanent fence keeps the node passive; returning it to service needs a
       later set change or a view-change rule that does not exist yet.
 
+54. **Rejected: a complete next round does not justify a local skip.**
+    A stuck round whose next round is fully accounted for (held or fenced) looked
+    safe to skip without an anchor: no further vote can arrive, so the leader can
+    never reach a quorum. The mesh tests rejected this. A run diverged at round 0/1
+    and the set-change mesh failed with “nodes did not converge on the same commit
+    root”. Completeness is a local view: the node holding the full round skips,
+    while a node missing one vertex waits and may later commit the leader's
+    history at a different point through the canonical lowest-anchor rule. The
+    change was reverted.
+    - The measured stall (`cursor 73`, votes 2 of quorum 4, missing none,
+      can-anchor false) remains open. A safe fix needs a quorum certificate for a
+      view change, not a local proof.
+    - Any such certificate would need the same dissemination and persistence
+      treatment as a fence, plus a safety argument for nodes that already voted.
+
 ## Build order
 
 | Stage | Crate | State |

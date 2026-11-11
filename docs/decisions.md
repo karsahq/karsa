@@ -1962,6 +1962,40 @@ prototype's permanent fence; returning it to service needs a later set change or
 a view-change rule, neither of which exists. The test wipes the store on purpose,
 so it does not cover a store that still holds pre-fence history.
 
+## D68 — Rejected: a complete next round is not enough to skip without an anchor
+
+**Tried (reverted).** When the cursor is stuck, `try_commit` has already found
+less than a quorum of votes. If every author of the next round is accounted for
+(vertex held or fenced), no further vote for the leader can appear, so the round
+looked safe to skip without an anchor: `Dag::round_is_complete` plus
+`Dag::skip_complete_round`, called from the pacemaker only when no anchored round
+exists ahead. A new `complete` skip counter attributed the decision.
+
+The mesh tests rejected it. `a_small_run_certifies_every_sample_and_agrees`
+failed with "every node must credit every sample", and
+`a_mesh_authorizes_a_set_change_and_crosses_the_boundary` failed with "nodes did
+not converge on the same commit root"; the first order difference was at round 0
+or 1 between val-0 and val-2/val-3. The change was reverted.
+
+**Why it diverges.** Completeness is a local view. The node that holds the whole
+next round skips immediately; a node that is missing one vertex waits. If the
+waiting node later receives the vertex, it still cannot commit the leader by a
+vote quorum, but the canonical lowest-anchor rule may commit that leader's
+history at a different point in the order. The commit order is a function of the
+DAG, and a local completeness proof is not a quorum statement, so two nodes can
+pick different orders. The indirect rule deliberately waits for an anchor for
+exactly this reason.
+
+**Consequence.** The live stall observed at `cursor 73`, `votes 2 of quorum 4`,
+`missing none`, `can-anchor false` with a dead validator whose last observed
+round was 75 remains open. A safe fix needs a quorum declaration, not a local
+proof: for example, a view-change certificate in which a supermajority attests
+it did not vote for the leader of round `r` and will not, so at most `f` votes
+can exist and the round can be skipped. That certificate would need the same
+dissemination and persistence treatment as a fence, and a safety argument that
+covers a node that already voted (it cannot sign the attestation). This is the
+next view-change step; the complete-round shortcut must not be reintroduced.
+
 ## Open decisions
 
 1. **Does a node serve history it does not hold?** Model B says no beyond the
