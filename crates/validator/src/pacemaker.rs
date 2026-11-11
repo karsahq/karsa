@@ -149,6 +149,8 @@ pub struct SkipCounts {
     pub fence_leader: u64,
     /// A quorum fenced the only missing voter of a live leader.
     pub fence_voter: u64,
+    /// A round-skip proof accounted for every voter below the quorum.
+    pub attested: u64,
 }
 
 impl SkipCounts {
@@ -165,6 +167,7 @@ impl SkipCounts {
             .saturating_add(self.indirect)
             .saturating_add(self.absent)
             .saturating_add(self.fenced())
+            .saturating_add(self.attested)
     }
 }
 
@@ -393,6 +396,15 @@ impl Pacemaker {
         // declaration.
         if dag.skip_with_fence(round)? {
             self.skips.fence_voter = self.skips.fence_voter.saturating_add(1);
+            self.cursor = round + 1;
+            return Ok(Advance::Skip);
+        }
+        // A verified round-skip proof partitions the whole voter set and bounds
+        // the possible votes below the quorum. Unlike a local completeness
+        // check, the proof is a quorum statement, so every node that adopts it
+        // skips the same round.
+        if dag.skip_with_attestation(round)? {
+            self.skips.attested = self.skips.attested.saturating_add(1);
             self.cursor = round + 1;
             return Ok(Advance::Skip);
         }

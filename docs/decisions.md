@@ -2024,11 +2024,41 @@ two votes plus two missing voters, a non-vote listed as a vote, an unheld id, an
 a fence starting after the voting round are rejected; the attestation and the
 proof round-trip.
 
-*Cost and open.* This is the evidence primitive only. Nothing is on the wire and
-the DAG does not consume a proof yet, so the `cursor 73` stall is not released by
-this change. The next stage must decide where the certificate is recorded: a
-control frame alone lets a node that misses it diverge, and D68 showed that the
-skip decision changes the commit order when nodes decide at different times.
+*Cost and open.* This decision defines the evidence only. D70 adds the DAG
+consumer and the pacemaker rule; nothing is on the wire yet, so the `cursor 73`
+stall is not released live. The next stage must decide where the certificate is
+recorded: a control frame alone lets a node that misses it diverge, and D68
+showed that the skip decision changes the commit order when nodes decide at
+different times.
+
+## D70 — The pacemaker consumes a verified round-skip proof
+
+**Decided (prototype).** `Dag::apply_round_skip` verifies a `RoundSkipProof`
+against the voter set active at the voting round, the set active at each carried
+fence, and the vertices the DAG holds. The named leader
+must be the vertex this DAG elected and holds for the round; a proof for another
+vertex at the same round is refused. The verified proof is stored by round, and
+`Dag::skip_with_attestation` records a skip only when it still matches the held
+leader. The pacemaker runs this rule after the two fence rules and before the
+anchor rules, and attributes the move to a new `attested` counter.
+`/status.skips` exposes it as `attested`.
+
+*Measured (unit).* `a_verified_round_skip_proof_frees_the_stalled_leader`
+reproduces the live shape: five validators, `f = 1`, quorum four, cursor 73,
+leader `val-3`, round 74 held from `val-1..=val-4` with two votes and two
+non-votes, `val-0` missing. `try_commit(73)` is `Undecided`; the proof verifies
+`votes = 2`, `non_votes = 2`, `missing = 1`, `possible_votes = 3 < 4`; the
+pacemaker moves the cursor to 74, reports `attested = 1`, and records the skip at
+round 73. `a_round_skip_proof_for_another_leader_is_refused` pins the leader
+binding: a proof with a different digest is refused and is not stored.
+
+*Cost and open.* The proof is built and applied in-process only. No wire message
+carries it, no store log persists it, and a live node does not yet construct one
+from its own DAG. Until that dissemination exists, the rule cannot release a
+live stall: a node that holds the proof skips, and a node that does not keeps
+waiting, which is the D68 divergence risk. The next stage is `Message::RoundSkip`
+with `WIRE_PROTOCOL` 10, a store log, rebroadcast, and snapshot/replay coverage,
+so every node reaches the same proof before the cursor depends on it.
 
 ## Open decisions
 

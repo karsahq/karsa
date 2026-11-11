@@ -25,6 +25,7 @@ use crypto::{CryptoError, CryptoErrorKind};
 
 use crate::fence::{Fence, FenceCertificate, FenceError};
 use crate::frontier::CommitFrontier;
+use crate::round_skip::{RoundSkipCheck, RoundSkipError, RoundSkipProof};
 use crate::schedule::{EpochSchedule, ValidatorSet};
 use crate::set_change::{SetChangeError, SetSchedule, Transition, TransitionCertificate};
 use crate::vertex::{Vertex, VertexId, tally_votes};
@@ -85,6 +86,14 @@ pub struct Dag {
     /// node stop voting immediately without rejecting vertices it may still need
     /// to follow the chain.
     local_fences: BTreeMap<Vec<u8>, u64>,
+    /// Round-skip proofs this node verified, keyed by leader round.
+    ///
+    /// A proof is evidence that the round cannot reach a vote quorum: held votes,
+    /// held non-votes, no-vote promises, fenced absent voters, and explicitly
+    /// missing voters are partitioned, and the bound stays below the quorum.
+    /// Keeping it beside the vertices lets the pacemaker release the cursor from
+    /// a quorum statement rather than from a local completeness check.
+    round_skips: BTreeMap<u64, RoundSkipProof>,
 }
 
 impl Dag {
@@ -103,6 +112,7 @@ impl Dag {
             floor: None,
             fences: BTreeMap::new(),
             local_fences: BTreeMap::new(),
+            round_skips: BTreeMap::new(),
         }
     }
 
@@ -153,6 +163,7 @@ impl Dag {
             floor: None,
             fences: BTreeMap::new(),
             local_fences: BTreeMap::new(),
+            round_skips: BTreeMap::new(),
         })
     }
 
@@ -374,6 +385,83 @@ impl Dag {
         let leader = self.leader(round).expect("a skippable leader is held");
         let author = leader.author.clone();
         let digest = Some(leader.id()?.digest);
+        Ok(self.record_skip(round, author, digest))
+    }
+
+    /// Installs a round-skip proof for the leader of its round.
+    ///
+    /// The proof is checked against the voter set active at the voting round,
+    /// the set active at each carried fence, and the vertices this DAG holds. The
+    /// named leader must be the vertex this DAG elected and holds for the round.
+    ///
+    /// # Errors
+    ///
+    /// Every error from [`RoundSkipProof::verify`], plus
+    /// [`RoundSkipError::Mismatch`] when the DAG does not hold the named leader
+    /// or already adopted a different proof for the same round.
+    pub fn apply_round_skip(
+        &mut self,
+        chain_id: &[u8],
+        proof: RoundSkipProof,
+    ) -> Result<RoundSkipCheck, RoundSkipError> {
+        let round = proof.attestation.skip.round();
+        let leader_id = self
+            .leader(round)
+            .ok_or_else(|| RoundSkipError::Mismatch("the skipped leader is not held".to_string()))?
+            .id()
+            .map_err(RoundSkipError::Encoding)?;
+        if proof.attestation.skip.leader != leader_id {
+            return Err(RoundSkipError::Mismatch(
+                "the proof names a different leader vertex".to_string(),
+            ));
+        }
+        if let Some(current) = self.round_skips.get(&round)
+            && current.attestation.skip != proof.attestation.skip
+        {
+            return Err(RoundSkipError::Mismatch(
+                "this round already has a different skip proof".to_string(),
+            ));
+        }
+        let voter_set = self.set_for_round(round.saturating_add(1)).clone();
+        let check = proof.verify(
+            chain_id,
+            &voter_set,
+            &leader_id,
+            |fence_round| self.set_for_round(fence_round).clone(),
+            |id| self.get(id.round, &id.author).cloned(),
+        )?;
+        self.round_skips.entry(round).or_insert(proof);
+        Ok(check)
+    }
+
+    /// The round-skip proof this DAG adopted for `round`, if any.
+    #[must_use]
+    pub fn round_skip(&self, round: u64) -> Option<&RoundSkipProof> {
+        self.round_skips.get(&round)
+    }
+
+    /// Whether a verified round-skip proof authorizes skipping `round`'s leader.
+    ///
+    /// The proof is only accepted when it names the leader this DAG holds. A
+    /// proof for another vertex at the same round, or one this DAG has not
+    /// adopted, decides nothing.
+    ///
+    /// # Errors
+    ///
+    /// Propagates vertex id encoding when the leader is held.
+    pub fn skip_with_attestation(&mut self, round: u64) -> Result<bool, CryptoError> {
+        let Some(proof) = self.round_skips.get(&round) else {
+            return Ok(false);
+        };
+        let Some(leader) = self.leader(round) else {
+            return Ok(false);
+        };
+        let leader_id = leader.id()?;
+        if proof.attestation.skip.leader != leader_id {
+            return Ok(false);
+        }
+        let author = leader.author.clone();
+        let digest = Some(leader_id.digest);
         Ok(self.record_skip(round, author, digest))
     }
 
@@ -1082,6 +1170,8 @@ impl CommitProof {
 mod tests {
     use super::*;
     use crate::certificate::{bitmap_len, set_bit};
+    use crate::pacemaker::{Pacemaker, PacemakerConfig, Step};
+    use crate::round_skip::{NoVoteAttestation, RoundSkip, RoundSkipProof};
     use crate::schedule::{NO_EXPIRY, ValidatorKey, ValidatorRecord};
     use crate::set_change::SetChange;
     use crypto::registry::ALG_ED25519;
@@ -1321,6 +1411,111 @@ mod tests {
             !fixture.dag.can_skip_with_fence(1).unwrap(),
             "three held votes exceed the two-fault budget"
         );
+    }
+
+    /// The stalled shape from the live run: round 73's leader is held, round 74
+    /// is held from four of five validators (two votes, two non-votes), and
+    /// validator 0 is missing.
+    ///
+    /// Only the vertices a decision touches are materialized. The reference rule
+    /// counts previous-round authors, not held vertices, so the earlier rounds
+    /// can be named by id without building them.
+    fn stalled_round_skip() -> (Fixture, VertexId) {
+        let mut fixture = fixture(5);
+        let fabricated = |round: u64, author: usize| VertexId {
+            round,
+            author: format!("val-{author}").into_bytes(),
+            digest: [u8::try_from(author + 1).unwrap(); 32],
+        };
+        let references: Vec<VertexId> = (0..4).map(|author| fabricated(72, author)).collect();
+        let leader = fixture
+            .dag
+            .insert(vertex(&fixture, 3, 73, references))
+            .unwrap();
+        for author in 1..5 {
+            let mut references: Vec<VertexId> =
+                (0..4).map(|author| fabricated(73, author)).collect();
+            if author <= 2 {
+                references.push(leader.clone());
+            }
+            fixture
+                .dag
+                .insert(vertex(&fixture, author, 74, references))
+                .unwrap();
+        }
+        (fixture, leader)
+    }
+
+    fn stall_proof(fixture: &Fixture, leader: &VertexId) -> RoundSkipProof {
+        let id = |author: usize| {
+            fixture
+                .dag
+                .get(74, format!("val-{author}").as_bytes())
+                .expect("the stall holds every survivor's voting-round vertex")
+                .id()
+                .unwrap()
+        };
+        RoundSkipProof {
+            attestation: NoVoteAttestation {
+                skip: RoundSkip::new(b"karsa-dag-1".to_vec(), leader.clone()),
+                signer_bitmap: vec![0u8; bitmap_len(5)],
+                signatures: Vec::new(),
+            },
+            votes: vec![id(1), id(2)],
+            non_votes: vec![id(3), id(4)],
+            fenced_absent: Vec::new(),
+            missing: vec![b"val-0".to_vec()],
+        }
+    }
+
+    #[test]
+    fn a_verified_round_skip_proof_frees_the_stalled_leader() {
+        let (mut fixture, leader) = stalled_round_skip();
+        assert_eq!(
+            fixture.dag.try_commit(73).unwrap(),
+            Decision::Undecided,
+            "two votes of four commit nothing and are not a quorum of non-votes"
+        );
+        assert!(!fixture.dag.skip_with_attestation(73).unwrap());
+
+        let proof = stall_proof(&fixture, &leader);
+        let check = fixture
+            .dag
+            .apply_round_skip(b"karsa-dag-1", proof)
+            .expect("two votes plus one missing voter stay below the quorum");
+        assert_eq!(check.votes, 2);
+        assert_eq!(check.non_votes, 2);
+        assert_eq!(check.missing, 1);
+        assert_eq!(check.possible_votes, 3);
+        assert_eq!(check.quorum, 4);
+        assert!(fixture.dag.round_skip(73).is_some());
+
+        let mut pacemaker = Pacemaker::new(PacemakerConfig::default(), 73);
+        let step = pacemaker.tick(&mut fixture.dag).unwrap();
+        assert_eq!(pacemaker.cursor(), 74);
+        assert_eq!(pacemaker.skip_counts().attested, 1);
+        assert_eq!(pacemaker.skip_counts().total(), 1);
+        assert!(matches!(
+            step,
+            Step::Advanced {
+                skips: 1,
+                commits: 0,
+                ..
+            }
+        ));
+        assert_eq!(fixture.dag.skipped()[0].round, 73);
+    }
+
+    #[test]
+    fn a_round_skip_proof_for_another_leader_is_refused() {
+        let (mut fixture, leader) = stalled_round_skip();
+        let mut proof = stall_proof(&fixture, &leader);
+        proof.attestation.skip.leader.digest = [9u8; 32];
+        assert!(matches!(
+            fixture.dag.apply_round_skip(b"karsa-dag-1", proof),
+            Err(RoundSkipError::Mismatch(_))
+        ));
+        assert!(fixture.dag.round_skip(73).is_none());
     }
 
     #[test]

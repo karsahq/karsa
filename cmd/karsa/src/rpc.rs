@@ -865,6 +865,7 @@ impl RpcCore {
                 absent: self.run.skips.absent,
                 fence_leader: self.run.skips.fence_leader,
                 fence_voter: self.run.skips.fence_voter,
+                attested: self.run.skips.attested,
             },
             tracked_transactions: self.records.len(),
             silent: self.silent.clone(),
@@ -1166,6 +1167,7 @@ struct SkipView {
     absent: u64,
     fence_leader: u64,
     fence_voter: u64,
+    attested: u64,
 }
 
 #[derive(Deserialize)]

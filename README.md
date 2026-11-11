@@ -1291,8 +1291,21 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     - Fourteen unit tests cover the quorum, the exact partition, the vote cap,
       the fence-round boundary, the signing rule, the held-non-vote and
       missing-voter arithmetic, and both round trips.
-    - The proof is not on the wire and the DAG does not consume it yet. The
+    - The proof is not on the wire yet. D70 adds the DAG consumer; the
       `cursor 73` stall and deterministic dissemination remain open.
+
+56. **The pacemaker can consume a verified round-skip proof.**
+    `Dag::apply_round_skip` checks the proof against the voter set, the carried
+    fences, and the held vertices; it requires the named leader to be the vertex
+    this DAG elected, stores the proof by round, and `Dag::skip_with_attestation`
+    releases the leader. The pacemaker runs the rule after the two fence rules
+    and attributes the move to `attested` in `/status.skips`.
+    - `a_verified_round_skip_proof_frees_the_stalled_leader` reproduces the live
+      shape: cursor 73, two votes, two held non-votes, one missing voter, bound 3
+      of quorum 4. The cursor moves to 74 and `attested` is 1.
+    - `a_round_skip_proof_for_another_leader_is_refused` pins the leader binding.
+    - No wire message, store log, or live proof construction exists yet, so a
+      live stall still needs the dissemination stage.
 
 ## Build order
 
