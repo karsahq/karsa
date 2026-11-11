@@ -33,9 +33,9 @@ use crypto::registry::ALG_ED25519;
 use crypto::scheme::Ed25519Scheme;
 use crypto::{CryptoError, CryptoErrorKind};
 use validator::{
-    CommitFrontier, Dag, FenceCertificate, FenceError, NO_EXPIRY, Pacemaker, PacemakerConfig,
-    SetChangeError, Step, Transition, TransitionCertificate, ValidatorKey, ValidatorRecord,
-    ValidatorSet, Vertex, VertexId,
+    CommitFrontier, Dag, Fence, FenceCertificate, FenceError, NO_EXPIRY, Pacemaker,
+    PacemakerConfig, SetChangeError, Step, Transition, TransitionCertificate, ValidatorKey,
+    ValidatorRecord, ValidatorSet, Vertex, VertexId,
 };
 
 const CHAIN_ID: &[u8] = b"karsa-net-1";
@@ -271,6 +271,20 @@ impl Node {
         self.dag.apply_fence(&self.chain_id, certificate)
     }
 
+    /// Records a fence share this node signed.
+    ///
+    /// The node stops referencing the author from the fence round on, without
+    /// rejecting that author's vertices: the promise is about this node's vote,
+    /// not about what the DAG may hold.
+    pub fn note_local_fence(&mut self, fence: &Fence) {
+        self.dag.note_local_fence(fence);
+    }
+
+    /// Forgets a local fence promise whose certificate was abandoned.
+    pub fn clear_local_fence(&mut self, validator_id: &[u8]) {
+        self.dag.clear_local_fence(validator_id);
+    }
+
     /// Ids of every vertex this node holds in `round`.
     fn ids(&self, round: u64) -> Vec<VertexId> {
         self.dag
@@ -278,6 +292,7 @@ impl Node {
             .validators
             .iter()
             .filter(|record| !self.dag.is_fenced(&record.validator_id, round))
+            .filter(|record| !self.dag.is_locally_fenced(&record.validator_id, round))
             .filter_map(|record| self.dag.get(round, &record.validator_id))
             .filter_map(|vertex| vertex.id().ok())
             .collect()
@@ -776,6 +791,51 @@ mod tests {
     }
 
     #[test]
+    fn a_signed_fence_share_stops_this_node_referencing_the_author() {
+        let mut nodes = test_nodes(4);
+        let mut rounds: Vec<Vec<Vertex>> = Vec::new();
+        for _ in 0..2 {
+            let mut authored = Vec::with_capacity(4);
+            for node in &mut nodes {
+                authored.push(node.author().unwrap().expect("a vertex"));
+            }
+            for vertex in &authored {
+                for node in &mut nodes {
+                    node.receive(vertex.clone()).unwrap();
+                }
+            }
+            rounds.push(authored);
+        }
+
+        let target = rounds[1]
+            .iter()
+            .find(|vertex| vertex.author == b"val-1")
+            .expect("val-1's round-1 vertex")
+            .id()
+            .unwrap();
+        let fence = Fence::new(CHAIN_ID.to_vec(), 1, b"val-1".to_vec());
+        nodes[0].note_local_fence(&fence);
+
+        let authored = nodes[0]
+            .author()
+            .unwrap()
+            .expect("a vertex after the promise");
+        assert!(
+            !authored.references.contains(&target),
+            "a signed fence share must stop this node from voting for the author"
+        );
+        assert!(
+            authored.references.len() >= 3,
+            "the reference quorum still holds without the fenced author"
+        );
+
+        // The promise is about this node's vote, not about what the DAG may hold.
+        let other = nodes[1].author().unwrap().expect("val-1 still authors");
+        assert_eq!(other.author, b"val-1");
+        nodes[0].receive(other).unwrap();
+    }
+
+    #[test]
     fn two_validators_converge_but_tolerate_no_faults() {
         let mut pair = config(0, None);
         pair.validators = 2;
@@ -791,5 +851,39 @@ mod tests {
             summary.committed[0], 0,
             "one node cannot form a quorum alone"
         );
+    }
+
+    /// Four nodes with the simulator's demo identities and independent keys.
+    fn test_nodes(count: usize) -> Vec<Node> {
+        let mut validators = Vec::with_capacity(count);
+        let mut keys = Vec::with_capacity(count);
+        for index in 0..count {
+            let (public_key, private_key) = keypair(u8::try_from(index + 1).unwrap()).unwrap();
+            validators.push(ValidatorRecord {
+                validator_id: format!("val-{index}").into_bytes(),
+                keys: vec![ValidatorKey {
+                    key_id: format!("val-{index}-k0").into_bytes(),
+                    algorithm_id: ALG_ED25519,
+                    public_key,
+                    activation_epoch: 0,
+                    retirement_epoch: NO_EXPIRY,
+                }],
+            });
+            keys.push(private_key);
+        }
+        let set = ValidatorSet {
+            epoch: EPOCH,
+            validators,
+        };
+        set.validate().unwrap();
+        (0..count)
+            .map(|index| {
+                Node::new(
+                    set.clone(),
+                    format!("val-{index}").into_bytes(),
+                    keys[index].clone(),
+                )
+            })
+            .collect()
     }
 }

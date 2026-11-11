@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashSet};
 use crypto::merkle::{MerkleProof, MerkleTree};
 use crypto::{CryptoError, CryptoErrorKind};
 
-use crate::fence::{FenceCertificate, FenceError};
+use crate::fence::{Fence, FenceCertificate, FenceError};
 use crate::frontier::CommitFrontier;
 use crate::schedule::{EpochSchedule, ValidatorSet};
 use crate::set_change::{SetChangeError, SetSchedule, Transition, TransitionCertificate};
@@ -78,6 +78,13 @@ pub struct Dag {
     /// Quorum-authorized failures, keyed by validator id. The value is the first
     /// round at which the validator is fenced, plus the certificate that proved it.
     fences: BTreeMap<Vec<u8>, (u64, FenceCertificate)>,
+    /// Failures this node signed but has not seen a quorum certificate for yet.
+    ///
+    /// A signature is a promise not to vote for that author from the round on.
+    /// Keeping the promise here, separately from the certified fences, lets a
+    /// node stop voting immediately without rejecting vertices it may still need
+    /// to follow the chain.
+    local_fences: BTreeMap<Vec<u8>, u64>,
 }
 
 impl Dag {
@@ -95,6 +102,7 @@ impl Dag {
             schedule: EpochSchedule::single(epoch),
             floor: None,
             fences: BTreeMap::new(),
+            local_fences: BTreeMap::new(),
         }
     }
 
@@ -144,6 +152,7 @@ impl Dag {
             schedule: EpochSchedule::advancing(base, rounds_per_epoch),
             floor: None,
             fences: BTreeMap::new(),
+            local_fences: BTreeMap::new(),
         })
     }
 
@@ -249,6 +258,31 @@ impl Dag {
         self.fences
             .get(validator_id)
             .is_some_and(|(from_round, _)| round >= *from_round)
+    }
+
+    /// Records a fence share this node signed, before a quorum certificate exists.
+    ///
+    /// The earliest round wins: signing two fences for the same validator promises
+    /// not to vote at either boundary, and the earlier one is the stricter promise.
+    pub fn note_local_fence(&mut self, fence: &Fence) {
+        let entry = self
+            .local_fences
+            .entry(fence.validator_id.clone())
+            .or_insert(fence.from_round);
+        *entry = (*entry).min(fence.from_round);
+    }
+
+    /// Forgets a local promise whose partial certificate was abandoned.
+    pub fn clear_local_fence(&mut self, validator_id: &[u8]) {
+        self.local_fences.remove(validator_id);
+    }
+
+    /// Whether this node has promised not to vote for `validator_id` from `round`.
+    #[must_use]
+    pub fn is_locally_fenced(&self, validator_id: &[u8], round: u64) -> bool {
+        self.local_fences
+            .get(validator_id)
+            .is_some_and(|from_round| round >= *from_round)
     }
 
     /// Whether the leader of `round` is fenced and the round can be skipped.

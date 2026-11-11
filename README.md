@@ -1152,6 +1152,13 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       ahead is safe because it cannot have voted for a vertex it never saw. This
       is what lets survivors whose cursors diverged (rounds 60 and 64 in an
       earlier debug run) combine into one quorum.
+    - A node that signs a fence share immediately stops referencing that author
+      from the fence round on, before a quorum certificate exists; it still accepts
+      the author's vertices, so its DAG stays complete and only its own vote is
+      withheld. Pinned by
+      `a_signed_fence_share_stops_this_node_referencing_the_author`. The local
+      promise is in memory only; a restart forgets a partial certificate that was
+      never completed.
     - The vote-fence rule treats the quorum declaration as authoritative for the
       missing voters. It is a view-change liveness rule, not a slashing proof; a
       falsely fenced honest validator that later equivocates remains outside the

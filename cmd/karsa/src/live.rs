@@ -2523,6 +2523,7 @@ async fn node_task(
                                         &identity.id,
                                         &identity.private_key,
                                     )?;
+                                    node.note_local_fence(&certificate.fence);
                                     if pending
                                         .merge(&own, &chain_id, &set)
                                         .is_ok_and(|changed| changed)
@@ -2995,19 +2996,21 @@ async fn node_task(
                 // keeping it would block a different proposal and broadcast a
                 // failure claim the local evidence no longer supports.
                 if !fence_adopted
-                    && pending_fence.as_ref().is_some_and(|certificate| {
+                    && let Some(validator) = pending_fence.as_ref().and_then(|certificate| {
                         silent
                             .iter()
                             .all(|(validator, _)| validator != &certificate.fence.validator_id)
+                            .then(|| certificate.fence.validator_id.clone())
                     })
                 {
                     pending_fence = None;
                     fence_dirty = false;
+                    node.clear_local_fence(&validator);
                 }
-                // A silent leader is fenced at its own round; a silent missing
-                // voter is fenced at the round its vote belongs to. Every
-                // survivor signs the same pair; the quorum is what authorizes the
-                // skip, not this local report.
+                // A silent leader or missing voter is fenced at the validator's
+                // last observed round plus one, so survivors with different
+                // cursors still name the same round; the quorum is what authorizes
+                // the skip, not this local report.
                 if config.fence_silent
                     && pending_fence.is_none()
                     && let Some((validator, from_round)) = fence_candidate(&node, &silent)
@@ -3025,6 +3028,7 @@ async fn node_task(
                                 eprintln!(
                                     "node {index} proposes a fence for round {from_round}"
                                 );
+                                node.note_local_fence(&fence);
                                 pending_fence = Some(certificate);
                                 fence_dirty = true;
                             }
