@@ -1349,6 +1349,25 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       not final through that anchor, and returning them to the mempool needs
       retry, deduplication, and persistence tests.
 
+59. **A causal certificate can skip a reachable leader, and the batch comes back.**
+    With `--round-skip`, a valid certificate inside the selected anchor's causal
+    history turns a `Commit` into a `Skip`; the check runs before
+    `try_indirect_decide` because that call commits history as a side effect.
+    The skipped leader's batch is not in the committed order, so
+    `RpcCore::readmit_batch` returns its transactions to the mempool from the
+    batch content. It handles the author's existing record and the restart case
+    where no record exists, and it is idempotent. `recover_skipped_batches` runs
+    after every commit loop and once after restore.
+    - Three unit tests cover the fresh readmit, the author's record, and
+      `return_batch`.
+    - A four-node devnet reached 2,370-2,374 certified heights in about
+      twenty-five seconds with 41-43 attested skips per node; a submitted
+      transfer finalized in 100 ms. The transfer did not land in a skipped
+      batch, so the recovery glue was not observed live.
+    - Still open: a targeted devnet with a transaction in a skipped batch, a
+      restart between skip and re-author, and an author that is down while a
+      peer holds the batch.
+
 ## Build order
 
 | Stage | Crate | State |

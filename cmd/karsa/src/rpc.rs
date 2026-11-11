@@ -617,6 +617,100 @@ impl RpcCore {
         }
     }
 
+    /// Re-admits the transactions of a batch whose vertex was skipped.
+    ///
+    /// A stage-A skip leaves the leader's batch out of the committed order, so
+    /// its transactions were never applied. A restart also loses the in-memory
+    /// mempool, which is why this takes the batch content rather than a batch
+    /// map entry. Each transaction is checked exactly like a client submission;
+    /// one already recorded or already pending is skipped, so recovering the
+    /// same batch twice is harmless.
+    pub(crate) fn readmit_batch(&mut self, batch: &tx::batch::Batch, now: u64) -> usize {
+        let mut admitted = 0;
+        for transaction in &batch.transactions {
+            if self.readmit_transaction(transaction, now) {
+                admitted += 1;
+            }
+        }
+        admitted
+    }
+
+    fn readmit_transaction(&mut self, transaction: &Transaction, now: u64) -> bool {
+        if transaction.protocol_version != PROTOCOL_VERSION_V1
+            || transaction.chain_id != self.chain_id
+        {
+            return false;
+        }
+        let Ok(canonical) = transaction.encode() else {
+            return false;
+        };
+        let id: [u8; 32] = Sha256::digest(&canonical).into();
+        if let Some(record) = self.records.get_mut(&id) {
+            // The author still has the record from admission; the batch was
+            // skipped before it could be applied. Clear the batch binding and
+            // put the envelope back in the mempool. A terminal outcome is final
+            // and must not be reopened.
+            if record.outcome.is_some() {
+                return false;
+            }
+            if record.batch.is_some() {
+                record.batch = None;
+                record.vertex = None;
+            }
+            if self.mempool.iter().any(|pending| pending.id == id) {
+                return false;
+            }
+            self.mempool.push_back(PendingTx {
+                id,
+                transaction: transaction.clone(),
+                queued_at: Instant::now(),
+            });
+            return true;
+        }
+        if self.mempool.len() >= MAX_MEMPOOL {
+            return false;
+        }
+        let Some(policy) = self
+            .accounts
+            .iter()
+            .find(|(address, _)| address.as_slice() == transaction.sender.as_slice())
+            .map(|(_, policy)| policy)
+        else {
+            return false;
+        };
+        if transaction.verify(policy, now).is_err() {
+            return false;
+        }
+        let sender = transaction.sender.clone();
+        let applied = self.state_sequences.get(&sender).copied().unwrap_or(0);
+        if transaction.sequence <= applied {
+            return false;
+        }
+        let key = (sender.clone(), transaction.sequence);
+        if !self.pending_sequences.insert(key) {
+            return false;
+        }
+        self.records.insert(
+            id,
+            TxRecord {
+                sender,
+                sequence: transaction.sequence,
+                batch: None,
+                vertex: None,
+                outcome: None,
+                order_len_after: None,
+                finalized_height: None,
+                witness: None,
+            },
+        );
+        self.mempool.push_back(PendingTx {
+            id,
+            transaction: transaction.clone(),
+            queued_at: Instant::now(),
+        });
+        true
+    }
+
     /// Records the vertex that carries a batch.
     pub(crate) fn note_authored(&mut self, digest: &[u8; 32], vertex: VertexId) {
         let Some(entry) = self.batches.get_mut(digest) else {
@@ -1381,6 +1475,54 @@ mod tests {
 
     fn body_id(body: &[u8]) -> [u8; 32] {
         Sha256::digest(body).into()
+    }
+
+    #[test]
+    fn a_skipped_batch_is_readmitted_from_its_content() {
+        let (mut core, accounts, chain_id) = fixture();
+        let envelope = signed(&chain_id, &accounts[0], &accounts[1].address, 1, 10);
+        core.submit(&envelope, 1_700_000_000).unwrap();
+        let batch = core.take_batch(16).unwrap();
+
+        // A restart loses the records and the batch map, so recovery works from
+        // the payload alone on a fresh core.
+        let (mut recovered, _, _) = fixture();
+        assert_eq!(recovered.readmit_batch(&batch, 1_700_000_000), 1);
+        assert_eq!(recovered.mempool.len(), 1);
+
+        // Recovering the same batch again is harmless: the record dedupes it.
+        assert_eq!(recovered.readmit_batch(&batch, 1_700_000_000), 0);
+        assert_eq!(recovered.mempool.len(), 1);
+        assert_eq!(recovered.take_batch(16).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_skipped_batch_reuses_the_authors_record() {
+        let (mut core, accounts, chain_id) = fixture();
+        let envelope = signed(&chain_id, &accounts[0], &accounts[1].address, 1, 10);
+        core.submit(&envelope, 1_700_000_000).unwrap();
+        let batch = core.take_batch(16).unwrap();
+        assert_eq!(core.mempool.len(), 0);
+
+        // The author still has the record from admission. The skipped batch must
+        // clear its batch binding and go back to the mempool anyway.
+        assert_eq!(core.readmit_batch(&batch, 1_700_000_000), 1);
+        assert_eq!(core.mempool.len(), 1);
+        assert_eq!(core.readmit_batch(&batch, 1_700_000_000), 0);
+        assert_eq!(core.take_batch(16).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_returned_batch_is_authored_again() {
+        let (mut core, accounts, chain_id) = fixture();
+        let envelope = signed(&chain_id, &accounts[0], &accounts[1].address, 1, 10);
+        core.submit(&envelope, 1_700_000_000).unwrap();
+        let batch = core.take_batch(16).unwrap();
+        assert!(core.mempool.is_empty());
+
+        core.return_batch(batch);
+        assert_eq!(core.mempool.len(), 1);
+        assert_eq!(core.take_batch(16).unwrap().len(), 1);
     }
 
     #[test]

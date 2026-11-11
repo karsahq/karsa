@@ -955,9 +955,14 @@ fn restore(
     // could choose a different order and fail the stored head root.
     let mut control_digests: HashSet<[u8; 32]> = HashSet::new();
     for proof in store.round_skips().map_err(|error| error.to_string())? {
-        if let Ok(digest) = ControlPayload::RoundSkip(Box::new(proof.clone())).digest() {
+        let payload = ControlPayload::RoundSkip(Box::new(proof.clone()));
+        if let Ok(digest) = payload.digest() {
             control_digests.insert(digest);
         }
+        // Install the payload before the eager proof so a stage-A replay can
+        // find it inside an anchor's causal history.
+        node.add_control(payload)
+            .map_err(|error| format!("stored round skip payload is invalid: {error}"))?;
         node.apply_round_skip(proof)
             .map_err(|error| format!("stored round skip is not authorized: {error}"))?;
     }
@@ -1117,9 +1122,12 @@ fn restore_live(
     // replay; the ones below it are already part of the adopted prefix.
     let mut control_digests: HashSet<[u8; 32]> = HashSet::new();
     for proof in store.round_skips().map_err(|error| error.to_string())? {
-        if let Ok(digest) = ControlPayload::RoundSkip(Box::new(proof.clone())).digest() {
+        let payload = ControlPayload::RoundSkip(Box::new(proof.clone()));
+        if let Ok(digest) = payload.digest() {
             control_digests.insert(digest);
         }
+        node.add_control(payload)
+            .map_err(|error| format!("stored round skip payload is invalid: {error}"))?;
         node.apply_round_skip(proof)
             .map_err(|error| format!("stored round skip is not authorized: {error}"))?;
     }
@@ -1190,6 +1198,58 @@ fn remember_state(states: &mut VecDeque<(u64, State)>, applied: u64, state: &Sta
     while states.len() > SNAPSHOT_STATES {
         states.pop_front();
     }
+}
+
+/// Re-admits the batch of each newly skipped leader.
+///
+/// A stage-A skip records the round without committing its history, so the
+/// leader's batch stays out of the execution order. The author's mempool no
+/// longer holds those transactions; returning the batch is what keeps them from
+/// being stranded. If the same vertex later commits through another anchor, the
+/// execution state's sequence rule rejects the recovered copy, so recovery
+/// cannot apply a transaction twice.
+fn recover_skipped_batches(
+    node: &Node,
+    batches: &HashMap<[u8; 32], Batch>,
+    rpc: Option<&SharedRpc>,
+    recovered: &mut usize,
+    now: u64,
+) -> usize {
+    let skipped = node.dag().skipped();
+    if *recovered >= skipped.len() {
+        return 0;
+    }
+    let Some(rpc) = rpc else {
+        *recovered = skipped.len();
+        return 0;
+    };
+    let floor = node.dag().floor();
+    let mut admitted = 0;
+    for entry in &skipped[*recovered..] {
+        let Some(vertex) = node.dag().get(entry.round, &entry.author) else {
+            continue;
+        };
+        if floor.is_some_and(|floor| entry.round <= floor) {
+            continue;
+        }
+        let Ok(id) = vertex.id() else {
+            continue;
+        };
+        if node.dag().order().contains(&id) {
+            // The vertex already committed as history; the execution loop owns
+            // its batch.
+            continue;
+        }
+        let Some(batch) = batches.get(&vertex.payload_hash) else {
+            continue;
+        };
+        admitted += rpc
+            .lock()
+            .expect("rpc lock poisoned")
+            .readmit_batch(batch, now);
+    }
+    *recovered = skipped.len();
+    admitted
 }
 
 /// The last `limit` vertices this node authored, oldest first.
@@ -2376,6 +2436,21 @@ async fn node_task(
         None
     };
 
+    // A restart rebuilds the skipped rounds from the replay. Batches whose
+    // leaders were skipped are still in the store but not in the mempool, so
+    // re-admit them before the live loop starts.
+    let mut recovered_skips = 0usize;
+    let recovered = recover_skipped_batches(
+        &node,
+        &batches,
+        rpc.as_ref(),
+        &mut recovered_skips,
+        unix_now(),
+    );
+    if recovered > 0 {
+        eprintln!("node {index} re-admitted {recovered} transactions from skipped batches");
+    }
+
     // A transition already installed by a snapshot or a restart is rebroadcast
     // so a peer that missed the control frame can still adopt it. Otherwise this
     // node signs the configured proposal and starts collecting the old-set
@@ -2845,6 +2920,24 @@ async fn node_task(
                     }
                     Message::Control(payload) => {
                         let round = payload.round();
+                        if !round_skips.contains_key(&round)
+                            && let Some(proof) = payload.round_skip()
+                            && node.dag().check_round_skip(&chain_id, proof).is_ok()
+                        {
+                            if let Some(store) = &store
+                                && let Err(error) = store.put_round_skip(proof)
+                            {
+                                // A different proof for this round is already
+                                // stored; both imply the same skip, so the first
+                                // one is enough.
+                                eprintln!(
+                                    "node {index} kept the stored round skip for round {round}: \
+                                     {error}"
+                                );
+                            }
+                            round_skips.insert(round, proof.clone());
+                            round_skip_dirty = true;
+                        }
                         match node.add_control(*payload) {
                             Ok(digest) => {
                                 control_payloads.insert(digest, round);
@@ -2862,6 +2955,23 @@ async fn node_task(
                     // vertex that names its digest makes it a decision.
                     Message::RoundSkip(proof) => {
                         let round = proof.attestation.skip.round();
+                        if !round_skips.contains_key(&round)
+                            && node
+                                .dag()
+                                .check_round_skip(&chain_id, proof.as_ref())
+                                .is_ok()
+                        {
+                            if let Some(store) = &store
+                                && let Err(error) = store.put_round_skip(&proof)
+                            {
+                                eprintln!(
+                                    "node {index} kept the stored round skip for round {round}: \
+                                     {error}"
+                                );
+                            }
+                            round_skips.insert(round, (*proof).clone());
+                            round_skip_dirty = true;
+                        }
                         match node.add_control(ControlPayload::RoundSkip(proof)) {
                             Ok(digest) => {
                                 control_payloads.insert(digest, round);
@@ -3149,6 +3259,21 @@ async fn node_task(
                     }
                 }
                 profile.commit += commit_start.elapsed();
+                // A skip recorded by this commit loop leaves the leader's batch
+                // out of the order. Return it to the mempool before the next
+                // round can be authored, so its transactions are not stranded.
+                let recovered = recover_skipped_batches(
+                    &node,
+                    &batches,
+                    rpc.as_ref(),
+                    &mut recovered_skips,
+                    unix_now(),
+                );
+                if recovered > 0 {
+                    eprintln!(
+                        "node {index} re-admitted {recovered} transactions from a skipped batch"
+                    );
+                }
                 // A frozen cursor is the one condition an operator cannot see
                 // from `/status`: rounds and anchors keep advancing while committed
                 // entries stop. Anchors ahead reset the pacemaker's stall counter,

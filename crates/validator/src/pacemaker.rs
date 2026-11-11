@@ -42,7 +42,7 @@
 
 use crypto::{CryptoError, CryptoErrorKind};
 
-use crate::dag::{Dag, Decision};
+use crate::dag::{AnchorSkip, Dag, Decision};
 use crate::vertex::VertexId;
 
 /// How the pacemaker is configured.
@@ -409,10 +409,8 @@ impl Pacemaker {
             // A certificate only counts when it is inside this anchor's causal
             // history. The walk also surfaces a missing ancestor of the anchor as
             // MissingReference, so the caller repairs it instead of deciding on a
-            // partial history. Stage B reports the certificate but keeps the
-            // anchor decision unchanged; stage A will use the same primitive to
-            // turn a commit into a skip.
-            let _ = dag.anchor_skip(&anchor, round)?;
+            // partial history.
+            let certificate = dag.anchor_skip(&anchor, round)?;
             // `try_indirect_decide` commits the leader's history as a side effect,
             // so the two ways this node could be wrong are ruled out first: a walk
             // it cannot finish (nothing is proved), and a skip that could still win
@@ -437,6 +435,19 @@ impl Pacemaker {
 
             let decision = match reach {
                 Reach::Unknown => None,
+                // A causal certificate turns a commit into a skip. The check has
+                // to happen before `try_indirect_decide`, because that call
+                // commits the leader's history as a side effect.
+                Reach::Yes if matches!(certificate, AnchorSkip::Certificate(_)) => {
+                    let (author, digest) = {
+                        let leader = dag.leader(round).expect("a reachable leader is held");
+                        (leader.author.clone(), leader.id()?.digest)
+                    };
+                    dag.record_skip(round, author, Some(digest));
+                    self.skips.attested = self.skips.attested.saturating_add(1);
+                    self.cursor = round + 1;
+                    return Ok(Advance::Skip);
+                }
                 Reach::Yes if dag.held_voters(round)? <= dag.set().max_faulty() => None,
                 _ => Some(dag.try_indirect_decide(round, &anchor)?),
             };

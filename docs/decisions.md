@@ -2151,6 +2151,48 @@ through that anchor. The recovery path needs retry, deduplication, and
 persistence tests of its own. Until then the default chain does not use the
 certificate rule.
 
+## D73 — Stage A: a causal certificate can turn a commit into a skip
+
+**Decided (opt-in).** With `--round-skip`, a valid certificate inside the
+selected anchor's causal history now turns a reachable leader's `Commit` into a
+`Skip`. The check runs before `try_indirect_decide`, because that call commits
+the leader's history as a side effect. The override increments `attested` and
+never runs when the direct vote quorum already commits the round.
+
+**Batch recovery.** A skip leaves the leader's batch out of the committed order,
+so its transactions are not applied. `RpcCore::readmit_batch` returns them to
+the mempool from the batch content. It handles two shapes:
+
+- the author still has the record from admission: clear its batch and vertex
+  binding, then queue the envelope again;
+- a restart has no records: verify the envelope like a client submission, check
+  the restored sequence, and create the record.
+
+`recover_skipped_batches` runs after every commit loop and once after restore.
+It looks up the skipped round's author and digest, ignores a vertex already in
+the order or below the floor, and is idempotent because the recovered
+transaction's record dedupes the second attempt. If the skipped vertex later
+commits through another anchor, the execution sequence rule rejects the
+recovered copy, so a transaction cannot apply twice.
+
+*Measured (unit).* Three new tests pin the recovery: a fresh core readmits a
+batch from its content, the author's existing record is reused, and
+`return_batch` makes the batch authorable again. The full gate passes: fmt,
+clippy `-D warnings`, 481 default tests and 482 all-features tests.
+
+*Measured (functional).* A four-validator release devnet with
+`ROUND_SKIP=1 FENCE_SILENT=1 FAILURE_ROUNDS=15 CHECKPOINT_EVERY=128` reached
+2,370-2,374 certified heights in about twenty-five seconds with 41-43 attested
+skips per node; finality stayed within four heights across nodes. A submitted
+transfer finalized in 100 ms. That single transaction did not land in a skipped
+batch, so the devnet did not exercise `recover_skipped_batches`; the path is
+pinned by the unit tests.
+
+**Open.** A targeted devnet that puts a transaction in a skipped leader's batch,
+a restart between the skip and the re-author, and the case where the author is
+down while a peer holds the batch. The recovery path exists, but those three
+runs are not measured yet.
+
 ## Open decisions
 
 1. **Does a node serve history it does not hold?** Model B says no beyond the

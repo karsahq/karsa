@@ -1889,7 +1889,7 @@ mod tests {
     }
 
     #[test]
-    fn a_certificate_in_the_selected_anchors_history_does_not_change_the_decision() {
+    fn a_causal_certificate_turns_a_commit_into_a_skip() {
         let (mut fixture, proof) = split_round_two();
         let digest = ControlPayload::RoundSkip(Box::new(proof.clone()))
             .digest()
@@ -1916,30 +1916,24 @@ mod tests {
                     && check.quorum == 3
         ));
 
-        // Stage B reports the causal certificate but keeps the anchor decision.
-        // The leader is reachable through the two votes, so the round commits.
-        assert!(matches!(
-            fixture
-                .dag
-                .try_indirect_decide(LEADER_ROUND, &anchor)
-                .unwrap(),
-            Decision::Commit(_)
-        ));
+        // Stage A: the certificate is causal and the leader is reachable, so the
+        // anchor rule would commit. The certificate turns that commit into a skip
+        // without walking the leader's history.
         let leader = fixture.dag.leader(LEADER_ROUND).unwrap().id().unwrap();
-        assert!(fixture.dag.order().contains(&leader));
-
         let mut pacemaker = Pacemaker::new(PacemakerConfig::default(), LEADER_ROUND);
         let step = pacemaker.tick_one(&mut fixture.dag).unwrap();
         assert_eq!(pacemaker.cursor(), LEADER_ROUND + 1);
-        assert_eq!(pacemaker.skip_counts().attested, 0);
+        assert_eq!(pacemaker.skip_counts().attested, 1);
         assert!(matches!(
             step,
             Step::Advanced {
-                commits: 1,
-                skips: 0,
+                commits: 0,
+                skips: 1,
                 ..
             }
         ));
+        assert_eq!(fixture.dag.skipped()[0].round, LEADER_ROUND);
+        assert!(!fixture.dag.order().contains(&leader));
     }
 
     #[test]
