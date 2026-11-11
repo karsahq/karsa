@@ -131,6 +131,43 @@ enum Reach {
     Unknown,
 }
 
+/// How many times each decision rule moved the cursor past a leader.
+///
+/// The rules are not interchangeable: a direct or indirect skip is proved by the
+/// DAG alone, while a fence skip is proved by a quorum declaration plus the
+/// fault budget. Keeping them apart is what lets a live run say *why* a stuck
+/// round was released instead of only that the cursor moved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SkipCounts {
+    /// A supermajority of the next round was observed not to vote.
+    pub direct: u64,
+    /// A committed anchor decided the round.
+    pub indirect: u64,
+    /// An anchor proved the leader's vertex cannot be in this node's history.
+    pub absent: u64,
+    /// A quorum fenced the leader itself.
+    pub fence_leader: u64,
+    /// A quorum fenced the only missing voter of a live leader.
+    pub fence_voter: u64,
+}
+
+impl SkipCounts {
+    /// Skips that needed a fence certificate.
+    #[must_use]
+    pub fn fenced(self) -> u64 {
+        self.fence_leader.saturating_add(self.fence_voter)
+    }
+
+    /// All skips, whatever proved them.
+    #[must_use]
+    pub fn total(self) -> u64 {
+        self.direct
+            .saturating_add(self.indirect)
+            .saturating_add(self.absent)
+            .saturating_add(self.fenced())
+    }
+}
+
 /// Drives a [`Dag`] forward one round at a time.
 #[derive(Debug, Clone)]
 pub struct Pacemaker {
@@ -139,6 +176,7 @@ pub struct Pacemaker {
     observed: u64,
     ticks_waited: u32,
     timeouts: u64,
+    skips: SkipCounts,
 }
 
 impl Pacemaker {
@@ -154,6 +192,7 @@ impl Pacemaker {
             observed: start_round,
             ticks_waited: 0,
             timeouts: 0,
+            skips: SkipCounts::default(),
         }
     }
 
@@ -183,6 +222,12 @@ impl Pacemaker {
     #[must_use]
     pub fn timeouts(&self) -> u64 {
         self.timeouts
+    }
+
+    /// How each skip decision was proved, since construction.
+    #[must_use]
+    pub fn skip_counts(&self) -> SkipCounts {
+        self.skips
     }
 
     /// Takes one logical tick.
@@ -326,6 +371,7 @@ impl Pacemaker {
                 return Ok(Advance::Commit);
             }
             Decision::Skip => {
+                self.skips.direct = self.skips.direct.saturating_add(1);
                 self.cursor = round + 1;
                 return Ok(Advance::Skip);
             }
@@ -337,6 +383,7 @@ impl Pacemaker {
         // rules: a commit always wins, and a fence only decides a round that is
         // otherwise stuck.
         if dag.skip_fenced_leader(round)? {
+            self.skips.fence_leader = self.skips.fence_leader.saturating_add(1);
             self.cursor = round + 1;
             return Ok(Advance::Skip);
         }
@@ -345,6 +392,7 @@ impl Pacemaker {
         // reach the `2f + 1` quorum, so the skip is safe under the fence's
         // declaration.
         if dag.skip_with_fence(round)? {
+            self.skips.fence_voter = self.skips.fence_voter.saturating_add(1);
             self.cursor = round + 1;
             return Ok(Advance::Skip);
         }
@@ -390,6 +438,7 @@ impl Pacemaker {
                         return Ok(Advance::Commit);
                     }
                     Decision::Skip => {
+                        self.skips.indirect = self.skips.indirect.saturating_add(1);
                         self.cursor = round + 1;
                         return Ok(Advance::Skip);
                     }
@@ -398,6 +447,7 @@ impl Pacemaker {
                         // rule bails out before checking reachability when the
                         // node does not hold the leader's vertex.
                         if self.skip_absent_leader(dag, &anchor)? {
+                            self.skips.absent = self.skips.absent.saturating_add(1);
                             self.cursor = round + 1;
                             return Ok(Advance::Skip);
                         }
@@ -762,6 +812,14 @@ mod tests {
         );
         assert_eq!(pacemaker.cursor(), 2);
         assert_eq!(fixture.dag.skipped().len(), 1);
+        assert_eq!(
+            pacemaker.skip_counts(),
+            SkipCounts {
+                fence_leader: 1,
+                ..SkipCounts::default()
+            },
+            "only the fenced-leader rule may release this round"
+        );
     }
 
     #[test]
@@ -823,6 +881,14 @@ mod tests {
             "one held vote plus one fenced missing voter is safe to skip: {after:?}"
         );
         assert_eq!(pacemaker.cursor(), 2);
+        assert_eq!(
+            pacemaker.skip_counts(),
+            SkipCounts {
+                fence_voter: 1,
+                ..SkipCounts::default()
+            },
+            "one held vote plus one fenced missing voter is the only proof"
+        );
     }
 
     #[test]
@@ -943,6 +1009,11 @@ mod tests {
         assert_eq!(skipped.round, 5);
         assert_eq!(skipped.author, b"val-1");
         assert!(skipped.digest.is_some(), "the leader's vertex is held");
+        assert_eq!(
+            pacemaker.skip_counts().fenced(),
+            0,
+            "an observed non-vote quorum needs no fence"
+        );
         assert_skipped_leaders_stay_uncommitted(&fixture);
     }
 
@@ -963,6 +1034,8 @@ mod tests {
         // The rounds around the gap still committed.
         assert!(fixture.dag.order().iter().any(|id| id.round == 6));
         assert!(fixture.dag.order().iter().any(|id| id.round == 7));
+        assert_eq!(pacemaker.skip_counts().fenced(), 0);
+        assert!(pacemaker.skip_counts().absent > 0);
     }
 
     #[test]

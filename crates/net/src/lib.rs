@@ -205,6 +205,12 @@ impl Node {
         self.round = round;
     }
 
+    /// How each skip decision was proved, since this node started.
+    #[must_use]
+    pub fn skip_counts(&self) -> validator::SkipCounts {
+        self.pacemaker.skip_counts()
+    }
+
     /// Adopts a verified committed order prefix from a snapshot.
     pub fn seed_order(&mut self, order: Vec<VertexId>) {
         self.dag.seed_order(order);

@@ -1055,15 +1055,17 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
 
 47. **The failure detector is a local silence report, not a decision.**
     `validator::FailureDetector` records the last round each validator was seen at
-    and reports those more than `--failure-rounds` rounds behind the highest round
-    the node holds. The threshold is in rounds, not wall time; zero disables it.
-    The detector is seeded from the restored DAG and fed by every accepted or
-    authored vertex, and it is exposed as `/status.silent` (`validator`,
-    `last_round`) plus one log line per new silence, cleared when the validator
-    returns. It feeds no commit, skip, or quorum rule: a local view is not shared
-    evidence, two nodes with different delivery may disagree, and a transition that
-    acts on a report must be authorized by the set (the checked set-change path,
-    D41).
+    and the highest round when that last round last advanced. A validator is
+    reported when the highest round has since advanced by more than
+    `--failure-rounds`; a node that is simply a few rounds behind but still
+    authoring is not failed. The threshold is in rounds, not wall time; zero
+    disables it. The detector is seeded from the restored DAG and fed by every
+    accepted or authored vertex, and it is exposed as `/status.silent`
+    (`validator`, `last_round`) plus one log line per new silence, cleared when
+    the validator returns. It feeds no commit, skip, or quorum rule: a local view
+    is not shared evidence, two nodes with different delivery may disagree, and a
+    transition that acts on a report must be authorized by the set (the checked
+    set-change path, D41).
     - Four-process devnet, checkpoints disabled, threshold 50: before the kill a
       survivor's `/status` reported `silent: []`. Node 0 was killed; after about a
       second the survivor reported node 0's validator address with `last_round`
@@ -1073,10 +1075,14 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       before the kill reported nothing.
     - The detector stores one entry per validator and recomputes the list per tick,
       O(n); a delivery gap is reported as quickly as a dead node, so the threshold
-      trades false positives for speed. It does not by itself recover the stalled
-      cursor; the restart replay in finding 46 does that for a returning node.
-      Permanent failure needs an authorized transition or a view change, which
-      remains open. Pinned by three `failure` unit tests over a fixed set.
+      trades false positives for speed. A run with an eight-round threshold once
+      fenced a healthy peer because absolute round numbers were compared; the
+      progress-based reading plus a one-second startup grace remove that false
+      positive. It does not by itself recover the stalled cursor; the restart
+      replay in finding 46 does that for a returning node. Permanent failure needs
+      an authorized transition or a view change. Pinned by four `failure` unit
+      tests over a fixed set, including a validator that stays five rounds behind
+      for twenty rounds without being reported.
 
 48. **A set change is a certificate, and activation is deterministic.**
     A `SetChange` names the chain, the old and new set ids, the activation epoch,
@@ -1127,13 +1133,22 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       `a_fenced_missing_voter_frees_a_live_leaders_round` pin the two rules; the
       first also checks that the round is not skipped before the certificate is
       applied.
-    - The automated four-process devnet test kills validator 0 after two certified
-      heights and requires all three survivors to certify at least five more;
-      they do, with 0 conflicts. The test is the regression for the permanent
+    - The automated four-process devnet test kills validator 0 after twenty
+      certified heights and requires all three survivors to certify at least five
+      more; they do, with 0 conflicts. The test is the regression for the permanent
       failure that motivated the fence. It does not assert that a fence was the
       mechanism, because the surviving quorum can also advance through the
       existing anchor rules; the fence unit tests are the direct evidence for the
       skip rule.
+    - `/status.skips` attributes each cursor move to `direct`, `indirect`,
+      `absent`, `fence_leader`, or `fence_voter`. In a 20 s release devnet with
+      threshold 50 and validator 0 killed, every survivor reported
+      `fence_leader: 40`, so the fence rule itself advanced the cursor rather than
+      only the anchor rules. The two fence unit tests assert the same attribution:
+      only the expected counter moves. In one debug run the survivors proposed
+      fences at rounds 60 and 64 because their cursors had diverged and the
+      signatures did not combine into a quorum; a declaration whose round does not
+      depend on each signer's cursor is the next view-change step.
     - The vote-fence rule treats the quorum declaration as authoritative for the
       missing voters. It is a view-change liveness rule, not a slashing proof; a
       falsely fenced honest validator that later equivocates remains outside the

@@ -28,7 +28,7 @@ pub use fence::{FENCE_VERSION_V1, Fence, FenceCertificate, FenceError};
 pub use finality::{Build, Certified, Finalizer, Share, VALIDATOR_SET_ID, signing_payload};
 pub use frontier::CommitFrontier;
 pub use header::{HEADER_VERSION_V1, Header, HeaderChain};
-pub use pacemaker::{Pacemaker, PacemakerConfig, Step};
+pub use pacemaker::{Pacemaker, PacemakerConfig, SkipCounts, Step};
 pub use schedule::{
     EpochSchedule, NO_EXPIRY, VALIDATOR_SET_VERSION_V1, ValidatorKey, ValidatorRecord,
     ValidatorSet, ValidatorSignature,

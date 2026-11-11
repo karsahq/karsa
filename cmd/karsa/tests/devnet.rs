@@ -180,18 +180,21 @@ fn a_four_process_devnet_keeps_moving_after_one_validator_dies() {
         &["--fence-silent", "--failure-rounds", "15"],
     );
 
-    let ready = wait_for(Duration::from_secs(10), || {
+    // Start from a chain all four nodes have already agreed on: an early kill
+    // leaves their cursors far apart, and a fence for one cursor's round does not
+    // cover another's.
+    let ready = wait_for(Duration::from_secs(15), || {
         for index in 0..VALIDATORS {
             let port = rpc_base + u16::try_from(index).expect("four ports fit a u16");
             let status = request(port, "/status")?;
-            if status["head_height"].as_u64().unwrap_or(0) < 2 {
+            if status["head_height"].as_u64().unwrap_or(0) < 20 {
                 return None;
             }
         }
         Some(())
     });
     if ready.is_none() {
-        devnet.fail("the four nodes never certified two heights");
+        devnet.fail("the four nodes never certified twenty heights");
     }
 
     let before: Vec<u64> = (1..VALIDATORS)
@@ -208,8 +211,8 @@ fn a_four_process_devnet_keeps_moving_after_one_validator_dies() {
     killed.wait().expect("reap validator 0");
 
     // The survivors must keep certifying. A round whose leader is missing is
-    // skipped once a quorum fence names the failed author; the point of this
-    // test is that the cursor does not stay on that round forever.
+    // released by an anchor or by a quorum fence; this test only requires that the
+    // cursor does not stay on it forever.
     let advanced = wait_for(Duration::from_secs(15), || {
         for (offset, index) in (1..VALIDATORS).enumerate() {
             let port = rpc_base + u16::try_from(index).expect("four ports fit a u16");

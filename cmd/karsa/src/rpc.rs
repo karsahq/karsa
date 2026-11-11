@@ -11,7 +11,7 @@
 //! | `POST /tx` | decode, verify, and admit a signed envelope; rejects replay and bad signatures |
 //! | `GET /tx/{id}` | which stage the transaction reached, and optionally a commit proof |
 //! | `GET /account/{addr}` | balance and Merkle proof against the *certified* state root |
-//! | `GET /status` | head, round, committed entries, applied transactions, peers |
+//! | `GET /status` | head, round, committed entries, applied transactions, peers, and skips by proof |
 //!
 //! # What is shared, and how
 //!
@@ -45,7 +45,7 @@ use sha2::{Digest, Sha256};
 use tx::address;
 use tx::envelope::{PROTOCOL_VERSION_V1, Transaction};
 use tx::policy::AuthPolicy;
-use validator::{CommitFrontier, CommitProof, Header, VertexId};
+use validator::{CommitFrontier, CommitProof, Header, SkipCounts, VertexId};
 
 use crate::chain::{self, TxResult};
 
@@ -188,6 +188,7 @@ struct RunView {
     applied_txs: u64,
     peers: usize,
     conflicts: usize,
+    skips: SkipCounts,
 }
 
 /// The mutex-protected state behind every endpoint.
@@ -312,6 +313,7 @@ impl RpcCore {
         applied_txs: u64,
         peers: usize,
         conflicts: usize,
+        skips: SkipCounts,
     ) {
         self.run = RunView {
             round,
@@ -319,6 +321,7 @@ impl RpcCore {
             applied_txs,
             peers,
             conflicts,
+            skips,
         };
     }
 
@@ -856,6 +859,13 @@ impl RpcCore {
             mempool: self.mempool.len(),
             peers: self.run.peers,
             conflicts: self.run.conflicts,
+            skips: SkipView {
+                direct: self.run.skips.direct,
+                indirect: self.run.skips.indirect,
+                absent: self.run.skips.absent,
+                fence_leader: self.run.skips.fence_leader,
+                fence_voter: self.run.skips.fence_voter,
+            },
             tracked_transactions: self.records.len(),
             silent: self.silent.clone(),
         }
@@ -1143,8 +1153,19 @@ struct StatusView {
     mempool: usize,
     peers: usize,
     conflicts: usize,
+    skips: SkipView,
     tracked_transactions: usize,
     silent: Vec<SilentView>,
+}
+
+/// How the decision rules moved the cursor, by proof.
+#[derive(Serialize)]
+struct SkipView {
+    direct: u64,
+    indirect: u64,
+    absent: u64,
+    fence_leader: u64,
+    fence_voter: u64,
 }
 
 #[derive(Deserialize)]

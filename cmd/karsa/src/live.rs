@@ -146,6 +146,14 @@ const SNAPSHOT_FLOOR_MARGIN: u64 = 2;
 /// frame per interval and lets a peer that reconnects catch up.
 const SET_CHANGE_TICKS: u32 = 25;
 
+/// Round-based silence is meaningful only after the mesh has finished starting.
+///
+/// A node that starts a few milliseconds late is many rounds behind, so a tight
+/// `--failure-rounds` could otherwise fence a healthy peer before it has had a
+/// chance to connect. The grace is wall-clock because startup skew is wall-clock;
+/// after it, silence is measured in rounds as before.
+const FENCE_STARTUP_GRACE: Duration = Duration::from_secs(1);
+
 /// One checked validator-set change a live run may propose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetChangeKind {
@@ -1327,7 +1335,11 @@ fn fence_candidate(node: &Node, silent: &[(Vec<u8>, u64)]) -> Option<(Vec<u8>, u
         let author = node.dag().leader_author(cursor)?;
         return silent
             .iter()
-            .find(|(validator, last_round)| validator.as_slice() == author && *last_round < cursor)
+            .find(|(validator, last_round)| {
+                validator.as_slice() == author
+                    && *last_round < cursor
+                    && validator.as_slice() != node.id()
+            })
             .map(|(validator, _)| (validator.clone(), cursor));
     }
     let voter_round = cursor.saturating_add(1);
@@ -1336,6 +1348,7 @@ fn fence_candidate(node: &Node, silent: &[(Vec<u8>, u64)]) -> Option<(Vec<u8>, u
         .iter()
         .find(|(validator, last_round)| {
             *last_round < voter_round
+                && validator.as_slice() != node.id()
                 && voters.validator(validator).is_some()
                 && node.dag().get(voter_round, validator).is_none()
         })
@@ -1344,6 +1357,10 @@ fn fence_candidate(node: &Node, silent: &[(Vec<u8>, u64)]) -> Option<(Vec<u8>, u
 
 /// Whether this node may sign a fence without contradicting its own view.
 fn may_sign_fence(node: &Node, failures: Option<&FailureDetector>, fence: &Fence) -> bool {
+    if fence.validator_id == node.id() {
+        // A quorum may declare this node failed; this node does not help.
+        return false;
+    }
     if !fence_relevant(node, fence.from_round, &fence.validator_id) {
         return false;
     }
@@ -2216,6 +2233,7 @@ async fn node_task(
             u64::try_from(applied).unwrap_or(u64::MAX),
             outbound.len(),
             finalizer.as_ref().map_or(0, Finalizer::conflicts),
+            node.skip_counts(),
         );
     }
 
@@ -2465,7 +2483,9 @@ async fn node_task(
                                 let pending = pending_fence.get_or_insert_with(|| {
                                     empty_fence_certificate(&certificate, &set)
                                 });
-                                if may_sign_fence(&node, failures.as_ref(), &certificate.fence) {
+                                if started.elapsed() >= FENCE_STARTUP_GRACE
+                                    && may_sign_fence(&node, failures.as_ref(), &certificate.fence)
+                                {
                                     let own = own_fence_share(
                                         &certificate.fence,
                                         &set,
@@ -2918,7 +2938,9 @@ async fn node_task(
                 // rule. It names validators this node has not seen for longer than
                 // the configured threshold; the line is printed once per silence.
                 let mut silent = Vec::new();
-                if let Some(failures) = failures.as_ref() {
+                if started.elapsed() >= FENCE_STARTUP_GRACE
+                    && let Some(failures) = failures.as_ref()
+                {
                     silent = failures.silent();
                     for (validator, last_round) in &silent {
                         if reported_silent.insert(validator.clone()) {
@@ -2991,6 +3013,7 @@ async fn node_task(
                         u64::try_from(applied).unwrap_or(u64::MAX),
                         outbound.len(),
                         finalizer.as_ref().map_or(0, Finalizer::conflicts),
+                        node.skip_counts(),
                     );
                     core.note_certified_heights(
                         finalizer

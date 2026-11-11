@@ -1,16 +1,19 @@
 //! A local liveness view over the DAG.
 //!
-//! The detector answers one question: which validators has this node not seen for
-//! more than `threshold` rounds? It reads only vertices the node holds, so the
-//! answer is a local view, not shared evidence. It is deliberately not a
-//! consensus input: two nodes with different delivery can hold different views,
-//! and a decision made from a local view could make their commit sequences
-//! diverge. A validator declared failed by this view is a *report*, and any
-//! transition that acts on it must be authorized and agreed on by the set
-//! (the checked set-change path in `set_change`).
+//! The detector answers one question: which validators have stopped advancing?
+//! It reads only vertices the node holds, so the answer is a local view, not
+//! shared evidence. It is deliberately not a consensus input: two nodes with
+//! different delivery can hold different views, and a decision made from a local
+//! view could make their commit sequences diverge. A validator declared failed by
+//! this view is a *report*, and any transition that acts on it must be authorized
+//! and agreed on by the set (the checked set-change path in `set_change`).
 //!
 //! The unit is rounds, not wall time: rounds are the protocol's own clock, and a
-//! node that is slow to receive can only report what it has seen.
+//! node that is slow to receive can only report what it has seen. Silence is
+//! measured as *lack of progress*: a validator is silent when the fastest author
+//! this node has seen advanced `threshold` rounds without that validator
+//! advancing. Comparing absolute rounds instead would call a node that simply
+//! started a few rounds behind silent forever, because its offset never closes.
 
 use std::collections::BTreeMap;
 
@@ -23,6 +26,11 @@ pub struct FailureDetector {
     threshold: u64,
     highest: u64,
     last: BTreeMap<Vec<u8>, u64>,
+    /// The highest round seen when this author last advanced.
+    ///
+    /// A node that is consistently a few rounds behind still advances its last
+    /// round every time it authors; only the gap from this mark is silence.
+    advanced_at: BTreeMap<Vec<u8>, u64>,
 }
 
 impl FailureDetector {
@@ -41,6 +49,7 @@ impl FailureDetector {
             threshold,
             highest: 0,
             last: BTreeMap::new(),
+            advanced_at: BTreeMap::new(),
         }
     }
 
@@ -51,7 +60,12 @@ impl FailureDetector {
     pub fn observe(&mut self, round: u64, author: &[u8]) {
         self.highest = self.highest.max(round);
         let last = self.last.entry(author.to_vec()).or_insert(round);
-        *last = (*last).max(round);
+        if round > *last {
+            *last = round;
+            self.advanced_at.insert(author.to_vec(), self.highest);
+        } else if !self.advanced_at.contains_key(author) {
+            self.advanced_at.insert(author.to_vec(), self.highest);
+        }
     }
 
     /// The highest round this detector has seen.
@@ -66,7 +80,8 @@ impl FailureDetector {
         self.threshold
     }
 
-    /// Validators silent for more than `threshold` rounds, in set order.
+    /// Validators that have not advanced for more than `threshold` rounds, in
+    /// set order.
     ///
     /// The second value is the last round each one was seen at; zero means it has
     /// never been seen. The list is empty when the threshold is zero.
@@ -78,8 +93,13 @@ impl FailureDetector {
         self.authors
             .iter()
             .filter_map(|author| {
-                let last = self.last.get(author).copied().unwrap_or(0);
-                (self.highest.saturating_sub(last) > self.threshold).then(|| (author.clone(), last))
+                let last = self.last.get(author).copied();
+                // Never seen: silence is measured from round zero, so a peer that
+                // never connects is reported. Seen: silence is measured from the
+                // point its last round advanced, not from that round itself.
+                let since = self.advanced_at.get(author).copied().unwrap_or(0);
+                (self.highest.saturating_sub(since) > self.threshold)
+                    .then(|| (author.clone(), last.unwrap_or(0)))
             })
             .collect()
     }
@@ -162,6 +182,26 @@ mod tests {
         assert_eq!(detector.silent().len(), 1, "val-0 missed four rounds");
         detector.observe(6, b"val-0");
         assert!(detector.silent().is_empty(), "a return clears the report");
+    }
+
+    #[test]
+    fn a_constant_lag_is_not_silence() {
+        // `val-3` started a few rounds late, so its absolute round stays behind.
+        // It advances every round, which is liveness; the detector must not call
+        // that silence forever.
+        let mut detector = FailureDetector::new(&set(), 2);
+        for round in 1..=20 {
+            for author in 0..3 {
+                detector.observe(round, format!("val-{author}").as_bytes());
+            }
+            if round > 5 {
+                detector.observe(round - 5, b"val-3");
+            }
+        }
+        assert!(
+            detector.silent().is_empty(),
+            "an advancing validator is not silent just because it is behind"
+        );
     }
 
     #[test]
