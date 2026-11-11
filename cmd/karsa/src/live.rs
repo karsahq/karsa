@@ -64,6 +64,12 @@ use crate::rpc::{self, RpcCore, SharedRpc};
 const WANT_LIMIT: usize = 4096;
 /// How often an unanswered want is repeated.
 const WANT_RETRY: Duration = Duration::from_millis(250);
+/// How long the cursor must sit still before asking for missing voter slots.
+///
+/// The reference scans cannot see a vote that was broadcast while this node was
+/// down and that no later vertex names. Waiting a moment first keeps the slot
+/// request out of the ordinary commit path.
+const WANT_SLOT_AFTER: Duration = Duration::from_millis(200);
 /// Attempts before a want is abandoned and counted.
 const WANT_TRIES: u8 = 8;
 /// Control frames a peer may have queued: wants and their answers.
@@ -2664,6 +2670,18 @@ async fn node_task(
                             }
                         }
                     }
+                    Message::WantSlot { round, author } => {
+                        // The requester knows the round and the author from the
+                        // set but not the digest. Answer only with a vertex this
+                        // node still holds; a pruned round is already covered by
+                        // the requester's snapshot or out of scope.
+                        if let Some(vertex) = node.dag().get(round, &author) {
+                            if let Ok(bytes) = wire::frame(&Message::Vertex(vertex.clone()), now()) {
+                                broadcast(&outbound, true, &bytes, &mut dropped);
+                                served += 1;
+                            }
+                        }
+                    }
                     Message::Vertex(vertex) => {
                         if let Ok(id) = vertex.id()
                             && wanted.remove(&id).is_some()
@@ -3694,6 +3712,49 @@ async fn node_task(
                             broadcast(&outbound, true, &bytes, &mut dropped);
                         }
                     }
+                    // A vote broadcast while this node was down is invisible to
+                    // both scans above when no later vertex names it: the DAG has
+                    // no edge to ask about. Once the cursor has been still for a
+                    // moment, ask for every missing voter slot of its voting round
+                    // by round and author. A peer that still holds one answers
+                    // with a vertex, which is the same repair a named want gets.
+                    if cursor_since.elapsed() >= WANT_SLOT_AFTER {
+                        // The leader slot itself. A restart can resume below a
+                        // vertex a later anchor references, and the digest want
+                        // for it may already have been abandoned while the links
+                        // were still reconnecting.
+                        if node.dag().leader(cursor).is_none()
+                            && let Some(author) = node.dag().leader_author(cursor)
+                            && !node.dag().is_fenced(author, cursor)
+                        {
+                            let request = Message::WantSlot {
+                                round: cursor,
+                                author: author.to_vec(),
+                            };
+                            if let Ok(bytes) = wire::frame(&request, now()) {
+                                broadcast(&outbound, true, &bytes, &mut dropped);
+                            }
+                        }
+                        if node.dag().leader(cursor).is_some() {
+                            let voting = cursor.saturating_add(1);
+                            let voters = node.dag().set_for_round(voting).clone();
+                            for record in &voters.validators {
+                                if record.validator_id.as_slice() == node.id()
+                                    || node.dag().get(voting, &record.validator_id).is_some()
+                                    || node.dag().is_fenced(&record.validator_id, voting)
+                                {
+                                    continue;
+                                }
+                                let request = Message::WantSlot {
+                                    round: voting,
+                                    author: record.validator_id.clone(),
+                                };
+                                if let Ok(bytes) = wire::frame(&request, now()) {
+                                    broadcast(&outbound, true, &bytes, &mut dropped);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // A checkpoint is a fresh anchor for the next restart. Without
@@ -3936,6 +3997,8 @@ async fn archive_task(
                     }
                     // An archive decides nothing, so a want is not addressed to it.
                     Message::Want(_) => {}
+                    // A slot want is the same repair as a named want.
+                    Message::WantSlot { .. } => {}
                     // An archive does not certify; the shares it receives are for
                     // validators to build certificates from.
                     Message::Share(_) => {}

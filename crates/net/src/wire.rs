@@ -14,6 +14,8 @@
 //! - [`Message::Hello`] is the first frame on a link and names the chain.
 //! - [`Message::Vertex`] is the broadcast.
 //! - [`Message::Want`] asks a peer for one vertex by id.
+//! - [`Message::WantSlot`] asks a peer for the vertex one author made in one
+//!   round, for a vote that was broadcast while this node was down.
 //! - [`Message::Payload`] carries the batch a vertex names, on the data plane.
 //! - [`Message::Control`] carries a control payload a vertex names, on the same
 //!   causal plane as a batch.
@@ -72,13 +74,14 @@ const KIND_SET_CHANGE: u8 = 9;
 const KIND_FENCE: u8 = 10;
 const KIND_ROUND_SKIP: u8 = 11;
 const KIND_CONTROL: u8 = 12;
+const KIND_WANT_SLOT: u8 = 13;
 
 /// The framing and message layout this build speaks.
 ///
 /// A peer that answers with another number is not necessarily hostile; it may be a
 /// different build. The link is closed rather than parsed optimistically, because
 /// the next frame kind could mean something else there.
-pub const WIRE_PROTOCOL: u16 = 11;
+pub const WIRE_PROTOCOL: u16 = 12;
 
 /// The first frame on every link: which chain the sender is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +151,17 @@ pub enum Message {
     Vertex(Vertex),
     /// A request for one vertex, named by id.
     Want(VertexId),
+    /// A request for the vertex one author authored in one round.
+    ///
+    /// The missing-reference scan cannot find a vote that was broadcast while
+    /// this node was down and is not named by any later reference; the requester
+    /// knows only the round and the author from the set.
+    WantSlot {
+        /// Round the requested vertex must be in.
+        round: u64,
+        /// Validator that authored the requested vertex.
+        author: Vec<u8>,
+    },
     /// A batch a vertex names, sent on the data plane.
     Payload(Batch),
     /// A protocol payload a vertex names, carrying the same causal weight as a
@@ -438,6 +452,12 @@ pub fn frame(message: &Message, sent_at_nanos: u64) -> Result<Vec<u8>, CryptoErr
         }
         Message::Vertex(vertex) => (KIND_VERTEX, vertex.encode()?),
         Message::Want(id) => (KIND_WANT, encode_id(id)?),
+        Message::WantSlot { round, author } => {
+            let mut encoder = Encoder::with_capacity(8 + 4 + author.len());
+            encoder.put_u64(*round);
+            encoder.put_bytes(author)?;
+            (KIND_WANT_SLOT, encoder.finish())
+        }
         Message::Payload(batch) => (KIND_PAYLOAD, batch.encode()?),
         Message::Control(payload) => (KIND_CONTROL, payload.encode()?),
         Message::Share(share) => (KIND_SHARE, encode_share(share)?),
@@ -512,6 +532,13 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
         }
         KIND_VERTEX => Message::Vertex(Vertex::decode(payload)?),
         KIND_WANT => Message::Want(decode_id(&mut Decoder::new(payload))?),
+        KIND_WANT_SLOT => {
+            let mut decoder = Decoder::new(payload);
+            let round = decoder.read_u64()?;
+            let author = decoder.read_bytes()?.to_vec();
+            decoder.finish()?;
+            Message::WantSlot { round, author }
+        }
         KIND_PAYLOAD => Message::Payload(Batch::decode(payload)?),
         KIND_CONTROL => Message::Control(Box::new(ControlPayload::decode(payload)?)),
         KIND_SHARE => Message::Share(decode_share(payload)?),
@@ -627,6 +654,17 @@ mod tests {
         let mut buffer = frame(&Message::Want(want(7)), 11).unwrap();
         let frame = take_frame(&mut buffer).unwrap().unwrap();
         assert_eq!(frame.message, Message::Want(want(7)));
+    }
+
+    #[test]
+    fn a_want_slot_frame_round_trips() {
+        let request = Message::WantSlot {
+            round: 91,
+            author: b"val-2".to_vec(),
+        };
+        let mut buffer = frame(&request, 12).unwrap();
+        let frame = take_frame(&mut buffer).unwrap().unwrap();
+        assert_eq!(frame.message, request);
     }
 
     #[test]

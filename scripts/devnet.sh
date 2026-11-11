@@ -43,6 +43,11 @@ FENCE_SILENT=${FENCE_SILENT:-}
 ROUND_SKIP=${ROUND_SKIP:-}
 FAILURE_ROUNDS=${FAILURE_ROUNDS:-50}
 BIN=${BIN:-target/release/karsa}
+# One tokio worker and one verifier per process by default. Four validators on
+# one four-core host otherwise oversubscribe the machine hard enough to trip the
+# hardware watchdog; raise these when the host has headroom.
+WORKERS=${WORKERS:-1}
+VERIFY_THREADS=${VERIFY_THREADS:-1}
 VALIDATORS=${VALIDATORS:-4}
 
 CHANGE_ARGS=""
@@ -93,7 +98,7 @@ trap stop INT TERM
 
 i=0
 while [ "$i" -lt "$VALIDATORS" ]; do
-    "$BIN" live \
+    TOKIO_WORKER_THREADS=$WORKERS "$BIN" live \
         --validators "$VALIDATORS" \
         --node-index "$i" \
         --port-base "$PORT_BASE" \
@@ -104,6 +109,7 @@ while [ "$i" -lt "$VALIDATORS" ]; do
         --timeout-seconds "$LIFETIME" \
         --checkpoint-every "$CHECKPOINT_EVERY" \
         --failure-rounds "$FAILURE_ROUNDS" \
+        --verify-threads "$VERIFY_THREADS" \
         --home "$DEVNET" \
         --store "$DEVNET/data" \
         $CHANGE_ARGS \
