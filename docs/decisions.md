@@ -2094,6 +2094,63 @@ same requirement D59 met for set changes by carrying the certificate in the
 snapshot and the store, and it is the last blocker for freeing `cursor 73`
 without the finality race.
 
+## D72 — Stage B: a certificate only counts inside the selected anchor's history
+
+**Tried (opt-in).** Wire protocol 11 adds `ControlPayload` and
+`Message::Control`; a vertex names a round-skip certificate by hash and the live
+builder authors that binding vertex. The first live version let a held proof
+preempt the anchor rule and made the pacemaker wait on a pending payload. A
+four-node devnet converged on one certified head but finality stopped there: a
+node with the certificate skipped while a node with an anchor committed the
+leader's history, splitting the same prefix across different header boundaries.
+
+**Revised (stage B).** The preempting rule and the pending wait are gone. A held
+certificate is no longer a decision. `Dag::anchor_skip` walks the causal history
+of the anchor the pacemaker actually selected and reports a certificate only
+when:
+
+- the binding vertex is an ancestor of that anchor;
+- the leader the proof names is an ancestor;
+- every vote and non-vote the proof lists is an ancestor.
+
+A listed id outside the history is not causal evidence for this anchor and is
+ignored. An ancestor the node does not hold is `MissingReference`, so the caller
+repairs the anchor history instead of deciding on a partial one. If more than
+one valid proof is in the same history, the reported one is chosen by digest
+order; both imply a skip, so the decision does not depend on which arrives
+first. A proof that is not in the selected anchor's history does not delay the
+decision at all.
+
+**Stage B keeps the anchor decision.** The pacemaker calls `anchor_skip` before
+`try_indirect_decide` to prove the causal path is complete, but it ignores the
+returned certificate: a round that the anchor rule commits still commits. The
+purpose is to isolate the determinism question from the transaction question.
+Overriding a commit with a skip changes what happens to the skipped leader's
+batch, and that needs a recovery path before it is used live.
+
+*Measured (unit).* Four new tests pin the stage-B rule:
+`a_certificate_in_the_selected_anchors_history_does_not_change_the_decision`
+(reported, anchor still commits, `attested` stays 0),
+`a_certificate_outside_the_selected_anchors_history_is_ignored`,
+`a_certificate_whose_evidence_is_outside_the_anchor_history_is_ignored`, and
+`a_missing_ancestor_stops_the_certificate_check` (`MissingReference`). The full
+gate passes: fmt, clippy `-D warnings`, 478 default tests and 479 all-features
+tests.
+
+*Measured (functional).* A four-validator release devnet with
+`ROUND_SKIP=1 FENCE_SILENT=1 FAILURE_ROUNDS=15 CHECKPOINT_EVERY=128` built about
+200 certificates per node and stayed healthy: after twenty seconds three nodes
+reported the same certified height 2,368 and 10,463 committed entries, the
+fourth was two heights ahead, and `attested` was 0 on every node. No node
+skipped a round on the certificate; the chain followed the anchor rule exactly.
+
+**Open.** Stage A will let a valid causal certificate turn a commit into a skip.
+That is only safe to run live after a skipped batch is returned to the mempool
+(or otherwise re-authored), because the leader's transactions are not final
+through that anchor. The recovery path needs retry, deduplication, and
+persistence tests of its own. Until then the default chain does not use the
+certificate rule.
+
 ## Open decisions
 
 1. **Does a node serve history it does not hold?** Model B says no beyond the

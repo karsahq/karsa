@@ -1325,6 +1325,30 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       every node commits the same prefix at the same height before the cursor
       moves.
 
+58. **A certificate only counts inside the selected anchor's history.**
+    Wire protocol 11 adds `ControlPayload` and `Message::Control`: a vertex names
+    a round-skip certificate by hash and the live builder authors that binding
+    vertex. `Dag::anchor_skip` walks the causal history of the anchor the
+    pacemaker actually selected and reports a certificate only when the binding
+    vertex, the leader, and every listed vote/non-vote are ancestors. An id
+    outside the history is not causal evidence; a missing ancestor is
+    `MissingReference`, so the node repairs instead of deciding on a partial
+    history. Stage B reports the certificate but keeps the anchor decision, so a
+    commit stays a commit.
+    - Four tests pin the rule: a certificate in the selected anchor's history is
+      reported without moving the decision, one outside the history is ignored,
+      one whose evidence is outside is ignored, and a missing ancestor surfaces
+      as `MissingReference`.
+    - A four-node release devnet with `ROUND_SKIP=1 FENCE_SILENT=1` built about
+      200 certificates per node and stayed healthy: three nodes agreed on
+      certified height 2,368 and 10,463 committed entries after twenty seconds,
+      the fourth was two heights ahead, and `attested` stayed 0. No node skipped
+      on the certificate.
+    - Stage A (a causal certificate turns a commit into a skip) still needs a
+      batch-recovery path before live use: a skipped leader's transactions are
+      not final through that anchor, and returning them to the mempool needs
+      retry, deduplication, and persistence tests.
+
 ## Build order
 
 | Stage | Crate | State |

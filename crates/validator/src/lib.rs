@@ -7,6 +7,7 @@
 
 mod address;
 mod certificate;
+mod control;
 mod dag;
 mod failure;
 mod fence;
@@ -23,7 +24,8 @@ pub use address::validator_address;
 pub use certificate::{
     CERTIFICATE_VERSION_V1, Certificate, bit_is_set, bitmap_len, bitmap_of, set_bit,
 };
-pub use dag::{CommitProof, Dag, Decision, SkippedRound, commit_leaf, commit_root};
+pub use control::{CONTROL_PAYLOAD_DOMAIN, CONTROL_PAYLOAD_VERSION_V1, ControlPayload};
+pub use dag::{AnchorSkip, CommitProof, Dag, Decision, SkippedRound, commit_leaf, commit_root};
 pub use failure::FailureDetector;
 pub use fence::{FENCE_VERSION_V1, Fence, FenceCertificate, FenceError};
 pub use finality::{Build, Certified, Finalizer, Share, VALIDATOR_SET_ID, signing_payload};

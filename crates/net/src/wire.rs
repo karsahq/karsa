@@ -9,12 +9,14 @@
 //! u32 body length || u64 sent-at nanos || u8 kind || payload
 //! ```
 //!
-//! Ten kinds share a link:
+//! Eleven kinds share a link:
 //!
 //! - [`Message::Hello`] is the first frame on a link and names the chain.
 //! - [`Message::Vertex`] is the broadcast.
 //! - [`Message::Want`] asks a peer for one vertex by id.
 //! - [`Message::Payload`] carries the batch a vertex names, on the data plane.
+//! - [`Message::Control`] carries a control payload a vertex names, on the same
+//!   causal plane as a batch.
 //! - [`Message::Share`] carries one validator's signature over a header.
 //! - [`Message::SnapshotWant`] and [`Message::Snapshot`] are a snapshot link.
 //! - [`Message::Tx`] gossips one signed envelope so every node can track it.
@@ -44,7 +46,7 @@ use crypto::encoding::{Decoder, Encoder};
 use crypto::{CryptoError, CryptoErrorKind};
 use tx::batch::Batch;
 use validator::{
-    Certificate, CommitFrontier, FenceCertificate, Header, RoundSkipProof, Share,
+    Certificate, CommitFrontier, ControlPayload, FenceCertificate, Header, RoundSkipProof, Share,
     TransitionCertificate, Vertex, VertexId,
 };
 
@@ -69,13 +71,14 @@ const KIND_TX: u8 = 8;
 const KIND_SET_CHANGE: u8 = 9;
 const KIND_FENCE: u8 = 10;
 const KIND_ROUND_SKIP: u8 = 11;
+const KIND_CONTROL: u8 = 12;
 
 /// The framing and message layout this build speaks.
 ///
 /// A peer that answers with another number is not necessarily hostile; it may be a
 /// different build. The link is closed rather than parsed optimistically, because
 /// the next frame kind could mean something else there.
-pub const WIRE_PROTOCOL: u16 = 10;
+pub const WIRE_PROTOCOL: u16 = 11;
 
 /// The first frame on every link: which chain the sender is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +150,13 @@ pub enum Message {
     Want(VertexId),
     /// A batch a vertex names, sent on the data plane.
     Payload(Batch),
+    /// A protocol payload a vertex names, carrying the same causal weight as a
+    /// batch.
+    ///
+    /// The first such payload is a round-skip certificate. The frame is the data
+    /// plane for that payload; the vertex that names its digest is what gives it
+    /// a position in the DAG.
+    Control(Box<ControlPayload>),
     /// One validator's signature over one header.
     Share(Share),
     /// A request for a state snapshot, sent on a dedicated snapshot link.
@@ -429,6 +439,7 @@ pub fn frame(message: &Message, sent_at_nanos: u64) -> Result<Vec<u8>, CryptoErr
         Message::Vertex(vertex) => (KIND_VERTEX, vertex.encode()?),
         Message::Want(id) => (KIND_WANT, encode_id(id)?),
         Message::Payload(batch) => (KIND_PAYLOAD, batch.encode()?),
+        Message::Control(payload) => (KIND_CONTROL, payload.encode()?),
         Message::Share(share) => (KIND_SHARE, encode_share(share)?),
         Message::SnapshotWant => (KIND_SNAPSHOT_WANT, Vec::new()),
         Message::Snapshot(snapshot) => (KIND_SNAPSHOT, encode_snapshot(snapshot)?),
@@ -502,6 +513,7 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
         KIND_VERTEX => Message::Vertex(Vertex::decode(payload)?),
         KIND_WANT => Message::Want(decode_id(&mut Decoder::new(payload))?),
         KIND_PAYLOAD => Message::Payload(Batch::decode(payload)?),
+        KIND_CONTROL => Message::Control(Box::new(ControlPayload::decode(payload)?)),
         KIND_SHARE => Message::Share(decode_share(payload)?),
         KIND_SNAPSHOT_WANT => {
             if !payload.is_empty() {
@@ -773,6 +785,15 @@ mod tests {
         let frame = take_frame(&mut buffer).unwrap().unwrap();
         assert_eq!(frame.message, Message::RoundSkip(Box::new(proof)));
         assert_eq!(frame.sent_at_nanos, 19);
+    }
+
+    #[test]
+    fn a_control_payload_frame_round_trips() {
+        let payload = ControlPayload::RoundSkip(Box::new(round_skip_proof()));
+        let mut buffer = frame(&Message::Control(Box::new(payload.clone())), 20).unwrap();
+        let frame = take_frame(&mut buffer).unwrap().unwrap();
+        assert_eq!(frame.message, Message::Control(Box::new(payload)));
+        assert_eq!(frame.sent_at_nanos, 20);
     }
 
     #[test]

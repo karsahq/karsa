@@ -33,7 +33,7 @@ use crypto::registry::ALG_ED25519;
 use crypto::scheme::Ed25519Scheme;
 use crypto::{CryptoError, CryptoErrorKind};
 use validator::{
-    CommitFrontier, Dag, Fence, FenceCertificate, FenceError, NO_EXPIRY, Pacemaker,
+    CommitFrontier, ControlPayload, Dag, Fence, FenceCertificate, FenceError, NO_EXPIRY, Pacemaker,
     PacemakerConfig, RoundSkipCheck, RoundSkipError, RoundSkipProof, SetChangeError, Step,
     Transition, TransitionCertificate, ValidatorKey, ValidatorRecord, ValidatorSet, Vertex,
     VertexId,
@@ -133,12 +133,14 @@ impl Node {
         private_key: Vec<u8>,
         chain_id: Vec<u8>,
     ) -> Self {
+        let mut dag = Dag::with_epoch_length(set, epoch_rounds);
+        dag.set_chain_id(chain_id.clone());
         Self {
             id,
             private_key,
             chain_id,
             round: 0,
-            dag: Dag::with_epoch_length(set, epoch_rounds),
+            dag,
             pacemaker: Pacemaker::new(PacemakerConfig::default(), 1),
             authored: 0,
         }
@@ -163,12 +165,14 @@ impl Node {
         private_key: Vec<u8>,
         chain_id: Vec<u8>,
     ) -> Result<Self, CryptoError> {
+        let mut dag = Dag::with_epoch_length_and_change(set, next, change_epoch, epoch_rounds)?;
+        dag.set_chain_id(chain_id.clone());
         Ok(Self {
             id,
             private_key,
             chain_id,
             round: 0,
-            dag: Dag::with_epoch_length_and_change(set, next, change_epoch, epoch_rounds)?,
+            dag,
             pacemaker: Pacemaker::new(PacemakerConfig::default(), 1),
             authored: 0,
         })
@@ -282,6 +286,30 @@ impl Node {
         proof: RoundSkipProof,
     ) -> Result<RoundSkipCheck, RoundSkipError> {
         self.dag.apply_round_skip(&self.chain_id, proof)
+    }
+
+    /// Installs a control payload received on the data plane.
+    ///
+    /// The payload is applied only when the vertex that names its digest is
+    /// held, so the skip has a causal position in the DAG.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`validator::ControlPayload::digest`].
+    pub fn add_control(&mut self, payload: ControlPayload) -> Result<[u8; 32], CryptoError> {
+        self.dag.add_control(payload)
+    }
+
+    /// Applies every control payload whose binding vertex and evidence are
+    /// available.
+    ///
+    /// # Errors
+    ///
+    /// No error is returned; a permanently invalid payload is reported in the
+    /// result and dropped, while a payload with missing evidence stays queued.
+    #[must_use]
+    pub fn apply_ready_controls(&mut self) -> Vec<(u64, Result<RoundSkipCheck, RoundSkipError>)> {
+        self.dag.apply_controls(&self.chain_id)
     }
 
     /// The round-skip proof this node adopted for `round`, if any.

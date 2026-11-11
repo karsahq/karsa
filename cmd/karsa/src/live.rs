@@ -51,9 +51,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tx::batch::Batch;
 use validator::{
-    Certificate, FailureDetector, Fence, FenceCertificate, Finalizer, Header, NoVoteAttestation,
-    RoundSkip, RoundSkipError, RoundSkipProof, SetChange, SetSchedule, Step, TransitionCertificate,
-    ValidatorSet, VertexId, bitmap_len, commit_root, set_bit,
+    Certificate, ControlPayload, FailureDetector, Fence, FenceCertificate, Finalizer, Header,
+    NoVoteAttestation, RoundSkip, RoundSkipProof, SetChange, SetSchedule, Step,
+    TransitionCertificate, ValidatorSet, VertexId, bitmap_len, commit_root, set_bit,
 };
 
 use crate::chain;
@@ -145,6 +145,24 @@ const SNAPSHOT_FLOOR_MARGIN: u64 = 2;
 /// The certificate is the durable authorization; repeating it costs one small
 /// frame per interval and lets a peer that reconnects catch up.
 const SET_CHANGE_TICKS: u32 = 25;
+/// Additional rounds a live node may author past its decision cursor while the
+/// round-skip experiment is enabled.
+///
+/// Settling round `r` through an anchor needs rounds `r + 2` and `r + 3`, so a
+/// small lead is required. Authoring thousands of rounds ahead is not: those
+/// rounds cannot commit before the cursor moves, and they widen the window in
+/// which different delivery lets two nodes make different skip decisions. The
+/// effective lead is raised above the failure-detector threshold, and the cap
+/// is off without `--round-skip` and in closed-loop modes, where the harness
+/// owns the round budget.
+const AUTHORING_LEAD: u64 = 12;
+
+/// How often an adopted control payload is repeated for a peer that joined late.
+///
+/// A control payload is named by a vertex, so the vertex reference and its want
+/// sweep are the primary repair path; the periodic repeat only covers a peer that
+/// missed both halves while it was away.
+const CONTROL_REBROADCAST_TICKS: u32 = 1000;
 
 /// Round-based silence is meaningful only after the mesh has finished starting.
 ///
@@ -935,7 +953,11 @@ fn restore(
 
     // Round skips are decision inputs: replaying the same vertices without them
     // could choose a different order and fail the stored head root.
+    let mut control_digests: HashSet<[u8; 32]> = HashSet::new();
     for proof in store.round_skips().map_err(|error| error.to_string())? {
+        if let Ok(digest) = ControlPayload::RoundSkip(Box::new(proof.clone())).digest() {
+            control_digests.insert(digest);
+        }
         node.apply_round_skip(proof)
             .map_err(|error| format!("stored round skip is not authorized: {error}"))?;
     }
@@ -955,6 +977,10 @@ fn restore(
         let Some(vertex) = node.dag().get(id.round, &id.author) else {
             break;
         };
+        if vertex.payload_hash == [0u8; 32] || control_digests.contains(&vertex.payload_hash) {
+            *live.applied_cursor += 1;
+            continue;
+        }
         let Some(batch) = live.batches.get(&vertex.payload_hash) else {
             break;
         };
@@ -1089,7 +1115,11 @@ fn restore_live(
 
     // Round skips above the snapshot floor are decision inputs for the tail
     // replay; the ones below it are already part of the adopted prefix.
+    let mut control_digests: HashSet<[u8; 32]> = HashSet::new();
     for proof in store.round_skips().map_err(|error| error.to_string())? {
+        if let Ok(digest) = ControlPayload::RoundSkip(Box::new(proof.clone())).digest() {
+            control_digests.insert(digest);
+        }
         node.apply_round_skip(proof)
             .map_err(|error| format!("stored round skip is not authorized: {error}"))?;
     }
@@ -1116,7 +1146,7 @@ fn restore_live(
         let Some(vertex) = node.dag().get(id.round, &id.author) else {
             break;
         };
-        if vertex.payload_hash == [0u8; 32] {
+        if vertex.payload_hash == [0u8; 32] || control_digests.contains(&vertex.payload_hash) {
             *live.applied_cursor += 1;
             continue;
         }
@@ -2416,6 +2446,19 @@ async fn node_task(
     };
     let mut round_skip_dirty = !round_skips.is_empty();
 
+    // Control payloads this node holds, by digest, with the round they target.
+    // A vertex that names a control carries no transactions; the execution loop
+    // steps over it without waiting for a batch.
+    let mut control_payloads: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+    for proof in round_skips.values() {
+        if let Ok(digest) = ControlPayload::RoundSkip(Box::new(proof.clone())).digest() {
+            control_payloads.insert(digest, proof.attestation.skip.round());
+        }
+    }
+    // A locally built certificate waits for a vertex to bind it. It is not a
+    // decision before that vertex is held.
+    let mut pending_control: Option<([u8; 32], RoundSkipProof)> = None;
+
     let mut failure_epoch = node.dag().set_for_round(node.round()).epoch;
     let mut failures = (config.failure_rounds > 0).then(|| {
         FailureDetector::new(
@@ -2800,56 +2843,34 @@ async fn node_task(
                             }
                         }
                     }
-                    Message::RoundSkip(proof) => {
-                        let proof = *proof;
-                        let round = proof.attestation.skip.round();
-                        if let Some(existing) = round_skips.get(&round) {
-                            if existing != &proof {
-                                rejected += 1;
+                    Message::Control(payload) => {
+                        let round = payload.round();
+                        match node.add_control(*payload) {
+                            Ok(digest) => {
+                                control_payloads.insert(digest, round);
                             }
-                        } else {
-                            match node.apply_round_skip(proof.clone()) {
-                                Ok(check) => {
-                                    if let Some(store) = &store {
-                                        store
-                                            .put_round_skip(&proof)
-                                            .map_err(|error| error.to_string())?;
-                                    }
-                                    println!(
-                                        "node val-{index} adopted a round skip at round {round} \
-                                         ({} votes, {} non-votes, {} missing)",
-                                        check.votes, check.non_votes, check.missing
-                                    );
-                                    round_skips.insert(round, proof);
-                                    round_skip_dirty = true;
-                                }
-                                Err(RoundSkipError::MissingEvidence(id)) => {
-                                    // The proof is evidence, not a command: ask for
-                                    // the missing vertex and let the sender
-                                    // rebroadcast rather than accepting less.
-                                    rejected += 1;
-                                    if wanted.len() < WANT_LIMIT
-                                        && !wanted.contains_key(&id)
-                                        && let Ok(bytes) =
-                                            wire::frame(&Message::Want(id.clone()), now())
-                                    {
-                                        broadcast(&outbound, true, &bytes, &mut dropped);
-                                        wanted.insert(
-                                            id,
-                                            Want {
-                                                at: Instant::now(),
-                                                tries: 0,
-                                            },
-                                        );
-                                        wanted_total += 1;
-                                    }
-                                }
-                                Err(error) => {
-                                    rejected += 1;
-                                    eprintln!(
-                                        "node {index} refused a round skip at round {round}: {error}"
-                                    );
-                                }
+                            Err(error) => {
+                                rejected += 1;
+                                eprintln!(
+                                    "node {index} refused a control payload at round {round}: {error}"
+                                );
+                            }
+                        }
+                    }
+                    // The legacy control frame carries the same evidence. It is
+                    // installed as a pending payload, not applied here: only the
+                    // vertex that names its digest makes it a decision.
+                    Message::RoundSkip(proof) => {
+                        let round = proof.attestation.skip.round();
+                        match node.add_control(ControlPayload::RoundSkip(proof)) {
+                            Ok(digest) => {
+                                control_payloads.insert(digest, round);
+                            }
+                            Err(error) => {
+                                rejected += 1;
+                                eprintln!(
+                                    "node {index} refused a round skip at round {round}: {error}"
+                                );
                             }
                         }
                     }
@@ -2924,20 +2945,47 @@ async fn node_task(
                     }
                     fence_dirty = false;
                 }
-                if round_skip_dirty || ticks % SET_CHANGE_TICKS == 0 {
+                if round_skip_dirty || ticks % CONTROL_REBROADCAST_TICKS == 0 {
                     for proof in round_skips.values() {
-                        let bytes =
-                            wire::frame(&Message::RoundSkip(Box::new(proof.clone())), now())
-                                .map_err(|error| error.to_string())?;
+                        let payload = ControlPayload::RoundSkip(Box::new(proof.clone()));
+                        let bytes = wire::frame(&Message::Control(Box::new(payload)), now())
+                            .map_err(|error| error.to_string())?;
                         broadcast(&outbound, true, &bytes, &mut dropped);
                     }
                     round_skip_dirty = false;
                 }
-                if !authoring_stopped && (config.rpc_port > 0 || node.round() <= config.rounds) {
+                // The lead cap belongs to the round-skip experiment. Without it a
+                // live node authors far past the cursor, which widens the window
+                // in which delivery differences change a skip decision. The cap
+                // must stay above the failure-detector threshold, or a silent
+                // validator is never observed far enough behind to be fenced.
+                let lead = AUTHORING_LEAD.max(config.failure_rounds.saturating_add(4));
+                let within_lead = config.rpc_port == 0
+                    || !config.round_skip
+                    || node.round() <= node.cursor().saturating_add(lead);
+                if !authoring_stopped
+                    && within_lead
+                    && (config.rpc_port > 0 || node.round() <= config.rounds)
+                {
                     let round = node.round();
                     let slot = usize::try_from(round).unwrap_or(usize::MAX);
                     let mut sign = Duration::ZERO;
-                    let payload = if config.rpc_port > 0 {
+                    // A locally built certificate waits for a vertex to bind it.
+                    // If another node already bound and applied the same proof,
+                    // the wait is over and a normal batch can be authored.
+                    if pending_control.as_ref().is_some_and(|(_, proof)| {
+                        node.dag()
+                            .round_skip(proof.attestation.skip.round())
+                            .is_some()
+                    }) {
+                        pending_control = None;
+                    }
+                    let control_digest = pending_control.as_ref().map(|(digest, _)| *digest);
+                    let payload = if control_digest.is_some() {
+                        // The binding vertex orders no transactions. The batch
+                        // this round would have carried waits for a later round.
+                        None
+                    } else if config.rpc_port > 0 {
                         // The mempool is the only source in RPC mode: a real client
                         // signs before submitting, and an empty mempool is an empty
                         // batch rather than a synthetic one.
@@ -2971,9 +3019,13 @@ async fn node_task(
                         Some(batch)
                     };
                     profile.sign += sign;
-                    let digest = match &payload {
-                        Some(batch) => batch.digest().map_err(|error| error.to_string())?,
-                        None => [0u8; 32],
+                    let digest = if let Some(digest) = control_digest {
+                        digest
+                    } else {
+                        match &payload {
+                            Some(batch) => batch.digest().map_err(|error| error.to_string())?,
+                            None => [0u8; 32],
+                        }
                     };
                     let author_start = Instant::now();
                     let author = node.author_with(digest);
@@ -3009,6 +3061,17 @@ async fn node_task(
                                     put_payload(store, &coding, index, batch, config.shard)?;
                                 }
                                 profile.store += store_start.elapsed();
+                            }
+                            // The payload goes out before the vertex that binds
+                            // it, so a peer that receives the vertex second already
+                            // knows the round must wait for this certificate.
+                            if control_digest.is_some()
+                                && let Some((_, proof)) = pending_control.take()
+                            {
+                                let control = ControlPayload::RoundSkip(Box::new(proof));
+                                let frame = wire::frame(&Message::Control(Box::new(control)), now())
+                                    .map_err(|error| error.to_string())?;
+                                broadcast(&outbound, true, &frame, &mut dropped);
                             }
                             let frame_start = Instant::now();
                             let bytes = wire::frame(&Message::Vertex(vertex), now())
@@ -3110,8 +3173,11 @@ async fn node_task(
                     let voters = node.dag().held_voters(cursor).unwrap_or(0);
                     let quorum = node.dag().set().quorum_size();
                     let can_anchor = node.dag().can_still_anchor(cursor).unwrap_or(true);
+                    let skip_held = node.dag().round_skip(cursor).is_some();
+                    let skip_pending = node.dag().has_pending_control(cursor);
+                    let leader_held = node.dag().leader(cursor).is_some();
                     eprintln!(
-                        "node {index} commit stalled at round {cursor} (observed {observed}), missing {detail}, votes {voters} of quorum {quorum}, can-anchor {can_anchor}"
+                        "node {index} commit stalled at round {cursor} (observed {observed}), missing {detail}, votes {voters} of quorum {quorum}, can-anchor {can_anchor}, round-skip held {skip_held}, pending {skip_pending}, leader-held {leader_held}"
                     );
                 }
                 if config.execute {
@@ -3131,9 +3197,12 @@ async fn node_task(
                             break;
                         };
                         // A vertex can carry no payload (an empty mempool still has
-                        // to author for the DAG to advance). There is nothing to
-                        // apply, so the cursor moves without touching state.
-                        if vertex.payload_hash == [0u8; 32] {
+                        // to author for the DAG to advance), or a control payload
+                        // such as a round-skip certificate. Neither changes account
+                        // state, so the cursor moves without touching it.
+                        if vertex.payload_hash == [0u8; 32]
+                            || control_payloads.contains_key(&vertex.payload_hash)
+                        {
                             applied_cursor += 1;
                             // A pending header can name this exact prefix, so the
                             // state root has to be captured here rather than only
@@ -3356,28 +3425,47 @@ async fn node_task(
                 }
                 // The proof is built from what this node holds: held votes and
                 // non-votes, fences covering absent voters, and the rest as
-                // missing. It is verified with the same function a receiver uses,
-                // and it can fire only when more than `f` voters are held as
-                // non-votes, so a live vote quorum is already impossible.
+                // missing. It is verified before publication, and only its binding
+                // vertex makes it a decision.
                 if config.round_skip
+                    && pending_control.is_none()
                     && !round_skips.contains_key(&node.cursor())
+                    && node
+                        .dag()
+                        .set_for_round(node.round())
+                        .validator(node.id())
+                        .is_some()
+                    && !node.dag().is_fenced(node.id(), node.round())
                     && let Some(proof) = round_skip_candidate(&node, &chain_id)
                 {
                     let round = proof.attestation.skip.round();
-                    match node.apply_round_skip(proof.clone()) {
+                    match node.dag().check_round_skip(&chain_id, &proof) {
                         Ok(check) => {
-                            if let Some(store) = &store {
-                                store
-                                    .put_round_skip(&proof)
-                                    .map_err(|error| error.to_string())?;
+                            let payload = ControlPayload::RoundSkip(Box::new(proof.clone()));
+                            match node.add_control(payload) {
+                                Ok(digest) => {
+                                    if let Some(store) = &store {
+                                        store
+                                            .put_round_skip(&proof)
+                                            .map_err(|error| error.to_string())?;
+                                    }
+                                    eprintln!(
+                                        "node {index} proved round {round} cannot reach a quorum \
+                                         ({} votes, {} non-votes, {} missing)",
+                                        check.votes, check.non_votes, check.missing
+                                    );
+                                    control_payloads.insert(digest, round);
+                                    pending_control = Some((digest, proof.clone()));
+                                    round_skips.insert(round, proof);
+                                    round_skip_dirty = true;
+                                }
+                                Err(error) => {
+                                    eprintln!(
+                                        "node {index} cannot queue a round-skip certificate \
+                                         at round {round}: {error}"
+                                    );
+                                }
                             }
-                            eprintln!(
-                                "node {index} proved round {round} cannot reach a quorum \
-                                 ({} votes, {} non-votes, {} missing)",
-                                check.votes, check.non_votes, check.missing
-                            );
-                            round_skips.insert(round, proof);
-                            round_skip_dirty = true;
                         }
                         Err(error) => {
                             eprintln!(
@@ -3738,6 +3826,8 @@ async fn archive_task(
                     Message::Fence(_) => {}
                     // A round skip is a decision input; an archive keeps no DAG.
                     Message::RoundSkip(_) => {}
+                    // Control payloads share the round-skip fate here.
+                    Message::Control(_) => {}
                     // The accept side consumes the hello before the loop starts.
                     Message::Hello(_) => rejected += 1,
                 }

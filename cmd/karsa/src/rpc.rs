@@ -843,6 +843,11 @@ impl RpcCore {
     }
 
     fn status(&self) -> StatusView {
+        let order_len = self.order_base + self.order.len();
+        let order_root = self
+            .order_prefix
+            .root_at(&self.order, self.order.len())
+            .expect("the retained tail is covered by its own length");
         StatusView {
             node: self.node,
             chain_id: hex::encode(&self.chain_id),
@@ -855,6 +860,8 @@ impl RpcCore {
             certified_heights: self.certified_heights,
             round: self.run.round,
             committed_entries: self.run.committed_entries,
+            order_len,
+            order_root: hex::encode(order_root),
             applied_txs: self.run.applied_txs,
             mempool: self.mempool.len(),
             peers: self.run.peers,
@@ -1150,6 +1157,10 @@ struct StatusView {
     certified_heights: usize,
     round: u64,
     committed_entries: usize,
+    /// Committed order entries this node has seen, prefix included.
+    order_len: usize,
+    /// Merkle root over the committed order, so two nodes can compare it.
+    order_root: String,
     applied_txs: u64,
     mempool: usize,
     peers: usize,
@@ -1837,5 +1848,39 @@ mod tests {
         assert_eq!(view.status, "finalized");
         assert_eq!(view.finalized_height, Some(2));
         assert!(view.commit_proof.is_some());
+    }
+
+    #[test]
+    fn the_status_reports_the_root_of_the_committed_order() {
+        let (mut core, _accounts, _chain_id) = fixture();
+        let first = VertexId {
+            round: 1,
+            author: b"val-0".to_vec(),
+            digest: [1; 32],
+        };
+        let second = VertexId {
+            round: 2,
+            author: b"val-1".to_vec(),
+            digest: [2; 32],
+        };
+        core.note_order_from(&CommitFrontier::empty(), &[first.clone(), second.clone()]);
+        let view = core.status();
+        assert_eq!(view.order_len, 2);
+        assert_eq!(
+            view.order_root,
+            hex::encode(CommitFrontier::from_order(&[first.clone(), second.clone()]).root())
+        );
+
+        // The same two entries summarized as a pruned prefix plus a retained tail
+        // must hash to the same root; that is the shape a checkpoint restart
+        // reports, so a survivor can still compare order with a fresher node.
+        let prefix = CommitFrontier::from_order(std::slice::from_ref(&first));
+        core.note_order_from(&prefix, std::slice::from_ref(&second));
+        let view = core.status();
+        assert_eq!(view.order_len, 2);
+        assert_eq!(
+            view.order_root,
+            hex::encode(prefix.root_at(std::slice::from_ref(&second), 1).unwrap())
+        );
     }
 }

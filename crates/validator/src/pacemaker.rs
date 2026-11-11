@@ -399,15 +399,6 @@ impl Pacemaker {
             self.cursor = round + 1;
             return Ok(Advance::Skip);
         }
-        // A verified round-skip proof partitions the whole voter set and bounds
-        // the possible votes below the quorum. Unlike a local completeness
-        // check, the proof is a quorum statement, so every node that adopts it
-        // skips the same round.
-        if dag.skip_with_attestation(round)? {
-            self.skips.attested = self.skips.attested.saturating_add(1);
-            self.cursor = round + 1;
-            return Ok(Advance::Skip);
-        }
 
         // An anchor two or more rounds ahead is what makes an earlier slot
         // decidable at all. Use the *lowest* usable one and never skip over a
@@ -415,6 +406,13 @@ impl Pacemaker {
         // leader the lower one does not, so choosing it early would make the
         // commit order depend on when data arrived rather than on the DAG.
         if let Some(anchor) = self.stable_anchor(dag, round)? {
+            // A certificate only counts when it is inside this anchor's causal
+            // history. The walk also surfaces a missing ancestor of the anchor as
+            // MissingReference, so the caller repairs it instead of deciding on a
+            // partial history. Stage B reports the certificate but keeps the
+            // anchor decision unchanged; stage A will use the same primitive to
+            // turn a commit into a skip.
+            let _ = dag.anchor_skip(&anchor, round)?;
             // `try_indirect_decide` commits the leader's history as a side effect,
             // so the two ways this node could be wrong are ruled out first: a walk
             // it cannot finish (nothing is proved), and a skip that could still win

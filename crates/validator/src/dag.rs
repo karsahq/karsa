@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, HashSet};
 use crypto::merkle::{MerkleProof, MerkleTree};
 use crypto::{CryptoError, CryptoErrorKind};
 
+use crate::control::ControlPayload;
 use crate::fence::{Fence, FenceCertificate, FenceError};
 use crate::frontier::CommitFrontier;
 use crate::round_skip::{RoundSkipCheck, RoundSkipError, RoundSkipProof};
@@ -39,6 +40,18 @@ pub enum Decision {
     Skip,
     /// Neither quorum has been observed yet.
     Undecided,
+}
+
+/// What a selected anchor's causal history says about a round-skip certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnchorSkip {
+    /// No valid certificate for the target round is inside the anchor history.
+    None,
+    /// A valid certificate is inside the anchor history.
+    ///
+    /// Stage B reports it without changing the anchor decision. The check is
+    /// returned so the caller can audit which evidence the certificate used.
+    Certificate(RoundSkipCheck),
 }
 
 /// A round whose leader this node has decided to skip.
@@ -94,6 +107,26 @@ pub struct Dag {
     /// Keeping it beside the vertices lets the pacemaker release the cursor from
     /// a quorum statement rather than from a local completeness check.
     round_skips: BTreeMap<u64, RoundSkipProof>,
+    /// Chain identifier control payloads are verified against.
+    ///
+    /// Vertex signatures are bound by the set schedule, but a round-skip
+    /// certificate carries its own chain id. `Node` sets this from the same id
+    /// it signs vertices with; an empty value means no certificate can verify,
+    /// which is the safe default for fixtures that never exercise one.
+    chain_id: Vec<u8>,
+    /// Control payloads received on the data plane, keyed by the digest their
+    /// binding vertex names.
+    ///
+    /// A payload is not a decision here: it is applied only once the vertex that
+    /// names it is held, so the skip has a causal position in the DAG. A payload
+    /// that arrives first waits; the pacemaker also waits instead of deciding
+    /// the same round through an anchor.
+    controls: BTreeMap<[u8; 32], ControlPayload>,
+    /// The first vertex that named each payload digest.
+    ///
+    /// This maps a control payload back to its binding vertex without scanning
+    /// every held vertex.
+    payload_vertices: BTreeMap<[u8; 32], VertexId>,
 }
 
 impl Dag {
@@ -113,6 +146,9 @@ impl Dag {
             fences: BTreeMap::new(),
             local_fences: BTreeMap::new(),
             round_skips: BTreeMap::new(),
+            chain_id: Vec::new(),
+            controls: BTreeMap::new(),
+            payload_vertices: BTreeMap::new(),
         }
     }
 
@@ -164,6 +200,9 @@ impl Dag {
             fences: BTreeMap::new(),
             local_fences: BTreeMap::new(),
             round_skips: BTreeMap::new(),
+            chain_id: Vec::new(),
+            controls: BTreeMap::new(),
+            payload_vertices: BTreeMap::new(),
         })
     }
 
@@ -388,6 +427,136 @@ impl Dag {
         Ok(self.record_skip(round, author, digest))
     }
 
+    /// Verifies a round-skip proof against this DAG without adopting it.
+    ///
+    /// This is the check a builder runs before it publishes a certificate, so a
+    /// node never authors a payload it would reject itself.
+    ///
+    /// # Errors
+    ///
+    /// Every error from [`RoundSkipProof::verify`], plus
+    /// [`RoundSkipError::Mismatch`] when the named leader is not held or is not
+    /// this DAG's leader for the round.
+    pub fn check_round_skip(
+        &self,
+        chain_id: &[u8],
+        proof: &RoundSkipProof,
+    ) -> Result<RoundSkipCheck, RoundSkipError> {
+        let round = proof.attestation.skip.round();
+        if self.is_pruned(round) {
+            return Ok(RoundSkipCheck::default());
+        }
+        let leader_id = self
+            .leader(round)
+            .ok_or_else(|| RoundSkipError::Mismatch("the skipped leader is not held".to_string()))?
+            .id()
+            .map_err(RoundSkipError::Encoding)?;
+        if proof.attestation.skip.leader != leader_id {
+            return Err(RoundSkipError::Mismatch(
+                "the proof names a different leader vertex".to_string(),
+            ));
+        }
+        let voter_set = self.set_for_round(round.saturating_add(1)).clone();
+        proof.verify(
+            chain_id,
+            &voter_set,
+            &leader_id,
+            |fence_round| self.set_for_round(fence_round).clone(),
+            |id| self.get(id.round, &id.author).cloned(),
+        )
+    }
+
+    /// Whether any held control payload targets `round`.
+    ///
+    /// This is the cheap gate before the causal walk: when no certificate for a
+    /// round is held, the anchor decision cannot depend on one.
+    #[must_use]
+    pub fn has_control_for_round(&self, round: u64) -> bool {
+        self.controls
+            .values()
+            .any(|payload| payload.round() == round)
+    }
+
+    /// Looks for a valid round-skip certificate inside a selected anchor's
+    /// causal history.
+    ///
+    /// The walk is the causal rule stage B is testing: a certificate only counts
+    /// when the binding vertex is an ancestor of the anchor, and the leader and
+    /// every vote/non-vote the proof names are also in that history. A listed id
+    /// that is not an ancestor is not causal evidence for this anchor and is
+    /// ignored; an ancestor this node does not hold is a missing reference, so
+    /// the caller repairs the anchor history instead of deciding on a partial
+    /// one.
+    ///
+    /// The returned certificate is reported, not applied: the anchor decision
+    /// stays exactly what [`Dag::try_indirect_decide`] would make. Stage A will
+    /// use the same primitive to override that decision behind a separate test.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoErrorKind::MissingReference`] when the anchor's causal history is
+    /// incomplete. Verification errors on individual certificates are ignored:
+    /// an invalid payload is not evidence and must not block the anchor.
+    pub fn anchor_skip(&self, anchor: &VertexId, round: u64) -> Result<AnchorSkip, CryptoError> {
+        if !self.has_control_for_round(round) {
+            return Ok(AnchorSkip::None);
+        }
+
+        let mut seen: HashSet<VertexId> = HashSet::new();
+        let mut stack = vec![anchor.clone()];
+        let mut candidates: Vec<[u8; 32]> = Vec::new();
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            if self.is_pruned(current.round) {
+                continue;
+            }
+            let vertex = self
+                .vertices
+                .get(&(current.round, current.author.clone()))
+                .ok_or_else(|| missing(&current))?;
+            if let Some(payload) = self.controls.get(&vertex.payload_hash)
+                && payload.round() == round
+            {
+                candidates.push(vertex.payload_hash);
+            }
+            stack.extend(vertex.references.iter().cloned());
+        }
+
+        // A digest order makes the reported certificate reproducible when more
+        // than one valid proof is in the same history. Both imply a skip, so the
+        // decision does not depend on which one is returned first.
+        candidates.sort_unstable();
+        candidates.dedup();
+        for digest in candidates {
+            let Some(payload) = self.controls.get(&digest) else {
+                continue;
+            };
+            let Some(proof) = payload.round_skip() else {
+                continue;
+            };
+            if !self.is_ancestor(&proof.attestation.skip.leader, anchor)? {
+                continue;
+            }
+            let mut closed = true;
+            for id in proof.votes.iter().chain(&proof.non_votes) {
+                if !self.is_ancestor(id, anchor)? {
+                    closed = false;
+                    break;
+                }
+            }
+            if !closed {
+                continue;
+            }
+            match self.check_round_skip(&self.chain_id, proof) {
+                Ok(check) => return Ok(AnchorSkip::Certificate(check)),
+                Err(_) => continue,
+            }
+        }
+        Ok(AnchorSkip::None)
+    }
+
     /// Installs a round-skip proof for the leader of its round.
     ///
     /// The proof is checked against the voter set active at the voting round,
@@ -411,16 +580,6 @@ impl Dag {
             // not fail because the leader's vertex is gone.
             return Ok(RoundSkipCheck::default());
         }
-        let leader_id = self
-            .leader(round)
-            .ok_or_else(|| RoundSkipError::Mismatch("the skipped leader is not held".to_string()))?
-            .id()
-            .map_err(RoundSkipError::Encoding)?;
-        if proof.attestation.skip.leader != leader_id {
-            return Err(RoundSkipError::Mismatch(
-                "the proof names a different leader vertex".to_string(),
-            ));
-        }
         if let Some(current) = self.round_skips.get(&round)
             && current.attestation.skip != proof.attestation.skip
         {
@@ -428,14 +587,7 @@ impl Dag {
                 "this round already has a different skip proof".to_string(),
             ));
         }
-        let voter_set = self.set_for_round(round.saturating_add(1)).clone();
-        let check = proof.verify(
-            chain_id,
-            &voter_set,
-            &leader_id,
-            |fence_round| self.set_for_round(fence_round).clone(),
-            |id| self.get(id.round, &id.author).cloned(),
-        )?;
+        let check = self.check_round_skip(chain_id, &proof)?;
         self.round_skips.entry(round).or_insert(proof);
         Ok(check)
     }
@@ -451,6 +603,11 @@ impl Dag {
     /// The proof is only accepted when it names the leader this DAG holds. A
     /// proof for another vertex at the same round, or one this DAG has not
     /// adopted, decides nothing.
+    ///
+    /// The pacemaker does not call this directly: stage B routes every
+    /// certificate through [`Dag::anchor_skip`], so only evidence inside the
+    /// selected anchor's history counts. This method remains the primitive stage
+    /// A will use for the override.
     ///
     /// # Errors
     ///
@@ -469,6 +626,130 @@ impl Dag {
         let author = leader.author.clone();
         let digest = Some(leader_id.digest);
         Ok(self.record_skip(round, author, digest))
+    }
+
+    /// Installs a control payload received on the data plane.
+    ///
+    /// The payload is not a decision: it becomes one only when the vertex whose
+    /// `payload_hash` names its digest is held. Keeping it here makes a payload
+    /// that arrived first survive until the binding vertex arrives, and lets the
+    /// pacemaker wait instead of deciding the round through an anchor.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ControlPayload::digest`].
+    pub fn add_control(&mut self, payload: ControlPayload) -> Result<[u8; 32], CryptoError> {
+        let digest = payload.digest()?;
+        // A rebroadcast of a certificate this DAG already adopted is a duplicate,
+        // not a new pending payload: keeping it would delay the same round again.
+        if let Some(proof) = payload.round_skip()
+            && self
+                .round_skips
+                .contains_key(&proof.attestation.skip.round())
+        {
+            return Ok(digest);
+        }
+        self.controls.entry(digest).or_insert(payload);
+        Ok(digest)
+    }
+
+    /// The control payload this DAG holds for `digest`, if any.
+    #[must_use]
+    pub fn control(&self, digest: &[u8; 32]) -> Option<&ControlPayload> {
+        self.controls.get(digest)
+    }
+
+    /// The vertex that names `digest`, if this DAG holds it.
+    #[must_use]
+    pub fn vertex_for_payload(&self, digest: &[u8; 32]) -> Option<&VertexId> {
+        self.payload_vertices.get(digest)
+    }
+
+    /// Whether a held control payload targets `round` and has not been decided.
+    ///
+    /// Stage B keeps this as a reporting helper. The pacemaker no longer blocks
+    /// on a pending payload: a certificate counts only through the selected
+    /// anchor's causal history, so a missing binding vertex simply leaves the
+    /// ordinary anchor decision in place.
+    #[must_use]
+    pub fn has_pending_control(&self, round: u64) -> bool {
+        !self.round_skips.contains_key(&round)
+            && self.leader(round).is_some()
+            && self
+                .controls
+                .values()
+                .any(|payload| payload.round() == round)
+    }
+
+    /// Digests of control payloads that have not been applied yet.
+    #[must_use]
+    pub fn pending_controls(&self) -> Vec<[u8; 32]> {
+        self.controls
+            .iter()
+            .filter(|(_, payload)| !self.round_skips.contains_key(&payload.round()))
+            .map(|(digest, _)| *digest)
+            .collect()
+    }
+
+    /// Applies every held control payload whose binding vertex and evidence are
+    /// available.
+    ///
+    /// This is the eager path used by tests and kept for stage A. The pacemaker
+    /// itself does not call it; it uses [`Dag::anchor_skip`] so a certificate
+    /// only counts when it is inside the selected anchor's causal history.
+    ///
+    /// A payload whose binding vertex or leader is missing stays queued, so a
+    /// later delivery completes it. A proof that verifies is installed exactly
+    /// as [`Dag::apply_round_skip`] installs one; a proof with missing evidence
+    /// also stays queued, and the caller can request the named vertex. A
+    /// permanently invalid proof is dropped instead of blocking a round forever.
+    ///
+    /// Returns one `(round, result)` per payload attempted in this call, in
+    /// digest order, so two nodes starting from the same DAG apply in the same
+    /// order.
+    pub fn apply_controls(
+        &mut self,
+        chain_id: &[u8],
+    ) -> Vec<(u64, Result<RoundSkipCheck, RoundSkipError>)> {
+        // A payload for a round this DAG already decided is not pending: another
+        // proof for the same leader won the race. Keeping it would make the
+        // pacemaker wait on a decision it already has.
+        let decided: Vec<u64> = self.round_skips.keys().copied().collect();
+        self.controls
+            .retain(|_, payload| !decided.contains(&payload.round()));
+        let ready: Vec<[u8; 32]> = self
+            .controls
+            .keys()
+            .filter(|digest| self.payload_vertices.contains_key(*digest))
+            .copied()
+            .collect();
+        let mut applied = Vec::with_capacity(ready.len());
+        for digest in ready {
+            let Some(payload) = self.controls.get(&digest) else {
+                continue;
+            };
+            let round = payload.round();
+            // A missing leader is a delivery condition: the proof cannot decide
+            // the round yet, and the indirect rule may still settle it.
+            if !self.is_pruned(round) && self.leader(round).is_none() {
+                continue;
+            }
+            let Some(payload) = self.controls.remove(&digest) else {
+                continue;
+            };
+            let result = match &payload {
+                ControlPayload::RoundSkip(proof) => {
+                    self.apply_round_skip(chain_id, (**proof).clone())
+                }
+            };
+            if matches!(result, Err(RoundSkipError::MissingEvidence(_))) {
+                // The proof may still be valid; keep it for the pass that holds
+                // the missing vertex. The binding vertex is already here.
+                self.controls.insert(digest, payload);
+            }
+            applied.push((round, result));
+        }
+        applied
     }
 
     /// The epoch a round belongs to.
@@ -511,6 +792,8 @@ impl Dag {
         self.floor = Some(floor);
         let before = self.vertices.len();
         self.vertices.retain(|(round, _), _| *round > floor);
+        self.controls.retain(|_, payload| payload.round() > floor);
+        self.payload_vertices.retain(|_, id| id.round > floor);
         before - self.vertices.len()
     }
 
@@ -540,6 +823,20 @@ impl Dag {
     #[must_use]
     pub fn set_for_round(&self, round: u64) -> &ValidatorSet {
         self.sets.set_for_round(&self.schedule, round)
+    }
+
+    /// Sets the chain id control payloads are verified against.
+    ///
+    /// `Node` calls this with the same id it signs vertices with. A DAG that
+    /// never adopts a certificate can leave it empty.
+    pub fn set_chain_id(&mut self, chain_id: Vec<u8>) {
+        self.chain_id = chain_id;
+    }
+
+    /// The chain id control payloads are verified against.
+    #[must_use]
+    pub fn chain_id(&self) -> &[u8] {
+        &self.chain_id
     }
 
     /// Inserts a vertex after verifying it and its shape.
@@ -585,6 +882,11 @@ impl Dag {
             return existing.id();
         }
         let id = vertex.id()?;
+        if vertex.payload_hash != [0u8; 32] {
+            self.payload_vertices
+                .entry(vertex.payload_hash)
+                .or_insert_with(|| id.clone());
+        }
         self.vertices.insert(key, vertex);
         Ok(id)
     }
@@ -1218,10 +1520,11 @@ mod tests {
             validators,
         };
         set.validate().unwrap();
-        Fixture {
-            keys,
-            dag: Dag::new(set),
-        }
+        let mut dag = Dag::new(set);
+        // The fixtures sign round-skip certificates over this chain, so the same
+        // id has to be available to the control-payload verifier.
+        dag.set_chain_id(b"karsa-dag-1".to_vec());
+        Fixture { keys, dag }
     }
 
     fn fence_certificate(fixture: &Fixture, from_round: u64, validator: &[u8]) -> FenceCertificate {
@@ -1243,12 +1546,28 @@ mod tests {
     }
 
     fn vertex(fixture: &Fixture, author: usize, round: u64, references: Vec<VertexId>) -> Vertex {
+        vertex_with_payload(
+            fixture,
+            author,
+            round,
+            references,
+            [u8::try_from(author + 1).unwrap(); 32],
+        )
+    }
+
+    fn vertex_with_payload(
+        fixture: &Fixture,
+        author: usize,
+        round: u64,
+        references: Vec<VertexId>,
+        payload_hash: [u8; 32],
+    ) -> Vertex {
         let mut vertex = Vertex {
             chain_id: b"karsa-dag-1".to_vec(),
             epoch: EPOCH,
             round,
             author: format!("val-{author}").into_bytes(),
-            payload_hash: [u8::try_from(author + 1).unwrap(); 32],
+            payload_hash,
             references,
             signature: Vec::new(),
         };
@@ -1474,8 +1793,68 @@ mod tests {
         }
     }
 
+    /// Bootstrapped four-validator DAG with a split voting round for round one.
+    ///
+    /// Authors 0 and 1 vote for the round-one leader; authors 2 and 3 do not.
+    /// The returned proof partitions that round into two votes and two non-votes,
+    /// which bounds the possible vote quorum at two of three.
+    fn split_round_two() -> (Fixture, RoundSkipProof) {
+        let mut fixture = bootstrapped(4);
+        let leader = fixture.dag.leader(LEADER_ROUND).unwrap().id().unwrap();
+        let votes = fixture.ids(LEADER_ROUND);
+        let without_leader = fixture.ids_without_leader(LEADER_ROUND);
+        for author in 0..4 {
+            let references = if author < 2 {
+                votes.clone()
+            } else {
+                without_leader.clone()
+            };
+            fixture
+                .dag
+                .insert(vertex(&fixture, author, LEADER_ROUND + 1, references))
+                .unwrap();
+        }
+        let round_two = fixture.ids(LEADER_ROUND + 1);
+        let proof = RoundSkipProof {
+            attestation: NoVoteAttestation {
+                skip: RoundSkip::new(b"karsa-dag-1".to_vec(), leader),
+                signer_bitmap: vec![0u8; bitmap_len(4)],
+                signatures: Vec::new(),
+            },
+            votes: round_two[..2].to_vec(),
+            non_votes: round_two[2..].to_vec(),
+            fenced_absent: Vec::new(),
+            missing: Vec::new(),
+        };
+        (fixture, proof)
+    }
+
+    /// Inserts round three with one author naming the certificate digest.
+    fn insert_certificate_round(
+        fixture: &mut Fixture,
+        carrier: usize,
+        digest: [u8; 32],
+        references: Vec<VertexId>,
+    ) {
+        for author in 0..4 {
+            let payload = if author == carrier {
+                digest
+            } else {
+                [u8::try_from(author + 1).unwrap(); 32]
+            };
+            let vertex = vertex_with_payload(
+                fixture,
+                author,
+                LEADER_ROUND + 2,
+                references.clone(),
+                payload,
+            );
+            fixture.dag.insert(vertex).unwrap();
+        }
+    }
+
     #[test]
-    fn a_verified_round_skip_proof_frees_the_stalled_leader() {
+    fn a_verified_round_skip_proof_is_stored_but_waits_for_an_anchor() {
         let (mut fixture, leader) = stalled_round_skip();
         assert_eq!(
             fixture.dag.try_commit(73).unwrap(),
@@ -1496,20 +1875,239 @@ mod tests {
         assert_eq!(check.quorum, 4);
         assert!(fixture.dag.round_skip(73).is_some());
 
+        // The DAG can still record the skip when a caller asks directly, but the
+        // pacemaker no longer treats a held proof as a decision. Without an anchor
+        // in this fixture the cursor has to wait.
+        assert!(fixture.dag.skip_with_attestation(73).unwrap());
+        assert_eq!(fixture.dag.skipped()[0].round, 73);
+
         let mut pacemaker = Pacemaker::new(PacemakerConfig::default(), 73);
         let step = pacemaker.tick(&mut fixture.dag).unwrap();
-        assert_eq!(pacemaker.cursor(), 74);
-        assert_eq!(pacemaker.skip_counts().attested, 1);
-        assert_eq!(pacemaker.skip_counts().total(), 1);
+        assert_eq!(pacemaker.cursor(), 73);
+        assert_eq!(pacemaker.skip_counts().attested, 0);
+        assert!(matches!(step, Step::Waiting { .. } | Step::TimedOut { .. }));
+    }
+
+    #[test]
+    fn a_certificate_in_the_selected_anchors_history_does_not_change_the_decision() {
+        let (mut fixture, proof) = split_round_two();
+        let digest = ControlPayload::RoundSkip(Box::new(proof.clone()))
+            .digest()
+            .unwrap();
+        let round_two = fixture.ids(LEADER_ROUND + 1);
+        // The round-three leader (author 3) carries the certificate, so the anchor
+        // the pacemaker selects for round one has the payload in its own history.
+        insert_certificate_round(&mut fixture, 3, digest, round_two);
+        let round_three = fixture.ids(LEADER_ROUND + 2);
+        fixture.full_round(LEADER_ROUND + 3, &round_three).unwrap();
+        fixture
+            .dag
+            .add_control(ControlPayload::RoundSkip(Box::new(proof)))
+            .unwrap();
+
+        let anchor = fixture.dag.leader(LEADER_ROUND + 2).unwrap().id().unwrap();
+        let skip = fixture.dag.anchor_skip(&anchor, LEADER_ROUND).unwrap();
+        assert!(matches!(
+            skip,
+            AnchorSkip::Certificate(check)
+                if check.votes == 2
+                    && check.non_votes == 2
+                    && check.possible_votes == 2
+                    && check.quorum == 3
+        ));
+
+        // Stage B reports the causal certificate but keeps the anchor decision.
+        // The leader is reachable through the two votes, so the round commits.
+        assert!(matches!(
+            fixture
+                .dag
+                .try_indirect_decide(LEADER_ROUND, &anchor)
+                .unwrap(),
+            Decision::Commit(_)
+        ));
+        let leader = fixture.dag.leader(LEADER_ROUND).unwrap().id().unwrap();
+        assert!(fixture.dag.order().contains(&leader));
+
+        let mut pacemaker = Pacemaker::new(PacemakerConfig::default(), LEADER_ROUND);
+        let step = pacemaker.tick_one(&mut fixture.dag).unwrap();
+        assert_eq!(pacemaker.cursor(), LEADER_ROUND + 1);
+        assert_eq!(pacemaker.skip_counts().attested, 0);
         assert!(matches!(
             step,
             Step::Advanced {
-                skips: 1,
-                commits: 0,
+                commits: 1,
+                skips: 0,
                 ..
             }
         ));
-        assert_eq!(fixture.dag.skipped()[0].round, 73);
+    }
+
+    #[test]
+    fn a_certificate_outside_the_selected_anchors_history_is_ignored() {
+        let (mut fixture, proof) = split_round_two();
+        let digest = ControlPayload::RoundSkip(Box::new(proof.clone()))
+            .digest()
+            .unwrap();
+        let round_two = fixture.ids(LEADER_ROUND + 1);
+        // Author 0 carries the certificate, but the round-three leader is author
+        // 3. Same-round vertices do not reference each other, so the payload is
+        // not in the selected anchor's causal past.
+        insert_certificate_round(&mut fixture, 0, digest, round_two);
+        let round_three = fixture.ids(LEADER_ROUND + 2);
+        fixture.full_round(LEADER_ROUND + 3, &round_three).unwrap();
+        fixture
+            .dag
+            .add_control(ControlPayload::RoundSkip(Box::new(proof)))
+            .unwrap();
+
+        let anchor = fixture.dag.leader(LEADER_ROUND + 2).unwrap().id().unwrap();
+        assert_eq!(
+            fixture.dag.anchor_skip(&anchor, LEADER_ROUND).unwrap(),
+            AnchorSkip::None
+        );
+        assert!(matches!(
+            fixture
+                .dag
+                .try_indirect_decide(LEADER_ROUND, &anchor)
+                .unwrap(),
+            Decision::Commit(_)
+        ));
+    }
+
+    #[test]
+    fn a_certificate_whose_evidence_is_outside_the_anchor_history_is_ignored() {
+        let (mut fixture, proof) = split_round_two();
+        let digest = ControlPayload::RoundSkip(Box::new(proof.clone()))
+            .digest()
+            .unwrap();
+        let round_two = fixture.ids(LEADER_ROUND + 1);
+        // The anchor references authors 1, 2 and 3, omitting author 0's vote. The
+        // proof names that vote, but it is not in the anchor's causal past, so the
+        // certificate is not causal evidence for this anchor.
+        insert_certificate_round(&mut fixture, 3, digest, round_two[1..].to_vec());
+        let round_three = fixture.ids(LEADER_ROUND + 2);
+        fixture.full_round(LEADER_ROUND + 3, &round_three).unwrap();
+        fixture
+            .dag
+            .add_control(ControlPayload::RoundSkip(Box::new(proof)))
+            .unwrap();
+
+        let anchor = fixture.dag.leader(LEADER_ROUND + 2).unwrap().id().unwrap();
+        assert_eq!(
+            fixture.dag.anchor_skip(&anchor, LEADER_ROUND).unwrap(),
+            AnchorSkip::None
+        );
+        assert!(matches!(
+            fixture
+                .dag
+                .try_indirect_decide(LEADER_ROUND, &anchor)
+                .unwrap(),
+            Decision::Commit(_)
+        ));
+    }
+
+    #[test]
+    fn a_missing_ancestor_stops_the_certificate_check() {
+        let (mut fixture, proof) = split_round_two();
+        let digest = ControlPayload::RoundSkip(Box::new(proof.clone()))
+            .digest()
+            .unwrap();
+        let mut references = fixture.ids(LEADER_ROUND + 1);
+        references.push(VertexId {
+            round: LEADER_ROUND + 1,
+            author: b"val-9".to_vec(),
+            digest: [9u8; 32],
+        });
+        insert_certificate_round(&mut fixture, 3, digest, references);
+        let round_three = fixture.ids(LEADER_ROUND + 2);
+        fixture.full_round(LEADER_ROUND + 3, &round_three).unwrap();
+        fixture
+            .dag
+            .add_control(ControlPayload::RoundSkip(Box::new(proof)))
+            .unwrap();
+
+        let anchor = fixture.dag.leader(LEADER_ROUND + 2).unwrap().id().unwrap();
+        let error = fixture
+            .dag
+            .anchor_skip(&anchor, LEADER_ROUND)
+            .expect_err("a partial anchor history cannot decide the certificate");
+        assert_eq!(error.kind(), CryptoErrorKind::MissingReference);
+    }
+
+    #[test]
+    fn a_control_payload_applies_only_after_its_binding_vertex_is_held() {
+        let (mut fixture, leader) = stalled_round_skip();
+        let payload = ControlPayload::RoundSkip(Box::new(stall_proof(&fixture, &leader)));
+        let digest = payload.digest().unwrap();
+        fixture.dag.add_control(payload).unwrap();
+
+        // The payload arrived first. Holding it is not a decision; the binding
+        // vertex is what lets the causal anchor walk find it later.
+        assert!(fixture.dag.has_pending_control(73));
+        assert!(fixture.dag.round_skip(73).is_none());
+        let mut pacemaker = Pacemaker::new(PacemakerConfig::default(), 73);
+        let step = pacemaker.tick(&mut fixture.dag).unwrap();
+        assert_eq!(pacemaker.cursor(), 73);
+        assert!(matches!(step, Step::Waiting { .. } | Step::TimedOut { .. }));
+
+        // The author names the payload digest in a later vertex. Holding that
+        // vertex is what makes the payload reachable from an anchor's history.
+        let references = fixture.ids(74);
+        let binding = vertex_with_payload(&fixture, 0, 75, references, digest);
+        fixture.dag.insert(binding).unwrap();
+        let applied = fixture.dag.apply_controls(b"karsa-dag-1");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].0, 73);
+        assert!(applied[0].1.is_ok());
+        assert!(!fixture.dag.has_pending_control(73));
+        assert!(fixture.dag.round_skip(73).is_some());
+
+        // Stage B stores the proof but still does not move the pacemaker on it.
+        let step = pacemaker.tick(&mut fixture.dag).unwrap();
+        assert_eq!(pacemaker.cursor(), 73);
+        assert_eq!(pacemaker.skip_counts().attested, 0);
+        assert!(matches!(step, Step::Waiting { .. } | Step::TimedOut { .. }));
+    }
+
+    #[test]
+    fn a_control_payload_without_a_binding_vertex_stays_pending() {
+        let (mut fixture, leader) = stalled_round_skip();
+        let payload = ControlPayload::RoundSkip(Box::new(stall_proof(&fixture, &leader)));
+        let digest = payload.digest().unwrap();
+        fixture.dag.add_control(payload).unwrap();
+
+        assert!(fixture.dag.apply_controls(b"karsa-dag-1").is_empty());
+        assert_eq!(fixture.dag.pending_controls(), vec![digest]);
+        assert!(fixture.dag.round_skip(73).is_none());
+    }
+
+    #[test]
+    fn a_second_proof_for_a_decided_round_is_not_pending() {
+        let (mut fixture, leader) = stalled_round_skip();
+        let first = ControlPayload::RoundSkip(Box::new(stall_proof(&fixture, &leader)));
+        fixture.dag.add_control(first).unwrap();
+
+        // A second, equally valid proof for the same leader. Its evidence is the
+        // same votes in another order, so the encoding and digest differ and it
+        // does not share the first payload's binding vertex.
+        let mut other = stall_proof(&fixture, &leader);
+        other.votes.reverse();
+        let second = ControlPayload::RoundSkip(Box::new(other));
+        let second_digest = second.digest().unwrap();
+        fixture.dag.add_control(second).unwrap();
+
+        let references = fixture.ids(74);
+        let binding = vertex_with_payload(&fixture, 0, 75, references, second_digest);
+        fixture.dag.insert(binding).unwrap();
+        let applied = fixture.dag.apply_controls(b"karsa-dag-1");
+        assert_eq!(applied.len(), 1);
+        assert!(applied[0].1.is_ok());
+
+        // The first proof was never bound, but its round is decided. It must not
+        // keep the pacemaker waiting on a decision the DAG already has.
+        assert!(!fixture.dag.has_pending_control(73));
+        assert!(fixture.dag.apply_controls(b"karsa-dag-1").is_empty());
+        assert!(fixture.dag.pending_controls().is_empty());
     }
 
     #[test]
