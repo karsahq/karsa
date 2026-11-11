@@ -2201,8 +2201,13 @@ async fn node_task(
     let mut fence_adopted = pending_fence.is_some();
     let mut fence_dirty = pending_fence.is_some();
 
-    let mut failures = (config.failure_rounds > 0)
-        .then(|| FailureDetector::new(node.dag().set(), config.failure_rounds));
+    let mut failure_epoch = node.dag().set_for_round(node.round()).epoch;
+    let mut failures = (config.failure_rounds > 0).then(|| {
+        FailureDetector::new(
+            node.dag().set_for_round(node.round()),
+            config.failure_rounds,
+        )
+    });
     if let Some(failures) = failures.as_mut() {
         for vertex in held_vertices(&node) {
             failures.observe(vertex.round, &vertex.author);
@@ -2964,6 +2969,17 @@ async fn node_task(
                                 .put_header(&certified.header, &certified.certificate)
                                 .map_err(|error| error.to_string())?;
                         }
+                    }
+                }
+                // The active set can change at a set-change boundary. Rebuild the
+                // detector's author list from the schedule rather than from the
+                // base set, so a removed validator is dropped and a new one is
+                // tracked from the epoch it becomes active.
+                if let Some(failures) = failures.as_mut() {
+                    let active = node.dag().set_for_round(node.round());
+                    if active.epoch != failure_epoch {
+                        failures.update_set(active);
+                        failure_epoch = active.epoch;
                     }
                 }
                 // The failure detector is a report, not an input to the commit

@@ -1073,6 +1073,12 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       `failure detector: 0400601c39bf002c silent (last seen at round 1984, highest
       round 2035)`. The other two survivors reported the same author. A healthy run
       before the kill reported nothing.
+    - The detector's author list follows the DAG schedule, not the genesis set.
+      When the active epoch changes it is rebuilt from `set_for_round`, keeping
+      observations for validators that remain and dropping ones that left. In a
+      five-validator devnet with a removal at epoch 4 and `--fence-silent`, all
+      five adopted, no removed validator was reported silent or fenced after the
+      boundary, and the run reached 1,577 certified heights with 0 conflicts.
     - The detector stores one entry per validator and recomputes the list per tick,
       O(n); a delivery gap is reported as quickly as a dead node, so the threshold
       trades false positives for speed. A run with an eight-round threshold once

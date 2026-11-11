@@ -80,6 +80,23 @@ impl FailureDetector {
         self.threshold
     }
 
+    /// Tracks the validators of the set active now.
+    ///
+    /// Observations for validators that remain are kept; a validator that left
+    /// the set is dropped, and a new one starts unseen. A key rotation keeps the
+    /// same identities, so it leaves the observations untouched.
+    pub fn update_set(&mut self, set: &ValidatorSet) {
+        self.authors = set
+            .validators
+            .iter()
+            .map(|validator| validator.validator_id.clone())
+            .collect();
+        self.last
+            .retain(|author, _| self.authors.iter().any(|tracked| tracked == author));
+        self.advanced_at
+            .retain(|author, _| self.authors.iter().any(|tracked| tracked == author));
+    }
+
     /// Validators that have not advanced for more than `threshold` rounds, in
     /// set order.
     ///
@@ -201,6 +218,33 @@ mod tests {
         assert!(
             detector.silent().is_empty(),
             "an advancing validator is not silent just because it is behind"
+        );
+    }
+
+    #[test]
+    fn a_removed_validator_is_no_longer_tracked() {
+        let mut detector = FailureDetector::new(&set(), 2);
+        for round in 1..=5 {
+            for author in 0..4 {
+                detector.observe(round, format!("val-{author}").as_bytes());
+            }
+        }
+        for round in 6..=8 {
+            for author in 0..3 {
+                detector.observe(round, format!("val-{author}").as_bytes());
+            }
+        }
+        assert_eq!(detector.silent().len(), 1, "val-3 went silent");
+
+        let mut smaller = set();
+        smaller
+            .validators
+            .retain(|validator| validator.validator_id != b"val-3");
+        smaller.validate().unwrap();
+        detector.update_set(&smaller);
+        assert!(
+            detector.silent().is_empty(),
+            "a validator that left the set must not be reported"
         );
     }
 
