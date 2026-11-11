@@ -10,6 +10,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,18 @@ const VALIDATORS: usize = 4;
 
 /// The binary built for this test.
 const BIN: &str = env!("CARGO_BIN_EXE_karsa");
+
+/// Serializes the two devnet tests.
+///
+/// Each test starts four processes; running both at once puts eight nodes on a
+/// four-core machine, and the resulting scheduling gaps are indistinguishable
+/// from failed validators. The lock keeps the fault test's silence real.
+fn devnet_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// A devnet directory plus its four processes.
 struct Devnet {
@@ -156,6 +169,7 @@ fn wait_for<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Optio
 
 #[test]
 fn a_four_process_devnet_keeps_moving_after_one_validator_dies() {
+    let _devnet = devnet_lock();
     let dir = test_home("fence");
     let genesis = Command::new(BIN)
         .args(["genesis", "--home"])
@@ -228,6 +242,24 @@ fn a_four_process_devnet_keeps_moving_after_one_validator_dies() {
         devnet.fail("the survivors stopped certifying after validator 0 died");
     }
 
+    // Progress alone does not prove the fence rule ran: the anchor rule can also
+    // release a missing leader. The fence round is derived from the failed
+    // validator's last observed round, so every survivor names the same round and
+    // the shares combine. Wait for the counter, then keep checking progress.
+    let fenced = wait_for(Duration::from_secs(10), || {
+        for index in 1..VALIDATORS {
+            let port = rpc_base + u16::try_from(index).expect("four ports fit a u16");
+            let status = request(port, "/status")?;
+            if status["skips"]["fence_leader"].as_u64().unwrap_or(0) == 0 {
+                return None;
+            }
+        }
+        Some(())
+    });
+    if fenced.is_none() {
+        devnet.fail("the survivors never skipped a fenced leader");
+    }
+
     for index in 1..VALIDATORS {
         let port = rpc_base + u16::try_from(index).expect("four ports fit a u16");
         let status = request(port, "/status")
@@ -237,11 +269,16 @@ fn a_four_process_devnet_keeps_moving_after_one_validator_dies() {
             Some(0),
             "node {index} reported a conflict: {status}"
         );
+        assert!(
+            status["skips"]["fence_leader"].as_u64().unwrap_or(0) > 0,
+            "node {index} never skipped a fenced leader: {status}"
+        );
     }
 }
 
 #[test]
 fn a_four_process_devnet_finalizes_a_transfer_on_every_node() {
+    let _devnet = devnet_lock();
     let dir = test_home("cold");
     let genesis = Command::new(BIN)
         .args(["genesis", "--home"])

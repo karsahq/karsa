@@ -1124,31 +1124,34 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
     is skipped at its own round; a live leader is skipped when every missing
     next-round voter is fenced and the held vote count is at most `f`. In the second case even a late vote from every fenced
     validator reaches at most `2f`, below the `2f + 1` quorum. The live loop
-    proposes a fence only when the failure detector reports the validator silent,
-    the node has not decided the fence round, and the validator is the missing
-    leader or a missing voter at the cursor. Partial fences travel as
-    `Message::Fence`, the full certificate is stored in `fence`, and
-    `WIRE_PROTOCOL` is 8.
+    proposes a fence only when the failure detector reports the validator silent
+    and the validator is the missing leader or a missing voter; the fence starts at
+    the validator's last observed round plus one (raised to the DAG floor), not at
+    the proposer's cursor, so survivors with diverged cursors name the same round.
+    Partial fences travel as `Message::Fence`, the full certificate is stored in
+    `fence`, and `WIRE_PROTOCOL` is 8.
     - `a_fenced_leader_is_skipped_without_a_vote_or_anchor` and
       `a_fenced_missing_voter_frees_a_live_leaders_round` pin the two rules; the
       first also checks that the round is not skipped before the certificate is
       applied.
     - The automated four-process devnet test kills validator 0 after twenty
       certified heights and requires all three survivors to certify at least five
-      more; they do, with 0 conflicts. The test is the regression for the permanent
-      failure that motivated the fence. It does not assert that a fence was the
-      mechanism, because the surviving quorum can also advance through the
-      existing anchor rules; the fence unit tests are the direct evidence for the
-      skip rule.
+      more and to report `fence_leader > 0`; they do, with 0 conflicts. The two
+      devnet tests share a lock so their eight processes do not compete for four
+      cores.
     - `/status.skips` attributes each cursor move to `direct`, `indirect`,
       `absent`, `fence_leader`, or `fence_voter`. In a 20 s release devnet with
-      threshold 50 and validator 0 killed, every survivor reported
-      `fence_leader: 40`, so the fence rule itself advanced the cursor rather than
-      only the anchor rules. The two fence unit tests assert the same attribution:
-      only the expected counter moves. In one debug run the survivors proposed
-      fences at rounds 60 and 64 because their cursors had diverged and the
-      signatures did not combine into a quorum; a declaration whose round does not
-      depend on each signer's cursor is the next view-change step.
+      threshold 15 and validator 0 killed, all three survivors proposed the same
+      fence at round 1870 — the dead validator's last observed round plus one —
+      and reported `fence_leader: 30`. The two fence unit tests assert the same
+      attribution: only the expected counter moves.
+    - The fence round does not come from the signer's cursor. A signer may sign a
+      fence at any round after its own last observation of that validator; a later
+      proposal supersedes an earlier partial, and a completed certificate is
+      accepted even when another partial is pending. A signer whose cursor is
+      ahead is safe because it cannot have voted for a vertex it never saw. This
+      is what lets survivors whose cursors diverged (rounds 60 and 64 in an
+      earlier debug run) combine into one quorum.
     - The vote-fence rule treats the quorum declaration as authoritative for the
       missing voters. It is a view-change liveness rule, not a slashing proof; a
       falsely fenced honest validator that later equivocates remains outside the

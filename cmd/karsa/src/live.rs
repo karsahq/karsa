@@ -1303,65 +1303,77 @@ fn own_fence_share(
     })
 }
 
-/// Whether a fence descriptor targets the round this node is stuck on.
-///
-/// A missing leader is fenced at its own round; a missing voter is fenced at the
-/// round its vote belongs to, which is the cursor's next round.
-fn fence_relevant(node: &Node, from_round: u64, validator: &[u8]) -> bool {
-    let cursor = node.cursor();
-    if from_round == cursor && node.dag().leader(cursor).is_none() {
-        return node
-            .dag()
-            .leader_author(cursor)
-            .is_some_and(|author| author == validator);
-    }
-    if from_round == cursor.saturating_add(1) && node.dag().leader(cursor).is_some() {
-        return node
-            .dag()
-            .set_for_round(from_round)
-            .validator(validator)
-            .is_some()
-            && node.dag().get(from_round, validator).is_none();
-    }
-    false
-}
-
 /// Picks the silent validator this node should fence, and the round the fence
-/// starts at. A missing leader uses the cursor round; a missing voter uses the
-/// next round, because that is where the vote would have been.
+/// starts at.
+///
+/// The round is derived from the failed validator's last observed round, not from
+/// this node's cursor. Two survivors whose cursors have diverged still name the
+/// same round, so their shares can combine into one certificate. A missing leader
+/// needs a fence at or below its own round; a missing voter needs one at or below
+/// the voter's round, which `last_round + 1` satisfies in both cases.
 fn fence_candidate(node: &Node, silent: &[(Vec<u8>, u64)]) -> Option<(Vec<u8>, u64)> {
     let cursor = node.cursor();
-    if node.dag().leader(cursor).is_none() {
+    let lowest = node
+        .dag()
+        .floor()
+        .map_or(1, |floor| floor.saturating_add(1));
+    let (validator, last_round, relevant_round) = if node.dag().leader(cursor).is_none() {
         let author = node.dag().leader_author(cursor)?;
-        return silent
-            .iter()
-            .find(|(validator, last_round)| {
-                validator.as_slice() == author
-                    && *last_round < cursor
-                    && validator.as_slice() != node.id()
-            })
-            .map(|(validator, _)| (validator.clone(), cursor));
-    }
-    let voter_round = cursor.saturating_add(1);
-    let voters = node.dag().set_for_round(voter_round);
-    silent
-        .iter()
-        .find(|(validator, last_round)| {
+        let (validator, last_round) = silent.iter().find(|(validator, last_round)| {
+            validator.as_slice() == author
+                && *last_round < cursor
+                && validator.as_slice() != node.id()
+        })?;
+        (validator, *last_round, cursor)
+    } else {
+        let voter_round = cursor.saturating_add(1);
+        let voters = node.dag().set_for_round(voter_round);
+        let (validator, last_round) = silent.iter().find(|(validator, last_round)| {
             *last_round < voter_round
                 && validator.as_slice() != node.id()
                 && voters.validator(validator).is_some()
                 && node.dag().get(voter_round, validator).is_none()
-        })
-        .map(|(validator, _)| (validator.clone(), voter_round))
+        })?;
+        (validator, *last_round, voter_round)
+    };
+    let from_round = last_round.saturating_add(1).max(lowest);
+    if from_round > relevant_round
+        || node
+            .dag()
+            .set_for_round(from_round)
+            .validator(validator)
+            .is_none()
+    {
+        return None;
+    }
+    Some((validator.clone(), from_round))
 }
 
 /// Whether this node may sign a fence without contradicting its own view.
+///
+/// The signer promises not to vote for the fenced validator from `from_round`
+/// on. That promise is safe exactly when the signer has never seen the validator
+/// at or after that round: a vote for it would have required holding its vertex.
+/// The signer's own cursor is irrelevant; tying the fence to it is what made two
+/// survivors propose different rounds and fail to reach a quorum.
 fn may_sign_fence(node: &Node, failures: Option<&FailureDetector>, fence: &Fence) -> bool {
     if fence.validator_id == node.id() {
         // A quorum may declare this node failed; this node does not help.
         return false;
     }
-    if !fence_relevant(node, fence.from_round, &fence.validator_id) {
+    if node
+        .dag()
+        .floor()
+        .is_some_and(|floor| fence.from_round <= floor)
+    {
+        return false;
+    }
+    if node
+        .dag()
+        .set_for_round(fence.from_round)
+        .validator(&fence.validator_id)
+        .is_none()
+    {
         return false;
     }
     let Some(failures) = failures else {
@@ -2479,7 +2491,26 @@ async fn node_task(
                                 .dag()
                                 .set_for_round(certificate.fence.from_round)
                                 .clone();
-                            let ready = {
+                            let ready = if certificate.verify(&chain_id, &set).is_ok() {
+                                // A completed certificate needs no local share, and
+                                // taking it even when a different partial is pending
+                                // is what stops two surviving views from waiting on
+                                // each other forever.
+                                Some(*certificate)
+                            } else {
+                                // A later round is signable by every observer that
+                                // could sign an earlier one: a signer must have seen
+                                // the validator below the fence round. Converging on
+                                // the highest proposal is therefore safe and lets
+                                // diverged cursors still combine.
+                                if pending_fence.as_ref().is_some_and(|pending| {
+                                    pending.fence.validator_id == certificate.fence.validator_id
+                                        && certificate.fence.from_round
+                                            > pending.fence.from_round
+                                }) {
+                                    pending_fence = None;
+                                    fence_dirty = false;
+                                }
                                 let pending = pending_fence.get_or_insert_with(|| {
                                     empty_fence_certificate(&certificate, &set)
                                 });
