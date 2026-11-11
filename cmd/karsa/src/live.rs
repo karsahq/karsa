@@ -959,8 +959,8 @@ fn restore(
         if let Ok(digest) = payload.digest() {
             control_digests.insert(digest);
         }
-        // Install the payload before the eager proof so a stage-A replay can
-        // find it inside an anchor's causal history.
+        // Install the payload before the eager proof so a replay that walks the
+        // anchor's causal history still finds it.
         node.add_control(payload)
             .map_err(|error| format!("stored round skip payload is invalid: {error}"))?;
         node.apply_round_skip(proof)
@@ -1202,8 +1202,8 @@ fn remember_state(states: &mut VecDeque<(u64, State)>, applied: u64, state: &Sta
 
 /// Re-admits the batch of each newly skipped leader.
 ///
-/// A stage-A skip records the round without committing its history, so the
-/// leader's batch stays out of the execution order. The author's mempool no
+/// A skip records the round without committing its history, so the leader's
+/// batch stays out of the execution order. The author's mempool no
 /// longer holds those transactions; returning the batch is what keeps them from
 /// being stranded. If the same vertex later commits through another anchor, the
 /// execution state's sequence rule rejects the recovered copy, so recovery

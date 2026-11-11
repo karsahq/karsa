@@ -489,8 +489,10 @@ impl Dag {
     /// one.
     ///
     /// The returned certificate is reported, not applied: the anchor decision
-    /// stays exactly what [`Dag::try_indirect_decide`] would make. Stage A will
-    /// use the same primitive to override that decision behind a separate test.
+    /// stays exactly what [`Dag::try_indirect_decide`] would make. A certificate
+    /// is negative evidence that can arrive late, so overriding a commit with it
+    /// forked the committed order on one devnet node; the pacemaker therefore
+    /// treats this as reporting only.
     ///
     /// # Errors
     ///
@@ -604,10 +606,12 @@ impl Dag {
     /// proof for another vertex at the same round, or one this DAG has not
     /// adopted, decides nothing.
     ///
-    /// The pacemaker does not call this directly: stage B routes every
-    /// certificate through [`Dag::anchor_skip`], so only evidence inside the
-    /// selected anchor's history counts. This method remains the primitive stage
-    /// A will use for the override.
+    /// The pacemaker does not call this: certificates are reporting evidence,
+    /// not decisions. A certificate is negative evidence and can arrive after
+    /// another node has committed the same round, so it must not move the
+    /// cursor. The method remains available to tests and to a future rule that
+    /// proves the round cannot be committed, not merely that no vote quorum can
+    /// form.
     ///
     /// # Errors
     ///
@@ -694,9 +698,9 @@ impl Dag {
     /// Applies every held control payload whose binding vertex and evidence are
     /// available.
     ///
-    /// This is the eager path used by tests and kept for stage A. The pacemaker
-    /// itself does not call it; it uses [`Dag::anchor_skip`] so a certificate
-    /// only counts when it is inside the selected anchor's causal history.
+    /// This is the eager path used by tests and kept for the pending-control
+    /// bookkeeping. The pacemaker does not call it: a certificate is reporting
+    /// evidence, and only the anchor and fence rules decide a round.
     ///
     /// A payload whose binding vertex or leader is missing stays queued, so a
     /// later delivery completes it. A proof that verifies is installed exactly
@@ -1889,7 +1893,7 @@ mod tests {
     }
 
     #[test]
-    fn a_causal_certificate_turns_a_commit_into_a_skip() {
+    fn a_causal_certificate_does_not_override_a_commit() {
         let (mut fixture, proof) = split_round_two();
         let digest = ControlPayload::RoundSkip(Box::new(proof.clone()))
             .digest()
@@ -1916,24 +1920,22 @@ mod tests {
                     && check.quorum == 3
         ));
 
-        // Stage A: the certificate is causal and the leader is reachable, so the
-        // anchor rule would commit. The certificate turns that commit into a skip
-        // without walking the leader's history.
+        // The primitive still reports the certificate, but the pacemaker must not
+        // turn the anchor's commit into a skip. A node that has not received the
+        // certificate yet commits the same round; overriding here is what made
+        // one devnet node's commit root diverge from the other three. Only the
+        // anchor rule and the fence rules advance the cursor.
         let leader = fixture.dag.leader(LEADER_ROUND).unwrap().id().unwrap();
         let mut pacemaker = Pacemaker::new(PacemakerConfig::default(), LEADER_ROUND);
         let step = pacemaker.tick_one(&mut fixture.dag).unwrap();
         assert_eq!(pacemaker.cursor(), LEADER_ROUND + 1);
-        assert_eq!(pacemaker.skip_counts().attested, 1);
+        assert_eq!(pacemaker.skip_counts().attested, 0);
         assert!(matches!(
             step,
-            Step::Advanced {
-                commits: 0,
-                skips: 1,
-                ..
-            }
+            Step::Advanced { commits, skips: 0, .. } if commits > 0
         ));
-        assert_eq!(fixture.dag.skipped()[0].round, LEADER_ROUND);
-        assert!(!fixture.dag.order().contains(&leader));
+        assert!(fixture.dag.order().contains(&leader));
+        assert!(fixture.dag.skipped().is_empty());
     }
 
     #[test]

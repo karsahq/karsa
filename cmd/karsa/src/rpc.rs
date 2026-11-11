@@ -619,8 +619,8 @@ impl RpcCore {
 
     /// Re-admits the transactions of a batch whose vertex was skipped.
     ///
-    /// A stage-A skip leaves the leader's batch out of the committed order, so
-    /// its transactions were never applied. A restart also loses the in-memory
+    /// A skip leaves the leader's batch out of the committed order, so its
+    /// transactions are never applied. A restart also loses the in-memory
     /// mempool, which is why this takes the batch content rather than a batch
     /// map entry. Each transaction is checked exactly like a client submission;
     /// one already recorded or already pending is skipped, so recovering the

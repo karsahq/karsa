@@ -42,7 +42,7 @@
 
 use crypto::{CryptoError, CryptoErrorKind};
 
-use crate::dag::{AnchorSkip, Dag, Decision};
+use crate::dag::{Dag, Decision};
 use crate::vertex::VertexId;
 
 /// How the pacemaker is configured.
@@ -150,6 +150,9 @@ pub struct SkipCounts {
     /// A quorum fenced the only missing voter of a live leader.
     pub fence_voter: u64,
     /// A round-skip proof accounted for every voter below the quorum.
+    ///
+    /// Always zero after D74: a certificate is reporting evidence and never
+    /// moves the cursor.
     pub attested: u64,
 }
 
@@ -406,15 +409,18 @@ impl Pacemaker {
         // leader the lower one does not, so choosing it early would make the
         // commit order depend on when data arrived rather than on the DAG.
         if let Some(anchor) = self.stable_anchor(dag, round)? {
-            // A certificate only counts when it is inside this anchor's causal
-            // history. The walk also surfaces a missing ancestor of the anchor as
-            // MissingReference, so the caller repairs it instead of deciding on a
-            // partial history.
-            let certificate = dag.anchor_skip(&anchor, round)?;
-            // `try_indirect_decide` commits the leader's history as a side effect,
-            // so the two ways this node could be wrong are ruled out first: a walk
-            // it cannot finish (nothing is proved), and a skip that could still win
-            // (a non-vote quorum may exist, and a skip must not race a commit).
+            // A round-skip certificate is negative evidence: it proves that no
+            // vote quorum can form, but it can arrive after another node has
+            // already committed the same leader through its anchor. Overriding
+            // that commit here forks the committed order (measured: an A/B
+            // devnet changed the commit root on one node only). A certificate is
+            // therefore reporting evidence, not a decision; the anchor rule and
+            // the fence rules remain the only things that advance the cursor.
+            // `try_indirect_decide` commits the leader's history as a side
+            // effect, so the two ways this node could be wrong are ruled out
+            // first: a walk it cannot finish (nothing is proved), and a skip
+            // that could still win (a non-vote quorum may exist, and a skip must
+            // not race a commit).
             let reach = match dag.leader(round) {
                 Some(leader) => {
                     let leader_id = leader.id()?;
@@ -435,19 +441,6 @@ impl Pacemaker {
 
             let decision = match reach {
                 Reach::Unknown => None,
-                // A causal certificate turns a commit into a skip. The check has
-                // to happen before `try_indirect_decide`, because that call
-                // commits the leader's history as a side effect.
-                Reach::Yes if matches!(certificate, AnchorSkip::Certificate(_)) => {
-                    let (author, digest) = {
-                        let leader = dag.leader(round).expect("a reachable leader is held");
-                        (leader.author.clone(), leader.id()?.digest)
-                    };
-                    dag.record_skip(round, author, Some(digest));
-                    self.skips.attested = self.skips.attested.saturating_add(1);
-                    self.cursor = round + 1;
-                    return Ok(Advance::Skip);
-                }
                 Reach::Yes if dag.held_voters(round)? <= dag.set().max_faulty() => None,
                 _ => Some(dag.try_indirect_decide(round, &anchor)?),
             };

@@ -2153,7 +2153,10 @@ certificate rule.
 
 ## D73 — Stage A: a causal certificate can turn a commit into a skip
 
-**Decided (opt-in).** With `--round-skip`, a valid certificate inside the
+**Superseded by D74.** The override described here forked the committed order in
+an A/B devnet; the batch-recovery half survives, the override does not.
+
+**Decided (opt-in, later removed).** With `--round-skip`, a valid certificate inside the
 selected anchor's causal history now turns a reachable leader's `Commit` into a
 `Skip`. The check runs before `try_indirect_decide`, because that call commits
 the leader's history as a side effect. The override increments `attested` and
@@ -2192,6 +2195,47 @@ pinned by the unit tests.
 a restart between the skip and the re-author, and the case where the author is
 down while a peer holds the batch. The recovery path exists, but those three
 runs are not measured yet.
+
+## D74 — A causal certificate must not override an anchor commit
+
+**Decided.** The stage A override (D73) is removed. A round-skip certificate is
+reporting evidence, never a decision: the pacemaker checks only the anchor rule
+and the fence rules for `Commit`/`Skip`, so `attested` stays zero. The
+certificate is still verified, persisted, bound to a vertex, and reported by
+`Dag::anchor_skip`; it cannot turn a reachable leader's commit into a skip.
+
+**Why.** A certificate is negative evidence and arrives asynchronously. A node
+that held the certificate inside its selected anchor's history skipped the
+round; a node that had not received the binding vertex yet committed the same
+round through `try_indirect_decide`, which commits every leader reachable from
+the anchor without requiring a vote quorum for that leader. The orders fork
+permanently:
+
+- `ROUND_SKIP=1 FENCE_SILENT=1`, four validators, thirty seconds of client
+transfers: node 0 `commit_root=9b88c815...`, nodes 1-3 `f9f1ba05...`, while all
+four shared `state_root=5a01418f...`. The diverging node reported 65 attested
+skips against 68 on a peer.
+- The same load with `ROUND_SKIP` off: all four nodes
+`commit_root=46275d46...` and `state_root=6b5abab2...`.
+- Without `FENCE_SILENT` but with `ROUND_SKIP`, certified heights stopped at 517
+while committed entries grew past 16,000; the same load without `ROUND_SKIP`
+certified steadily (1,455 to 2,026 in ten seconds).
+
+**What stays.** `RpcCore::readmit_batch` and `recover_skipped_batches` stay:
+fence and absent skips still leave a leader's batch out of the order. A live
+devnet observed `re-admitted` lines from those rules on every node.
+
+**Measured (fixed build).** `ROUND_SKIP=1 FENCE_SILENT=1`, thirty seconds of
+transfers: 590 submitted transactions, 590 applied, identical
+`commit_root=24f4a493...` and `state_root=25131fa9...` on all four nodes,
+`attested=0`, and 1/4/7/7 `re-admitted` events per node. The three client
+failures were `/account` HTTP 409 (the certified applied count was older than
+the retained state window), not submission or finality failures.
+
+**Open.** A deterministic certificate rule still needs a causal cutoff that
+proves the round cannot be committed by any anchor, not merely that no vote
+quorum can form. Without that cutoff, an asynchronous certificate cannot decide
+a round.
 
 ## Open decisions
 

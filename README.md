@@ -1344,29 +1344,46 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       certified height 2,368 and 10,463 committed entries after twenty seconds,
       the fourth was two heights ahead, and `attested` stayed 0. No node skipped
       on the certificate.
-    - Stage A (a causal certificate turns a commit into a skip) still needs a
-      batch-recovery path before live use: a skipped leader's transactions are
-      not final through that anchor, and returning them to the mempool needs
-      retry, deduplication, and persistence tests.
+    - Stage A (a causal certificate turns a commit into a skip) was implemented
+      next and then removed: the override forked the committed order, and a
+      certificate is reporting evidence only (finding 60).
 
-59. **A causal certificate can skip a reachable leader, and the batch comes back.**
-    With `--round-skip`, a valid certificate inside the selected anchor's causal
-    history turns a `Commit` into a `Skip`; the check runs before
-    `try_indirect_decide` because that call commits history as a side effect.
-    The skipped leader's batch is not in the committed order, so
-    `RpcCore::readmit_batch` returns its transactions to the mempool from the
-    batch content. It handles the author's existing record and the restart case
-    where no record exists, and it is idempotent. `recover_skipped_batches` runs
-    after every commit loop and once after restore.
+59. **A skipped leader's batch comes back, and only anchor/fence rules decide a
+    skip.** `RpcCore::readmit_batch` returns the transactions of a skipped
+    leader's batch to the mempool from the batch content. It handles the author's
+    existing record and the restart case where no record exists, and it is
+    idempotent. `recover_skipped_batches` runs after every commit loop and once
+    after restore.
     - Three unit tests cover the fresh readmit, the author's record, and
       `return_batch`.
-    - A four-node devnet reached 2,370-2,374 certified heights in about
-      twenty-five seconds with 41-43 attested skips per node; a submitted
-      transfer finalized in 100 ms. The transfer did not land in a skipped
-      batch, so the recovery glue was not observed live.
-    - Still open: a targeted devnet with a transaction in a skipped batch, a
-      restart between skip and re-author, and an author that is down while a
-      peer holds the batch.
+    - A four-node release devnet with `ROUND_SKIP=1 FENCE_SILENT=1` and thirty
+      seconds of client transfers applied 590 of 590 submitted transactions.
+      Every node reported the same `commit_root=24f4a493...` and
+      `state_root=25131fa9...`, with 1-7 `re-admitted` log lines per node from
+      fence and absent skips. The three client-side failures were `/account`
+      HTTP 409 (certified applied count older than the retained state window),
+      not submissions or finality.
+    - A causal certificate does not turn a commit into a skip. That override
+      forked the order (finding 60); the certificate stays reporting evidence,
+      and `attested` remains zero.
+
+60. **A causal round-skip certificate forked the committed order.** A
+    certificate is negative evidence and can arrive after a peer has already
+    committed the same leader. If the node that holds the certificate inside its
+    selected anchor's history overrides `try_indirect_decide`, the node that has
+    not received the binding vertex yet commits instead, and the two orders fork
+    permanently.
+    - `ROUND_SKIP=1 FENCE_SILENT=1`, four validators, thirty seconds of
+      transfers: node 0 reported `commit_root=9b88c815...`, nodes 1-3 reported
+      `f9f1ba05...`; all four shared the same state root. The diverging node also
+      reported 65 attested skips against 68 on a peer.
+    - The same load with `ROUND_SKIP` off produced one `commit_root=46275d46...`
+      on all four nodes. Without `FENCE_SILENT` but with `ROUND_SKIP`, header
+      certification stopped at height 517 while committed entries grew past
+      16,000; the same load without `ROUND_SKIP` certified steadily.
+    - Decision D74 removes the override. A future certificate rule needs a causal
+      cutoff that proves the round cannot be committed, not merely that no vote
+      quorum can form.
 
 ## Build order
 
