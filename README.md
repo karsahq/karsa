@@ -1227,6 +1227,43 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       between adopting a certificate and clearing the share leaves one redundant
       record; the loader skips it because the adopted certificate wins.
 
+52. **Two fences coexist at seven validators, and the budget is enforced.**
+    With `f = 2`, two certificates live side by side in the same DAG and a third
+    is refused with `TooMany { count: 3, limit: 2 }`. A held leader whose two
+    missing voters are both fenced is released with five held vertices; three
+    held votes block the same skip, because the held-vote cap is `f`. A
+    seven-process devnet with validators 0 and 1 killed after 1,317 agreed
+    heights had all five survivors adopt both certificates at round 1,523, keep
+    certifying, and report 0 conflicts. `karsa audit` on a survivor printed
+    `fences: 2 (...)` and re-derived all 1,604 state and DAG roots.
+    - `two_fences_coexist_at_seven_validators_and_a_third_is_refused`,
+      `two_fenced_missing_voters_free_a_live_leader_at_two_faults`, and
+      `three_held_votes_block_a_fence_skip_at_two_faults` are the deterministic
+      predicates; the devnet was functional only and measured no timing.
+    - With two of seven dead the five survivors still form a quorum, so the
+      absent-leader rule can release some rounds before the failure detector
+      fires; the fence rule runs first when a certificate exists. This run only
+      covers one kill pattern.
+
+53. **A fenced validator can cold-join from a snapshot and stays passive.**
+    `Node::author_with` returns `Ok(None)` when the DAG reports this node fenced
+    at its round, instead of signing a vertex every peer would reject and
+    failing the live loop; its round advances to the newest held vertex while it
+    keeps following the chain. Five validators with fencing and checkpoints ran,
+    validator 0 was killed after roughly 490 heights, and the survivors fenced it
+    at round 523. Its store was deleted and it restarted with
+    `--sync-from-peers`; it adopted a snapshot at height 817, round 924, floor
+    922 (above the fence round), with 25 tail vertices, caught up, and continued
+    to a 1,921-height checkpoint. `karsa audit` printed
+    `fences: 1 (...)` against the snapshot certificate and re-derived 60 of 60
+    heights above the anchor.
+    - `a_fenced_node_follows_without_authoring_or_failing` pins the passive
+      authoring behavior; the live run was functional and measured no timing.
+    - The fence round below the snapshot floor is the D64 case: the join would
+      have rejected the certificate before D64.
+    - A permanent fence keeps the node passive; returning it to service needs a
+      later set change or a view-change rule that does not exist yet.
+
 ## Build order
 
 | Stage | Crate | State |

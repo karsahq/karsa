@@ -339,6 +339,17 @@ impl Node {
             }
             return Ok(None);
         }
+        if self.dag.is_fenced(&self.id, round) {
+            // A quorum declared this validator failed from this round. It still
+            // follows and commits, but a vertex signed here would be rejected by
+            // every peer; return without consuming the round instead of failing
+            // the node. Keep the round tracking the newest vertex so the next
+            // tick evaluates the current set.
+            if let Some(highest) = self.dag.highest_round() {
+                self.round = self.round.max(highest.saturating_add(1));
+            }
+            return Ok(None);
+        }
         let references = if round == 0 {
             Vec::new()
         } else {
@@ -715,6 +726,7 @@ impl Simulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use validator::{bitmap_len, set_bit};
 
     fn config(jitter: u64, crashed: Option<usize>) -> SimConfig {
         SimConfig {
@@ -855,6 +867,11 @@ mod tests {
 
     /// Four nodes with the simulator's demo identities and independent keys.
     fn test_nodes(count: usize) -> Vec<Node> {
+        test_nodes_with_keys(count).0
+    }
+
+    /// The same nodes, with the private keys so a test can sign a certificate.
+    fn test_nodes_with_keys(count: usize) -> (Vec<Node>, Vec<Vec<u8>>) {
         let mut validators = Vec::with_capacity(count);
         let mut keys = Vec::with_capacity(count);
         for index in 0..count {
@@ -876,7 +893,7 @@ mod tests {
             validators,
         };
         set.validate().unwrap();
-        (0..count)
+        let nodes = (0..count)
             .map(|index| {
                 Node::new(
                     set.clone(),
@@ -884,6 +901,55 @@ mod tests {
                     keys[index].clone(),
                 )
             })
-            .collect()
+            .collect();
+        (nodes, keys)
+    }
+
+    #[test]
+    fn a_fenced_node_follows_without_authoring_or_failing() {
+        let (mut nodes, keys) = test_nodes_with_keys(4);
+        for _ in 0..2 {
+            let authored: Vec<Vertex> = nodes
+                .iter_mut()
+                .map(|node| node.author().unwrap().expect("a vertex"))
+                .collect();
+            for vertex in &authored {
+                for node in &mut nodes {
+                    node.receive(vertex.clone()).unwrap();
+                }
+            }
+        }
+
+        let set = nodes[0].dag().set().clone();
+        let fence = Fence::new(CHAIN_ID.to_vec(), 2, b"val-0".to_vec());
+        let payload = fence.signing_payload().unwrap();
+        let mut signer_bitmap = vec![0u8; bitmap_len(set.validators.len())];
+        let mut signatures = Vec::new();
+        for (index, key) in keys.iter().enumerate().take(set.quorum_size()) {
+            set_bit(&mut signer_bitmap, index);
+            signatures.push(Ed25519Scheme.sign(key, &payload).unwrap());
+        }
+        nodes[0]
+            .apply_fence(&FenceCertificate {
+                fence,
+                signer_bitmap,
+                signatures,
+            })
+            .unwrap();
+
+        assert_eq!(nodes[0].round(), 2);
+        assert!(
+            nodes[0].author().unwrap().is_none(),
+            "a fenced validator must not sign a vertex the DAG rejects"
+        );
+        assert_eq!(
+            nodes[0].round(),
+            nodes[0].dag().highest_round().unwrap().saturating_add(1),
+            "the passive node keeps its round at the newest vertex"
+        );
+
+        // The rest of the committee still authors and the fenced node follows.
+        let authored = nodes[1].author().unwrap().expect("a live vertex");
+        nodes[0].receive(authored).unwrap();
     }
 }

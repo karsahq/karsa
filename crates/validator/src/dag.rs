@@ -1230,6 +1230,100 @@ mod tests {
     }
 
     #[test]
+    fn two_fences_coexist_at_seven_validators_and_a_third_is_refused() {
+        let mut fixture = fixture(7);
+        for validator in [b"val-0".as_slice(), b"val-1".as_slice()] {
+            let certificate = fence_certificate(&fixture, 1, validator);
+            fixture
+                .dag
+                .apply_fence(b"karsa-dag-1", &certificate)
+                .unwrap();
+        }
+        assert!(fixture.dag.is_fenced(b"val-0", 1));
+        assert!(fixture.dag.is_fenced(b"val-1", 1));
+
+        let third = fence_certificate(&fixture, 1, b"val-2");
+        assert!(matches!(
+            fixture.dag.apply_fence(b"karsa-dag-1", &third),
+            Err(crate::fence::FenceError::TooMany { count: 3, limit: 2 })
+        ));
+    }
+
+    #[test]
+    fn two_fenced_missing_voters_free_a_live_leader_at_two_faults() {
+        let mut fixture = fixture(7);
+        fixture.full_round(0, &[]).unwrap();
+        let genesis = fixture.ids(0);
+        fixture.full_round(1, &genesis).unwrap();
+        let leader = fixture.dag.leader_author(1).unwrap().to_vec();
+        let non_leader: Vec<VertexId> = fixture
+            .ids(1)
+            .into_iter()
+            .filter(|id| id.author != leader)
+            .take(5)
+            .collect();
+        // Five voters, none of them naming the leader. The two authors that did
+        // not vote are both fenced; with f = 2 that is the whole fault budget.
+        for author in 0..5 {
+            fixture
+                .dag
+                .insert(vertex(&fixture, author, 2, non_leader.clone()))
+                .unwrap();
+        }
+        for validator in [b"val-5".as_slice(), b"val-6".as_slice()] {
+            let certificate = fence_certificate(&fixture, 2, validator);
+            fixture
+                .dag
+                .apply_fence(b"karsa-dag-1", &certificate)
+                .unwrap();
+        }
+        assert!(fixture.dag.can_skip_with_fence(1).unwrap());
+        assert!(fixture.dag.skip_with_fence(1).unwrap());
+        assert_eq!(fixture.dag.skipped().len(), 1);
+        assert_eq!(fixture.dag.skipped()[0].round, 1);
+    }
+
+    #[test]
+    fn three_held_votes_block_a_fence_skip_at_two_faults() {
+        let mut fixture = fixture(7);
+        fixture.full_round(0, &[]).unwrap();
+        let genesis = fixture.ids(0);
+        fixture.full_round(1, &genesis).unwrap();
+        let leader = fixture.dag.leader(1).unwrap().id().unwrap();
+        let non_leader: Vec<VertexId> = fixture
+            .ids(1)
+            .into_iter()
+            .filter(|id| id.author != leader.author)
+            .take(5)
+            .collect();
+        let mut vote_refs = non_leader[..4].to_vec();
+        vote_refs.push(leader);
+        for author in 0..3 {
+            fixture
+                .dag
+                .insert(vertex(&fixture, author, 2, vote_refs.clone()))
+                .unwrap();
+        }
+        for author in 3..5 {
+            fixture
+                .dag
+                .insert(vertex(&fixture, author, 2, non_leader.clone()))
+                .unwrap();
+        }
+        for validator in [b"val-5".as_slice(), b"val-6".as_slice()] {
+            let certificate = fence_certificate(&fixture, 2, validator);
+            fixture
+                .dag
+                .apply_fence(b"karsa-dag-1", &certificate)
+                .unwrap();
+        }
+        assert!(
+            !fixture.dag.can_skip_with_fence(1).unwrap(),
+            "three held votes exceed the two-fault budget"
+        );
+    }
+
+    #[test]
     fn a_fenced_author_cannot_insert_a_new_vertex() {
         let mut fixture = fixture(4);
         let certificate = fence_certificate(&fixture, 1, b"val-0");

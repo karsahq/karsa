@@ -1900,6 +1900,68 @@ large set and PQ keys this is bounded by `f` shares. A node that crashes between
 adopting a certificate and clearing its share leaves one redundant record, which
 the loader skips because the adopted certificate wins.
 
+## D66 — Two fences coexist at seven validators and the budget is enforced
+
+**Decided (prototype).** The fence rules were exercised below the fault budget in
+the four-validator mesh; this decision covers `f = 2`. Three deterministic DAG
+tests pin the arithmetic: two certificates coexist at seven validators and a
+third is refused with `TooMany { count: 3, limit: 2 }`; a held leader whose two
+missing voters are both fenced is released with five held vertices; and three
+held votes block the same skip even when the missing voters are fenced, because
+the held-vote cap is `f`. The live path was then run with seven processes and
+validators 0 and 1 killed after 1,317 agreed heights. All five survivors proposed
+and adopted both certificates at round 1,523 (the dead validators' last observed
+round plus one), continued certifying, and reported 0 conflicts. `karsa audit` on
+a survivor printed `fences: 2 (0400601c39bf002c, 097347e2d48326b8)` and re-derived
+all 1,604 state and DAG roots.
+
+*Measured (functional).* The predicates are
+`two_fences_coexist_at_seven_validators_and_a_third_is_refused`,
+`two_fenced_missing_voters_free_a_live_leader_at_two_faults`, and
+`three_held_votes_block_a_fence_skip_at_two_faults`. The devnet ran with
+`FENCE_SILENT=1 FAILURE_ROUNDS=15 CHECKPOINT_EVERY=0`; no timing was measured.
+
+*Cost and open.* With two of seven validators dead the five survivors still form
+a quorum, so the absent-leader rule can often release a missing leader before the
+failure detector reaches its threshold; the fence rule runs first when it exists,
+but the live evidence only covers this one kill pattern. Two fences can name the
+same round when both validators were last seen together; diverged views still
+rely on D62's round choice. Fences remain a liveness declaration, not a slashing
+proof.
+
+## D67 — A fenced validator can cold-join from a snapshot and stays passive
+
+**Decided (prototype).** A node that a quorum has fenced still follows the chain.
+`Node::author_with` now returns `Ok(None)` when the DAG reports this node fenced
+at its round, instead of signing a vertex every peer would reject and failing the
+live loop with `cannot author`. The round advances to the newest held vertex, so
+the next tick evaluates the current set. `a_fenced_node_follows_without_authoring_or_failing`
+pins both the `None` and the round advance; the rest of the committee keeps
+authoring and the passive node receives their vertices.
+
+The cold-join path was then run end to end. Five validators, fencing enabled,
+checkpoints every 64. Validator 0 was killed after roughly 490 certified heights;
+the four survivors fenced it at round 523 and kept certifying. Validator 0's store
+was deleted and the process restarted with `--sync-from-peers`. It adopted a
+peer's snapshot at height 817, round 924, floor 922 — above the fence round — with
+25 tail vertices, caught up to the survivors, and continued to a 1,921-height
+checkpoint. `karsa audit` on the joined store printed
+`fences: 1 (0400601c39bf002c)`, treated the live snapshot certificate as the trust
+anchor, and re-derived all 60 heights above it. The fence round being below the
+snapshot floor is exactly the case D64 allows; without that change the join would
+have rejected the certificate.
+
+*Measured (functional).* The devnet used
+`VALIDATORS=5 FENCE_SILENT=1 FAILURE_ROUNDS=15 CHECKPOINT_EVERY=64` and a
+180-second lifetime; no timing was measured. The snapshot log line was
+`adopted snapshot height 817 round 924, floor Some(922), 25 tail vertices`.
+
+*Cost and open.* The joiner verifies the anchor certificate and every carried
+fence, then replays only the tail. A fenced node never authors again under the
+prototype's permanent fence; returning it to service needs a later set change or
+a view-change rule, neither of which exists. The test wipes the store on purpose,
+so it does not cover a store that still holds pre-fence history.
+
 ## Open decisions
 
 1. **Does a node serve history it does not hold?** Model B says no beyond the
