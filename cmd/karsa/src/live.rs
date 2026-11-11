@@ -2482,10 +2482,6 @@ async fn node_task(
     let mut gave_up = 0u64;
     let mut ticks: u32 = 0;
     let mut cursor: u64 = node.cursor();
-    // Committed order length already turned into a pending header. A header's
-    // round is the highest round in the slice it covers, which is a function of
-    // the committed prefix rather than of the local decision slot.
-    let mut recorded_order = node.dag().order_len();
     let mut cursor_since = Instant::now();
     let mut reported_stall: Option<u64> = None;
     // The interval is measured from the checkpoint or head this run resumed at,
@@ -3069,23 +3065,7 @@ async fn node_task(
                             if commits > 0
                                 && let Some(finalizer) = finalizer.as_mut()
                             {
-                                let order = node.dag().order();
-                                let order_len = node.dag().order_len();
-                                let prefix = node.dag().prefix().len();
-                                let start = recorded_order.max(prefix).saturating_sub(prefix);
-                                let end = order_len.saturating_sub(prefix).min(order.len());
-                                let start = start.min(end);
-                                // The decision slot is not deterministic across
-                                // nodes: two nodes can commit the same prefix at
-                                // different cursor rounds when one adopts a skip
-                                // proof first. The covered slice is.
-                                let round = order[start..end]
-                                    .iter()
-                                    .map(|id| id.round)
-                                    .max()
-                                    .unwrap_or(from);
-                                recorded_order = order_len;
-                                finalizer.record_commit(round, order_len);
+                                finalizer.record_commit(from, node.dag().order_len());
                             }
                             if anchors > 0 {
                                 break;

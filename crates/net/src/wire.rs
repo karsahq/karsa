@@ -21,6 +21,8 @@
 //! - [`Message::SetChange`] carries a transition certificate authorized by the
 //!   old set.
 //! - [`Message::Fence`] carries a quorum statement that one validator failed.
+//! - [`Message::RoundSkip`] carries evidence that a leader round cannot reach a
+//!   vote quorum.
 //!
 //! The hello exists because a vertex is only meaningful on one chain: the chain id
 //! is part of what a validator signs, so a peer on another genesis would produce

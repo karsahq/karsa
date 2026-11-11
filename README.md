@@ -1304,8 +1304,24 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       shape: cursor 73, two votes, two held non-votes, one missing voter, bound 3
       of quorum 4. The cursor moves to 74 and `attested` is 1.
     - `a_round_skip_proof_for_another_leader_is_refused` pins the leader binding.
-    - No wire message, store log, or live proof construction exists yet, so a
-      live stall still needs the dissemination stage.
+    - Wire protocol 10, the `round-skips` store log, and the live builder now
+      exist behind `--round-skip`; D71 records why the live path is not enabled
+      by default yet.
+
+57. **A control-plane round skip stalls finality before it frees the cursor.**
+    `Message::RoundSkip` (wire protocol 10), a `round-skips` store log, and a
+    live builder behind `--round-skip` carry and replay the proof. A four-node
+    release devnet with `ROUND_SKIP=1 FENCE_SILENT=1` agreed on the committed
+    order (9,706 entries) and on one certified head, but finality stopped at
+    height 16: a node that adopted a skip proof first split the same prefix into
+    headers at different commit heights, so the finality shares never combined.
+    - The proof path itself worked: all four nodes built, verified, stored, and
+      rebroadcast proofs, and `attested` reached about 200 in twenty seconds.
+    - Deriving the header round from the committed slice did not fix the
+      grouping and was reverted.
+    - The next step is a certificate the DAG replays, not a control frame, so
+      every node commits the same prefix at the same height before the cursor
+      moves.
 
 ## Build order
 

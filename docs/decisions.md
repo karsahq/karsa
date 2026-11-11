@@ -2052,13 +2052,45 @@ pacemaker moves the cursor to 74, reports `attested = 1`, and records the skip a
 round 73. `a_round_skip_proof_for_another_leader_is_refused` pins the leader
 binding: a proof with a different digest is refused and is not stored.
 
-*Cost and open.* The proof is built and applied in-process only. No wire message
-carries it, no store log persists it, and a live node does not yet construct one
-from its own DAG. Until that dissemination exists, the rule cannot release a
-live stall: a node that holds the proof skips, and a node that does not keeps
-waiting, which is the D68 divergence risk. The next stage is `Message::RoundSkip`
-with `WIRE_PROTOCOL` 10, a store log, rebroadcast, and snapshot/replay coverage,
-so every node reaches the same proof before the cursor depends on it.
+*Cost and open.* The proof is built and applied in-process here. D71 adds the
+wire message, the store log, and the live builder; the live run shows that a
+control frame is not a decision record, so the path stays opt-in until the
+certificate is recorded in the DAG.
+
+## D71 — A control-plane round skip is not deterministic enough
+
+**Tried (opt-in).** Wire protocol 10 adds `Message::RoundSkip`; the store keeps
+one proof per leader round in a `round-skips` log, restarts apply them before
+the replay, and a live node builds a proof from its own DAG, verifies a
+received one, persists it, and rebroadcasts it. `--round-skip` enables the local
+builder; without the flag the node only adopts proofs it receives, and the
+default chain does not use the rule.
+
+*Measured (functional, failing).* A four-validator release devnet with
+`ROUND_SKIP=1 FENCE_SILENT=1 FAILURE_ROUNDS=15 CHECKPOINT_EVERY=64` reached
+rounds near 2,500 and all four nodes agreed on the committed order (9,706
+entries) and on one certified head, but finality stopped at height 16. Each node
+records one header per local commit decision; a node that adopts a skip proof
+first skips a round another node still commits through an anchor, so the same
+prefix is split into headers at different heights. The shares then name
+different headers and never combine. The rule also fires often on this devnet
+(about 200 `attested` skips in twenty seconds) because voters author without the
+leader when delivery is slower than the round, which makes the grouping race
+regular rather than rare.
+
+*Rejected fix.* Deriving the header round from the highest round in the newly
+committed slice was tried: it removed the slot from the header id but not the
+grouping, and finality still stopped at the first divergent grouping. It was
+reverted.
+
+**Consequence.** The proof is a sound local statement but a control frame is not
+a decision record. The live path stays opt-in and unproven, and the default gate
+is unchanged. The next stage must record the skip certificate where the DAG can
+replay it (a vertex payload field or a canonical header boundary), so every node
+commits the same prefix at the same height before the cursor moves. This is the
+same requirement D59 met for set changes by carrying the certificate in the
+snapshot and the store, and it is the last blocker for freeing `cursor 73`
+without the finality race.
 
 ## Open decisions
 
