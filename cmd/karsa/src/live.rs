@@ -1683,6 +1683,7 @@ fn build_live_snapshot(
         floor: Some(floor),
         vertices,
         batches: tail_batches,
+        round_skips: node.dag().round_skips().cloned().collect(),
     })
 }
 
@@ -1910,6 +1911,7 @@ fn adopt_snapshot(
         certificate,
         transition,
         fences,
+        round_skips,
         cursor,
         floor,
         vertices,
@@ -1966,6 +1968,20 @@ fn adopt_snapshot(
         node.receive(vertex.clone())
             .map_err(|error| format!("cannot replay a snapshot tail vertex: {error}"))?;
     }
+    // Round skips are decision inputs for the tail. Install them only after the
+    // vertices they name are held: a proof is verified against the leader and
+    // the voting-round vertices, so a proof that arrived before its evidence
+    // would be rejected rather than queued. The proofs are persisted with the
+    // rest of the snapshot, after their evidence is on disk.
+    let mut verified_skips = Vec::new();
+    for proof in round_skips {
+        let payload = ControlPayload::RoundSkip(Box::new(proof.clone()));
+        node.add_control(payload)
+            .map_err(|error| format!("snapshot round skip payload is invalid: {error}"))?;
+        node.apply_round_skip(proof.clone())
+            .map_err(|error| format!("snapshot round skip is not authorized: {error}"))?;
+        verified_skips.push(proof);
+    }
     if let Some(store) = store {
         store
             .put_live_snapshot(&store::LiveSnapshot {
@@ -1996,6 +2012,11 @@ fn adopt_snapshot(
         }
         for batch in &incoming {
             store.put_batch(batch).map_err(|error| error.to_string())?;
+        }
+        for proof in &verified_skips {
+            store
+                .put_round_skip(proof)
+                .map_err(|error| error.to_string())?;
         }
     }
     for batch in incoming {
@@ -5467,6 +5488,39 @@ mod tests {
             1,
             genesis_ids[..set.quorum_size()].to_vec(),
         ));
+        // Two more voting-round vertices that do not reference the leader. They
+        // make the round-skip partition exact: one vote, two non-votes, and the
+        // fenced author as the absent voter.
+        for author in [2, 3] {
+            vertices.push(signed_vertex(
+                &membership,
+                &chain_id,
+                author,
+                1,
+                genesis_ids[1..4].to_vec(),
+            ));
+        }
+        let round_one = |author: usize| {
+            vertices
+                .iter()
+                .find(|vertex| {
+                    vertex.round == 1 && vertex.author == set.validators[author].validator_id
+                })
+                .expect("the voting round holds this author")
+                .id()
+                .unwrap()
+        };
+        let skip_proof = RoundSkipProof {
+            attestation: NoVoteAttestation {
+                skip: RoundSkip::new(chain_id.clone(), genesis_ids[0].clone()),
+                signer_bitmap: vec![0u8; bitmap_len(set.validators.len())],
+                signatures: Vec::new(),
+            },
+            votes: vec![round_one(1)],
+            non_votes: vec![round_one(2), round_one(3)],
+            fenced_absent: vec![fence_certificate.clone()],
+            missing: Vec::new(),
+        };
 
         let snapshot = wire::Snapshot {
             state: state.encode().unwrap(),
@@ -5477,6 +5531,7 @@ mod tests {
             certificate,
             transition: None,
             fences: vec![fence_certificate.clone()],
+            round_skips: vec![skip_proof.clone()],
             cursor: 4,
             floor: None,
             vertices,
@@ -5514,7 +5569,7 @@ mod tests {
         )
         .expect("the fenced snapshot must be adopted");
 
-        assert_eq!(adopted.vertices, 5, "four genesis vertices and one vote");
+        assert_eq!(adopted.vertices, 7, "four genesis vertices and three votes");
         assert!(node.dag().is_fenced(&fenced, 1));
         assert!(node.dag().is_fenced(&fenced, 99));
         assert!(node.dag().get(1, &fenced).is_none());
@@ -5522,6 +5577,8 @@ mod tests {
             node.dag().get(1, &set.validators[1].validator_id).is_some(),
             "a live author's tail vertex must survive"
         );
+        assert_eq!(node.dag().round_skip(0), Some(&skip_proof));
+        assert_eq!(store.round_skips().unwrap(), vec![skip_proof.clone()]);
         assert_eq!(store.fences().unwrap(), vec![fence_certificate.clone()]);
         assert_eq!(
             store.live_snapshot().unwrap().unwrap().fences,

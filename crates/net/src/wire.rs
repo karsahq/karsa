@@ -81,7 +81,7 @@ const KIND_WANT_SLOT: u8 = 13;
 /// A peer that answers with another number is not necessarily hostile; it may be a
 /// different build. The link is closed rather than parsed optimistically, because
 /// the next frame kind could mean something else there.
-pub const WIRE_PROTOCOL: u16 = 12;
+pub const WIRE_PROTOCOL: u16 = 13;
 
 /// The first frame on every link: which chain the sender is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +132,14 @@ pub struct Snapshot {
     /// already declared failed, so the certificates travel with the state they
     /// apply to. Each is verified against the set active at its round.
     pub fences: Vec<FenceCertificate>,
+    /// Round-skip proofs the sender adopted, including those below its floor.
+    ///
+    /// A tail vertex can name a control payload whose digest is not a batch.
+    /// Carrying the proofs with the state gives the joiner the same decision
+    /// inputs the sender used, instead of relying on a live rebroadcast that may
+    /// already be gone. Each is verified against the set and the vertices the
+    /// joiner holds.
+    pub round_skips: Vec<RoundSkipProof>,
     /// Decision round the joiner resumes from.
     pub cursor: u64,
     /// Rounds at or below this are covered by `state` and are not transferred.
@@ -316,6 +324,10 @@ fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>, CryptoError> {
     for certificate in &snapshot.fences {
         encoder.put_bytes(&certificate.encode()?)?;
     }
+    encoder.put_u32(count(snapshot.round_skips.len(), "round skip")?);
+    for proof in &snapshot.round_skips {
+        encoder.put_bytes(&proof.encode()?)?;
+    }
     encoder.put_u64(snapshot.cursor);
     match snapshot.floor {
         None => encoder.put_u8(0),
@@ -391,6 +403,17 @@ fn decode_snapshot(payload: &[u8]) -> Result<Snapshot, CryptoError> {
     for _ in 0..fence_count {
         fences.push(FenceCertificate::decode(decoder.read_bytes()?)?);
     }
+    let skip_count = decoder.read_u32()? as usize;
+    if skip_count > MAX_FRAME {
+        return Err(CryptoError::new(
+            CryptoErrorKind::FieldTooLong,
+            format!("{skip_count} round skips exceed the frame cap"),
+        ));
+    }
+    let mut round_skips = Vec::with_capacity(skip_count.min(64));
+    for _ in 0..skip_count {
+        round_skips.push(RoundSkipProof::decode(decoder.read_bytes()?)?);
+    }
     let cursor = decoder.read_u64()?;
     let floor = match decoder.read_u8()? {
         0 => None,
@@ -429,6 +452,7 @@ fn decode_snapshot(payload: &[u8]) -> Result<Snapshot, CryptoError> {
         certificate,
         transition,
         fences,
+        round_skips,
         cursor,
         floor,
         vertices,
@@ -733,6 +757,7 @@ mod tests {
             },
             transition: Some(transition_certificate()),
             fences: vec![fence_certificate()],
+            round_skips: vec![round_skip_proof()],
             cursor: 5,
             floor: Some(2),
             vertices: vec![vertex(4)],

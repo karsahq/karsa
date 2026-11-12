@@ -600,6 +600,14 @@ impl Dag {
         self.round_skips.get(&round)
     }
 
+    /// Every round-skip proof this DAG adopted, one per leader round.
+    ///
+    /// A snapshot carries these so a joining node starts with the same decision
+    /// inputs as the sender rather than depending on a live rebroadcast.
+    pub fn round_skips(&self) -> impl Iterator<Item = &RoundSkipProof> {
+        self.round_skips.values()
+    }
+
     /// Whether a verified round-skip proof authorizes skipping `round`'s leader.
     ///
     /// The proof is only accepted when it names the leader this DAG holds. A
