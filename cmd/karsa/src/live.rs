@@ -1619,6 +1619,9 @@ enum SnapshotDecline {
     StateEvicted { applied: u64 },
     StateRootMismatch,
     StateEncoding,
+    BridgeIncomplete { round: u64 },
+    PayloadMissing,
+    ControlPending,
 }
 
 impl std::fmt::Display for SnapshotDecline {
@@ -1652,8 +1655,75 @@ impl std::fmt::Display for SnapshotDecline {
                 )
             }
             Self::StateEncoding => write!(formatter, "the retained state cannot be encoded"),
+            Self::BridgeIncomplete { round } => {
+                write!(formatter, "a tail reference at round {round} has no bridge")
+            }
+            Self::PayloadMissing => {
+                write!(
+                    formatter,
+                    "a tail vertex names a batch this node does not hold"
+                )
+            }
+            Self::ControlPending => {
+                write!(formatter, "a tail vertex names a pending control payload")
+            }
         }
     }
+}
+
+/// Rejects a snapshot whose tail is not a closed bridge.
+///
+/// Every reference above the floor must name a vertex in the tail. A reference
+/// at or below the floor is covered only when it is committed at the anchor or
+/// already pruned. Every non-empty payload must be a carried batch or a carried
+/// round-skip proof; a pending control is not carried yet, so it makes the
+/// bridge incomplete instead of pretending the joiner can apply it.
+fn check_snapshot_bridge(
+    dag: &validator::Dag,
+    floor: u64,
+    vertices: &[validator::Vertex],
+    committed: &HashSet<VertexId>,
+    round_skips: &[RoundSkipProof],
+    batches: &HashMap<[u8; 32], Batch>,
+) -> Result<(), SnapshotDecline> {
+    let held: HashSet<VertexId> = vertices
+        .iter()
+        .filter_map(|vertex| vertex.id().ok())
+        .collect();
+    let controls: HashSet<[u8; 32]> = round_skips
+        .iter()
+        .filter_map(|proof| {
+            ControlPayload::RoundSkip(Box::new(proof.clone()))
+                .digest()
+                .ok()
+        })
+        .collect();
+    for vertex in vertices {
+        for reference in &vertex.references {
+            let covered = if reference.round <= floor {
+                dag.floor()
+                    .is_some_and(|dag_floor| reference.round <= dag_floor)
+                    || committed.contains(reference)
+            } else {
+                held.contains(reference)
+            };
+            if !covered {
+                return Err(SnapshotDecline::BridgeIncomplete {
+                    round: reference.round,
+                });
+            }
+        }
+        if vertex.payload_hash == [0u8; 32] || controls.contains(&vertex.payload_hash) {
+            continue;
+        }
+        if dag.control(&vertex.payload_hash).is_some() {
+            return Err(SnapshotDecline::ControlPending);
+        }
+        if !batches.contains_key(&vertex.payload_hash) {
+            return Err(SnapshotDecline::PayloadMissing);
+        }
+    }
+    Ok(())
 }
 
 /// Builds the snapshot this node can serve right now.
@@ -1727,6 +1797,9 @@ fn build_live_snapshot(
             tail_batches.push(batch.clone());
         }
     }
+    let round_skips: Vec<RoundSkipProof> = node.dag().round_skips().cloned().collect();
+    let committed: HashSet<VertexId> = committed_tail.iter().cloned().collect();
+    check_snapshot_bridge(dag, floor, &vertices, &committed, &round_skips, batches)?;
     Ok(wire::Snapshot {
         state: state.encode().map_err(|_| SnapshotDecline::StateEncoding)?,
         order,
@@ -1740,7 +1813,7 @@ fn build_live_snapshot(
         floor: Some(floor),
         vertices,
         batches: tail_batches,
-        round_skips: node.dag().round_skips().cloned().collect(),
+        round_skips,
     })
 }
 
@@ -5479,6 +5552,79 @@ mod tests {
         assert!(error.contains("declined the snapshot"), "{error}");
         assert!(error.contains("state evicted"), "{error}");
         server.await.unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_bridge_must_close_every_reference() {
+        use validator::{Dag, Vertex};
+
+        fn signed_vertex(
+            membership: &chain::Membership,
+            chain_id: &[u8],
+            author: usize,
+            round: u64,
+            references: Vec<VertexId>,
+            payload_hash: [u8; 32],
+        ) -> Vertex {
+            let mut vertex = Vertex {
+                chain_id: chain_id.to_vec(),
+                epoch: membership.set.epoch,
+                round,
+                author: membership.consensus[author].id.clone(),
+                payload_hash,
+                references,
+                signature: Vec::new(),
+            };
+            let payload = vertex.signing_payload().unwrap();
+            vertex.signature = Ed25519Scheme
+                .sign(&membership.consensus[author].private_key, &payload)
+                .unwrap();
+            vertex
+        }
+
+        let membership = chain::membership(4, None).expect("a demo committee");
+        let set = membership.set.clone();
+        let chain_id = b"karsa-snapshot-bridge".to_vec();
+        let mut dag = Dag::with_epoch_length(set.clone(), 2);
+        let genesis: Vec<Vertex> = (0..4)
+            .map(|author| signed_vertex(&membership, &chain_id, author, 0, Vec::new(), [0u8; 32]))
+            .collect();
+        for vertex in &genesis {
+            dag.insert(vertex.clone()).unwrap();
+        }
+        let genesis_ids: Vec<VertexId> =
+            genesis.iter().map(|vertex| vertex.id().unwrap()).collect();
+        let committed: HashSet<VertexId> = genesis_ids.iter().cloned().collect();
+
+        // The shape rule only counts reference authors, so a wrong digest at a
+        // real author is accepted into the DAG. The bridge check must catch it.
+        let dangling = VertexId {
+            round: 0,
+            author: genesis_ids[0].author.clone(),
+            digest: [7u8; 32],
+        };
+        let mut references = genesis_ids[..3].to_vec();
+        references.push(dangling);
+        let tail = signed_vertex(&membership, &chain_id, 1, 1, references, [0u8; 32]);
+        dag.insert(tail.clone()).unwrap();
+        let error =
+            check_snapshot_bridge(&dag, 0, &[tail], &committed, &[], &HashMap::new()).unwrap_err();
+        assert_eq!(error, SnapshotDecline::BridgeIncomplete { round: 0 });
+
+        // A payload the sender does not hold is a missing bridge, not an empty
+        // tail the joiner can apply.
+        let paid = signed_vertex(
+            &membership,
+            &chain_id,
+            2,
+            1,
+            genesis_ids[..3].to_vec(),
+            [9u8; 32],
+        );
+        dag.insert(paid.clone()).unwrap();
+        let error =
+            check_snapshot_bridge(&dag, 0, &[paid], &committed, &[], &HashMap::new()).unwrap_err();
+        assert_eq!(error, SnapshotDecline::PayloadMissing);
     }
 
     #[test]
