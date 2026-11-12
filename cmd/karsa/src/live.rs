@@ -1605,6 +1605,57 @@ fn may_sign_fence(node: &Node, failures: Option<&FailureDetector>, fence: &Fence
         })
 }
 
+/// Why a node cannot serve a snapshot right now.
+///
+/// A decline is diagnostic, not a consensus statement. The joining node uses it
+/// to fail over to another peer instead of waiting for the snapshot timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotDecline {
+    NoExecution,
+    NoCertifiedHead,
+    NoCertifiedOrder,
+    CoverageOutsideOrder,
+    NoSafeFloor,
+    StateEvicted { applied: u64 },
+    StateRootMismatch,
+    StateEncoding,
+}
+
+impl std::fmt::Display for SnapshotDecline {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoExecution => write!(formatter, "the node does not execute state"),
+            Self::NoCertifiedHead => write!(formatter, "no certified header yet"),
+            Self::NoCertifiedOrder => {
+                write!(
+                    formatter,
+                    "the certified head has no committed order length"
+                )
+            }
+            Self::CoverageOutsideOrder => {
+                write!(
+                    formatter,
+                    "the certified coverage is outside the held order"
+                )
+            }
+            Self::NoSafeFloor => write!(formatter, "no floor is safe to prune at"),
+            Self::StateEvicted { applied } => {
+                write!(
+                    formatter,
+                    "the state at applied {applied} is no longer retained"
+                )
+            }
+            Self::StateRootMismatch => {
+                write!(
+                    formatter,
+                    "the retained state does not match the certified root"
+                )
+            }
+            Self::StateEncoding => write!(formatter, "the retained state cannot be encoded"),
+        }
+    }
+}
+
 /// Builds the snapshot this node can serve right now.
 ///
 /// It is anchored at the certified head, so the receiver has a quorum statement
@@ -1617,21 +1668,24 @@ fn build_live_snapshot(
     last_certified: Option<&(Header, Certificate)>,
     states: &VecDeque<(u64, State)>,
     batches: &HashMap<[u8; 32], Batch>,
-) -> Option<wire::Snapshot> {
+) -> Result<wire::Snapshot, SnapshotDecline> {
     // The anchor is the latest *certified* header, not the finalizer's built head.
     // Those can differ: a node that built one header and certified another at the
     // same height would otherwise never checkpoint, and its store would grow until
     // the next restart. A certificate is self-contained, so anchoring at it is safe.
-    let (header, certificate) = last_certified?;
-    let coverage = finalizer.certified_order(header.height)?;
+    let (header, certificate) = last_certified.ok_or(SnapshotDecline::NoCertifiedHead)?;
+    let coverage = finalizer
+        .certified_order(header.height)
+        .ok_or(SnapshotDecline::NoCertifiedOrder)?;
     let dag = node.dag();
     let base = dag.prefix().len();
     if coverage > dag.order_len() || coverage < base {
-        return None;
+        return Err(SnapshotDecline::CoverageOutsideOrder);
     }
     let tail_coverage = coverage - base;
     let committed_tail = &dag.order()[..tail_coverage];
-    let proposed = snapshot_floor(node, committed_tail, header.round)?;
+    let proposed =
+        snapshot_floor(node, committed_tail, header.round).ok_or(SnapshotDecline::NoSafeFloor)?;
     // The floor only rises: a held prefix below the current floor is already
     // committed, so a candidate that would go backwards cannot drop it again.
     let floor = proposed.max(dag.floor().unwrap_or(0));
@@ -1645,11 +1699,14 @@ fn build_live_snapshot(
     let state = states
         .iter()
         .rev()
-        .find(|(applied, _)| *applied == header.applied)?
+        .find(|(applied, _)| *applied == header.applied)
+        .ok_or(SnapshotDecline::StateEvicted {
+            applied: header.applied,
+        })?
         .1
         .clone();
     if state.state_root() != header.state_root {
-        return None;
+        return Err(SnapshotDecline::StateRootMismatch);
     }
     // Only certificates the DAG adopted travel: a partial promise has no quorum
     // and a joiner would have to reject the whole snapshot. A fence below the
@@ -1670,8 +1727,8 @@ fn build_live_snapshot(
             tail_batches.push(batch.clone());
         }
     }
-    Some(wire::Snapshot {
-        state: state.encode().ok()?,
+    Ok(wire::Snapshot {
+        state: state.encode().map_err(|_| SnapshotDecline::StateEncoding)?,
         order,
         order_len: coverage,
         prefix,
@@ -1736,6 +1793,9 @@ async fn fetch_one(target: &str, chain_id: &[u8]) -> Result<wire::Snapshot, Stri
             Ok(Some(frame)) => {
                 return match frame.message {
                     Message::Snapshot(snapshot) => Ok(*snapshot),
+                    Message::SnapshotDeclined(reason) => {
+                        Err(format!("{target} declined the snapshot: {reason}"))
+                    }
                     other => Err(format!("{target} answered with {other:?}")),
                 };
             }
@@ -2365,7 +2425,7 @@ async fn node_task(
     // A snapshot link is separate from the consensus mesh: the joiner asks, the
     // server answers from the node loop's own state, and nothing is broadcast.
     let (snapshot_tx, mut snapshot_rx) =
-        mpsc::channel::<oneshot::Sender<Option<wire::Snapshot>>>(4);
+        mpsc::channel::<oneshot::Sender<Result<wire::Snapshot, SnapshotDecline>>>(4);
     if config.snapshot_port > 0 {
         let target = rpc_address(config.snapshot_port, index)?;
         let listener = TcpListener::bind(&target)
@@ -2402,14 +2462,17 @@ async fn node_task(
                             if tx.send(reply_tx).await.is_err() {
                                 return;
                             }
-                            let Ok(Ok(Some(snapshot))) =
-                                tokio::time::timeout(SNAPSHOT_REPLY_TIMEOUT, reply_rx).await
-                            else {
-                                return;
+                            let reply = tokio::time::timeout(SNAPSHOT_REPLY_TIMEOUT, reply_rx).await;
+                            let message = match reply {
+                                Ok(Ok(Ok(snapshot))) => Message::Snapshot(Box::new(snapshot)),
+                                Ok(Ok(Err(reason))) => {
+                                    Message::SnapshotDeclined(reason.to_string())
+                                }
+                                _ => Message::SnapshotDeclined(String::from(
+                                    "the node loop did not build a snapshot in time",
+                                )),
                             };
-                            if let Ok(frame) =
-                                wire::frame(&Message::Snapshot(Box::new(snapshot)), unix_nanos())
-                            {
+                            if let Ok(frame) = wire::frame(&message, unix_nanos()) {
                                 let _ = stream.write_all(&frame).await;
                                 let _ = stream.flush().await;
                             }
@@ -2891,7 +2954,9 @@ async fn node_task(
                         }
                     }
                     // Snapshots travel on their own link, not on the mesh.
-                    Message::SnapshotWant | Message::Snapshot(_) => rejected += 1,
+                    Message::SnapshotWant | Message::Snapshot(_) | Message::SnapshotDeclined(_) => {
+                        rejected += 1
+                    }
                     Message::SetChange(certificate) => {
                         if set_change_adopted {
                             let same = pending_change.as_ref().is_some_and(|current| {
@@ -3128,7 +3193,7 @@ async fn node_task(
                 authoring_stopped = *stop_authoring.borrow();
             }
             Some(reply) = snapshot_rx.recv() => {
-                let built = finalizer.as_ref().and_then(|finalizer| {
+                let built = finalizer.as_ref().map_or(Err(SnapshotDecline::NoExecution), |finalizer| {
                     build_live_snapshot(
                         &node,
                         finalizer,
@@ -3913,7 +3978,7 @@ async fn node_task(
                         header.height
                             >= last_checkpoint.saturating_add(config.checkpoint_every)
                     })
-                    && let Some(snapshot) = build_live_snapshot(
+                    && let Ok(snapshot) = build_live_snapshot(
                         &node,
                         finalizer,
                         last_certified.as_ref(),
@@ -4148,7 +4213,7 @@ async fn archive_task(
                     // validators to build certificates from.
                     Message::Share(_) => {}
                     // Snapshots need execution state, which an archive does not keep.
-                    Message::SnapshotWant | Message::Snapshot(_) => {}
+                    Message::SnapshotWant | Message::Snapshot(_) | Message::SnapshotDeclined(_) => {}
                     // An archive has no RPC state, so a gossiped envelope has no
                     // record to attach to. It is ignored rather than stored.
                     Message::Tx(_) => {}
@@ -5389,6 +5454,31 @@ mod tests {
         };
         let error = check_hello(b"chain-a", &hello).unwrap_err();
         assert!(error.contains("wire protocol"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_declined_snapshot_is_an_error_the_caller_can_skip() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        let chain = b"chain-a".to_vec();
+        let server = {
+            let chain = chain.clone();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = Vec::new();
+                handshake(&mut stream, &mut buffer, &chain).await.unwrap();
+                let want = read_one_message(&mut stream, &mut buffer).await.unwrap();
+                assert_eq!(want, Message::SnapshotWant);
+                let frame =
+                    wire::frame(&Message::SnapshotDeclined(String::from("state evicted")), 1)
+                        .unwrap();
+                stream.write_all(&frame).await.unwrap();
+            })
+        };
+        let error = fetch_one(&target, &chain).await.unwrap_err();
+        assert!(error.contains("declined the snapshot"), "{error}");
+        assert!(error.contains("state evicted"), "{error}");
+        server.await.unwrap();
     }
 
     #[test]

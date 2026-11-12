@@ -75,13 +75,14 @@ const KIND_FENCE: u8 = 10;
 const KIND_ROUND_SKIP: u8 = 11;
 const KIND_CONTROL: u8 = 12;
 const KIND_WANT_SLOT: u8 = 13;
+const KIND_SNAPSHOT_DECLINED: u8 = 14;
 
 /// The framing and message layout this build speaks.
 ///
 /// A peer that answers with another number is not necessarily hostile; it may be a
 /// different build. The link is closed rather than parsed optimistically, because
 /// the next frame kind could mean something else there.
-pub const WIRE_PROTOCOL: u16 = 13;
+pub const WIRE_PROTOCOL: u16 = 14;
 
 /// The first frame on every link: which chain the sender is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +186,11 @@ pub enum Message {
     SnapshotWant,
     /// A state snapshot response.
     Snapshot(Box<Snapshot>),
+    /// The peer cannot serve a snapshot right now, with the reason.
+    ///
+    /// A joining node uses this to fail over to another peer instead of waiting
+    /// for the snapshot read timeout. The reason is diagnostic, not trusted.
+    SnapshotDeclined(String),
     /// One encoded transaction envelope, gossiped so a peer can track it.
     ///
     /// The frame carries the canonical envelope, not a decoded transaction:
@@ -487,6 +493,11 @@ pub fn frame(message: &Message, sent_at_nanos: u64) -> Result<Vec<u8>, CryptoErr
         Message::Share(share) => (KIND_SHARE, encode_share(share)?),
         Message::SnapshotWant => (KIND_SNAPSHOT_WANT, Vec::new()),
         Message::Snapshot(snapshot) => (KIND_SNAPSHOT, encode_snapshot(snapshot)?),
+        Message::SnapshotDeclined(reason) => {
+            let mut encoder = Encoder::with_capacity(4 + reason.len());
+            encoder.put_bytes(reason.as_bytes())?;
+            (KIND_SNAPSHOT_DECLINED, encoder.finish())
+        }
         Message::Tx(envelope) => (KIND_TX, {
             let mut encoder = Encoder::with_capacity(4 + envelope.len());
             encoder.put_bytes(envelope)?;
@@ -576,6 +587,13 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
             Message::SnapshotWant
         }
         KIND_SNAPSHOT => Message::Snapshot(Box::new(decode_snapshot(payload)?)),
+        KIND_SNAPSHOT_DECLINED => {
+            let mut decoder = Decoder::new(payload);
+            let reason = String::from_utf8(decoder.read_bytes()?.to_vec())
+                .map_err(|_| invalid("snapshot decline reason is not UTF-8".to_string()))?;
+            decoder.finish()?;
+            Message::SnapshotDeclined(reason)
+        }
         KIND_TX => {
             let mut decoder = Decoder::new(payload);
             let envelope = decoder.read_bytes()?.to_vec();
@@ -767,6 +785,15 @@ mod tests {
         let frame = take_frame(&mut buffer).unwrap().unwrap();
         assert_eq!(frame.message, Message::Snapshot(Box::new(snapshot)));
         assert_eq!(frame.sent_at_nanos, 13);
+    }
+
+    #[test]
+    fn a_snapshot_decline_round_trips() {
+        let reason = String::from("the state at applied 7 is no longer retained");
+        let mut buffer = frame(&Message::SnapshotDeclined(reason.clone()), 14).unwrap();
+        let frame = take_frame(&mut buffer).unwrap().unwrap();
+        assert_eq!(frame.message, Message::SnapshotDeclined(reason));
+        assert_eq!(frame.sent_at_nanos, 14);
     }
 
     fn transition_certificate() -> TransitionCertificate {
