@@ -1982,24 +1982,6 @@ fn adopt_snapshot(
             .map_err(|error| format!("snapshot round skip is not authorized: {error}"))?;
         verified_skips.push(proof);
     }
-    if let Some(store) = store {
-        store
-            .put_live_snapshot(&store::LiveSnapshot {
-                round: anchor.round,
-                floor,
-                cursor,
-                applied: anchor.applied,
-                state: state.clone(),
-                order: stored_order,
-                order_len,
-                prefix: stored_prefix,
-                header: anchor.clone(),
-                certificate: certificate.clone(),
-                transition: transition.clone(),
-                fences: fences.clone(),
-            })
-            .map_err(|error| error.to_string())?;
-    }
     let batch_count = incoming.len();
     if let Some(store) = store {
         store
@@ -2018,6 +2000,28 @@ fn adopt_snapshot(
                 .put_round_skip(proof)
                 .map_err(|error| error.to_string())?;
         }
+        // The live snapshot is the activation point: all records the restart
+        // needs are already on disk before this file appears. A crash before
+        // the write leaves valid tail records without an adopted snapshot, so
+        // the node resumes from its previous anchor and replays them; a crash
+        // after it leaves a complete snapshot. Writing it first would make a
+        // crash leave a snapshot whose tail was never stored.
+        store
+            .put_live_snapshot(&store::LiveSnapshot {
+                round: anchor.round,
+                floor,
+                cursor,
+                applied: anchor.applied,
+                state: state.clone(),
+                order: stored_order,
+                order_len,
+                prefix: stored_prefix,
+                header: anchor.clone(),
+                certificate: certificate.clone(),
+                transition: transition.clone(),
+                fences: fences.clone(),
+            })
+            .map_err(|error| error.to_string())?;
     }
     for batch in incoming {
         if let Ok(digest) = batch.digest() {
