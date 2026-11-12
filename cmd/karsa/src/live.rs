@@ -51,8 +51,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tx::batch::Batch;
 use validator::{
-    Certificate, ControlPayload, FailureDetector, Fence, FenceCertificate, Finalizer, Header,
-    NoVoteAttestation, RoundSkip, RoundSkipProof, SetChange, SetSchedule, Step,
+    Certificate, CommitFrontier, ControlPayload, FailureDetector, Fence, FenceCertificate,
+    Finalizer, Header, NoVoteAttestation, RoundSkip, RoundSkipProof, SetChange, SetSchedule, Step,
     TransitionCertificate, ValidatorSet, VertexId, bitmap_len, commit_root, set_bit,
 };
 
@@ -117,6 +117,11 @@ const QUIET_TICKS: u32 = 50;
 /// Anchors ahead of the cursor keep the pacemaker productive, so a timeout count
 /// never fires while the DAG still grows; the cursor's own age is the signal.
 const STALL_REPORT_AFTER: Duration = Duration::from_millis(1_500);
+/// Window over which a stalled node reports its own committed-entry rate.
+///
+/// This is the local lambda an operator needs to tell "the chain is moving but
+/// this cursor is behind" from "the chain itself has stopped producing commits".
+const COMMIT_RATE_WINDOW: Duration = Duration::from_secs(5);
 /// Balance each demo account starts with in a live run.
 ///
 /// The chain demo funds accounts with a thousand units, which is plenty for a
@@ -341,6 +346,7 @@ struct NodeResult {
     head_round: u64,
     conflicts: usize,
     restored: Option<Restored>,
+    snapshot: Option<SnapshotReport>,
     disk_bytes: u64,
     rejected: usize,
     committed: usize,
@@ -349,6 +355,9 @@ struct NodeResult {
     latencies: Vec<u64>,
     commit_root: [u8; 32],
     order: Vec<VertexId>,
+    /// Compact summary of the committed entries below `order`, when a snapshot
+    /// restored this node from a checkpoint. Empty for a full-history node.
+    prefix: CommitFrontier,
     profile: Profile,
 }
 
@@ -799,6 +808,20 @@ struct Signals {
 struct Start {
     started: Instant,
     prebuilt: Option<Vec<Option<Batch>>>,
+}
+
+/// What a snapshot join adopted and how long each half took.
+#[derive(Debug, Clone, Copy)]
+struct SnapshotReport {
+    height: u64,
+    round: u64,
+    floor: Option<u64>,
+    order_len: usize,
+    applied: usize,
+    vertices: usize,
+    batches: usize,
+    fetch_ms: u64,
+    install_ms: u64,
 }
 
 /// What a restart rebuilt before the live loop started.
@@ -1754,14 +1777,32 @@ async fn fetch_snapshot(
                 // A snapshot at or below what this node already certified would
                 // move its trust anchor backwards. Keep looking for one that is
                 // ahead, which is what a lagging node needs.
-                Ok(snapshot) if snapshot.anchor.height > min_height => return Ok(snapshot),
+                Ok(snapshot) if snapshot.anchor.height > min_height => {
+                    println!(
+                        "  node val-{index} snapshot candidate {target}: height {} round {} floor {:?}, committed {}, tail {} vertices / {} batches",
+                        snapshot.anchor.height,
+                        snapshot.anchor.round,
+                        snapshot.floor,
+                        snapshot.order_len,
+                        snapshot.vertices.len(),
+                        snapshot.batches.len()
+                    );
+                    return Ok(snapshot);
+                }
                 Ok(snapshot) => {
+                    println!(
+                        "  node val-{index} snapshot candidate {target}: height {} floor {:?} is not above the stored head {min_height}",
+                        snapshot.anchor.height, snapshot.floor
+                    );
                     last = format!(
                         "{target}: snapshot height {} is not above the stored head {min_height}",
                         snapshot.anchor.height
                     );
                 }
-                Err(error) => last = format!("{target}: {error}"),
+                Err(error) => {
+                    println!("  node val-{index} snapshot candidate {target}: {error}");
+                    last = format!("{target}: {error}");
+                }
             }
         }
         if tokio::time::Instant::now() >= deadline {
@@ -2094,6 +2135,7 @@ async fn node_task(
     // The listener is up first so peers can finish their outbound connects and
     // start their own snapshot servers; only then can this node ask for one. The
     // snapshot exchange uses its own port, not the consensus links.
+    let sync_started = Instant::now();
     let synced = if config.sync_from_peers {
         if config.snapshot_port == 0 {
             return Err(format!("node {index} cannot sync without --snapshot-port"));
@@ -2106,6 +2148,9 @@ async fn node_task(
                 .map_or(0, |record| record.header.height),
             None => 0,
         };
+        println!(
+            "  node val-{index} reseed: --sync-from-peers requested, stored head {stored_head}"
+        );
         if stored_head > 0 {
             println!(
                 "  node val-{index} has history to height {stored_head}; --sync-from-peers adopts a peer snapshot above it"
@@ -2115,6 +2160,7 @@ async fn node_task(
     } else {
         None
     };
+    let fetch_ms = u64::try_from(sync_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     // Outbound: one link per peer, connected with retries because the nodes start
     // together and a listener may not exist yet. Archives are peers too: what makes
@@ -2376,7 +2422,9 @@ async fn node_task(
     let mut applied_cursor = 0usize;
 
     let mut adopted_anchor: Option<(Header, Certificate)> = None;
+    let mut snapshot_report = None;
     if let Some(snapshot) = synced {
+        let install_started = Instant::now();
         let adopted = adopt_snapshot(
             snapshot,
             &mut node,
@@ -2385,6 +2433,7 @@ async fn node_task(
             &chain_id,
             store.as_ref(),
         )?;
+        let install_ms = u64::try_from(install_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let state_root = adopted.state.state_root();
         println!(
             "  node val-{index} adopted snapshot height {} round {}, floor {:?}, {} tail \
@@ -2396,6 +2445,21 @@ async fn node_task(
             adopted.batches,
             hex::encode(&state_root[..6])
         );
+        println!(
+            "  node val-{index} snapshot boundary: committed {}, applied {}, tail {} vertices / {} batches, fetched {fetch_ms} ms, verified+installed {install_ms} ms",
+            adopted.order_len, adopted.applied, adopted.vertices, adopted.batches
+        );
+        snapshot_report = Some(SnapshotReport {
+            height: adopted.anchor.height,
+            round: adopted.anchor.round,
+            floor: adopted.floor,
+            order_len: adopted.order_len,
+            applied: adopted.applied,
+            vertices: adopted.vertices,
+            batches: adopted.batches,
+            fetch_ms,
+            install_ms,
+        });
         if let Some(store) = &store {
             // A resync moves a store that already has history forward. The data
             // below the adopted floor can no longer be reached by a restart, so
@@ -2421,6 +2485,7 @@ async fn node_task(
         adopted_anchor = Some((anchor, certificate));
     }
 
+    let restore_started = Instant::now();
     let restored = if adopted_anchor.is_some() {
         None
     } else if let Some(store) = &store {
@@ -2441,6 +2506,32 @@ async fn node_task(
     } else {
         None
     };
+    let restore_ms = u64::try_from(restore_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if let Some(restored) = &restored {
+        let entries_per_second = if restore_ms == 0 {
+            0.0
+        } else {
+            restored.order_len as f64 / (restore_ms as f64 / 1e3)
+        };
+        println!(
+            "  node val-{index} replay: {} committed entries in {restore_ms} ms ({entries_per_second:.0} entries/s), applied {}, certified head {}",
+            restored.order_len, restored.applied, restored.head_height
+        );
+    }
+    if snapshot_report.is_some() || restored.is_some() {
+        let head = finalizer.as_ref().map_or_else(
+            || String::from("none"),
+            |finalizer| format!("{}/{}", finalizer.head().height, finalizer.head().round),
+        );
+        println!(
+            "  node val-{index} catch-up: committed {}, applied {}, floor {:?}, cursor {}, round {}, certified head {head}",
+            node.dag().order_len(),
+            applied,
+            node.dag().floor(),
+            node.cursor(),
+            node.round()
+        );
+    }
 
     // A restart rebuilds the skipped rounds from the replay. Batches whose
     // leaders were skipped are still in the store but not in the mempool, so
@@ -2608,6 +2699,10 @@ async fn node_task(
     let mut cursor: u64 = node.cursor();
     let mut cursor_since = Instant::now();
     let mut reported_stall: Option<u64> = None;
+    // Local lambda: committed entries over the last few seconds. A frozen cursor
+    // with a healthy rate means this node is behind; a frozen cursor with a zero
+    // rate means the chain itself stopped producing commits.
+    let mut commit_rate: VecDeque<(Instant, usize)> = VecDeque::new();
     // The interval is measured from the checkpoint or head this run resumed at,
     // not from process start: otherwise a restart with a large interval would
     // fire a checkpoint (and now a prune) as soon as the head passed the
@@ -3251,6 +3346,19 @@ async fn node_task(
                             if next > cursor {
                                 cursor_since = Instant::now();
                                 reported_stall = None;
+                                let now = Instant::now();
+                                while commit_rate
+                                    .front()
+                                    .is_some_and(|(at, _)| now.duration_since(*at) > COMMIT_RATE_WINDOW)
+                                {
+                                    commit_rate.pop_front();
+                                }
+                                if commit_rate
+                                    .back()
+                                    .is_none_or(|(at, _)| at.elapsed() >= Duration::from_millis(200))
+                                {
+                                    commit_rate.push_back((now, node.dag().order_len()));
+                                }
                             }
                             cursor = next;
                             if commits > 0
@@ -3319,8 +3427,18 @@ async fn node_task(
                     let skip_held = node.dag().round_skip(cursor).is_some();
                     let skip_pending = node.dag().has_pending_control(cursor);
                     let leader_held = node.dag().leader(cursor).is_some();
+                    let missing_count = node.dag().missing_references().len();
+                    let rate = match (commit_rate.front(), commit_rate.back()) {
+                        (Some((first_at, first_len)), Some((last_at, last_len)))
+                            if last_at > first_at =>
+                        {
+                            (*last_len as f64 - *first_len as f64)
+                                / last_at.duration_since(*first_at).as_secs_f64()
+                        }
+                        _ => 0.0,
+                    };
                     eprintln!(
-                        "node {index} commit stalled at round {cursor} (observed {observed}), missing {detail}, votes {voters} of quorum {quorum}, can-anchor {can_anchor}, round-skip held {skip_held}, pending {skip_pending}, leader-held {leader_held}"
+                        "node {index} commit stalled at round {cursor} (observed {observed}), missing {detail} (count {missing_count}), rate {rate:.1} committed/s, votes {voters} of quorum {quorum}, can-anchor {can_anchor}, round-skip held {skip_held}, pending {skip_pending}, leader-held {leader_held}"
                     );
                 }
                 if config.execute {
@@ -3876,6 +3994,7 @@ async fn node_task(
             .as_ref()
             .map_or(0, |finalizer| finalizer.conflicts()),
         restored,
+        snapshot: snapshot_report,
         disk_bytes: store
             .as_ref()
             .map_or(0, |store| directory_bytes(store.path())),
@@ -3886,6 +4005,7 @@ async fn node_task(
         latencies,
         commit_root: node.dag().commit_root(),
         order: node.dag().order().to_vec(),
+        prefix: node.dag().prefix().clone(),
         profile,
     })
 }
@@ -4050,6 +4170,7 @@ async fn archive_task(
         head_round: 0,
         conflicts: 0,
         restored: None,
+        snapshot: None,
         disk_bytes: store
             .as_ref()
             .map_or(0, |store| directory_bytes(store.path())),
@@ -4060,6 +4181,7 @@ async fn archive_task(
         latencies: Vec::new(),
         commit_root: [0u8; 32],
         order: Vec::new(),
+        prefix: CommitFrontier::empty(),
         profile: Profile::default(),
     })
 }
@@ -4274,6 +4396,20 @@ fn run_one_node(
             restored.order_len,
             restored.head_height,
             hex::encode(&restored.state_root[..6])
+        );
+    }
+    if let Some(snapshot) = &result.snapshot {
+        println!(
+            "  snapshot join     anchor {}/{} floor {:?}, committed {}, applied {}, tail {} vertices / {} batches, fetched {} ms, installed {} ms",
+            snapshot.height,
+            snapshot.round,
+            snapshot.floor,
+            snapshot.order_len,
+            snapshot.applied,
+            snapshot.vertices,
+            snapshot.batches,
+            snapshot.fetch_ms,
+            snapshot.install_ms
         );
     }
     if let Some(authoring) = authoring {
@@ -4768,6 +4904,24 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let mut served = 0u64;
     let mut gave_up = 0u64;
     let mut roots: Vec<[u8; 32]> = Vec::new();
+    // A node may commit entries beyond the last certified header while another
+    // has not received them yet, so the local orders can differ in length at the
+    // end of a wall-clock run. Compare the root over the common committed prefix.
+    // A snapshot-restored node keeps its prefix compact, so only entries above
+    // its own prefix can be recomputed: the common index must clear the longest
+    // prefix among the signing nodes.
+    let signing: Vec<&NodeResult> = results.iter().filter(|result| result.signs).collect();
+    let mut lengths: Vec<usize> = signing.iter().map(|result| result.committed).collect();
+    lengths.sort_unstable();
+    let shortest = lengths.first().copied().unwrap_or(0);
+    let longest = lengths.last().copied().unwrap_or(0);
+    let longest_prefix = signing
+        .iter()
+        .map(|result| result.prefix.len())
+        .max()
+        .unwrap_or(0);
+    let same_length = shortest == longest;
+    let comparable = same_length || longest_prefix <= shortest;
     let mut payload_batches = 0usize;
     let mut payload_txs = 0usize;
     let mut payload_txs_received = 0usize;
@@ -4806,7 +4960,16 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             state_roots.push(root);
         }
         if result.signs {
-            roots.push(result.commit_root);
+            roots.push(if same_length {
+                result.commit_root
+            } else if comparable {
+                result
+                    .prefix
+                    .root_at(&result.order, shortest - result.prefix.len())
+                    .unwrap_or([0u8; 32])
+            } else {
+                result.commit_root
+            });
             latencies.extend_from_slice(&result.latencies);
         }
         println!(
@@ -5001,8 +5164,19 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             }
         }
     }
-    let agreed = roots.windows(2).all(|pair| pair[0] == pair[1]);
-    println!("  same commit root  {agreed}");
+    let agreed = (same_length || comparable) && roots.windows(2).all(|pair| pair[0] == pair[1]);
+    if same_length {
+        println!("  same commit root  {agreed} at {shortest} committed entries");
+    } else {
+        println!(
+            "  same commit root  {agreed} at {shortest} common committed entries (lengths {shortest}..{longest})"
+        );
+    }
+    if !same_length && !comparable {
+        println!(
+            "    the common index {shortest} is below a node's pruned prefix {longest_prefix}; roots are not comparable"
+        );
+    }
     if !agreed {
         for (index, root) in roots.iter().enumerate() {
             println!("    val-{index} {}", hex::encode(&root[..6]));
@@ -5668,7 +5842,7 @@ mod tests {
         let _mesh = mesh_test_lock();
         let dir = TestDir::new("set-change");
         let home = crate::home::Home::resolve(Some(dir.0.clone())).expect("a test home");
-        crate::genesis::run(&home, None, true, Some(4), None).expect("a four-round genesis");
+        crate::genesis::run(&home, None, true, Some(2), None).expect("a two-round epoch genesis");
 
         let mut config = mesh_config(&dir, a_free_port_base(4), 25, 2);
         config.home = Some(dir.0.clone());
