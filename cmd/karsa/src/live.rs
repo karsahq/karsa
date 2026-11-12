@@ -2693,6 +2693,11 @@ async fn node_task(
             node.round()
         );
     }
+    if let Some(rpc) = &rpc {
+        rpc.lock()
+            .expect("rpc lock poisoned")
+            .note_floor(node.dag().floor());
+    }
 
     // A restart rebuilds the skipped rounds from the replay. Batches whose
     // leaders were skipped are still in the store but not in the mempool, so
@@ -4084,6 +4089,11 @@ async fn node_task(
                     // below it must be dropped rather than written back into the
                     // store the checkpoint just pruned.
                     node.set_floor(floor);
+                    if let Some(rpc) = &rpc {
+                        rpc.lock()
+                            .expect("rpc lock poisoned")
+                            .note_floor(Some(floor));
+                    }
                     let pruned = store
                         .prune_to_checkpoint(usize::from(config.shard))
                         .map_err(|error| error.to_string())?;

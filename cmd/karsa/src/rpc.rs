@@ -226,6 +226,8 @@ pub(crate) struct RpcCore {
     order_prefix: CommitFrontier,
     /// Number of committed entries before `order`.
     order_base: usize,
+    /// Rounds at or below this are summarized by the prefix and no longer held.
+    floor: Option<u64>,
     /// Certified headers that finalized at least one tracked transaction, with
     /// the commit prefix each one covers. Bounded, and only the heights a client
     /// can still ask about need to be here.
@@ -267,6 +269,7 @@ impl RpcCore {
             order: Vec::new(),
             order_prefix: CommitFrontier::empty(),
             order_base: 0,
+            floor: None,
             finalized_headers: BTreeMap::new(),
             head: HeadView {
                 height: genesis.height,
@@ -801,6 +804,11 @@ impl RpcCore {
         }
     }
 
+    /// Records the DAG floor a checkpoint or snapshot adopted.
+    pub(crate) fn note_floor(&mut self, floor: Option<u64>) {
+        self.floor = floor;
+    }
+
     /// Records a certified header and finalizes every executed batch its commit
     /// prefix covers.
     ///
@@ -956,6 +964,7 @@ impl RpcCore {
             committed_entries: self.run.committed_entries,
             order_len,
             order_root: hex::encode(order_root),
+            dag_floor: self.floor,
             applied_txs: self.run.applied_txs,
             mempool: self.mempool.len(),
             peers: self.run.peers,
@@ -1255,6 +1264,8 @@ struct StatusView {
     order_len: usize,
     /// Merkle root over the committed order, so two nodes can compare it.
     order_root: String,
+    /// Rounds at or below this are summarized by the prefix and no longer held.
+    dag_floor: Option<u64>,
     applied_txs: u64,
     mempool: usize,
     peers: usize,
@@ -2008,6 +2019,9 @@ mod tests {
         core.note_order_from(&CommitFrontier::empty(), &[first.clone(), second.clone()]);
         let view = core.status();
         assert_eq!(view.order_len, 2);
+        assert_eq!(view.dag_floor, None);
+        core.note_floor(Some(3));
+        assert_eq!(core.status().dag_floor, Some(3));
         assert_eq!(
             view.order_root,
             hex::encode(CommitFrontier::from_order(&[first.clone(), second.clone()]).root())
