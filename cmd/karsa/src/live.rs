@@ -139,6 +139,13 @@ const SNAPSHOT_STARTUP_WAIT: Duration = Duration::from_secs(15);
 const SNAPSHOT_READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a serving node waits for the node loop to build a snapshot.
 const SNAPSHOT_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a served snapshot's floor stays pinned against pruning.
+///
+/// A joiner that adopted the snapshot may still need the tail vertices through
+/// the normal want path. Checkpoints that would prune above this floor are
+/// deferred until the pin expires; the next checkpoint then covers the same
+/// history in one step.
+const SNAPSHOT_PIN_TTL: Duration = Duration::from_secs(60);
 /// Per-`applied` states kept so a certified head's state can be served.
 const SNAPSHOT_STATES: usize = 256;
 /// Ticks between attempts to write a periodic checkpoint.
@@ -1726,6 +1733,23 @@ fn check_snapshot_bridge(
     Ok(())
 }
 
+/// Extends a served-snapshot floor pin.
+///
+/// The pin keeps the lowest served floor for one TTL window. A checkpoint that
+/// would prune above it is deferred, so a joiner that adopted the snapshot can
+/// still repair its tail with ordinary wants.
+fn pin_snapshot_floor(
+    current: Option<(u64, Instant)>,
+    floor: u64,
+    now: Instant,
+) -> Option<(u64, Instant)> {
+    let kept = current.filter(|(_, at)| now.duration_since(*at) <= SNAPSHOT_PIN_TTL);
+    Some(match kept {
+        Some((pinned, _)) => (pinned.min(floor), now),
+        None => (floor, now),
+    })
+}
+
 /// Builds the snapshot this node can serve right now.
 ///
 /// It is anchored at the certified head, so the receiver has a quorum statement
@@ -2499,6 +2523,7 @@ async fn node_task(
     // server answers from the node loop's own state, and nothing is broadcast.
     let (snapshot_tx, mut snapshot_rx) =
         mpsc::channel::<oneshot::Sender<Result<wire::Snapshot, SnapshotDecline>>>(4);
+    let mut pinned_floor: Option<(u64, Instant)> = None;
     if config.snapshot_port > 0 {
         let target = rpc_address(config.snapshot_port, index)?;
         let listener = TcpListener::bind(&target)
@@ -3280,6 +3305,11 @@ async fn node_task(
                         &batches,
                     )
                 });
+                if let Ok(snapshot) = &built
+                    && let Some(floor) = snapshot.floor
+                {
+                    pinned_floor = pin_snapshot_floor(pinned_floor, floor, Instant::now());
+                }
                 let _ = reply.send(built);
             }
             _ = ticker.tick() => {
@@ -4048,6 +4078,11 @@ async fn node_task(
                 // grows with uptime; with one, the tail is at most this interval.
                 // A head whose state is no longer retained, or whose order length
                 // the finalizer does not know, simply waits for the next one.
+                if let Some((_, at)) = pinned_floor
+                    && at.elapsed() > SNAPSHOT_PIN_TTL
+                {
+                    pinned_floor = None;
+                }
                 if config.checkpoint_every > 0
                     && ticks % CHECKPOINT_TICKS == 0
                     && let Some(store) = &store
@@ -4064,6 +4099,7 @@ async fn node_task(
                         &batches,
                     )
                     && let Some(floor) = snapshot.floor
+                    && pinned_floor.is_none_or(|(pinned, _)| floor <= pinned)
                 {
                     let height = snapshot.anchor.height;
                     store
@@ -5635,6 +5671,22 @@ mod tests {
         let error =
             check_snapshot_bridge(&dag, 0, &[paid], &committed, &[], &HashMap::new()).unwrap_err();
         assert_eq!(error, SnapshotDecline::PayloadMissing);
+    }
+
+    #[test]
+    fn a_served_snapshot_pin_keeps_the_lowest_floor_for_one_ttl() {
+        let now = Instant::now();
+        let pinned = pin_snapshot_floor(None, 7, now).unwrap();
+        assert_eq!(pinned.0, 7);
+        let later = now + Duration::from_secs(5);
+        let pinned = pin_snapshot_floor(Some(pinned), 9, later).unwrap();
+        assert_eq!(
+            pinned.0, 7,
+            "a newer snapshot must not raise the pinned floor"
+        );
+        let expired = later + SNAPSHOT_PIN_TTL + Duration::from_secs(1);
+        let pinned = pin_snapshot_floor(Some(pinned), 12, expired).unwrap();
+        assert_eq!(pinned.0, 12, "an expired pin follows the new snapshot");
     }
 
     #[test]
