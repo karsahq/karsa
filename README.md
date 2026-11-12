@@ -1385,6 +1385,22 @@ The fix is a rule, not a patch: the anchor is **derived** from the DAG on every
       cutoff that proves the round cannot be committed, not merely that no vote
       quorum can form.
 
+61. **A fenced validator is not a possible voter.** `Dag::can_still_anchor`
+    counted every missing validator as a possible vote, including one a quorum
+    had already fenced. A restarted node that had been fenced at round X then
+    stalled on X-1: the between-round scan refused a higher anchor because the
+    fenced leader at X was still "possible". Excluding fenced leaders and voters
+    fixed it.
+    - Four-node devnet, node 3 killed and restarted at its fence round. Before
+      the fix it stopped at 2,356 committed entries with `votes 2 of quorum 3`
+      and never advanced. After the fix it passed the round and kept committing
+      (9,418 to 11,568 entries in 43 seconds) with no stall.
+    - Survivors committed 16,320 entries with identical roots; the restarted
+      node was still catching up when the run ended. Full convergence with one
+      worker per process is open because replay is slower than the live chain.
+    - `a_fenced_missing_leader_cannot_anchor` pins the missing-leader case; the
+      voter case is the same filter.
+
 ## Build order
 
 | Stage | Crate | State |

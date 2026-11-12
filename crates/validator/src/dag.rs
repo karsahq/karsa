@@ -1150,21 +1150,43 @@ impl Dag {
     /// Propagates [`tally_votes`].
     pub fn can_still_anchor(&self, round: u64) -> Result<bool, CryptoError> {
         let Some(leader) = self.leader(round) else {
-            // The leader's vertex is missing, not disproved. It may still arrive,
-            // and a held vote already names its id, so the conservative answer is
-            // "possible": the caller keeps waiting instead of passing the round.
-            return Ok(true);
+            // A fenced author can never produce the missing leader, so waiting
+            // for it would keep the cursor below a fence forever. Without a
+            // fence the leader's vertex is missing, not disproved: it may still
+            // arrive, and a held vote already names its id, so the conservative
+            // answer is "possible".
+            return Ok(self
+                .leader_author(round)
+                .is_none_or(|author| !self.is_fenced(author, round)));
         };
         let leader_id = leader.id()?;
+
         let candidates: Vec<Vertex> = self
             .round_vertices(round + 1)
             .into_iter()
             .cloned()
             .collect();
         let voter_set = self.set_for_round(round + 1);
-        let voters = tally_votes(voter_set, &leader_id, &candidates, &self.schedule)?.len();
-        let missing = voter_set.validators.len().saturating_sub(candidates.len());
-        Ok(voters.saturating_add(missing) >= voter_set.quorum_size())
+        let voters = tally_votes(voter_set, &leader_id, &candidates, &self.schedule)?;
+        let held: HashSet<&[u8]> = candidates
+            .iter()
+            .map(|vertex| vertex.author.as_slice())
+            .collect();
+        // A fenced validator cannot vote from its fence round on. Counting a
+        // fenced held vote or a fenced missing voter as possible would keep a
+        // round "possible" forever and make a restarted node wait below its own
+        // fence (measured: a node killed at its fence round stalled on the round
+        // just before it).
+        let possible = voter_set
+            .validators
+            .iter()
+            .filter(|record| {
+                !self.is_fenced(&record.validator_id, round + 1)
+                    && (voters.contains(&record.validator_id)
+                        || !held.contains(record.validator_id.as_slice()))
+            })
+            .count();
+        Ok(possible >= voter_set.quorum_size())
     }
 
     /// Collects `id` and its ancestors that are not yet committed, in a
@@ -2778,6 +2800,24 @@ mod tests {
             !fixture.dag.can_still_anchor(LEADER_ROUND).unwrap(),
             "two held non-votes plus two missing votes cannot reach three"
         );
+    }
+
+    #[test]
+    fn a_fenced_missing_leader_cannot_anchor() {
+        let mut fixture = fixture(4);
+        fixture.full_round(0, &[]).unwrap();
+        let leader = fixture.leader_index(LEADER_ROUND);
+        let author = format!("val-{leader}");
+        let certificate = fence_certificate(&fixture, LEADER_ROUND, author.as_bytes());
+        fixture
+            .dag
+            .apply_fence(b"karsa-dag-1", &certificate)
+            .unwrap();
+
+        // The leader vertex is missing. Without the fence a held vote could still
+        // name it; the fence says the author is failed from this round, so the
+        // round can never anchor and a higher anchor must be used.
+        assert!(!fixture.dag.can_still_anchor(LEADER_ROUND).unwrap());
     }
 
     fn transition_keys(count: usize) -> Vec<Vec<u8>> {

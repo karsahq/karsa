@@ -2237,6 +2237,35 @@ proves the round cannot be committed by any anchor, not merely that no vote
 quorum can form. Without that cutoff, an asynchronous certificate cannot decide
 a round.
 
+## D75 — A fenced validator is not a possible voter
+
+**Decided.** `Dag::can_still_anchor` now excludes a validator that is fenced
+from the voting round. A missing leader whose author is fenced also makes the
+round impossible immediately. The rule feeds `stable_anchor`'s between-round
+scan: before this, a fenced validator counted as a possible vote, so a round
+whose leader was already failed stayed "possible" and the scan refused to use a
+higher anchor.
+
+**Why it matters.** A node killed and restarted at its own fence round stalled
+forever on the round just before the fence. It held the previous leader, had two
+votes of quorum three, and `can_still_anchor` said the next round could still
+anchor even though the fence already said the next leader (the restarted node)
+could never produce a vertex there. The survivors, which crossed the fence
+before it was complete, moved on; the restarted node waited.
+
+**Measured.** Four validators, `ROUND_SKIP=1 FENCE_SILENT=1 FAILURE_ROUNDS=15`,
+node 3 killed at round ~2356 and restarted six seconds later:
+
+- before the fix, the restarted node stalled at round 2356 with `votes 2 of
+  quorum 3` and never advanced;
+- after the fix, it passed 2356 and kept committing (9,418 to 11,568 entries in
+  the remaining ~43 seconds) with no stall. The survivors committed 16,320
+  entries; the restarted node was still catching up when the run ended, so this
+  proves the fence stall is gone, not full convergence.
+
+**Unit test.** `a_fenced_missing_leader_cannot_anchor` pins the missing-leader
+case; the voter case is the same filter.
+
 ## Open decisions
 
 1. **Does a node serve history it does not hold?** Model B says no beyond the
