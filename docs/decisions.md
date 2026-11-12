@@ -2266,6 +2266,48 @@ node 3 killed at round ~2356 and restarted six seconds later:
 **Unit test.** `a_fenced_missing_leader_cannot_anchor` pins the missing-leader
 case; the voter case is the same filter.
 
+## D76 — Pruning floors gossip, and a hard reseed trigger is logged before it acts
+
+**Decided.** `WIRE_PROTOCOL` 15 adds `Message::Floor { validator, floor }`. A
+validator broadcasts `dag.floor()` when it starts, whenever a checkpoint moves
+it, and every 500 ticks (about one second). A receiver records the floor per
+validator in the set current at its own round, exposes the map at
+`/status.peer_floors`, and logs a hard trigger when a missing commit dependency
+has exhausted its want budget and sits at or below every peer's floor. The
+trigger is log-only: no reseed path exists yet.
+
+**Why.** A node that cannot repair a want has no way to tell a pruned peer from
+a silent one. The gossip is the input a reseed decision needs, but acting on a
+self-reported, unauthenticated floor before the reseed install is atomic would
+add a liveness attack surface: a Byzantine peer could inflate its floor to push
+the node out of a healthy mesh. The frame names its sender because the
+handshake binds the chain, not the identity, so the value is diagnostic and no
+safety decision uses it.
+
+**Measured.** Four validators, in-process live mesh, checkpoint every four
+heights, ten transactions per batch: every node logged peer floors, the values
+advanced with checkpoints, and the run ended with `same commit root true` at 65
+committed entries and equal state roots. The hard-trigger line is covered by
+unit test but has not appeared in a run; reaching it needs a dependency pruned
+by every peer.
+
+## D77 — Compare state roots only on the same applied prefix
+
+**Decided.** A `live` mesh no longer fails because a node at the drain boundary
+has applied fewer transactions. The commit root is already compared at the
+shortest common committed index; the state root is compared only when all nodes
+applied the same count or committed the same length. Equal committed length with
+different state still fails.
+
+**Why.** A state root is a function of the applied prefix. A node still catching
+up holds a shorter prefix, not a divergent state, and failing on different roots
+made a short `--checkpoint-every` run exit 1 whenever the drain ended first.
+
+**Measured.** Four validators, checkpoint every four heights, 20 rounds, ten
+transactions per batch, 300 ms drain: committed lengths 51..54, applied 510 vs
+540, `same commit root true` at 51 common committed entries, exit 0 with state
+roots reported as not comparable.
+
 ## Open decisions
 
 1. **Does a node serve history it does not hold?** Model B says no beyond the

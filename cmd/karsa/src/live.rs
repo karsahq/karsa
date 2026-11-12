@@ -182,6 +182,13 @@ const AUTHORING_LEAD: u64 = 12;
 /// missed both halves while it was away.
 const CONTROL_REBROADCAST_TICKS: u32 = 1000;
 
+/// Ticks between gossip frames that report this node's pruning floor.
+///
+/// A floor changes only at a checkpoint, so the periodic repeat exists for a
+/// peer that connected after the last change. One small frame per second is far
+/// below the cost of anything on the data plane.
+const FLOOR_GOSSIP_TICKS: u32 = 500;
+
 /// Round-based silence is meaningful only after the mesh has finished starting.
 ///
 /// A node that starts a few milliseconds late is many rounds behind, so a tight
@@ -1733,6 +1740,60 @@ fn check_snapshot_bridge(
     Ok(())
 }
 
+/// Prints a hard reseed trigger once per committed cursor and dependency.
+///
+/// The trigger is log-only: no reseed path exists to act on it. It fires when a
+/// wanted dependency sits at or below every peer's pruning floor, so no peer can
+/// answer the want. The value is repeated only when the dependency changes.
+fn report_hard_trigger(
+    index: usize,
+    cursor: u64,
+    missing: &VertexId,
+    covering: &[(Vec<u8>, u64)],
+    reported: &mut Option<(u64, [u8; 32])>,
+) {
+    let key = (cursor, missing.digest);
+    if *reported == Some(key) {
+        return;
+    }
+    *reported = Some(key);
+    let peers = covering
+        .iter()
+        .map(|(peer, floor)| format!("{}={floor}", hex::encode(&peer[..peer.len().min(8)])))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!(
+        "node {index} reseed: hard trigger at round {cursor}: dependency {} round {} is below every peer floor ({peers})",
+        hex::encode(&missing.digest[..6]),
+        missing.round
+    );
+}
+
+/// Returns the peers whose reported floor covers `round`, when every peer does.
+///
+/// A floor of `f` means the peer cannot answer a want for any vertex at or below
+/// `f`. A hard reseed trigger needs all peers to have spoken and all of them to
+/// cover the missing dependency: one peer that still holds history can serve it,
+/// and one peer that never reported might be able to. An empty map is not a
+/// trigger for the same reason.
+fn peers_cannot_serve(
+    peer_floors: &BTreeMap<Vec<u8>, Option<u64>>,
+    round: u64,
+) -> Option<Vec<(Vec<u8>, u64)>> {
+    if peer_floors.is_empty() {
+        return None;
+    }
+    let mut covering = Vec::with_capacity(peer_floors.len());
+    for (peer, floor) in peer_floors {
+        let floor = (*floor)?;
+        if floor < round {
+            return None;
+        }
+        covering.push((peer.clone(), floor));
+    }
+    Some(covering)
+}
+
 /// Extends a served-snapshot floor pin.
 ///
 /// The pin keeps the lowest served floor for one TTL window. A checkpoint that
@@ -2429,6 +2490,10 @@ async fn node_task(
     }
 
     let mut wanted: HashMap<VertexId, Want> = HashMap::new();
+    // Ids whose want budget is exhausted. A later sweep inserts the same gap
+    // again with a fresh budget, so the retry count alone cannot tell a trigger
+    // that all repair avenues were tried.
+    let mut abandoned: HashSet<VertexId> = HashSet::new();
     let mut batches: HashMap<[u8; 32], Batch> = HashMap::new();
     let mut state = if let Some(store) = &store {
         match store.genesis_state().map_err(|error| error.to_string())? {
@@ -2890,6 +2955,13 @@ async fn node_task(
     let mut cursor: u64 = node.cursor();
     let mut cursor_since = Instant::now();
     let mut reported_stall: Option<u64> = None;
+    // What each peer says it has pruned, keyed by the validator id in its frame.
+    // Diagnostic only: the gossip names its sender, so it is not trusted for any
+    // decision, and a hard reseed trigger is logged rather than acted on.
+    let mut peer_floors: BTreeMap<Vec<u8>, Option<u64>> = BTreeMap::new();
+    let mut announced_floor: Option<Option<u64>> = None;
+    // The last (cursor, dependency) a hard trigger was logged for.
+    let mut reported_hard_trigger: Option<(u64, [u8; 32])> = None;
     // Local lambda: committed entries over the last few seconds. A frozen cursor
     // with a healthy rate means this node is behind; a frozen cursor with a zero
     // rate means the chain itself stopped producing commits.
@@ -2968,11 +3040,57 @@ async fn node_task(
                             }
                         }
                     }
+                    Message::Floor { validator, floor } => {
+                        // The handshake binds the chain, not the identity, so the
+                        // frame names its sender. Only a validator the current set
+                        // knows is tracked, and this node's own echo is ignored.
+                        let known = validator.as_slice() != node.id()
+                            && node
+                                .dag()
+                                .set_for_round(node.round())
+                                .validator(&validator)
+                                .is_some();
+                        // An unknown sender is ignored rather than counted as a
+                        // protocol error: the frame is diagnostic, and a removed
+                        // validator's last floor can arrive just after the change.
+                        if known {
+                            let changed =
+                                peer_floors.insert(validator.clone(), floor) != Some(floor);
+                            if changed {
+                                if let Some(floor) = floor {
+                                    let name =
+                                        hex::encode(&validator[..validator.len().min(8)]);
+                                    eprintln!("node {index} peer floor {name} = {floor}");
+                                }
+                                if let Some(rpc) = &rpc {
+                                    rpc.lock()
+                                        .expect("rpc lock poisoned")
+                                        .note_peer_floors(&peer_floors);
+                                }
+                            }
+                            // A floor that arrives after the stall was reported is
+                            // still the moment the trigger becomes visible.
+                            if let Some(missing) = node.dag().missing_history(cursor)
+                                && abandoned.contains(&missing)
+                                && let Some(covering) =
+                                    peers_cannot_serve(&peer_floors, missing.round)
+                            {
+                                report_hard_trigger(
+                                    index,
+                                    cursor,
+                                    &missing,
+                                    &covering,
+                                    &mut reported_hard_trigger,
+                                );
+                            }
+                        }
+                    }
                     Message::Vertex(vertex) => {
-                        if let Ok(id) = vertex.id()
-                            && wanted.remove(&id).is_some()
-                        {
-                            repaired += 1;
+                        if let Ok(id) = vertex.id() {
+                            if wanted.remove(&id).is_some() {
+                                repaired += 1;
+                            }
+                            abandoned.remove(&id);
                         }
                         // Only a vertex this node did not already hold is new, so a
                         // repaired or duplicated frame is not written twice.
@@ -3375,6 +3493,22 @@ async fn node_task(
                     }
                     round_skip_dirty = false;
                 }
+                // This node's pruning floor tells a peer whether a want can still
+                // be served. It moves only at a checkpoint, so it is repeated on a
+                // slow interval and announced as soon as it changes.
+                if announced_floor != Some(node.dag().floor())
+                    || ticks % FLOOR_GOSSIP_TICKS == 0
+                {
+                    let floor = node.dag().floor();
+                    let message = Message::Floor {
+                        validator: node.id().to_vec(),
+                        floor,
+                    };
+                    let bytes =
+                        wire::frame(&message, now()).map_err(|error| error.to_string())?;
+                    broadcast(&outbound, true, &bytes, &mut dropped);
+                    announced_floor = Some(floor);
+                }
                 // The lead cap belongs to the round-skip experiment. Without it a
                 // live node authors far past the cursor, which widens the window
                 // in which delivery differences change a skip decision. The cap
@@ -3544,6 +3678,9 @@ async fn node_task(
                             if next > cursor {
                                 cursor_since = Instant::now();
                                 reported_stall = None;
+                                // A dependency below the new cursor can no longer
+                                // block a commit, so its abandonment is stale.
+                                abandoned.retain(|id| id.round >= next);
                                 let now = Instant::now();
                                 while commit_rate
                                     .front()
@@ -3608,7 +3745,7 @@ async fn node_task(
                     reported_stall = Some(cursor);
                     let observed = node.dag().highest_round().unwrap_or(cursor);
                     let missing = node.dag().missing_history(cursor);
-                    let detail = missing.map_or_else(
+                    let detail = missing.as_ref().map_or_else(
                         || "none".to_string(),
                         |id| {
                             format!(
@@ -3638,6 +3775,19 @@ async fn node_task(
                     eprintln!(
                         "node {index} commit stalled at round {cursor} (observed {observed}), missing {detail} (count {missing_count}), rate {rate:.1} committed/s, votes {voters} of quorum {quorum}, can-anchor {can_anchor}, round-skip held {skip_held}, pending {skip_pending}, leader-held {leader_held}"
                     );
+                    if let Some(missing) = &missing
+                        && abandoned.contains(missing)
+                        && let Some(covering) =
+                            peers_cannot_serve(&peer_floors, missing.round)
+                    {
+                        report_hard_trigger(
+                            index,
+                            cursor,
+                            missing,
+                            &covering,
+                            &mut reported_hard_trigger,
+                        );
+                    }
                 }
                 if config.execute {
                     // Apply in commit order, and stop at the first vertex whose
@@ -4020,6 +4170,7 @@ async fn node_task(
                         want.at = Instant::now();
                         if want.tries >= WANT_TRIES {
                             wanted.remove(&id);
+                            abandoned.insert(id);
                             gave_up += 1;
                             continue;
                         }
@@ -4345,6 +4496,9 @@ async fn archive_task(
                     Message::RoundSkip(_) => {}
                     // Control payloads share the round-skip fate here.
                     Message::Control(_) => {}
+                    // A floor describes a peer's pruning, which an archive does
+                    // not use; it keeps no DAG to compare against.
+                    Message::Floor { .. } => {}
                     // The accept side consumes the hello before the loop starts.
                     Message::Hello(_) => rejected += 1,
                 }
@@ -5143,6 +5297,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let mut archive_txs = 0usize;
     let mut validator_txs = 0usize;
     let mut state_roots: Vec<[u8; 32]> = Vec::new();
+    let mut state_applied: Vec<usize> = Vec::new();
     for result in &results {
         bytes_in += result.bytes_in;
         bytes_out += result.bytes_out;
@@ -5167,6 +5322,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         }
         if let Some(root) = result.state_root {
             state_roots.push(root);
+            state_applied.push(result.applied);
         }
         if result.signs {
             roots.push(if same_length {
@@ -5360,16 +5516,38 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
              across the committee"
         );
     }
+    // A state root is a function of the applied prefix. Comparing roots from
+    // nodes that applied a different number of transactions says nothing: a node
+    // that is still catching up at the drain boundary holds a shorter prefix, not
+    // a different state. The commit root above already checks the common prefix.
+    let same_applied = state_applied.windows(2).all(|pair| pair[0] == pair[1]);
     if let Some(first) = state_roots.first() {
-        let agree = state_roots.iter().all(|root| root == first);
-        println!(
-            "  execution         {applied} tx applied, {exec_rejected} rejected, state root {} \
-             (all nodes agree: {agree})",
-            hex::encode(&first[..6])
-        );
+        let agree = same_applied && state_roots.iter().all(|root| root == first);
+        let shortest_applied = state_applied.iter().min().copied().unwrap_or(0);
+        let longest_applied = state_applied.iter().max().copied().unwrap_or(0);
+        if same_applied {
+            println!(
+                "  execution         {applied} tx applied, {exec_rejected} rejected, state root {} \
+                 (all nodes agree: {agree})",
+                hex::encode(&first[..6])
+            );
+        } else if same_length {
+            println!(
+                "  execution         {applied} tx applied, {exec_rejected} rejected, same commits \
+                 but nodes applied {shortest_applied}..{longest_applied} transactions"
+            );
+        } else {
+            println!(
+                "  execution         {applied} tx applied, {exec_rejected} rejected, state roots \
+                 not comparable: nodes applied {shortest_applied}..{longest_applied} transactions"
+            );
+        }
         if !agree {
-            for (index, root) in state_roots.iter().enumerate() {
-                println!("    val-{index} {}", hex::encode(&root[..6]));
+            for (index, (root, applied)) in state_roots.iter().zip(&state_applied).enumerate() {
+                println!(
+                    "    val-{index} {} at {applied} applied",
+                    hex::encode(&root[..6])
+                );
             }
         }
     }
@@ -5536,7 +5714,13 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             format!("{missing_payloads} vertices name a batch this node does not hold").into(),
         );
     }
-    if state_roots.len() > 1 && state_roots.iter().any(|root| *root != state_roots[0]) {
+    // Same committed length means the same commit sequence was applied, so a
+    // different state is divergence. The same applied count is the other
+    // comparable prefix; a shorter committed tail is only a catch-up.
+    if (same_length || same_applied)
+        && state_roots.len() > 1
+        && state_roots.iter().any(|root| *root != state_roots[0])
+    {
         return Err("nodes applied the same commits to different state".into());
     }
     Ok(())
@@ -5573,6 +5757,33 @@ mod tests {
         };
         let error = check_hello(b"chain-a", &hello).unwrap_err();
         assert!(error.contains("wire protocol"), "{error}");
+    }
+
+    #[test]
+    fn a_hard_trigger_needs_every_peer_to_cover_the_dependency() {
+        let mut floors = BTreeMap::new();
+        assert!(
+            peers_cannot_serve(&floors, 0).is_none(),
+            "no peer has spoken, so nobody has shown the history is gone"
+        );
+
+        floors.insert(b"val-1".to_vec(), Some(9));
+        floors.insert(b"val-2".to_vec(), Some(7));
+        floors.insert(b"val-3".to_vec(), Some(8));
+        assert_eq!(
+            peers_cannot_serve(&floors, 7).map(|covering| covering.len()),
+            Some(3)
+        );
+        assert!(
+            peers_cannot_serve(&floors, 10).is_none(),
+            "one peer still holds round 10"
+        );
+
+        floors.insert(b"val-2".to_vec(), None);
+        assert!(
+            peers_cannot_serve(&floors, 0).is_none(),
+            "a peer with no floor still holds full history"
+        );
     }
 
     #[tokio::test]

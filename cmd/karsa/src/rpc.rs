@@ -228,6 +228,8 @@ pub(crate) struct RpcCore {
     order_base: usize,
     /// Rounds at or below this are summarized by the prefix and no longer held.
     floor: Option<u64>,
+    /// Floors peers gossip, kept in validator-id order for a stable view.
+    peer_floors: Vec<PeerFloorView>,
     /// Certified headers that finalized at least one tracked transaction, with
     /// the commit prefix each one covers. Bounded, and only the heights a client
     /// can still ask about need to be here.
@@ -270,6 +272,7 @@ impl RpcCore {
             order_prefix: CommitFrontier::empty(),
             order_base: 0,
             floor: None,
+            peer_floors: Vec::new(),
             finalized_headers: BTreeMap::new(),
             head: HeadView {
                 height: genesis.height,
@@ -809,6 +812,21 @@ impl RpcCore {
         self.floor = floor;
     }
 
+    /// Records the pruning floors peers gossip.
+    ///
+    /// This is a view, not a decision: the frame names its sender and is not
+    /// verified, so the node loop only uses it to report and to log a possible
+    /// reseed trigger.
+    pub(crate) fn note_peer_floors(&mut self, floors: &BTreeMap<Vec<u8>, Option<u64>>) {
+        self.peer_floors = floors
+            .iter()
+            .map(|(validator, floor)| PeerFloorView {
+                validator: hex::encode(validator),
+                floor: *floor,
+            })
+            .collect();
+    }
+
     /// Records a certified header and finalizes every executed batch its commit
     /// prefix covers.
     ///
@@ -965,6 +983,7 @@ impl RpcCore {
             order_len,
             order_root: hex::encode(order_root),
             dag_floor: self.floor,
+            peer_floors: self.peer_floors.clone(),
             applied_txs: self.run.applied_txs,
             mempool: self.mempool.len(),
             peers: self.run.peers,
@@ -1247,6 +1266,13 @@ struct SilentView {
     last_round: u64,
 }
 
+/// What one peer reports about the history it has pruned.
+#[derive(Debug, Clone, Serialize)]
+struct PeerFloorView {
+    validator: String,
+    floor: Option<u64>,
+}
+
 #[derive(Serialize)]
 struct StatusView {
     node: usize,
@@ -1266,6 +1292,8 @@ struct StatusView {
     order_root: String,
     /// Rounds at or below this are summarized by the prefix and no longer held.
     dag_floor: Option<u64>,
+    /// What each peer says it has pruned, sorted by validator id.
+    peer_floors: Vec<PeerFloorView>,
     applied_txs: u64,
     mempool: usize,
     peers: usize,
@@ -2022,6 +2050,16 @@ mod tests {
         assert_eq!(view.dag_floor, None);
         core.note_floor(Some(3));
         assert_eq!(core.status().dag_floor, Some(3));
+        core.note_peer_floors(&BTreeMap::from([
+            (b"val-1".to_vec(), Some(4)),
+            (b"val-2".to_vec(), None),
+        ]));
+        let view = core.status();
+        assert_eq!(view.peer_floors.len(), 2);
+        assert_eq!(view.peer_floors[0].validator, hex::encode(b"val-1"));
+        assert_eq!(view.peer_floors[0].floor, Some(4));
+        assert_eq!(view.peer_floors[1].validator, hex::encode(b"val-2"));
+        assert_eq!(view.peer_floors[1].floor, None);
         assert_eq!(
             view.order_root,
             hex::encode(CommitFrontier::from_order(&[first.clone(), second.clone()]).root())

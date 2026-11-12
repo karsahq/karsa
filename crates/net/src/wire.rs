@@ -9,7 +9,7 @@
 //! u32 body length || u64 sent-at nanos || u8 kind || payload
 //! ```
 //!
-//! Eleven kinds share a link:
+//! Fifteen kinds share a link:
 //!
 //! - [`Message::Hello`] is the first frame on a link and names the chain.
 //! - [`Message::Vertex`] is the broadcast.
@@ -27,6 +27,8 @@
 //! - [`Message::Fence`] carries a quorum statement that one validator failed.
 //! - [`Message::RoundSkip`] carries evidence that a leader round cannot reach a
 //!   vote quorum.
+//! - [`Message::Floor`] reports how much history a validator has pruned, so a
+//!   peer can tell when a want can no longer be served.
 //!
 //! The hello exists because a vertex is only meaningful on one chain: the chain id
 //! is part of what a validator signs, so a peer on another genesis would produce
@@ -76,13 +78,14 @@ const KIND_ROUND_SKIP: u8 = 11;
 const KIND_CONTROL: u8 = 12;
 const KIND_WANT_SLOT: u8 = 13;
 const KIND_SNAPSHOT_DECLINED: u8 = 14;
+const KIND_FLOOR: u8 = 15;
 
 /// The framing and message layout this build speaks.
 ///
 /// A peer that answers with another number is not necessarily hostile; it may be a
 /// different build. The link is closed rather than parsed optimistically, because
 /// the next frame kind could mean something else there.
-pub const WIRE_PROTOCOL: u16 = 14;
+pub const WIRE_PROTOCOL: u16 = 15;
 
 /// The first frame on every link: which chain the sender is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,6 +205,20 @@ pub enum Message {
     /// The certificate carries the new set and is verified against the old set
     /// the receiver already holds; activation is a separate step.
     SetChange(Box<TransitionCertificate>),
+    /// One validator's pruning floor, gossiped so peers can see what history it
+    /// can still serve.
+    ///
+    /// A floor of `Some(r)` means every round at or below `r` has been pruned by
+    /// the sender: a want for a vertex there cannot be answered. The value is
+    /// diagnostic until a consumer acts on it, so the receiver records it per
+    /// peer rather than trusting it for any safety decision. The sender names
+    /// itself because the link handshake identifies the chain, not the identity.
+    Floor {
+        /// Validator that owns this floor, as the sender reports it.
+        validator: Vec<u8>,
+        /// Highest pruned round, or `None` before the first checkpoint.
+        floor: Option<u64>,
+    },
     /// A quorum declaration that one validator is failed from a round onward.
     Fence(Box<FenceCertificate>),
     /// Evidence that a leader round cannot reach a vote quorum.
@@ -504,6 +521,18 @@ pub fn frame(message: &Message, sent_at_nanos: u64) -> Result<Vec<u8>, CryptoErr
             encoder.finish()
         }),
         Message::SetChange(certificate) => (KIND_SET_CHANGE, certificate.encode()?),
+        Message::Floor { validator, floor } => {
+            let mut encoder = Encoder::with_capacity(4 + validator.len() + 9);
+            encoder.put_bytes(validator)?;
+            match floor {
+                None => encoder.put_u8(0),
+                Some(floor) => {
+                    encoder.put_u8(1);
+                    encoder.put_u64(*floor);
+                }
+            }
+            (KIND_FLOOR, encoder.finish())
+        }
         Message::Fence(certificate) => (KIND_FENCE, certificate.encode()?),
         Message::RoundSkip(proof) => (KIND_ROUND_SKIP, proof.encode()?),
     };
@@ -601,6 +630,17 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
             Message::Tx(envelope)
         }
         KIND_SET_CHANGE => Message::SetChange(Box::new(TransitionCertificate::decode(payload)?)),
+        KIND_FLOOR => {
+            let mut decoder = Decoder::new(payload);
+            let validator = decoder.read_bytes()?.to_vec();
+            let floor = match decoder.read_u8()? {
+                0 => None,
+                1 => Some(decoder.read_u64()?),
+                other => return Err(invalid(format!("unknown floor flag {other}"))),
+            };
+            decoder.finish()?;
+            Message::Floor { validator, floor }
+        }
         KIND_FENCE => Message::Fence(Box::new(FenceCertificate::decode(payload)?)),
         KIND_ROUND_SKIP => Message::RoundSkip(Box::new(RoundSkipProof::decode(payload)?)),
         other => return Err(invalid(format!("unknown frame kind {other}"))),
@@ -875,6 +915,20 @@ mod tests {
         let frame = take_frame(&mut buffer).unwrap().unwrap();
         assert_eq!(frame.message, Message::RoundSkip(Box::new(proof)));
         assert_eq!(frame.sent_at_nanos, 19);
+    }
+
+    #[test]
+    fn a_floor_frame_round_trips() {
+        for floor in [None, Some(0), Some(4_096)] {
+            let message = Message::Floor {
+                validator: b"val-1".to_vec(),
+                floor,
+            };
+            let mut buffer = frame(&message, 21).unwrap();
+            let frame = take_frame(&mut buffer).unwrap().unwrap();
+            assert_eq!(frame.message, message);
+            assert_eq!(frame.sent_at_nanos, 21);
+        }
     }
 
     #[test]
