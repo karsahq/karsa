@@ -660,8 +660,23 @@ impl Finalizer {
             // share sets would only make the lookup for the next height scan old
             // history that a long run keeps growing.
             self.shares.retain(|_, set| set.header.height > height);
-            if let Some(order_len) = self.order_lens.remove(&id) {
+            let built_order = self.order_lens.remove(&id);
+            if let Some(order_len) = built_order {
                 self.certified_orders.insert(height, order_len);
+            } else {
+                // This header was adopted from peers, not built here. If this
+                // node built a different header at the same height (or is still
+                // behind), its own `last_built` chain cannot extend the certified
+                // head. Continuing to build on it would produce headers whose
+                // `previous` names an orphan, and no field ever moves back to the
+                // canonical chain. Reset the builder to the new head and drop
+                // pending heights the head has passed. Heights already assigned
+                // above the head keep their numbers: `record_commit` may have
+                // queued several of them before this advance.
+                self.last_built = header.clone();
+                self.last_built_order = 0;
+                self.next_height = self.next_height.max(height.saturating_add(1));
+                self.pending.retain(|pending| pending.height > height);
             }
             certified.push(Certified {
                 header,
@@ -894,6 +909,64 @@ mod tests {
         );
         assert!(finalizer.is_certified(1));
         assert!(finalizer.is_certified(2));
+    }
+
+    #[test]
+    fn a_lagging_finalizer_extends_the_certified_peer_head() {
+        let (set, keys) = fixture(4);
+        let sets = SetSchedule::single(set.clone());
+        let schedule = EpochSchedule::single(1);
+        let chain_id = b"karsa-follow".to_vec();
+        let anchor = genesis(&chain_id, [0u8; 32]);
+
+        // A peer builds and certifies height 1 while this node has not built
+        // anything. The shares still reach it, so its chain head advances.
+        let mut leader = Finalizer::new(
+            sets.clone(),
+            schedule,
+            chain_id.clone(),
+            b"val-0".to_vec(),
+            keys[0].clone(),
+            anchor.clone(),
+            0,
+        )
+        .unwrap();
+        leader.record_commit(1, 1);
+        leader.mark_applied(1, [7u8; 32], 1);
+        let order = vec![order_entry(1, b"val-0")];
+        let built = leader.build_ready(&order, 10).unwrap();
+        let peer = built.shares[0].header.clone();
+
+        let mut follower = Finalizer::new(
+            sets,
+            schedule,
+            chain_id,
+            b"val-0".to_vec(),
+            keys[0].clone(),
+            anchor,
+            0,
+        )
+        .unwrap();
+        let payload = signing_payload(&peer).unwrap();
+        for (signer, key) in keys.iter().enumerate().take(set.quorum_size()) {
+            follower
+                .receive_share(Share {
+                    header: peer.clone(),
+                    signer,
+                    signature: Ed25519Scheme.sign(key, &payload).unwrap(),
+                    at: 20 + signer as u64,
+                })
+                .unwrap();
+        }
+        assert_eq!(follower.head().height, 1, "the peer chain is certified");
+
+        // Its next commit must extend that head, not rebuild height 1 behind it.
+        follower.record_commit(1, 1);
+        follower.mark_applied(1, [7u8; 32], 1);
+        let next = follower.build_ready(&order, 30).unwrap();
+        let own = next.shares.first().expect("the follower signs its header");
+        assert_eq!(own.header.height, 2);
+        assert_eq!(own.header.previous, peer.id().unwrap());
     }
 
     #[test]

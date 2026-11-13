@@ -2494,6 +2494,40 @@ trigger exists for; the constants (10 s window, 256 rounds, 60 s, 5 s sustain,
 0.5 rounds/s margin) are chosen conservatively and may need one measured
 adjustment once such a run exists.
 
+## D82 — A peer-certified head resets the local header builder
+
+**Decided.** When `advance_certified` adopts a header this node did not build
+(the header id is absent from `order_lens`), it resets `last_built` to that
+header, clears `last_built_order` (coverage is unknown for a peer header), moves
+`next_height` to at least `height + 1`, and drops pending heights the head has
+passed. Pending heights already assigned above the head keep their numbers so
+`record_commit` cannot create duplicate heights. A header this node did build
+leaves the builder untouched, including when the local builder is ahead of the
+certified head.
+
+**Why.** A lagging validator can receive a quorum for a peer-built header before
+it has built a matching one. The chain head then advances, but `last_built` still
+named its own earlier header (or the anchor). Every later build used that orphan
+as `previous`; no peer could sign it, so the node could never rejoin the
+canonical chain without a reseed. A unit test reproduces it: the follower
+certifies a peer height 1, then builds its next commit at height 1 with previous
+genesis. After the change it builds height 2 with previous equal to the peer
+id. The live consequence is that a node that falls behind but is not fenced must
+be able to author again on the canonical chain.
+
+**Measured.** Four validators, `CHECKPOINT_EVERY=32 FAILURE_ROUNDS=15`, no
+`--fence-silent`; node 3 was stopped for 5 s at t=10 s and resumed. All four
+ended at certified head 3622/4517, `commit_root 83aa2d32…`, `state_root
+690cb32b…`, conflicts 0; node 3 authored 4519 rounds after the pause, the same
+as nodes 0 and 1. The validator unit suite is green (170 tests), including the
+new follower test.
+
+**Open.** The fix covers a peer header adopted while the local builder is at or
+below it. It does not reconstruct whether an already-built local chain above the
+head was compatible; pending heights above the head are kept and built on the
+new head, and a divergent one simply fails to collect a quorum. An ancestry map
+for built headers would make that decision sharper.
+
 ## Open decisions
 
 1. **Does a node serve history it does not hold?** Model B says no beyond the
