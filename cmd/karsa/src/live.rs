@@ -8687,6 +8687,90 @@ mod tests {
     }
 
     #[test]
+    fn coverage_gap_tracks_an_unprovable_certified_head_until_prefix_recovery() {
+        use validator::EpochSchedule;
+
+        let membership = chain::membership(4, None).expect("a demo committee");
+        let set = membership.set.clone();
+        let chain_id = b"karsa-coverage-gap".to_vec();
+        let identity = &membership.consensus[0];
+        let genesis = Header::genesis(chain_id.clone(), set.epoch, [1; 32], commit_root(&[]));
+        let finalizer = Finalizer::new(
+            SetSchedule::single(set.clone()),
+            EpochSchedule::single(set.epoch),
+            chain_id.clone(),
+            identity.id.clone(),
+            identity.private_key.clone(),
+            genesis.clone(),
+            0,
+        )
+        .expect("a test finalizer");
+        let mut node = Node::with_chain_id_and_epoch_length(
+            set,
+            0,
+            identity.id.clone(),
+            identity.private_key.clone(),
+            chain_id.clone(),
+        );
+        let order: Vec<_> = (0..128)
+            .map(|round| VertexId {
+                round,
+                author: identity.id.clone(),
+                digest: [u8::try_from(round).expect("a small test round"); 32],
+            })
+            .collect();
+        let header = Header {
+            chain_id,
+            epoch: genesis.epoch,
+            height: RESEED_COVERAGE_GAP,
+            round: 128,
+            state_root: [2; 32],
+            dag_root: commit_root(&order),
+            previous: genesis.id().expect("the genesis ID"),
+            applied: 0,
+        };
+        let mut scan = CertifiedCoverageScan::default();
+        // Seed the same compacted prefix on both sides of recovery; only the
+        // retained suffix changes, invalidating the failed-scan cache.
+        node.seed_prefix(
+            CommitFrontier::from_order(&order[..32]),
+            order[32..64].to_vec(),
+        );
+        assert_eq!(finalizer.certified_order(header.height), None);
+        assert_eq!(
+            certified_coverage(&node, &finalizer, &header, 32, &mut scan),
+            None
+        );
+        assert_eq!(
+            certified_coverage(&node, &finalizer, &header, 32, &mut scan),
+            None
+        );
+        let provable_height = genesis.height;
+        assert!(
+            !coverage_gap_needed(provable_height, header.height, Duration::ZERO),
+            "a newly unprovable head must get the stall grace period"
+        );
+        assert!(
+            coverage_gap_needed(provable_height, header.height, RESEED_COVERAGE_STALL),
+            "a stalled head missing local coverage must arm the coverage-gap trigger"
+        );
+
+        node.seed_prefix(
+            CommitFrontier::from_order(&order[..32]),
+            order[32..].to_vec(),
+        );
+        assert_eq!(
+            certified_coverage(&node, &finalizer, &header, 32, &mut scan),
+            Some(order.len()),
+            "suffix recovery must make the certified head locally provable"
+        );
+        assert!(
+            !coverage_gap_needed(header.height, header.height, RESEED_COVERAGE_STALL),
+            "recovered coverage must disarm the trigger even with an old stall clock"
+        );
+    }
+
+    #[test]
     fn a_certified_header_waits_for_the_prefix_it_covers() {
         use validator::EpochSchedule;
 
