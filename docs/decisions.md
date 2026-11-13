@@ -2308,6 +2308,33 @@ transactions per batch, 300 ms drain: committed lengths 51..54, applied 510 vs
 540, `same commit root true` at 51 common committed entries, exit 0 with state
 roots reported as not comparable.
 
+## D78 — A snapshot pin has a budget and an explicit release
+
+**Decided.** A served snapshot pins one floor with three independent bounds: the
+ordinary 60 s TTL after the last request, a hard 300 s cap from the first
+request, and a byte/request budget (512 MiB, 16 requests). The first request in a
+window is always served; later ones are declined with `PinBusy` so the joiner
+fails over instead of believing the history is protected. A joiner that
+installed a snapshot sends `Message::SnapshotRelease { floor }` (wire protocol
+16). The server marks the pin released and keeps a 10 s grace, because another
+joiner may still be installing the same snapshot; a new request during the grace
+clears the marker. Only the floor the pin actually covers can release it.
+
+**Why.** A TTL that slides on every request lets one client defer pruning
+forever. A release lets a healthy joiner tell the server it is done, so the next
+checkpoint can prune without waiting the full window. The budget is deliberately
+smaller than the possible join traffic: refusing a snapshot is visible and
+recoverable by failover, while silently serving history that is about to be
+pruned is not. The release frame is unauthenticated like the request; it can
+only shorten a liveness pin, never change which history a server accepts.
+
+**Measured.** Unit tests cover the lowest-floor rule, TTL and max-age expiry, the
+byte and request bounds, the first-request exemption, and the release grace. The
+release frame round-trips and is exercised against a real loopback snapshot link.
+An end-to-end `--sync-from-peers` run that observes the server's release line is
+still pending; the manual attempt was cut short by a stale process holding a
+snapshot port, not by a release failure.
+
 ## Open decisions
 
 1. **Does a node serve history it does not hold?** Model B says no beyond the

@@ -139,13 +139,36 @@ const SNAPSHOT_STARTUP_WAIT: Duration = Duration::from_secs(15);
 const SNAPSHOT_READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a serving node waits for the node loop to build a snapshot.
 const SNAPSHOT_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
-/// How long a served snapshot's floor stays pinned against pruning.
+/// How long a served snapshot's floor stays pinned against pruning after the
+/// last request.
 ///
 /// A joiner that adopted the snapshot may still need the tail vertices through
 /// the normal want path. Checkpoints that would prune above this floor are
 /// deferred until the pin expires; the next checkpoint then covers the same
 /// history in one step.
 const SNAPSHOT_PIN_TTL: Duration = Duration::from_secs(60);
+/// Hard cap on one pin window, however many joiners keep requesting it.
+///
+/// Without this, a client that requests a snapshot every TTL could keep the
+/// server from pruning forever. The cap is well above a normal install.
+const SNAPSHOT_PIN_MAX: Duration = Duration::from_secs(300);
+/// Bytes one pin window may serve before it declines further requests.
+///
+/// The first request is always served: refusing it would refuse the sync the
+/// pin exists for. After that the budget bounds how much repeated serving can
+/// delay pruning.
+const SNAPSHOT_PIN_BYTES: u64 = 512 * 1024 * 1024;
+/// Snapshot requests one pin window serves before declining further ones.
+///
+/// The byte budget alone would let many small snapshots slide the TTL. The
+/// count is deliberately modest: a committee of ten has few joiners at once.
+const SNAPSHOT_PIN_REQUESTS: u32 = 16;
+/// Grace after the last joiner reports that it installed the snapshot.
+///
+/// Another joiner may still be installing the same snapshot, so the floor is
+/// not released immediately. A new request during the grace clears the marker
+/// and restarts the ordinary TTL.
+const SNAPSHOT_PIN_RELEASE_GRACE: Duration = Duration::from_secs(10);
 /// Per-`applied` states kept so a certified head's state can be served.
 const SNAPSHOT_STATES: usize = 256;
 /// Ticks between attempts to write a periodic checkpoint.
@@ -1633,9 +1656,11 @@ enum SnapshotDecline {
     StateEvicted { applied: u64 },
     StateRootMismatch,
     StateEncoding,
+    SnapshotTooLarge,
     BridgeIncomplete { round: u64 },
     PayloadMissing,
     ControlPending,
+    PinBusy { served: u32, bytes: u64 },
 }
 
 impl std::fmt::Display for SnapshotDecline {
@@ -1669,6 +1694,9 @@ impl std::fmt::Display for SnapshotDecline {
                 )
             }
             Self::StateEncoding => write!(formatter, "the retained state cannot be encoded"),
+            Self::SnapshotTooLarge => {
+                write!(formatter, "the snapshot exceeds the frame limit")
+            }
             Self::BridgeIncomplete { round } => {
                 write!(formatter, "a tail reference at round {round} has no bridge")
             }
@@ -1680,6 +1708,12 @@ impl std::fmt::Display for SnapshotDecline {
             }
             Self::ControlPending => {
                 write!(formatter, "a tail vertex names a pending control payload")
+            }
+            Self::PinBusy { served, bytes } => {
+                write!(
+                    formatter,
+                    "the served-snapshot pin already covers {served} requests and {bytes} bytes"
+                )
             }
         }
     }
@@ -1794,20 +1828,86 @@ fn peers_cannot_serve(
     Some(covering)
 }
 
-/// Extends a served-snapshot floor pin.
+/// The history one served snapshot keeps alive.
 ///
-/// The pin keeps the lowest served floor for one TTL window. A checkpoint that
-/// would prune above it is deferred, so a joiner that adopted the snapshot can
-/// still repair its tail with ordinary wants.
-fn pin_snapshot_floor(
-    current: Option<(u64, Instant)>,
+/// The pin keeps the lowest floor served in the window, the bytes and requests
+/// already spent, and whether the last joiner reported a successful install.
+#[derive(Debug, Clone, Copy)]
+struct SnapshotPin {
     floor: u64,
+    first_at: Instant,
+    last_at: Instant,
+    bytes: u64,
+    served: u32,
+    released_at: Option<Instant>,
+}
+
+/// Whether a pin no longer protects anything.
+///
+/// Three independent bounds end it: the ordinary TTL after the last request,
+/// the hard cap from the first request, and the grace after a joiner reported
+/// that it installed the snapshot.
+fn pin_expired(pin: &SnapshotPin, now: Instant) -> bool {
+    now.duration_since(pin.last_at) > SNAPSHOT_PIN_TTL
+        || now.duration_since(pin.first_at) > SNAPSHOT_PIN_MAX
+        || pin
+            .released_at
+            .is_some_and(|at| now.duration_since(at) > SNAPSHOT_PIN_RELEASE_GRACE)
+}
+
+/// Extends a served-snapshot floor pin, or declines when its budget is spent.
+///
+/// A snapshot with no floor keeps the current pin unchanged: nothing will be
+/// pruned on its behalf. A new, lower floor widens the protected history
+/// instead of resetting the window, so a second joiner cannot buy more time.
+fn extend_pin(
+    current: Option<SnapshotPin>,
+    floor: Option<u64>,
+    bytes: u64,
     now: Instant,
-) -> Option<(u64, Instant)> {
-    let kept = current.filter(|(_, at)| now.duration_since(*at) <= SNAPSHOT_PIN_TTL);
-    Some(match kept {
-        Some((pinned, _)) => (pinned.min(floor), now),
-        None => (floor, now),
+) -> Result<Option<SnapshotPin>, SnapshotDecline> {
+    let Some(floor) = floor else {
+        return Ok(current);
+    };
+    let mut pin = match current {
+        Some(pin) if !pin_expired(&pin, now) => pin,
+        _ => SnapshotPin {
+            floor,
+            first_at: now,
+            last_at: now,
+            bytes: 0,
+            served: 0,
+            released_at: None,
+        },
+    };
+    if pin.served > 0
+        && (pin.served >= SNAPSHOT_PIN_REQUESTS
+            || pin.bytes.saturating_add(bytes) > SNAPSHOT_PIN_BYTES)
+    {
+        return Err(SnapshotDecline::PinBusy {
+            served: pin.served,
+            bytes: pin.bytes,
+        });
+    }
+    pin.floor = pin.floor.min(floor);
+    pin.last_at = now;
+    pin.bytes = pin.bytes.saturating_add(bytes);
+    pin.served = pin.served.saturating_add(1);
+    pin.released_at = None;
+    Ok(Some(pin))
+}
+
+/// Marks a pin for release when the joiner reports the floor it adopted.
+///
+/// Only the floor the pin actually covers is accepted. A higher floor means the
+/// joiner adopted a different snapshot, and another joiner may still need the
+/// lower one.
+fn release_pin(current: Option<SnapshotPin>, floor: u64, now: Instant) -> Option<SnapshotPin> {
+    current.map(|mut pin| {
+        if pin.floor == floor && pin.released_at.is_none() {
+            pin.released_at = Some(now);
+        }
+        pin
     })
 }
 
@@ -1976,6 +2076,36 @@ async fn fetch_one(target: &str, chain_id: &[u8]) -> Result<wire::Snapshot, Stri
     }
 }
 
+/// Tells a snapshot server that this node installed its snapshot.
+///
+/// Best effort: a failed release leaves the pin to expire by its own bounds.
+/// The frame is small and the link is fresh, so this is one connect, one
+/// handshake, and one write.
+async fn release_snapshot(target: &str, chain_id: &[u8], floor: u64) -> Result<(), String> {
+    let mut stream = tokio::time::timeout(SNAPSHOT_CONNECT_TIMEOUT, TcpStream::connect(target))
+        .await
+        .map_err(|_| format!("connect to {target} timed out"))?
+        .map_err(|error| format!("connect to {target}: {error}"))?;
+    let mut buffer = Vec::new();
+    tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        handshake(&mut stream, &mut buffer, chain_id),
+    )
+    .await
+    .map_err(|_| format!("handshake with {target} timed out"))?
+    .map_err(|error| format!("handshake with {target}: {error}"))?;
+    let frame = wire::frame(&Message::SnapshotRelease { floor }, unix_nanos())
+        .map_err(|error| error.to_string())?;
+    stream
+        .write_all(&frame)
+        .await
+        .map_err(|error| format!("snapshot release to {target}: {error}"))?;
+    stream
+        .flush()
+        .await
+        .map_err(|error| format!("snapshot release to {target}: {error}"))
+}
+
 /// Tries every peer's snapshot port until one answers.
 async fn fetch_snapshot(
     port_base: u16,
@@ -1983,7 +2113,7 @@ async fn fetch_snapshot(
     total: usize,
     chain_id: &[u8],
     min_height: u64,
-) -> Result<wire::Snapshot, String> {
+) -> Result<(String, wire::Snapshot), String> {
     let deadline = tokio::time::Instant::now() + SNAPSHOT_STARTUP_WAIT;
     let mut last = String::from("no peers were tried");
     loop {
@@ -2006,7 +2136,7 @@ async fn fetch_snapshot(
                         snapshot.vertices.len(),
                         snapshot.batches.len()
                     );
-                    return Ok(snapshot);
+                    return Ok((target, snapshot));
                 }
                 Ok(snapshot) => {
                     println!(
@@ -2586,9 +2716,12 @@ async fn node_task(
 
     // A snapshot link is separate from the consensus mesh: the joiner asks, the
     // server answers from the node loop's own state, and nothing is broadcast.
+    // The reply is already framed so the node loop can charge the pin for the
+    // exact bytes it serves and the server does not encode the snapshot twice.
     let (snapshot_tx, mut snapshot_rx) =
-        mpsc::channel::<oneshot::Sender<Result<wire::Snapshot, SnapshotDecline>>>(4);
-    let mut pinned_floor: Option<(u64, Instant)> = None;
+        mpsc::channel::<oneshot::Sender<Result<Vec<u8>, SnapshotDecline>>>(4);
+    let (release_tx, mut release_rx) = mpsc::channel::<u64>(16);
+    let mut pinned_floor: Option<SnapshotPin> = None;
     if config.snapshot_port > 0 {
         let target = rpc_address(config.snapshot_port, index)?;
         let listener = TcpListener::bind(&target)
@@ -2598,6 +2731,7 @@ async fn node_task(
         let mut snapshot_shutdown = shutdown.clone();
         let snapshot_chain = chain_id.clone();
         let snapshot_tx = snapshot_tx.clone();
+        let snapshot_release = release_tx.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -2605,6 +2739,7 @@ async fn node_task(
                         let Ok((mut stream, _)) = accepted else { return };
                         let chain = snapshot_chain.clone();
                         let tx = snapshot_tx.clone();
+                        let release = snapshot_release.clone();
                         tokio::spawn(async move {
                             let mut buffer = Vec::new();
                             let hello = tokio::time::timeout(
@@ -2618,27 +2753,47 @@ async fn node_task(
                             let Ok(message) = read_one_message(&mut stream, &mut buffer).await else {
                                 return;
                             };
-                            if message != Message::SnapshotWant {
-                                return;
-                            }
-                            let (reply_tx, reply_rx) = oneshot::channel();
-                            if tx.send(reply_tx).await.is_err() {
-                                return;
-                            }
-                            let reply = tokio::time::timeout(SNAPSHOT_REPLY_TIMEOUT, reply_rx).await;
-                            let message = match reply {
-                                Ok(Ok(Ok(snapshot))) => Message::Snapshot(Box::new(snapshot)),
-                                Ok(Ok(Err(reason))) => {
-                                    Message::SnapshotDeclined(reason.to_string())
+                            let reply_rx = match message {
+                                Message::SnapshotWant => {
+                                    let (reply_tx, reply_rx) = oneshot::channel();
+                                    if tx.send(reply_tx).await.is_err() {
+                                        return;
+                                    }
+                                    reply_rx
                                 }
-                                _ => Message::SnapshotDeclined(String::from(
-                                    "the node loop did not build a snapshot in time",
-                                )),
+                                Message::SnapshotRelease { floor } => {
+                                    // Unauthenticated like the request. It can
+                                    // shorten a liveness pin, never change which
+                                    // history the server accepts.
+                                    let _ = release.send(floor).await;
+                                    return;
+                                }
+                                _ => return,
                             };
-                            if let Ok(frame) = wire::frame(&message, unix_nanos()) {
-                                let _ = stream.write_all(&frame).await;
-                                let _ = stream.flush().await;
-                            }
+                            let reply = tokio::time::timeout(SNAPSHOT_REPLY_TIMEOUT, reply_rx).await;
+                            let frame = match reply {
+                                Ok(Ok(Ok(frame))) => frame,
+                                Ok(Ok(Err(reason))) => {
+                                    match wire::frame(
+                                        &Message::SnapshotDeclined(reason.to_string()),
+                                        unix_nanos(),
+                                    ) {
+                                        Ok(frame) => frame,
+                                        Err(_) => return,
+                                    }
+                                }
+                                _ => match wire::frame(
+                                    &Message::SnapshotDeclined(String::from(
+                                        "the node loop did not build a snapshot in time",
+                                    )),
+                                    unix_nanos(),
+                                ) {
+                                    Ok(frame) => frame,
+                                    Err(_) => return,
+                                },
+                            };
+                            let _ = stream.write_all(&frame).await;
+                            let _ = stream.flush().await;
                         });
                     }
                     _ = snapshot_shutdown.changed() => return,
@@ -2674,7 +2829,8 @@ async fn node_task(
 
     let mut adopted_anchor: Option<(Header, Certificate)> = None;
     let mut snapshot_report = None;
-    if let Some(snapshot) = synced {
+    if let Some((served_by, snapshot)) = synced {
+        let release_floor = snapshot.floor;
         let install_started = Instant::now();
         let adopted = adopt_snapshot(
             snapshot,
@@ -2734,6 +2890,22 @@ async fn node_task(
         applied = applied_count;
         applied_cursor = order_len;
         adopted_anchor = Some((anchor, certificate));
+        // The install is complete, so the server can prune after its grace
+        // window. Release in the background: the joiner should not wait on a
+        // courtesy frame, and a failed release only leaves the TTL in charge.
+        if let Some(floor) = release_floor {
+            let chain = chain_id.clone();
+            tokio::spawn(async move {
+                match release_snapshot(&served_by, &chain, floor).await {
+                    Ok(()) => println!(
+                        "  node val-{index} released snapshot floor {floor} at {served_by}"
+                    ),
+                    Err(error) => {
+                        eprintln!("node {index} snapshot release to {served_by} failed: {error}");
+                    }
+                }
+            });
+        }
     }
 
     let restore_started = Instant::now();
@@ -3175,9 +3347,10 @@ async fn node_task(
                         }
                     }
                     // Snapshots travel on their own link, not on the mesh.
-                    Message::SnapshotWant | Message::Snapshot(_) | Message::SnapshotDeclined(_) => {
-                        rejected += 1
-                    }
+                    Message::SnapshotWant
+                    | Message::Snapshot(_)
+                    | Message::SnapshotDeclined(_)
+                    | Message::SnapshotRelease { .. } => rejected += 1,
                     Message::SetChange(certificate) => {
                         if set_change_adopted {
                             let same = pending_change.as_ref().is_some_and(|current| {
@@ -3414,21 +3587,67 @@ async fn node_task(
                 authoring_stopped = *stop_authoring.borrow();
             }
             Some(reply) = snapshot_rx.recv() => {
-                let built = finalizer.as_ref().map_or(Err(SnapshotDecline::NoExecution), |finalizer| {
-                    build_live_snapshot(
-                        &node,
-                        finalizer,
-                        last_certified.as_ref(),
-                        &state_history,
-                        &batches,
-                    )
-                });
-                if let Ok(snapshot) = &built
-                    && let Some(floor) = snapshot.floor
-                {
-                    pinned_floor = pin_snapshot_floor(pinned_floor, floor, Instant::now());
+                // Refuse a spent pin before cloning the state and the tail for a
+                // snapshot that would be thrown away. The exact byte check still
+                // happens after framing, where the size is known.
+                let now = Instant::now();
+                let busy = pinned_floor
+                    .filter(|pin| !pin_expired(pin, now))
+                    .and_then(|pin| {
+                        (pin.served > 0
+                            && (pin.served >= SNAPSHOT_PIN_REQUESTS
+                                || pin.bytes >= SNAPSHOT_PIN_BYTES))
+                            .then_some(SnapshotDecline::PinBusy {
+                                served: pin.served,
+                                bytes: pin.bytes,
+                            })
+                    });
+                let built = match busy {
+                    Some(reason) => {
+                        eprintln!("node {index} snapshot declined: {reason}");
+                        Err(reason)
+                    }
+                    None => finalizer
+                        .as_ref()
+                        .map_or(Err(SnapshotDecline::NoExecution), |finalizer| {
+                            build_live_snapshot(
+                                &node,
+                                finalizer,
+                                last_certified.as_ref(),
+                                &state_history,
+                                &batches,
+                            )
+                        }),
+                };
+                let framed = match built {
+                    Ok(snapshot) => {
+                        let floor = snapshot.floor;
+                        match wire::frame(&Message::Snapshot(Box::new(snapshot)), unix_nanos()) {
+                            Ok(frame) => {
+                                let bytes = u64::try_from(frame.len()).unwrap_or(u64::MAX);
+                                match extend_pin(pinned_floor, floor, bytes, Instant::now()) {
+                                    Ok(pin) => {
+                                        pinned_floor = pin;
+                                        Ok(frame)
+                                    }
+                                    Err(reason) => {
+                                        eprintln!("node {index} snapshot declined: {reason}");
+                                        Err(reason)
+                                    }
+                                }
+                            }
+                            Err(_) => Err(SnapshotDecline::SnapshotTooLarge),
+                        }
+                    }
+                    Err(reason) => Err(reason),
+                };
+                let _ = reply.send(framed);
+            }
+            Some(floor) = release_rx.recv() => {
+                if pinned_floor.is_some_and(|pin| pin.floor == floor) {
+                    pinned_floor = release_pin(pinned_floor, floor, Instant::now());
+                    eprintln!("node {index} snapshot pin released at floor {floor}");
                 }
-                let _ = reply.send(built);
             }
             _ = ticker.tick() => {
                 ticks = ticks.wrapping_add(1);
@@ -4229,8 +4448,8 @@ async fn node_task(
                 // grows with uptime; with one, the tail is at most this interval.
                 // A head whose state is no longer retained, or whose order length
                 // the finalizer does not know, simply waits for the next one.
-                if let Some((_, at)) = pinned_floor
-                    && at.elapsed() > SNAPSHOT_PIN_TTL
+                if let Some(pin) = pinned_floor
+                    && pin_expired(&pin, Instant::now())
                 {
                     pinned_floor = None;
                 }
@@ -4250,7 +4469,7 @@ async fn node_task(
                         &batches,
                     )
                     && let Some(floor) = snapshot.floor
-                    && pinned_floor.is_none_or(|(pinned, _)| floor <= pinned)
+                    && pinned_floor.is_none_or(|pin| floor <= pin.floor)
                 {
                     let height = snapshot.anchor.height;
                     store
@@ -4483,7 +4702,10 @@ async fn archive_task(
                     // validators to build certificates from.
                     Message::Share(_) => {}
                     // Snapshots need execution state, which an archive does not keep.
-                    Message::SnapshotWant | Message::Snapshot(_) | Message::SnapshotDeclined(_) => {}
+                    Message::SnapshotWant
+                    | Message::Snapshot(_)
+                    | Message::SnapshotDeclined(_)
+                    | Message::SnapshotRelease { .. } => {}
                     // An archive has no RPC state, so a gossiped envelope has no
                     // record to attach to. It is ignored rather than stored.
                     Message::Tx(_) => {}
@@ -5811,6 +6033,25 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn a_joiner_releases_the_snapshot_floor_it_adopted() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        let chain = b"chain-a".to_vec();
+        let server = {
+            let chain = chain.clone();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = Vec::new();
+                handshake(&mut stream, &mut buffer, &chain).await.unwrap();
+                let message = read_one_message(&mut stream, &mut buffer).await.unwrap();
+                assert_eq!(message, Message::SnapshotRelease { floor: 42 });
+            })
+        };
+        release_snapshot(&target, &chain, 42).await.unwrap();
+        server.await.unwrap();
+    }
+
     #[test]
     fn a_snapshot_bridge_must_close_every_reference() {
         use validator::{Dag, Vertex};
@@ -5885,19 +6126,71 @@ mod tests {
     }
 
     #[test]
-    fn a_served_snapshot_pin_keeps_the_lowest_floor_for_one_ttl() {
+    fn a_served_snapshot_pin_keeps_the_lowest_floor_and_expires() {
         let now = Instant::now();
-        let pinned = pin_snapshot_floor(None, 7, now).unwrap();
-        assert_eq!(pinned.0, 7);
+        let pinned = extend_pin(None, Some(7), 100, now).unwrap().unwrap();
+        assert_eq!(pinned.floor, 7);
         let later = now + Duration::from_secs(5);
-        let pinned = pin_snapshot_floor(Some(pinned), 9, later).unwrap();
+        let pinned = extend_pin(Some(pinned), Some(9), 100, later)
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            pinned.0, 7,
+            pinned.floor, 7,
             "a newer snapshot must not raise the pinned floor"
         );
+        assert_eq!(pinned.served, 2);
         let expired = later + SNAPSHOT_PIN_TTL + Duration::from_secs(1);
-        let pinned = pin_snapshot_floor(Some(pinned), 12, expired).unwrap();
-        assert_eq!(pinned.0, 12, "an expired pin follows the new snapshot");
+        assert!(pin_expired(&pinned, expired));
+        let pinned = extend_pin(Some(pinned), Some(12), 100, expired)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned.floor, 12, "an expired pin follows the new snapshot");
+        assert_eq!(pinned.served, 1);
+    }
+
+    #[test]
+    fn a_pin_window_has_a_byte_and_request_budget() {
+        let now = Instant::now();
+        let pinned = extend_pin(None, Some(7), SNAPSHOT_PIN_BYTES, now)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            extend_pin(Some(pinned), Some(7), 1, now),
+            Err(SnapshotDecline::PinBusy { .. })
+        ));
+
+        let mut pinned = None;
+        for _ in 0..SNAPSHOT_PIN_REQUESTS {
+            pinned = extend_pin(pinned, Some(3), 1, now).unwrap();
+        }
+        assert!(matches!(
+            extend_pin(pinned, Some(3), 1, now),
+            Err(SnapshotDecline::PinBusy { .. })
+        ));
+
+        let maxed = now + SNAPSHOT_PIN_MAX + Duration::from_secs(1);
+        let fresh = extend_pin(pinned, Some(9), 1, maxed).unwrap().unwrap();
+        assert_eq!(fresh.floor, 9, "a maxed window resets to the new floor");
+        assert_eq!(fresh.bytes, 1);
+        assert_eq!(fresh.served, 1);
+    }
+
+    #[test]
+    fn a_released_pin_keeps_a_grace_window_for_its_own_floor() {
+        let now = Instant::now();
+        let pin = extend_pin(None, Some(7), 10, now).unwrap().unwrap();
+        let other = release_pin(Some(pin), 9, now).unwrap();
+        assert!(
+            other.released_at.is_none(),
+            "another floor must not release the pin"
+        );
+        let released = release_pin(Some(pin), 7, now).unwrap();
+        assert_eq!(released.released_at, Some(now));
+        assert!(!pin_expired(&released, now + SNAPSHOT_PIN_RELEASE_GRACE));
+        assert!(pin_expired(
+            &released,
+            now + SNAPSHOT_PIN_RELEASE_GRACE + Duration::from_secs(1)
+        ));
     }
 
     #[test]

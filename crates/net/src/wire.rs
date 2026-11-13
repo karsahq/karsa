@@ -9,7 +9,7 @@
 //! u32 body length || u64 sent-at nanos || u8 kind || payload
 //! ```
 //!
-//! Fifteen kinds share a link:
+//! Sixteen kinds share a link:
 //!
 //! - [`Message::Hello`] is the first frame on a link and names the chain.
 //! - [`Message::Vertex`] is the broadcast.
@@ -29,6 +29,8 @@
 //!   vote quorum.
 //! - [`Message::Floor`] reports how much history a validator has pruned, so a
 //!   peer can tell when a want can no longer be served.
+//! - [`Message::SnapshotRelease`] tells a snapshot server that the joiner has
+//!   installed the snapshot, so its floor no longer needs to stay pinned.
 //!
 //! The hello exists because a vertex is only meaningful on one chain: the chain id
 //! is part of what a validator signs, so a peer on another genesis would produce
@@ -79,13 +81,14 @@ const KIND_CONTROL: u8 = 12;
 const KIND_WANT_SLOT: u8 = 13;
 const KIND_SNAPSHOT_DECLINED: u8 = 14;
 const KIND_FLOOR: u8 = 15;
+const KIND_SNAPSHOT_RELEASE: u8 = 16;
 
 /// The framing and message layout this build speaks.
 ///
 /// A peer that answers with another number is not necessarily hostile; it may be a
 /// different build. The link is closed rather than parsed optimistically, because
 /// the next frame kind could mean something else there.
-pub const WIRE_PROTOCOL: u16 = 15;
+pub const WIRE_PROTOCOL: u16 = 16;
 
 /// The first frame on every link: which chain the sender is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +197,15 @@ pub enum Message {
     /// A joining node uses this to fail over to another peer instead of waiting
     /// for the snapshot read timeout. The reason is diagnostic, not trusted.
     SnapshotDeclined(String),
+    /// The joiner installed a snapshot and no longer needs its floor pinned.
+    ///
+    /// The floor is the one the adopted snapshot reported. A server keeps the
+    /// pin for a short grace window after this frame, because another joiner may
+    /// still be installing the same snapshot.
+    SnapshotRelease {
+        /// Floor of the snapshot the joiner adopted.
+        floor: u64,
+    },
     /// One encoded transaction envelope, gossiped so a peer can track it.
     ///
     /// The frame carries the canonical envelope, not a decoded transaction:
@@ -515,6 +527,11 @@ pub fn frame(message: &Message, sent_at_nanos: u64) -> Result<Vec<u8>, CryptoErr
             encoder.put_bytes(reason.as_bytes())?;
             (KIND_SNAPSHOT_DECLINED, encoder.finish())
         }
+        Message::SnapshotRelease { floor } => {
+            let mut encoder = Encoder::with_capacity(8);
+            encoder.put_u64(*floor);
+            (KIND_SNAPSHOT_RELEASE, encoder.finish())
+        }
         Message::Tx(envelope) => (KIND_TX, {
             let mut encoder = Encoder::with_capacity(4 + envelope.len());
             encoder.put_bytes(envelope)?;
@@ -622,6 +639,12 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
                 .map_err(|_| invalid("snapshot decline reason is not UTF-8".to_string()))?;
             decoder.finish()?;
             Message::SnapshotDeclined(reason)
+        }
+        KIND_SNAPSHOT_RELEASE => {
+            let mut decoder = Decoder::new(payload);
+            let floor = decoder.read_u64()?;
+            decoder.finish()?;
+            Message::SnapshotRelease { floor }
         }
         KIND_TX => {
             let mut decoder = Decoder::new(payload);
@@ -915,6 +938,15 @@ mod tests {
         let frame = take_frame(&mut buffer).unwrap().unwrap();
         assert_eq!(frame.message, Message::RoundSkip(Box::new(proof)));
         assert_eq!(frame.sent_at_nanos, 19);
+    }
+
+    #[test]
+    fn a_snapshot_release_frame_round_trips() {
+        let message = Message::SnapshotRelease { floor: 4_096 };
+        let mut buffer = frame(&message, 22).unwrap();
+        let frame = take_frame(&mut buffer).unwrap().unwrap();
+        assert_eq!(frame.message, message);
+        assert_eq!(frame.sent_at_nanos, 22);
     }
 
     #[test]
