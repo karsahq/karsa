@@ -28,7 +28,10 @@ pub use certificate::{
     CERTIFICATE_VERSION_V1, Certificate, bit_is_set, bitmap_len, bitmap_of, set_bit,
 };
 pub use control::{CONTROL_PAYLOAD_DOMAIN, CONTROL_PAYLOAD_VERSION_V1, ControlPayload};
-pub use dag::{AnchorSkip, CommitProof, Dag, Decision, SkippedRound, commit_leaf, commit_root};
+pub use dag::{
+    AnchorSkip, CertifiedDag, CommitProof, Dag, Decision, PreparedSlotApplication, SkippedRound,
+    SlotApplicationResult, commit_leaf, commit_root,
+};
 pub use failure::FailureDetector;
 pub use fence::{FENCE_VERSION_V1, Fence, FenceCertificate, FenceError};
 pub use finality::{Build, Certified, Finalizer, Share, VALIDATOR_SET_ID, signing_payload};

@@ -129,6 +129,231 @@ pub struct Dag {
     payload_vertices: BTreeMap<[u8; 32], VertexId>,
 }
 
+/// Inactive, exclusively owned DAG whose decisions can only advance through certificates.
+///
+/// This wrapper does not activate consensus, sign, finalize transactions, or provide persistence.
+/// Checkpoint trust and durable request logging remain the caller's responsibility.
+pub struct CertifiedDag {
+    dag: Dag,
+    binding: crate::SlotDecisionBinding,
+    last_event: Option<([u8; 32], VertexId)>,
+}
+
+/// Outcome of applying a prepared certificate request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotApplicationResult {
+    /// A new decision and its binding were installed together.
+    Applied {
+        /// The newly decided round.
+        round: u64,
+        /// The inspected effect in deterministic commit order.
+        decision: Decision,
+    },
+    /// The exact most recently applied payload and QC carrier were retried.
+    AlreadyApplied {
+        /// The previously applied round.
+        round: u64,
+    },
+}
+
+/// Exclusive, validated application plan; dropping it leaves the DAG unchanged.
+///
+/// No persistence is performed. The borrow prevents ingest or another preparation
+/// from invalidating the inspected effect before application.
+///
+/// ```compile_fail
+/// use validator::{CertifiedDag, SlotCertificatePayload, Vertex, VertexId};
+/// fn cannot_ingest_while_prepared(
+///     dag: &mut CertifiedDag,
+///     payload: &SlotCertificatePayload,
+///     carrier: &VertexId,
+///     vertex: Vertex,
+/// ) {
+///     let prepared = dag.prepare(payload, carrier).unwrap();
+///     dag.insert(vertex).unwrap(); // The exclusive application borrow is still live.
+///     prepared.apply();
+/// }
+/// ```
+#[must_use = "dropping a prepared application leaves the DAG unchanged"]
+pub struct PreparedSlotApplication<'a> {
+    owner: &'a mut CertifiedDag,
+    plan: SlotApplicationPlan,
+}
+
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the short-lived exclusive plan stays inline to avoid an extra allocation per application"
+)]
+enum SlotApplicationPlan {
+    AlreadyApplied {
+        round: u64,
+    },
+    Apply {
+        round: u64,
+        decision: Decision,
+        skipped: Option<SkippedRound>,
+        tip: crate::SlotDecisionTip,
+        fingerprint: ([u8; 32], VertexId),
+    },
+}
+
+impl CertifiedDag {
+    /// Takes ownership of a trusted checkpoint after checking its local context and frontier.
+    ///
+    /// This checks consistency, not checkpoint authentication or historical authorization.
+    /// The caller must trust the DAG, tip, and predecessor-carrier association. No last
+    /// event is restored: retry recognition starts only after a validated application.
+    ///
+    /// # Errors
+    /// Rejects chain, frontier, or pinned validator-set/epoch mismatches and set encoding errors.
+    pub fn from_checkpoint(
+        dag: Dag,
+        binding: crate::SlotDecisionBinding,
+    ) -> Result<Self, CryptoError> {
+        let tip = binding.tip();
+        if dag.chain_id() != tip.chain_id()
+            || dag.order_len() as u64 != tip.order_len()
+            || dag.commit_root() != *tip.order_root()
+            || dag.set_for_round(tip.next_round()).id()? != *tip.set_id()
+            || dag.epoch_of(tip.next_round()) != tip.epoch()
+        {
+            return Err(CryptoError::new(
+                CryptoErrorKind::MalformedCertificate,
+                "certified DAG checkpoint context mismatch",
+            ));
+        }
+        Ok(Self {
+            dag,
+            binding,
+            last_event: None,
+        })
+    }
+
+    /// Borrows the DAG without exposing legacy mutation or decision APIs.
+    pub fn dag(&self) -> &Dag {
+        &self.dag
+    }
+
+    /// Borrows the current tip and its associated QC carrier.
+    pub fn binding(&self) -> &crate::SlotDecisionBinding {
+        &self.binding
+    }
+
+    /// Ingests a vertex using the DAG's signature and reference checks.
+    ///
+    /// # Errors
+    /// Propagates vertex validation errors from [`Dag::insert`].
+    pub fn insert(&mut self, vertex: Vertex) -> Result<VertexId, CryptoError> {
+        self.dag.insert(vertex)
+    }
+
+    /// Validates and exclusively borrows an application without changing state.
+    ///
+    /// This is NOT a durability boundary. Before calling [`PreparedSlotApplication::apply`],
+    /// the caller must persist the full request (payload and exact QC carrier) plus
+    /// supporting history, and complete a sync barrier. Neither preparation nor
+    /// application signs anything or performs transaction/finalizer effects.
+    /// Only an exact retry of the last event applied by this instance is recognized;
+    /// checkpoint construction does not validate or restore a last-event cache.
+    ///
+    /// # Errors
+    /// Rejects invalid certificates, history, continuity, encodings, or skip metadata.
+    /// All failures leave the DAG, binding, and retry cache unchanged.
+    pub fn prepare<'a>(
+        &'a mut self,
+        payload: &crate::SlotCertificatePayload,
+        carrier: &VertexId,
+    ) -> Result<PreparedSlotApplication<'a>, CryptoError> {
+        let digest = payload.digest()?;
+        let round = payload.proposal.decision.round;
+        if self
+            .last_event
+            .as_ref()
+            .is_some_and(|(last, previous)| *last == digest && previous == carrier)
+        {
+            return Ok(PreparedSlotApplication {
+                owner: self,
+                plan: SlotApplicationPlan::AlreadyApplied { round },
+            });
+        }
+        let decision = self
+            .dag
+            .inspect_slot_certificate(payload, carrier, &self.binding)?;
+        let mut tip = self.binding.tip().clone();
+        tip.advance_authorized(&payload.certificate, self.dag.set_for_round(round))?;
+        if self.dag.skipped.iter().any(|entry| entry.round == round) {
+            return Err(CryptoError::new(
+                CryptoErrorKind::MalformedCertificate,
+                "certified slot already has skip metadata",
+            ));
+        }
+        let skipped = if decision == Decision::Skip {
+            let leader = self
+                .dag
+                .leader(round)
+                .ok_or_else(|| {
+                    CryptoError::new(
+                        CryptoErrorKind::MalformedCertificate,
+                        "certified skip requires a held leader",
+                    )
+                })?
+                .id()?;
+            Some(SkippedRound {
+                round,
+                author: leader.author,
+                digest: Some(leader.digest),
+            })
+        } else {
+            None
+        };
+        Ok(PreparedSlotApplication {
+            owner: self,
+            plan: SlotApplicationPlan::Apply {
+                round,
+                decision,
+                skipped,
+                tip,
+                fingerprint: (digest, carrier.clone()),
+            },
+        })
+    }
+}
+
+impl PreparedSlotApplication<'_> {
+    /// Installs the inspected effect, tip, carrier, and retry fingerprint together.
+    ///
+    /// Performs no fallible validation or I/O; allocation failure may abort the process.
+    pub fn apply(self) -> SlotApplicationResult {
+        match self.plan {
+            SlotApplicationPlan::AlreadyApplied { round } => {
+                SlotApplicationResult::AlreadyApplied { round }
+            }
+            SlotApplicationPlan::Apply {
+                round,
+                decision,
+                skipped,
+                tip,
+                fingerprint,
+            } => {
+                if let Decision::Commit(history) = &decision {
+                    for vertex in history {
+                        self.owner.dag.committed.insert(vertex.digest);
+                        self.owner.dag.order.push(vertex.clone());
+                    }
+                }
+                if let Some(skipped) = skipped {
+                    self.owner.dag.skipped.push(skipped);
+                }
+                self.owner
+                    .binding
+                    .replace_validated(tip, fingerprint.1.clone());
+                self.owner.last_event = Some(fingerprint);
+                SlotApplicationResult::Applied { round, decision }
+            }
+        }
+    }
+}
+
 impl Dag {
     /// Creates an empty DAG for `set`.
     #[must_use]
@@ -2670,6 +2895,119 @@ mod tests {
         let references = fixture.ids(LEADER_ROUND + 2);
         let carrier = bind_slot_certificate(&mut fixture, &payload, references);
         (fixture, payload, carrier, binding)
+    }
+
+    #[test]
+    fn certified_dag_prepare_drop_apply_and_exact_retry() {
+        for committing in [false, true] {
+            let (fixture, payload, carrier, binding) = slot_certificate_fixture(committing);
+            let expected = fixture
+                .dag
+                .inspect_slot_certificate(&payload, &carrier, &binding)
+                .unwrap();
+            let before_order = fixture.dag.order().to_vec();
+            let before_root = fixture.dag.commit_root();
+            let before_skipped = fixture.dag.skipped().to_vec();
+            let mut certified =
+                CertifiedDag::from_checkpoint(fixture.dag, binding.clone()).unwrap();
+            drop(certified.prepare(&payload, &carrier).unwrap());
+            assert_eq!(certified.dag().order(), before_order);
+            assert_eq!(certified.dag().commit_root(), before_root);
+            assert_eq!(certified.dag().skipped(), before_skipped);
+            assert_eq!(certified.binding(), &binding);
+            assert!(certified.last_event.is_none());
+
+            assert_eq!(
+                certified.prepare(&payload, &carrier).unwrap().apply(),
+                SlotApplicationResult::Applied {
+                    round: LEADER_ROUND,
+                    decision: expected.clone()
+                }
+            );
+            let d = &payload.proposal.decision;
+            assert_eq!(certified.dag().order_len() as u64, d.after_len);
+            assert_eq!(certified.dag().commit_root(), d.after_root);
+            assert_eq!(certified.binding().tip().previous_id(), &d.id().unwrap());
+            assert_eq!(certified.binding().tip().next_round(), d.round + 1);
+            assert_eq!(certified.binding().tip().order_len(), d.after_len);
+            assert_eq!(certified.binding().tip().order_root(), &d.after_root);
+            assert_eq!(certified.binding().carrier(), Some(&carrier));
+            match expected {
+                Decision::Commit(history) => {
+                    assert_eq!(
+                        certified.dag().order(),
+                        [before_order, history.clone()].concat()
+                    );
+                    assert!(
+                        history
+                            .iter()
+                            .all(|id| certified.dag.committed.contains(&id.digest))
+                    );
+                    assert_eq!(certified.dag().skipped(), before_skipped);
+                }
+                Decision::Skip => {
+                    assert_eq!(certified.dag().order(), before_order);
+                    let leader = certified.dag().leader(d.round).unwrap().id().unwrap();
+                    assert_eq!(
+                        certified.dag().skipped().last(),
+                        Some(&SkippedRound {
+                            round: d.round,
+                            author: leader.author,
+                            digest: Some(leader.digest),
+                        })
+                    );
+                }
+                Decision::Undecided => panic!("certificate inspection must decide"),
+            }
+            let order = certified.dag().order().to_vec();
+            let skipped = certified.dag().skipped().to_vec();
+            let applied_binding = certified.binding().clone();
+            for _ in 0..2 {
+                assert_eq!(
+                    certified.prepare(&payload, &carrier).unwrap().apply(),
+                    SlotApplicationResult::AlreadyApplied { round: d.round }
+                );
+            }
+            let mut wrong_carrier = carrier.clone();
+            wrong_carrier.digest[0] ^= 1;
+            assert!(certified.prepare(&payload, &wrong_carrier).is_err());
+            let mut conflict = payload.clone();
+            conflict.certificate.signatures.reverse();
+            assert!(certified.prepare(&conflict, &carrier).is_err());
+            assert_eq!(certified.dag().order(), order);
+            assert_eq!(certified.dag().skipped(), skipped);
+            assert_eq!(certified.binding(), &applied_binding);
+
+            // A checkpoint does not reconstruct an exact-event retry cache.
+            let mut restored =
+                CertifiedDag::from_checkpoint(certified.dag, certified.binding).unwrap();
+            assert!(restored.prepare(&payload, &carrier).is_err());
+        }
+    }
+
+    #[test]
+    fn certified_dag_invalid_preparation_and_checkpoint_are_atomic() {
+        let (fixture, payload, carrier, binding) = slot_certificate_fixture(true);
+        let mut certified = CertifiedDag::from_checkpoint(fixture.dag, binding.clone()).unwrap();
+        let order = certified.dag().order().to_vec();
+        let root = certified.dag().commit_root();
+        let mut invalid = payload.clone();
+        invalid.certificate.signatures.clear();
+        assert!(certified.prepare(&invalid, &carrier).is_err());
+        let mut invalid = payload.clone();
+        invalid.proposal.decision.after_len += 1;
+        assert!(certified.prepare(&invalid, &carrier).is_err());
+        assert_eq!(certified.dag().order(), order);
+        assert_eq!(certified.dag().commit_root(), root);
+        assert!(certified.dag().skipped().is_empty());
+        assert_eq!(certified.binding(), &binding);
+        assert!(certified.last_event.is_none());
+        certified.dag.set_chain_id(b"wrong-chain".to_vec());
+        assert!(CertifiedDag::from_checkpoint(certified.dag, binding).is_err());
+
+        let (mut fixture, _, _, binding) = slot_certificate_fixture(true);
+        fixture.dag.seed_order(vec![carrier]);
+        assert!(CertifiedDag::from_checkpoint(fixture.dag, binding).is_err());
     }
 
     #[test]

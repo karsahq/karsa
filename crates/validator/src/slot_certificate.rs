@@ -169,12 +169,18 @@ impl SlotDecisionBinding {
         Ok(Self { tip, carrier })
     }
 
-    /// Returns the trusted bootstrap decision tip.
+    // Only the owned application wrapper installs an already validated successor.
+    pub(crate) fn replace_validated(&mut self, tip: SlotDecisionTip, carrier: VertexId) {
+        self.tip = tip;
+        self.carrier = Some(carrier);
+    }
+
+    /// Returns the current decision tip.
     pub fn tip(&self) -> &SlotDecisionTip {
         &self.tip
     }
 
-    /// Returns the prior certificate carrier from the trusted activation checkpoint.
+    /// Returns the current certificate carrier, or the trusted checkpoint predecessor.
     pub fn carrier(&self) -> Option<&VertexId> {
         self.carrier.as_ref()
     }

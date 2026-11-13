@@ -19,6 +19,10 @@
 //! Slot-decision intents are the exception: their root-level journal is synced
 //! on every successful reservation and rejects even incomplete tails.
 //!
+//! The inactive slot-application WAL likewise rejects torn records and syncs before
+//! in-memory application. It follows the active generation and does not replace
+//! authenticated checkpoint restoration or persist transaction/finalizer effects.
+//!
 //! Other logs do not fsync on every append: durability of the last record is the
 //! caller's tradeoff, and `Store::sync` exists for callers that want it.
 
@@ -29,7 +33,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+mod slot_application_journal;
+#[cfg(test)]
+mod slot_application_tests;
 mod slot_decision_journal;
+
+pub use slot_application_journal::StoredSlotApplication;
 
 use crypto::CryptoError;
 use crypto::encoding::{Decoder, Encoder};
@@ -321,6 +330,8 @@ pub struct Store {
     lock: Arc<File>,
     // Shared with private staged views; never follows active-generation routing.
     slot_decisions: Arc<Mutex<PathBuf>>,
+    // Serialize the inactive application WAL across clones and staged views.
+    slot_applications: Arc<Mutex<()>>,
 }
 
 /// An unpublished private copy, borrowing its owner until activation or drop.
@@ -428,9 +439,11 @@ impl Store {
             root.clone()
         };
         slot_decision_journal::read(&root)?;
+        slot_application_journal::read(&active)?;
         cleanup_generations(&root, generation.as_deref());
         Ok(Self {
             slot_decisions: Arc::new(Mutex::new(root.clone())),
+            slot_applications: Arc::new(Mutex::new(())),
             root,
             active: Arc::new(RwLock::new(active)),
             lock,
@@ -480,6 +493,7 @@ impl Store {
         };
         let lock = Arc::clone(&self.lock);
         let slot_decisions = Arc::clone(&self.slot_decisions);
+        let slot_applications = Arc::clone(&self.slot_applications);
         let stage = StagedStore {
             owner: self,
             view: Store {
@@ -487,6 +501,7 @@ impl Store {
                 active: Arc::new(RwLock::new(path.clone())),
                 lock,
                 slot_decisions,
+                slot_applications,
             },
             generation,
             published: false,

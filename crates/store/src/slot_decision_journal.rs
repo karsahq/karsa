@@ -59,7 +59,7 @@ pub(super) fn read(root: &Path) -> Result<Vec<SlotDecision>, StoreError> {
 
 // Persist each newly provisioned directory's entry in its parent, bottom-up.
 // Canonicalization also makes relative roots walk all the way to the filesystem root.
-fn sync_ancestors(
+pub(super) fn sync_ancestors(
     root: &Path,
     mut sync: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
