@@ -18,6 +18,7 @@ mod pacemaker;
 mod round_skip;
 mod schedule;
 mod set_change;
+pub mod slot_agreement;
 mod slot_certificate;
 mod slot_decision;
 mod slot_proposal;
