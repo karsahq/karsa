@@ -288,12 +288,26 @@ impl Finalizer {
 
     /// Committed entries the certified header at `height` covers.
     ///
-    /// `None` when this node did not build that header itself, which is the case
-    /// for a height it only adopted or certified from peer shares. Callers that
-    /// map work to finality must treat `None` as unknown, not as zero.
+    /// `None` when this node did not build that header itself and has not
+    /// recorded a prefix derived from its own order. Callers that map work to
+    /// finality must treat `None` as unknown, not as zero.
     #[must_use]
     pub fn certified_order(&self, height: u64) -> Option<usize> {
         self.certified_orders.get(&height).copied()
+    }
+
+    /// Records the committed prefix a peer-certified header covers.
+    ///
+    /// The live node derives this by finding the header's `dag_root` among the
+    /// prefix roots of its own committed order. A header this builder did not
+    /// produce has no entry otherwise, which would block checkpoints and make
+    /// `/status` report an unknown head coverage even though the node can prove
+    /// the prefix locally. The first recorded value wins.
+    pub fn note_certified_order(&mut self, height: u64, order_len: usize) {
+        self.certified_orders.entry(height).or_insert(order_len);
+        if self.last_built.height == height {
+            self.last_built_order = order_len;
+        }
     }
 
     /// Whether a header at `height` is certified on this chain.

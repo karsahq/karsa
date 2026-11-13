@@ -173,6 +173,13 @@ const RESEED_SOFT_CATCHUP_MS: u64 = 60_000;
 const RESEED_SOFT_SUSTAIN: Duration = Duration::from_secs(5);
 /// Rate margin that separates keeping pace from losing ground, in rounds/s.
 const RESEED_SOFT_RATE_MARGIN: f64 = 0.5;
+/// Prefix roots one coverage derivation may scan.
+///
+/// A node that keeps up has a certified head within a few dozen committed
+/// entries of its order tip. Scanning more than this usually means the node is
+/// behind the header, which a reseed fixes; walking its whole order on every
+/// certification would make the search quadratic in a lagging run.
+const COVERAGE_SCAN_LIMIT: usize = 4096;
 /// How long a served snapshot's floor stays pinned against pruning after the
 /// last request.
 ///
@@ -952,6 +959,8 @@ struct ProvableHead {
     /// Height of the highest stored header the replay reproduced, or the trust
     /// anchor when no header above it could be reproduced.
     height: u64,
+    /// Committed order length that header covers.
+    coverage: usize,
     /// Stored headers above `height`, which the replay cannot account for.
     dropped: usize,
     /// Height of the last stored header, for the drop report.
@@ -1041,6 +1050,7 @@ fn replay_to_provable_head(
         .map_or(base_height, |record| record.header.height);
     Ok(ProvableHead {
         height,
+        coverage: len,
         dropped,
         top,
     })
@@ -1173,6 +1183,9 @@ fn restore(
             finalizer
                 .adopt_certified(record.header, record.certificate)
                 .map_err(|error| format!("cannot adopt a stored header: {error}"))?;
+        }
+        if provable.height > 0 {
+            finalizer.note_certified_order(provable.height, provable.coverage);
         }
         finalizer.resume_from_head();
     }
@@ -1350,6 +1363,7 @@ fn restore_live(
             .adopt_certified(record.header, record.certificate)
             .map_err(|error| format!("cannot adopt a stored header: {error}"))?;
     }
+    finalizer.note_certified_order(provable.height, provable.coverage);
     finalizer.resume_from_head();
 
     Ok(Restored {
@@ -2157,6 +2171,31 @@ struct ReseedAttempt {
     mu: Option<f64>,
     backlog: u64,
     estimate_ms: Option<u64>,
+}
+
+/// Finds the committed prefix a certified header covers in the local order.
+///
+/// A header this node built already carries its coverage in the finalizer. A
+/// peer-built header does not, but if its `dag_root` is a prefix root of this
+/// node's order, that length is the coverage. Scanning starts at `lower`, the
+/// last coverage the node proved, so repeated derivations walk each order entry
+/// at most once across a run rather than once per header.
+fn certified_coverage(
+    node: &Node,
+    finalizer: &Finalizer,
+    header: &Header,
+    lower: usize,
+) -> Option<usize> {
+    if let Some(coverage) = finalizer.certified_order(header.height) {
+        return Some(coverage);
+    }
+    let dag = node.dag();
+    let upper = dag.order_len();
+    let start = lower.max(upper.saturating_sub(COVERAGE_SCAN_LIMIT));
+    if start > upper {
+        return None;
+    }
+    (start..=upper).find(|len| dag.commit_root_at(*len) == Some(header.dag_root))
 }
 
 /// The history one served snapshot keeps alive.
@@ -3302,6 +3341,13 @@ async fn node_task(
         None
     };
     let restore_ms = u64::try_from(restore_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // The last committed prefix this node proved. A peer-certified header's
+    // coverage is derived by scanning forward from here, so the order entries
+    // below it are never rescanned for every later peer header.
+    let mut coverage_lower = restored.as_ref().map_or(0, |restored| restored.order_len);
+    if let Some(report) = &snapshot_report {
+        coverage_lower = coverage_lower.max(report.order_len);
+    }
     if let Some(restored) = &restored {
         let entries_per_second = if restore_ms == 0 {
             0.0
@@ -3455,6 +3501,18 @@ async fn node_task(
     {
         last_certified = Some((record.header, record.certificate));
     }
+    // The highest certified header whose committed prefix this node has proved.
+    // It can lag `last_certified` on a follower whose head advanced through peer
+    // shares; checkpoints and served snapshots anchor here rather than refusing
+    // to run because the very top header has no local coverage.
+    let mut last_provable: Option<(Header, Certificate)> = last_certified
+        .as_ref()
+        .filter(|(header, _)| {
+            finalizer
+                .as_ref()
+                .is_some_and(|finalizer| finalizer.certified_order(header.height).is_some())
+        })
+        .map(|(header, certificate)| (header.clone(), certificate.clone()));
 
     let mut state_history: VecDeque<(u64, State)> = VecDeque::new();
     if config.snapshot_port > 0 || config.checkpoint_every > 0 {
@@ -3540,7 +3598,7 @@ async fn node_task(
     // interval, however little history had been added since the last one.
     let mut last_checkpoint = resumed_checkpoint_height(
         restored.as_ref(),
-        last_certified.as_ref().map(|(header, _)| header.height),
+        last_provable.as_ref().map(|(header, _)| header.height),
     );
     let mut announced = false;
     let mut first_author_ms: Option<u64> = None;
@@ -3725,6 +3783,25 @@ async fn node_task(
                                         certified.header.clone(),
                                         certified.certificate.clone(),
                                     ));
+                                }
+                                // A peer-built header usually has no coverage
+                                // here. Deriving it is deferred to a checkpoint
+                                // or snapshot request: scanning on every
+                                // certification would make a lagging node
+                                // quadratic. Coverage this node already knows
+                                // (a header it built) advances the bounds now.
+                                if let Some(coverage) =
+                                    finalizer.certified_order(certified.header.height)
+                                {
+                                    coverage_lower = coverage_lower.max(coverage);
+                                    if last_provable.as_ref().is_none_or(|(current, _)| {
+                                        current.height <= certified.header.height
+                                    }) {
+                                        last_provable = Some((
+                                            certified.header.clone(),
+                                            certified.certificate.clone(),
+                                        ));
+                                    }
                                 }
                                 if let Some(rpc) = &rpc {
                                     let mut core = rpc.lock().expect("rpc lock poisoned");
@@ -3983,6 +4060,22 @@ async fn node_task(
                 authoring_stopped = *stop_authoring.borrow();
             }
             Some(reply) = snapshot_rx.recv() => {
+                // A joiner wants the freshest provable boundary, not necessarily
+                // the latest certified height. Deriving the peer head's coverage
+                // here is bounded by COVERAGE_SCAN_LIMIT and happens only when
+                // there is a request to answer.
+                if let Some(finalizer) = finalizer.as_mut()
+                    && let Some((header, certificate)) = last_certified.as_ref()
+                    && last_provable
+                        .as_ref()
+                        .is_none_or(|(current, _)| current.height < header.height)
+                    && let Some(coverage) =
+                        certified_coverage(&node, &*finalizer, header, coverage_lower)
+                {
+                    finalizer.note_certified_order(header.height, coverage);
+                    coverage_lower = coverage_lower.max(coverage);
+                    last_provable = Some((header.clone(), certificate.clone()));
+                }
                 // Refuse a spent pin before cloning the state and the tail for a
                 // snapshot that would be thrown away. The exact byte check still
                 // happens after framing, where the size is known.
@@ -4009,7 +4102,7 @@ async fn node_task(
                             build_live_snapshot(
                                 &node,
                                 finalizer,
-                                last_certified.as_ref(),
+                                last_provable.as_ref(),
                                 &state_history,
                                 &batches,
                             )
@@ -4165,6 +4258,7 @@ async fn node_task(
                     applied_cursor = adopted.order_len;
                     last_certified =
                         Some((adopted.anchor.clone(), adopted.certificate.clone()));
+                    last_provable = Some((adopted.anchor.clone(), adopted.certificate.clone()));
                     certified_height = adopted.anchor.height;
                     certified_since = Instant::now();
 
@@ -4239,6 +4333,7 @@ async fn node_task(
                     }
                     announced_floor = None;
                     last_checkpoint = adopted.anchor.height;
+                    coverage_lower = coverage_lower.max(adopted.order_len);
                     if let Some(store) = &store {
                         // Everything below the adopted floor is now reachable
                         // only through the snapshot, exactly as after a startup
@@ -4815,6 +4910,19 @@ async fn node_task(
                                 certified.certificate.clone(),
                             ));
                         }
+                        if let Some(coverage) =
+                            finalizer.certified_order(certified.header.height)
+                        {
+                            coverage_lower = coverage_lower.max(coverage);
+                            if last_provable.as_ref().is_none_or(|(current, _)| {
+                                current.height <= certified.header.height
+                            }) {
+                                last_provable = Some((
+                                    certified.header.clone(),
+                                    certified.certificate.clone(),
+                                ));
+                            }
+                        }
                         if let Some(rpc) = &rpc {
                             let mut core = rpc.lock().expect("rpc lock poisoned");
                             core.note_order_from(node.dag().prefix(), node.dag().order());
@@ -5151,18 +5259,36 @@ async fn node_task(
                 {
                     pinned_floor = None;
                 }
+                // A certified head this node only adopted has no coverage until
+                // it is derived. Do that at the checkpoint cadence, not on every
+                // share, and let the provable anchor move up if the local order
+                // contains the peer header's dag_root.
+                if config.checkpoint_every > 0
+                    && ticks % CHECKPOINT_TICKS == 0
+                    && let Some(finalizer) = finalizer.as_mut()
+                    && let Some((header, certificate)) = last_certified.as_ref()
+                    && last_provable
+                        .as_ref()
+                        .is_none_or(|(current, _)| current.height < header.height)
+                    && let Some(coverage) =
+                        certified_coverage(&node, &*finalizer, header, coverage_lower)
+                {
+                    finalizer.note_certified_order(header.height, coverage);
+                    coverage_lower = coverage_lower.max(coverage);
+                    last_provable = Some((header.clone(), certificate.clone()));
+                }
                 if config.checkpoint_every > 0
                     && ticks % CHECKPOINT_TICKS == 0
                     && let Some(store) = &store
                     && let Some(finalizer) = finalizer.as_ref()
-                    && last_certified.as_ref().is_some_and(|(header, _)| {
+                    && last_provable.as_ref().is_some_and(|(header, _)| {
                         header.height
                             >= last_checkpoint.saturating_add(config.checkpoint_every)
                     })
                     && let Ok(snapshot) = build_live_snapshot(
                         &node,
                         finalizer,
-                        last_certified.as_ref(),
+                        last_provable.as_ref(),
                         &state_history,
                         &batches,
                     )
@@ -5170,6 +5296,7 @@ async fn node_task(
                     && pinned_floor.is_none_or(|pin| floor <= pin.floor)
                 {
                     let height = snapshot.anchor.height;
+                    let coverage = snapshot.order_len;
                     store
                         .put_live_snapshot(&store::LiveSnapshot {
                             round: snapshot.anchor.round,
@@ -5202,6 +5329,7 @@ async fn node_task(
                         .prune_to_checkpoint(usize::from(config.shard))
                         .map_err(|error| error.to_string())?;
                     last_checkpoint = height;
+                    coverage_lower = coverage_lower.max(coverage);
                     eprintln!(
                         "node {index} checkpoint at height {height} (pruned {} vertices, {} headers, {} batches, {} bytes)",
                         pruned.vertices, pruned.headers, pruned.batches_dropped, pruned.bytes_freed
@@ -5875,7 +6003,7 @@ fn run_one_node(
         let (stop_tx, stop_rx) = watch::channel(false);
         let (ready_tx, mut ready_rx) = mpsc::channel(1);
         let (executed_tx, mut executed_rx) = mpsc::channel(1);
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             node_task(
                 index,
                 &config,
@@ -5897,21 +6025,47 @@ fn run_one_node(
         let mut authoring = None;
         let deadline = tokio::time::sleep(timeout);
         tokio::pin!(deadline);
+        // A node that fails in startup returns long before its lifetime. Waiting
+        // for the deadline hides that error as an idle process and makes a store
+        // problem look like a hang, so the task is polled alongside the waits.
+        let mut task_result = None;
         tokio::select! {
-            _ = ready_rx.recv() => {
-                authoring = Some(started.elapsed());
+            result = &mut task => {
+                task_result = Some(result);
+            }
+            ready = ready_rx.recv() => {
+                if ready.is_some() {
+                    authoring = Some(started.elapsed());
+                }
             }
             _ = &mut deadline => {}
         }
-        if execute {
+        if task_result.is_none() && execute {
             tokio::select! {
+                result = &mut task => {
+                    task_result = Some(result);
+                }
                 _ = executed_rx.recv() => {}
                 _ = &mut deadline => {}
             }
         }
-        // Stay on the wire until the shared lifetime ends. An early finisher that
-        // closed its listener would strand the peers still authoring.
-        (&mut deadline).await;
+        if task_result.is_none() {
+            tokio::select! {
+                result = &mut task => {
+                    task_result = Some(result);
+                }
+                _ = &mut deadline => {}
+            }
+        }
+        if let Some(result) = task_result {
+            let _ = shutdown_tx.send(true);
+            let result = match result {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => return Err(error.into()),
+                Err(error) => return Err(format!("node {index} failed: {error}").into()),
+            };
+            return Ok::<_, Box<dyn Error>>((result, authoring));
+        }
         if rpc_mode {
             // A continuous run has no natural last round. Stop authoring first,
             // then keep the mesh up for the drain so the last rounds still reach

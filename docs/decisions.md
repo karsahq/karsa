@@ -2528,6 +2528,63 @@ head was compatible; pending heights above the head are kept and built on the
 new head, and a divergent one simply fails to collect a quorum. An ancestry map
 for built headers would make that decision sharper.
 
+## D83 — A node error is reported when it happens
+
+**Decided.** `run_one_node` polls the node task alongside the readiness wait,
+the execution wait, and the lifetime deadline. If the task completes early it
+sends shutdown and returns its result immediately: an error is printed and the
+process exits, an early `Ok` prints the usual summary. The deadline path is
+unchanged: stop authoring, drain, shutdown, then await the task.
+
+**Why.** A task that failed during link setup or store replay sent nothing, so the
+process looked idle until `--timeout-seconds` expired. A crash-store replay error
+was therefore indistinguishable from a hang, and a healed store that still had a
+certification gap appeared stuck for the rest of the lifetime. The node task is
+the component that knows it failed; waiting for the clock only hides that.
+
+**Measured.** A node started with no peers and `--timeout-seconds 30` now prints
+`error: node 0 cannot reach 127.0.0.1:9001: Connection refused` after 4 s (the
+connect retry budget). During the crash-store investigation the same class of
+error (`the certified head does not match any committed prefix`) surfaced only
+at the end of the configured lifetime.
+
+## D84 — A certified peer head carries a locally derived coverage
+
+**Decided.** When a checkpoint is due, or a peer asks for a snapshot, the live
+loop tries to derive the coverage of the latest peer-certified header by
+searching its own committed prefixes for that header's `dag_root`. The search
+starts at the last coverage the node proved and is capped at the last 4096
+prefixes near the order tip, so a lagging node cannot turn certification into a
+quadratic scan. The derived value is recorded with
+`Finalizer::note_certified_order`; the first value wins. The node tracks
+`last_provable`, the highest certified header with known coverage, and anchors
+checkpoints and served snapshots there. `last_certified` still drives the
+reseed minimum height and the finality-stall detector. Restore records the
+coverage of the head it proved.
+
+**Why.** After D82 a lagging follower advances its head through peer-certified
+headers instead of its orphaned local builder. Those peer headers have no
+coverage in the finalizer, so `build_live_snapshot` declined with `the certified
+head has no committed order length` and the node never checkpointed: its store
+grew without bound and a restart had to replay all of it. Anchoring at the
+highest provable certified header is safe: a checkpoint may be shorter than the
+node's committed DAG order, but never shorter than its certified prefix.
+
+**Measured.** The in-process checkpoint test (four nodes, checkpoint every two
+heights, 30 rounds, restart, audit) failed once during a gate with `node 1
+finished without writing a checkpoint`. With coverage derivation the same test
+passed three consecutive runs (31.0 s, 42.5 s, 35.7 s). A 60 s four-process
+devnet with `CHECKPOINT_EVERY=32`: before this change node 3 wrote 0 checkpoints
+while nodes 0..2 wrote 44..49; after, node 3 wrote 47 and kept a live snapshot.
+The same run left node 0 at one checkpoint because that process was severely
+lagged (its delivery p50 was seconds long); the in-process test is the stable
+signal.
+
+**Open.** A node further behind than the 4096-prefix scan window cannot derive
+the peer head's coverage; `last_provable` stops advancing and it needs a reseed
+to catch up. The bounded scan is still a walk rather than a frontier lookup;
+that would remove the remaining cost.
+
 ## Open decisions
 
 1. **Does a node serve history it does not hold?** Model B says no beyond the
