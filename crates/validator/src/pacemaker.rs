@@ -906,6 +906,127 @@ mod tests {
     }
 
     #[test]
+    fn fence_delivery_after_an_indirect_commit_preserves_order_and_root() {
+        fn run(decide_before_fence: bool) -> (Vec<VertexId>, [u8; 32], Vec<Vertex>) {
+            let mut fixture = chain(1, &[]);
+            let round1 = fixture.ids(1);
+            let leader = round1[1].clone();
+            // Match the arrival regression: two votes, two non-votes, f = 1.
+            for author in 0..COUNT {
+                let references = if author == 0 || author == 3 {
+                    vec![round1[0].clone(), leader.clone(), round1[2].clone()]
+                } else {
+                    vec![round1[0].clone(), round1[2].clone(), round1[3].clone()]
+                };
+                let vote = vertex(&fixture, author, 2, references);
+                fixture.dag.insert(vote).unwrap();
+            }
+            let honest_votes: Vec<_> = fixture
+                .ids(2)
+                .into_iter()
+                .filter(|id| id.author != b"val-0")
+                .collect();
+            fixture.insert_round(3, &honest_votes, &[0]).unwrap();
+            let round3 = fixture.ids(3);
+            fixture.insert_round(4, &round3, &[0]).unwrap();
+            let anchor = fixture.dag.is_anchored(3).unwrap().unwrap();
+            assert!(fixture.dag.is_ancestor(&leader, &anchor).unwrap());
+            assert_eq!(fixture.dag.held_voters(1).unwrap(), 2);
+            let suffix: Vec<_> = (3..=4)
+                .flat_map(|round| (1..COUNT).map(move |author| (round, format!("val-{author}"))))
+                .map(|(round, author)| fixture.dag.get(round, author.as_bytes()).unwrap().clone())
+                .collect();
+
+            let fence = Fence::new(b"karsa-pacemaker-1".to_vec(), 2, b"val-0".to_vec());
+            let payload = fence.signing_payload().unwrap();
+            let mut signer_bitmap = vec![0u8; bitmap_len(COUNT)];
+            let mut signatures = Vec::new();
+            for index in 1..COUNT {
+                // Signers never referenced val-0 at/after the proposed fence,
+                // including in the suffix authored before certificate delivery.
+                for round in 0..=4 {
+                    let author = format!("val-{index}");
+                    let authored = fixture.dag.get(round, author.as_bytes()).unwrap();
+                    assert!(authored.references.iter().all(|id| {
+                        id.author != fence.validator_id || id.round < fence.from_round
+                    }));
+                }
+                set_bit(&mut signer_bitmap, index);
+                signatures.push(Ed25519Scheme.sign(&fixture.keys[index], &payload).unwrap());
+            }
+            let certificate = FenceCertificate {
+                fence,
+                signer_bitmap,
+                signatures,
+            };
+            certificate
+                .verify(b"karsa-pacemaker-1", fixture.dag.set())
+                .unwrap();
+            let mut pacemaker = pacemaker(1);
+            if decide_before_fence {
+                assert!(matches!(
+                    pacemaker.tick_one(&mut fixture.dag).unwrap(),
+                    Step::Advanced {
+                        from: 1,
+                        cursor: 2,
+                        commits: 1,
+                        skips: 0,
+                        ..
+                    }
+                ));
+                assert!(fixture.dag.order().contains(&leader));
+                assert!(fixture.dag.order().iter().all(|id| {
+                    id.author != certificate.fence.validator_id
+                        || id.round < certificate.fence.from_round
+                }));
+            }
+            fixture
+                .dag
+                .apply_fence(b"karsa-pacemaker-1", &certificate)
+                .unwrap();
+            if !decide_before_fence {
+                assert_eq!(fixture.dag.held_voters(1).unwrap(), 1);
+                assert!(matches!(
+                    pacemaker.tick_one(&mut fixture.dag).unwrap(),
+                    Step::Advanced {
+                        from: 1,
+                        cursor: 2,
+                        commits: 0,
+                        skips: 1,
+                        ..
+                    }
+                ));
+                assert!(!fixture.dag.order().contains(&leader));
+            }
+            pacemaker.tick(&mut fixture.dag).unwrap();
+            // Round 4 elects the fenced val-0, so draining also skips that slot.
+            assert_eq!(pacemaker.cursor(), 5);
+            assert!(fixture.dag.order().contains(&leader));
+            (
+                fixture.dag.order().to_vec(),
+                fixture.dag.commit_root(),
+                suffix,
+            )
+        }
+
+        let (early_order, early_root, early_suffix) = run(true);
+        let (late_order, late_root, late_suffix) = run(false);
+        assert_eq!(
+            early_suffix, late_suffix,
+            "both views must drain the same honest suffix"
+        );
+        assert_eq!(early_order.len(), late_order.len());
+        let first_difference = early_order
+            .iter()
+            .zip(&late_order)
+            .position(|(a, b)| a != b);
+        assert!(
+            early_order == late_order && early_root == late_root,
+            "fence delivery across an indirect decision must preserve order/root: first_difference={first_difference:?}, early_root={early_root:02x?}, late_root={late_root:02x?}"
+        );
+    }
+
+    #[test]
     fn fenced_vote_arrival_timing_does_not_change_the_leader_decision() {
         fn run(vote_before_fence: bool) -> (Step, Vec<VertexId>) {
             let mut fixture = chain(1, &[]);

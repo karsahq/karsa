@@ -16,7 +16,10 @@
 //! not decode is a different thing: that is corruption, and it is an error. The
 //! two cases are deliberately not conflated.
 //!
-//! Nothing here fsyncs on every append: durability of the last record is the
+//! Slot-decision intents are the exception: their root-level journal is synced
+//! on every successful reservation and rejects even incomplete tails.
+//!
+//! Other logs do not fsync on every append: durability of the last record is the
 //! caller's tradeoff, and `Store::sync` exists for callers that want it.
 
 use std::collections::BTreeMap;
@@ -24,7 +27,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+
+mod slot_decision_journal;
 
 use crypto::CryptoError;
 use crypto::encoding::{Decoder, Encoder};
@@ -314,6 +319,8 @@ pub struct Store {
     active: Arc<RwLock<PathBuf>>,
     // Closing the last owner, clone, or private view releases the OS lock.
     lock: Arc<File>,
+    // Shared with private staged views; never follows active-generation routing.
+    slot_decisions: Arc<Mutex<PathBuf>>,
 }
 
 /// An unpublished private copy, borrowing its owner until activation or drop.
@@ -420,8 +427,10 @@ impl Store {
         } else {
             root.clone()
         };
+        slot_decision_journal::read(&root)?;
         cleanup_generations(&root, generation.as_deref());
         Ok(Self {
+            slot_decisions: Arc::new(Mutex::new(root.clone())),
             root,
             active: Arc::new(RwLock::new(active)),
             lock,
@@ -470,12 +479,14 @@ impl Store {
             }
         };
         let lock = Arc::clone(&self.lock);
+        let slot_decisions = Arc::clone(&self.slot_decisions);
         let stage = StagedStore {
             owner: self,
             view: Store {
                 root: path.clone(),
                 active: Arc::new(RwLock::new(path.clone())),
                 lock,
+                slot_decisions,
             },
             generation,
             published: false,
@@ -484,7 +495,8 @@ impl Store {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name == ".lock"
+            if name == slot_decision_journal::FILE
+                || name == ".lock"
                 || name == "CURRENT"
                 || name == "CURRENT.tmp"
                 || name.ends_with(".tmp")
@@ -2247,6 +2259,400 @@ mod tests {
         Fence, FenceCertificate, NO_EXPIRY, NoVoteAttestation, RoundSkip, RoundSkipProof,
         SetChange, ValidatorKey, ValidatorRecord, ValidatorSet, VertexId,
     };
+
+    fn slot_decision(round: u64) -> validator::SlotDecision {
+        validator::SlotDecision {
+            chain_id: b"chain".to_vec(),
+            validator_set_id: [1; 32],
+            epoch: 0,
+            round,
+            previous: [0; 32],
+            before_len: 0,
+            before_root: [0; 32],
+            after_len: 0,
+            after_root: [0; 32],
+            outcome: validator::SlotOutcome::Skip {
+                leader_author: b"leader".to_vec(),
+            },
+        }
+    }
+
+    // Inactive primitive harness only: these helpers are not live consensus wiring.
+    fn slot_decision_signing_fixture() -> (ValidatorSet, Vec<Vec<u8>>, [validator::SlotDecision; 2])
+    {
+        use crypto::scheme::Ed25519Scheme;
+        let mut keys = Vec::new();
+        let validators = (0..4u8)
+            .map(|index| {
+                let seed = [index + 1; 32];
+                let public = Ed25519Scheme::public_key_from_seed(&seed).unwrap();
+                keys.push([seed.as_slice(), public.as_slice()].concat());
+                ValidatorRecord {
+                    validator_id: vec![index],
+                    keys: vec![ValidatorKey {
+                        key_id: vec![index],
+                        algorithm_id: ALG_ED25519,
+                        public_key: public.to_vec(),
+                        activation_epoch: 0,
+                        retirement_epoch: NO_EXPIRY,
+                    }],
+                }
+            })
+            .collect();
+        let set = ValidatorSet {
+            epoch: 2,
+            validators,
+        };
+        set.validate().unwrap();
+        assert_eq!(set.quorum_size(), 3);
+        assert_eq!(set.max_faulty(), 1);
+        let mut commit = slot_decision(7);
+        commit.validator_set_id = set.id().unwrap();
+        commit.epoch = set.epoch;
+        commit.previous = [1; 32];
+        commit.before_len = 3;
+        commit.before_root = [2; 32];
+        commit.after_len = 4;
+        commit.after_root = [3; 32];
+        commit.outcome = validator::SlotOutcome::Commit {
+            leader: VertexId {
+                round: 7,
+                author: vec![0],
+                digest: [4; 32],
+            },
+        };
+        let mut skip = commit.clone();
+        skip.after_len = skip.before_len;
+        skip.after_root = skip.before_root;
+        skip.outcome = validator::SlotOutcome::Skip {
+            leader_author: vec![0],
+        };
+        commit.validate(&set).unwrap();
+        skip.validate(&set).unwrap();
+        assert_ne!(commit.id().unwrap(), skip.id().unwrap());
+        (set, keys, [commit, skip])
+    }
+
+    fn slot_decision_raw_signature(
+        decision: &validator::SlotDecision,
+        set: &ValidatorSet,
+        keys: &[Vec<u8>],
+        index: usize,
+    ) -> validator::ValidatorSignature {
+        use crypto::scheme::Ed25519Scheme;
+        let record = &set.validators[index];
+        validator::ValidatorSignature {
+            validator_id: record.validator_id.clone(),
+            key_id: record.keys[0].key_id.clone(),
+            signature: Ed25519Scheme
+                .sign(&keys[index], &decision.signing_payload().unwrap())
+                .unwrap(),
+        }
+    }
+
+    fn slot_decision_validate_lock_then_sign(
+        store: &Store,
+        decision: &validator::SlotDecision,
+        set: &ValidatorSet,
+        keys: &[Vec<u8>],
+        index: usize,
+    ) -> Result<validator::ValidatorSignature, StoreError> {
+        decision.validate(set)?;
+        store.lock_slot_decision(decision)?;
+        Ok(slot_decision_raw_signature(decision, set, keys, index))
+    }
+
+    #[test]
+    fn slot_decision_cross_layer_all_first_votes_prevent_conflicting_quorums() {
+        let (set, keys, decisions) = slot_decision_signing_fixture();
+        // All 16 first-vote assignments for four initially store-backed voters.
+        // Index 3 subsequently becomes Byzantine and bypasses its store entirely.
+        for pattern in 0..16usize {
+            let directories: Vec<_> = (0..4).map(|_| TempDir::new()).collect();
+            let mut certificates =
+                decisions
+                    .clone()
+                    .map(|decision| validator::SlotDecisionCertificate {
+                        decision,
+                        signatures: Vec::new(),
+                    });
+            for (index, directory) in directories.iter().enumerate() {
+                let choice = (pattern >> index) & 1;
+                let store = Store::open(&directory.0).unwrap();
+                let signature = slot_decision_validate_lock_then_sign(
+                    &store,
+                    &decisions[choice],
+                    &set,
+                    &keys,
+                    index,
+                )
+                .unwrap();
+                certificates[choice].signatures.push(signature);
+                drop(store);
+                if index < 3 {
+                    let reopened = Store::open(&directory.0).unwrap();
+                    assert!(
+                        slot_decision_validate_lock_then_sign(
+                            &reopened,
+                            &decisions[1 - choice],
+                            &set,
+                            &keys,
+                            index,
+                        )
+                        .is_err(),
+                        "pattern {pattern:04b}, honest validator {index} must not double sign after reopen"
+                    );
+                    assert_eq!(
+                        reopened.slot_decision_locks().unwrap(),
+                        vec![decisions[choice].clone()]
+                    );
+                    // Exact retries remain usable, not just conflict-rejecting.
+                    let retry = slot_decision_validate_lock_then_sign(
+                        &reopened,
+                        &decisions[choice],
+                        &set,
+                        &keys,
+                        index,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        retry,
+                        certificates[choice].signatures.last().unwrap().clone()
+                    );
+                }
+            }
+            let byzantine_choice = (pattern >> 3) & 1;
+            certificates[1 - byzantine_choice]
+                .signatures
+                .push(slot_decision_raw_signature(
+                    &decisions[1 - byzantine_choice],
+                    &set,
+                    &keys,
+                    3,
+                ));
+            let valid = certificates.each_ref().map(|certificate| {
+                let verified = certificate
+                    .verify(&certificate.decision.chain_id, &set)
+                    .is_ok();
+                assert_eq!(
+                    verified,
+                    certificate.signatures.len() >= 3,
+                    "pattern {pattern:04b}"
+                );
+                verified
+            });
+            assert!(
+                !(valid[0] && valid[1]),
+                "conflicting QCs for pattern {pattern:04b}"
+            );
+            // With the Byzantine signature on both sides, the honest majority
+            // always completes exactly one QC: avoid a vacuous all-invalid test.
+            assert!(valid[0] || valid[1], "no QC for pattern {pattern:04b}");
+        }
+    }
+
+    #[test]
+    fn slot_decision_cross_layer_split_honest_votes_and_withholding_stall() {
+        let (set, keys, decisions) = slot_decision_signing_fixture();
+        // Exercise every 2+1 honest split; the fourth independent store belongs
+        // to a withholding Byzantine voter. This demonstrates lack of liveness,
+        // not an unlock rule or an active live consensus fix.
+        for pattern in 1..7usize {
+            let directories: Vec<_> = (0..4).map(|_| TempDir::new()).collect();
+            let mut certificates =
+                decisions
+                    .clone()
+                    .map(|decision| validator::SlotDecisionCertificate {
+                        decision,
+                        signatures: Vec::new(),
+                    });
+            for (index, directory) in directories.iter().enumerate() {
+                let store = Store::open(&directory.0).unwrap();
+                if index == 3 {
+                    assert!(store.slot_decision_locks().unwrap().is_empty());
+                    continue;
+                }
+                let choice = (pattern >> index) & 1;
+                certificates[choice].signatures.push(
+                    slot_decision_validate_lock_then_sign(
+                        &store,
+                        &decisions[choice],
+                        &set,
+                        &keys,
+                        index,
+                    )
+                    .unwrap(),
+                );
+                drop(store);
+                let reopened = Store::open(&directory.0).unwrap();
+                assert!(
+                    slot_decision_validate_lock_then_sign(
+                        &reopened,
+                        &decisions[1 - choice],
+                        &set,
+                        &keys,
+                        index,
+                    )
+                    .is_err()
+                );
+            }
+            let mut counts = certificates
+                .each_ref()
+                .map(|certificate| certificate.signatures.len());
+            counts.sort();
+            assert_eq!(counts, [1, 2], "pattern {pattern:03b}");
+            for certificate in certificates {
+                assert!(
+                    certificate
+                        .verify(&certificate.decision.chain_id, &set)
+                        .is_err(),
+                    "withholding must prevent either QC for pattern {pattern:03b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slot_decision_reopen_conflicts_and_independent_keys() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let decision = slot_decision(1);
+        store.lock_slot_decision(&decision).unwrap();
+        let bytes = fs::read(dir.0.join(slot_decision_journal::FILE)).unwrap();
+        store.lock_slot_decision(&decision).unwrap();
+        assert_eq!(
+            fs::read(dir.0.join(slot_decision_journal::FILE)).unwrap(),
+            bytes
+        );
+        drop(store);
+        let store = Store::open(&dir.0).unwrap();
+        for variant in 0..4 {
+            let mut conflict = decision.clone();
+            match variant {
+                0 => conflict.previous = [9; 32],
+                1 => conflict.validator_set_id = [9; 32],
+                2 => conflict.epoch += 1,
+                _ => {
+                    conflict.outcome = validator::SlotOutcome::Skip {
+                        leader_author: b"other".to_vec(),
+                    }
+                }
+            }
+            assert!(store.lock_slot_decision(&conflict).is_err());
+        }
+        store.lock_slot_decision(&slot_decision(2)).unwrap();
+        let mut other_chain = decision.clone();
+        other_chain.chain_id = b"other".to_vec();
+        store.lock_slot_decision(&other_chain).unwrap();
+        assert_eq!(store.slot_decision_locks().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn slot_decision_torn_and_corrupt_fail_closed() {
+        for tail in [vec![1], vec![9, 0, 0, 0, 1], vec![0, 0, 0, 0]] {
+            let dir = TempDir::new();
+            let store = Store::open(&dir.0).unwrap();
+            store.lock_slot_decision(&slot_decision(1)).unwrap();
+            let path = dir.0.join(slot_decision_journal::FILE);
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(&tail)
+                .unwrap();
+            let damaged = fs::read(&path).unwrap();
+            assert!(store.slot_decision_locks().is_err());
+            assert!(store.lock_slot_decision(&slot_decision(1)).is_err());
+            assert!(store.lock_slot_decision(&slot_decision(2)).is_err());
+            assert_eq!(fs::read(&path).unwrap(), damaged);
+            drop(store);
+            assert!(Store::open(&dir.0).is_err());
+        }
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        store.lock_slot_decision(&slot_decision(1)).unwrap();
+        let path = dir.0.join(slot_decision_journal::FILE);
+        let mut bytes = fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        fs::write(&path, bytes).unwrap();
+        assert!(store.slot_decision_locks().is_err());
+        drop(store);
+        assert!(Store::open(&dir.0).is_err());
+    }
+
+    #[test]
+    fn slot_decision_stage_and_prune_preserve_promises() {
+        let dir = TempDir::new();
+        let mut store = Store::open(&dir.0).unwrap();
+        store.lock_slot_decision(&slot_decision(1)).unwrap();
+        {
+            let stage = store.stage().unwrap();
+            assert!(
+                !stage
+                    .store()
+                    .path()
+                    .join(slot_decision_journal::FILE)
+                    .exists()
+            );
+            stage.store().lock_slot_decision(&slot_decision(2)).unwrap();
+        }
+        let stage = store.stage().unwrap();
+        stage.store().lock_slot_decision(&slot_decision(3)).unwrap();
+        stage.activate().unwrap();
+        store.prune_below(100, 1).unwrap();
+        assert_eq!(store.slot_decision_locks().unwrap().len(), 3);
+        drop(store);
+        assert_eq!(
+            Store::open(&dir.0)
+                .unwrap()
+                .slot_decision_locks()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn slot_decision_clone_conflicts_serialize() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|epoch| {
+                let store = store.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut decision = slot_decision(1);
+                    decision.epoch = epoch;
+                    barrier.wait();
+                    store.lock_slot_decision(&decision).is_ok()
+                })
+            })
+            .collect();
+        assert_eq!(
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap().then_some(()))
+                .count(),
+            1
+        );
+        assert_eq!(store.slot_decision_locks().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slot_decision_symlink_rejected() {
+        let dir = TempDir::new();
+        let target = dir.0.join("target");
+        fs::write(&target, b"untouched").unwrap();
+        let store = Store::open(&dir.0).unwrap();
+        std::os::unix::fs::symlink(&target, dir.0.join(slot_decision_journal::FILE)).unwrap();
+        assert!(store.slot_decision_locks().is_err());
+        assert!(store.lock_slot_decision(&slot_decision(1)).is_err());
+        drop(store);
+        assert!(Store::open(&dir.0).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"untouched");
+    }
 
     #[test]
     fn staged_generations_publish_and_clones_follow() {

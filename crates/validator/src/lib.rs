@@ -18,6 +18,7 @@ mod pacemaker;
 mod round_skip;
 mod schedule;
 mod set_change;
+mod slot_decision;
 mod vertex;
 
 pub use address::validator_address;
@@ -44,5 +45,9 @@ pub use set_change::{
     SET_CHANGE_VERSION_V1, SetChange, SetChangeError, SetSchedule,
     TRANSITION_CERTIFICATE_VERSION_V1, Transition, TransitionCertificate, check_transition,
     min_intersection,
+};
+pub use slot_decision::{
+    SLOT_DECISION_ID_DOMAIN, SLOT_DECISION_SIGNING_DOMAIN, SLOT_DECISION_VERSION_V1, SlotDecision,
+    SlotDecisionCertificate, SlotDecisionTip, SlotOutcome,
 };
 pub use vertex::{VERTEX_VERSION_V1, Vertex, VertexId, tally_votes};
