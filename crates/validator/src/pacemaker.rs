@@ -906,6 +906,82 @@ mod tests {
     }
 
     #[test]
+    fn fenced_vote_arrival_timing_does_not_change_the_leader_decision() {
+        fn run(vote_before_fence: bool) -> (Step, Vec<VertexId>) {
+            let mut fixture = chain(1, &[]);
+            let round1 = fixture.ids(1);
+            let vote_references = vec![round1[0].clone(), round1[1].clone(), round1[2].clone()];
+            let fenced_vote = vertex(&fixture, 0, 2, vote_references.clone());
+            let honest_vote = vertex(&fixture, 3, 2, vote_references);
+            fixture.dag.insert(honest_vote).unwrap();
+            for author in [1, 2] {
+                let non_vote = vertex(
+                    &fixture,
+                    author,
+                    2,
+                    vec![round1[0].clone(), round1[2].clone(), round1[3].clone()],
+                );
+                fixture.dag.insert(non_vote).unwrap();
+            }
+            if vote_before_fence {
+                fixture.dag.insert(fenced_vote.clone()).unwrap();
+            }
+
+            let fence = Fence::new(b"karsa-pacemaker-1".to_vec(), 2, b"val-0".to_vec());
+            let payload = fence.signing_payload().unwrap();
+            let mut signer_bitmap = vec![0u8; bitmap_len(COUNT)];
+            let mut signatures = Vec::new();
+            // Only honest validators sign the fence; val-1 is the live leader.
+            for index in 1..COUNT {
+                set_bit(&mut signer_bitmap, index);
+                signatures.push(Ed25519Scheme.sign(&fixture.keys[index], &payload).unwrap());
+            }
+            fixture
+                .dag
+                .apply_fence(
+                    b"karsa-pacemaker-1",
+                    &FenceCertificate {
+                        fence,
+                        signer_bitmap,
+                        signatures,
+                    },
+                )
+                .unwrap();
+            if !vote_before_fence {
+                let error = fixture.dag.insert(fenced_vote).unwrap_err();
+                assert_eq!(error.kind(), CryptoErrorKind::InvalidVertex);
+            }
+
+            // The same honest-only suffix anchors round 3 in both views and
+            // reaches the round-1 leader through val-3's honest vote.
+            let honest_votes: Vec<_> = fixture
+                .ids(2)
+                .into_iter()
+                .filter(|id| id.author != b"val-0")
+                .collect();
+            fixture.insert_round(3, &honest_votes, &[0]).unwrap();
+            let round3 = fixture.ids(3);
+            fixture.insert_round(4, &round3, &[0]).unwrap();
+            assert!(fixture.dag.is_anchored(3).unwrap().is_some());
+
+            let mut pacemaker = pacemaker(1);
+            let decision = pacemaker.tick_one(&mut fixture.dag).unwrap();
+            (decision, fixture.dag.order().to_vec())
+        }
+
+        let (early_decision, early_order) = run(true);
+        let (late_decision, late_order) = run(false);
+        assert_eq!(
+            early_decision, late_decision,
+            "a fenced vote arriving before rather than after its fence must not change the honest leader's decision"
+        );
+        assert_eq!(
+            early_order, late_order,
+            "fenced vote delivery timing must not change committed order"
+        );
+    }
+
+    #[test]
     fn a_dead_author_does_not_block_rounds_that_follow_it() {
         // `val-1` stops authoring at round 5, the way a killed validator does. The
         // later rounds have three vertices, which is still a quorum; the missing

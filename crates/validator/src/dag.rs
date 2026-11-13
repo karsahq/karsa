@@ -972,11 +972,14 @@ impl Dag {
         self.vertices.keys().next_back().map(|(round, _)| *round)
     }
 
-    /// Vertices in the round after `round` that this node holds.
+    /// Eligible voting vertices held in `round`.
     fn round_vertices(&self, round: u64) -> Vec<&Vertex> {
         self.vertices
             .range((round, Vec::new())..)
             .take_while(|((r, _), _)| *r == round)
+            // Late fenced vertices are rejected on insertion; already-held votes
+            // must follow the same rule or fence decisions depend on arrival order.
+            .filter(|((_, author), _)| !self.is_fenced(author, round))
             .map(|(_, vertex)| vertex)
             .collect()
     }
