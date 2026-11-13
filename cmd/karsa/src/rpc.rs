@@ -240,6 +240,10 @@ pub(crate) struct RpcCore {
     certified_heights: usize,
     /// Validators this node's local failure detector reports as silent.
     silent: Vec<SilentView>,
+    /// The local catch-up estimate: backlog and the rates it is derived from.
+    catchup: CatchupView,
+    /// The last live reseed this node adopted, when any.
+    reseed: Option<ReseedView>,
 }
 
 impl RpcCore {
@@ -285,6 +289,8 @@ impl RpcCore {
             run: RunView::default(),
             certified_heights: 0,
             silent: Vec::new(),
+            catchup: CatchupView::default(),
+            reseed: None,
         }
     }
 
@@ -937,6 +943,19 @@ impl RpcCore {
         self.certified_heights = heights;
     }
 
+    /// Records the local catch-up estimate `/status` reports.
+    ///
+    /// This is a local measurement, not a promise about peers: the node loop
+    /// derives it from its own cursor and the highest round it has observed.
+    pub(crate) fn note_catchup(&mut self, catchup: CatchupView) {
+        self.catchup = catchup;
+    }
+
+    /// Records the last live reseed this node adopted.
+    pub(crate) fn note_reseed(&mut self, reseed: ReseedView) {
+        self.reseed = Some(reseed);
+    }
+
     /// Replaces the local silence report shown by `/status`.
     ///
     /// This is a view, not a decision: the node loop computes it from vertices it
@@ -998,6 +1017,8 @@ impl RpcCore {
             },
             tracked_transactions: self.records.len(),
             silent: self.silent.clone(),
+            catchup: self.catchup,
+            reseed: self.reseed.clone(),
         }
     }
 
@@ -1301,6 +1322,46 @@ struct StatusView {
     skips: SkipView,
     tracked_transactions: usize,
     silent: Vec<SilentView>,
+    /// Backlog and the rates a reseed estimate is derived from.
+    catchup: CatchupView,
+    /// The last live reseed this node adopted, when any.
+    reseed: Option<ReseedView>,
+}
+
+/// The local catch-up estimate reported by `/status`.
+///
+/// `catchup_ms` is `null` when the node cannot measure the rates yet or when
+/// `mu <= lambda`, because the backlog would never close at the current rates.
+/// `soft_pending_ms` is how long the soft trigger has been above its thresholds.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub(crate) struct CatchupView {
+    pub(crate) backlog_rounds: u64,
+    pub(crate) lambda_rounds_per_s: Option<f64>,
+    pub(crate) mu_rounds_per_s: Option<f64>,
+    pub(crate) catchup_ms: Option<u64>,
+    pub(crate) soft_pending_ms: Option<u64>,
+}
+
+/// The last live reseed this node adopted, with the trigger that released it.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ReseedView {
+    pub(crate) reason: String,
+    pub(crate) detail: String,
+    pub(crate) trigger_round: u64,
+    pub(crate) from_height: u64,
+    pub(crate) from_round: u64,
+    pub(crate) from_committed: usize,
+    pub(crate) to_height: u64,
+    pub(crate) to_round: u64,
+    pub(crate) to_committed: usize,
+    pub(crate) floor: Option<u64>,
+    pub(crate) served_by: String,
+    pub(crate) install_ms: u64,
+    pub(crate) lambda_rounds_per_s: Option<f64>,
+    pub(crate) mu_rounds_per_s: Option<f64>,
+    pub(crate) backlog_rounds: u64,
+    pub(crate) catchup_ms: Option<u64>,
+    pub(crate) at_ms: u64,
 }
 
 /// How the decision rules moved the cursor, by proof.

@@ -158,6 +158,21 @@ const RESEED_FINALITY_STALL: Duration = Duration::from_secs(5);
 /// Rounds the DAG may run ahead of the certified head before the gap is a stall
 /// rather than the ordinary authoring lead.
 const RESEED_CERT_GAP_ROUNDS: u64 = 256;
+/// Sampling cadence for the catch-up rate estimate.
+const RESEED_RATE_SAMPLE: Duration = Duration::from_millis(200);
+/// Moving window over which lambda and mu are measured.
+///
+/// A longer window smooths a burst of deliveries; a shorter one reacts to a
+/// sustained slowdown before the hard triggers would see a stall.
+const RESEED_RATE_WINDOW: Duration = Duration::from_secs(10);
+/// Backlog below which rate noise must not release a soft reseed.
+const RESEED_SOFT_BACKLOG: u64 = 256;
+/// Estimated catch-up time above which a snapshot is cheaper than waiting.
+const RESEED_SOFT_CATCHUP_MS: u64 = 60_000;
+/// How long the estimate must stay above its threshold (hysteresis).
+const RESEED_SOFT_SUSTAIN: Duration = Duration::from_secs(5);
+/// Rate margin that separates keeping pace from losing ground, in rounds/s.
+const RESEED_SOFT_RATE_MARGIN: f64 = 0.5;
 /// How long a served snapshot's floor stays pinned against pruning after the
 /// last request.
 ///
@@ -2046,6 +2061,104 @@ fn reseed_round_high_water(saved_round: u64, adopted_round: u64) -> u64 {
     saved_round.max(adopted_round)
 }
 
+/// Adds a sample to a moving window of a monotone counter.
+///
+/// Samples are taken at most every [`RESEED_RATE_SAMPLE`] and older entries fall
+/// out after [`RESEED_RATE_WINDOW`]. A repeated value is still a sample: a frozen
+/// cursor must show a zero rate, not keep the rate it had before it froze.
+fn sample_rate(window: &mut VecDeque<(Instant, u64)>, at: Instant, value: u64) {
+    if window
+        .back()
+        .is_none_or(|(last, _)| at.duration_since(*last) >= RESEED_RATE_SAMPLE)
+    {
+        window.push_back((at, value));
+    }
+    while window
+        .front()
+        .is_some_and(|(first, _)| at.duration_since(*first) > RESEED_RATE_WINDOW)
+    {
+        window.pop_front();
+    }
+}
+
+/// The slope of a sampled counter, in units per second.
+///
+/// A window shorter than half a second is not a measurement; the caller treats
+/// `None` as unknown rather than as zero.
+fn window_rate(window: &VecDeque<(Instant, u64)>) -> Option<f64> {
+    let (first_at, first) = window.front()?;
+    let (last_at, last) = window.back()?;
+    let seconds = last_at.duration_since(*first_at).as_secs_f64();
+    (seconds >= 0.5).then(|| last.saturating_sub(*first) as f64 / seconds)
+}
+
+/// Estimated time to close `backlog` rounds at the observed rates.
+///
+/// `None` means the estimate is unknown (too few samples) or that `mu <= lambda`,
+/// where the backlog would never close at the current rates. The two cases are
+/// distinguished by [`soft_catchup_needed`], which needs the rates anyway.
+fn catchup_estimate(backlog: u64, lambda: Option<f64>, mu: Option<f64>) -> Option<u64> {
+    let lambda = lambda?;
+    let mu = mu?;
+    if backlog == 0 {
+        return Some(0);
+    }
+    if mu <= lambda {
+        return None;
+    }
+    let millis = (backlog as f64 / (mu - lambda) * 1_000.0).min(u64::MAX as f64);
+    Some(millis as u64)
+}
+
+/// Whether the local rates say catch-up needs a snapshot rather than patience.
+///
+/// The backlog must be material, the network must actually be producing rounds
+/// (a global stall is not this node's catch-up problem), and either the node is
+/// losing ground or the measured catch-up time is too long. A margin keeps
+/// measurement noise around `mu == lambda` from firing.
+fn soft_catchup_needed(
+    backlog: u64,
+    lambda: Option<f64>,
+    mu: Option<f64>,
+    estimate_ms: Option<u64>,
+) -> bool {
+    if backlog < RESEED_SOFT_BACKLOG {
+        return false;
+    }
+    let Some(lambda) = lambda else {
+        return false;
+    };
+    let Some(mu) = mu else {
+        return false;
+    };
+    if lambda <= 0.0 {
+        return false;
+    }
+    if mu + RESEED_SOFT_RATE_MARGIN < lambda {
+        return true;
+    }
+    estimate_ms.is_some_and(|millis| millis >= RESEED_SOFT_CATCHUP_MS)
+}
+
+/// What released a live reseed fetch, kept until its snapshot arrives.
+///
+/// The fetch runs off the loop, so the reason and the measurements at trigger
+/// time have to travel with it; by the time the snapshot lands the rates and the
+/// certified head may already have moved.
+#[derive(Debug, Clone)]
+struct ReseedAttempt {
+    reason: &'static str,
+    detail: String,
+    trigger_round: u64,
+    from_height: u64,
+    from_round: u64,
+    from_committed: usize,
+    lambda: Option<f64>,
+    mu: Option<f64>,
+    backlog: u64,
+    estimate_ms: Option<u64>,
+}
+
 /// The history one served snapshot keeps alive.
 ///
 /// The pin keeps the lowest floor served in the window, the bytes and requests
@@ -3401,6 +3514,7 @@ async fn node_task(
         tokio::task::JoinHandle<Result<(String, wire::Snapshot), String>>,
     > = None;
     let mut last_reseed_attempt: Option<Instant> = None;
+    let mut reseed_attempt: Option<ReseedAttempt> = None;
     let mut reseeded = 0usize;
     // The certified height and when it last moved. A node that missed a
     // certificate share cannot advance, even if its DAG is caught up.
@@ -3408,9 +3522,17 @@ async fn node_task(
         .as_ref()
         .map_or(0, |(header, _)| header.height);
     let mut certified_since = Instant::now();
-    // Local lambda: committed entries over the last few seconds. A frozen cursor
-    // with a healthy rate means this node is behind; a frozen cursor with a zero
-    // rate means the chain itself stopped producing commits.
+    // Local rates for the catch-up estimate. `cursor_rate` is mu (rounds this
+    // node decides per second); `highest_rate` is lambda (rounds the network
+    // produces per second, as seen in the DAG tip). Repeated samples matter: a
+    // frozen cursor must decay to zero, not keep an old rate.
+    let mut cursor_rate: VecDeque<(Instant, u64)> = VecDeque::new();
+    let mut highest_rate: VecDeque<(Instant, u64)> = VecDeque::new();
+    let mut soft_since: Option<Instant> = None;
+    let mut soft_reported = false;
+    // Local lambda for the stall line: committed entries over the last few
+    // seconds. A frozen cursor with a healthy entry rate means this node is
+    // behind; a frozen cursor with a zero rate means the chain itself stopped.
     let mut commit_rate: VecDeque<(Instant, usize)> = VecDeque::new();
     // The interval is measured from the checkpoint or head this run resumed at,
     // not from process start: otherwise a restart with a large interval would
@@ -3934,6 +4056,12 @@ async fn node_task(
             }, if reseed_fetch.is_some() => {
                 reseed_fetch = None;
                 last_reseed_attempt = Some(Instant::now());
+                // A failed attempt starts the pressure clock again: the next
+                // trigger must be sustained by the rates measured from now, not
+                // inherited from before the fetch.
+                soft_since = None;
+                soft_reported = false;
+                let attempt = reseed_attempt.take();
                 let outcome = match fetched {
                     Ok(Ok((served_by, snapshot))) => {
                         let certified = last_certified
@@ -3963,15 +4091,17 @@ async fn node_task(
                             // flight. Moving the chain to an older anchor would
                             // roll back finality, so the snapshot is useless.
                             eprintln!(
-                                "node {index} reseed: snapshot from {served_by} at height {} is not above the certified head {certified}; ignored",
-                                snapshot.anchor.height
+                                "node {index} reseed: snapshot from {served_by} at height {} is not above the certified head {certified}; ignored (reason {})",
+                                snapshot.anchor.height,
+                                attempt.as_ref().map_or("unknown", |attempt| attempt.reason)
                             );
                             release_served_snapshot(index, served_by, &chain_id, snapshot.floor);
                             None
                         } else if snapshot.order_len < certified_order {
                             eprintln!(
-                                "node {index} reseed: snapshot from {served_by} commits {} entries but this node's certified prefix needs {certified_order}; ignored",
-                                snapshot.order_len
+                                "node {index} reseed: snapshot from {served_by} commits {} entries but this node's certified prefix needs {certified_order}; ignored (reason {})",
+                                snapshot.order_len,
+                                attempt.as_ref().map_or("unknown", |attempt| attempt.reason)
                             );
                             release_served_snapshot(index, served_by, &chain_id, snapshot.floor);
                             None
@@ -3996,7 +4126,8 @@ async fn node_task(
                                 )),
                                 Err(error) => {
                                     eprintln!(
-                                        "node {index} reseed: snapshot from {served_by} was rejected: {error}"
+                                        "node {index} reseed: snapshot from {served_by} was rejected: {error} (reason {})",
+                                        attempt.as_ref().map_or("unknown", |attempt| attempt.reason)
                                     );
                                     None
                                 }
@@ -4004,11 +4135,17 @@ async fn node_task(
                         }
                     }
                     Ok(Err(error)) => {
-                        eprintln!("node {index} reseed: no snapshot available: {error}");
+                        eprintln!(
+                            "node {index} reseed: no snapshot available (reason {}): {error}",
+                            attempt.as_ref().map_or("unknown", |attempt| attempt.reason)
+                        );
                         None
                     }
                     Err(error) => {
-                        eprintln!("node {index} reseed: fetch task failed: {error}");
+                        eprintln!(
+                            "node {index} reseed: fetch task failed (reason {}): {error}",
+                            attempt.as_ref().map_or("unknown", |attempt| attempt.reason)
+                        );
                         None
                     }
                 };
@@ -4040,6 +4177,10 @@ async fn node_task(
                     reported_hard_trigger = None;
                     cursor_since = Instant::now();
                     commit_rate.clear();
+                    cursor_rate.clear();
+                    highest_rate.clear();
+                    soft_since = None;
+                    soft_reported = false;
                     last_order = node.dag().order_len();
                     stable_ticks = 0;
 
@@ -4113,6 +4254,20 @@ async fn node_task(
                         }
                     }
 
+                    let reason = attempt
+                        .as_ref()
+                        .map_or("unknown", |attempt| attempt.reason);
+                    let detail = attempt
+                        .as_ref()
+                        .map_or_else(|| String::from("none"), |attempt| attempt.detail.clone());
+                    let was_height = attempt.as_ref().map_or(0, |attempt| attempt.from_height);
+                    let was_round = attempt.as_ref().map_or(0, |attempt| attempt.from_round);
+                    let was_committed =
+                        attempt.as_ref().map_or(0, |attempt| attempt.from_committed);
+                    let lambda = attempt.as_ref().and_then(|attempt| attempt.lambda);
+                    let mu = attempt.as_ref().and_then(|attempt| attempt.mu);
+                    let backlog = attempt.as_ref().map_or(0, |attempt| attempt.backlog);
+                    let estimate = attempt.as_ref().and_then(|attempt| attempt.estimate_ms);
                     if let Some(rpc) = &rpc {
                         let mut core = rpc.lock().expect("rpc lock poisoned");
                         core.note_state(u64::try_from(applied).unwrap_or(u64::MAX), &state);
@@ -4123,6 +4278,27 @@ async fn node_task(
                             core.note_certified_heights(finalizer.certified_ids().len());
                         }
                         core.note_floor(node.dag().floor());
+                        core.note_reseed(rpc::ReseedView {
+                            reason: reason.to_string(),
+                            detail: detail.clone(),
+                            trigger_round: attempt
+                                .as_ref()
+                                .map_or(0, |attempt| attempt.trigger_round),
+                            from_height: was_height,
+                            from_round: was_round,
+                            from_committed: was_committed,
+                            to_height: adopted.anchor.height,
+                            to_round: adopted.anchor.round,
+                            to_committed: adopted.order_len,
+                            floor: adopted.floor,
+                            served_by: served_by.clone(),
+                            install_ms,
+                            lambda_rounds_per_s: lambda,
+                            mu_rounds_per_s: mu,
+                            backlog_rounds: backlog,
+                            catchup_ms: estimate,
+                            at_ms: unix_millis(),
+                        });
                         core.set_run(
                             node.round(),
                             node.dag().order_len(),
@@ -4134,7 +4310,7 @@ async fn node_task(
                     }
                     reseeded = reseeded.saturating_add(1);
                     eprintln!(
-                        "node {index} reseed: adopted snapshot from {served_by} at height {} round {}, floor {:?}, committed {}, tail {} vertices / {} batches, state {}, install {install_ms} ms; round {saved_round}->{round_after}, cursor {saved_cursor}->{cursor}, total {reseeded}",
+                        "node {index} reseed: adopted snapshot from {served_by} at height {} round {}, floor {:?}, committed {}, tail {} vertices / {} batches, state {}, install {install_ms} ms; reason {reason}: {detail}; local was height {was_height}/{was_round} committed {was_committed}, lambda {}, mu {}, backlog {backlog} rounds, estimate {} ms; round {saved_round}->{round_after}, cursor {saved_cursor}->{cursor}, total {reseeded}",
                         adopted.anchor.height,
                         adopted.anchor.round,
                         adopted.floor,
@@ -4142,6 +4318,9 @@ async fn node_task(
                         adopted.vertices,
                         adopted.batches,
                         hex::encode(&state.state_root()[..6]),
+                        lambda.map_or_else(|| String::from("unknown"), |rate| format!("{rate:.1}/s")),
+                        mu.map_or_else(|| String::from("unknown"), |rate| format!("{rate:.1}/s")),
+                        estimate.map_or_else(|| String::from("never"), |millis| format!("{millis} ms")),
                     );
                     release_served_snapshot(index, served_by, &chain_id, adopted.floor);
                 }
@@ -4799,10 +4978,32 @@ async fn node_task(
                         }
                     }
                 }
+                // The catch-up estimate is local: backlog is the rounds this
+                // node has observed but not decided, lambda is how fast the DAG
+                // tip moves, and mu is how fast the cursor decides. Measuring
+                // before the reseed check means `/status` and the trigger see the
+                // same numbers for this tick.
+                let metrics_at = Instant::now();
+                let highest_observed = node.dag().highest_round().unwrap_or(cursor);
+                sample_rate(&mut cursor_rate, metrics_at, cursor);
+                sample_rate(&mut highest_rate, metrics_at, highest_observed);
+                let backlog_now = highest_observed.saturating_sub(cursor);
+                let lambda_now = window_rate(&highest_rate);
+                let mu_now = window_rate(&cursor_rate);
+                let estimate_now = catchup_estimate(backlog_now, lambda_now, mu_now);
                 if let Some(rpc) = &rpc {
                     let mut core = rpc.lock().expect("rpc lock poisoned");
                     core.note_order_from(node.dag().prefix(), node.dag().order());
                     core.note_failures(&silent);
+                    core.note_catchup(rpc::CatchupView {
+                        backlog_rounds: backlog_now,
+                        lambda_rounds_per_s: lambda_now,
+                        mu_rounds_per_s: mu_now,
+                        catchup_ms: estimate_now,
+                        soft_pending_ms: soft_since.map(|at| {
+                            u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)
+                        }),
+                    });
                     core.set_run(
                         node.round(),
                         node.dag().order_len(),
@@ -5077,6 +5278,28 @@ async fn node_task(
                         && node.dag().highest_round().is_some_and(|highest| {
                             highest >= certified_round.saturating_add(RESEED_CERT_GAP_ROUNDS)
                         });
+                    let from_height = last_certified
+                        .as_ref()
+                        .map_or(0, |(header, _)| header.height);
+                    let from_round = last_certified
+                        .as_ref()
+                        .map_or(0, |(header, _)| header.round);
+                    let from_committed = node.dag().order_len();
+                    let rates = |lambda: Option<f64>, mu: Option<f64>| {
+                        let value = |rate: Option<f64>| {
+                            rate.map_or_else(|| String::from("unknown"), |rate| format!("{rate:.1}/s"))
+                        };
+                        format!(
+                            "backlog {backlog_now} rounds, lambda {}, mu {}, estimate {}",
+                            value(lambda),
+                            value(mu),
+                            estimate_now.map_or_else(
+                                || String::from("never"),
+                                |millis| format!("{:.0}s", millis as f64 / 1_000.0)
+                            )
+                        )
+                    };
+                    let mut attempt: Option<ReseedAttempt> = None;
                     if let Some(missing) = &history {
                         let covering: Vec<(Vec<u8>, u64)> = required
                             .iter()
@@ -5093,6 +5316,23 @@ async fn node_task(
                             &covering,
                             &mut reported_hard_trigger,
                         );
+                        attempt = Some(ReseedAttempt {
+                            reason: "history-floor",
+                            detail: format!(
+                                "missing {} round {} by {}",
+                                hex::encode(&missing.digest[..missing.digest.len().min(6)]),
+                                missing.round,
+                                hex::encode(&missing.author[..missing.author.len().min(6)])
+                            ),
+                            trigger_round: cursor,
+                            from_height,
+                            from_round,
+                            from_committed,
+                            lambda: lambda_now,
+                            mu: mu_now,
+                            backlog: backlog_now,
+                            estimate_ms: estimate_now,
+                        });
                     } else if let Some(votes) = &votes {
                         let peers = votes
                             .covering
@@ -5102,12 +5342,27 @@ async fn node_task(
                             })
                             .collect::<Vec<_>>()
                             .join(" ");
-                        eprintln!(
-                            "node {index} reseed: hard vote trigger at round {cursor}: votes {} of quorum {}, every peer floor covers round {} ({peers})",
+                        let detail = format!(
+                            "votes {} of quorum {} at round {}",
                             votes.held,
                             votes.quorum,
                             cursor.saturating_add(1)
                         );
+                        eprintln!(
+                            "node {index} reseed: hard vote trigger at round {cursor}: {detail}, every peer floor covers the round ({peers})"
+                        );
+                        attempt = Some(ReseedAttempt {
+                            reason: "vote-quorum",
+                            detail,
+                            trigger_round: cursor,
+                            from_height,
+                            from_round,
+                            from_committed,
+                            lambda: lambda_now,
+                            mu: mu_now,
+                            backlog: backlog_now,
+                            estimate_ms: estimate_now,
+                        });
                     } else if let Some(covering) = &leader {
                         let author = node.dag().leader_author(cursor).map_or_else(
                             || String::from("unknown"),
@@ -5120,27 +5375,92 @@ async fn node_task(
                             })
                             .collect::<Vec<_>>()
                             .join(" ");
+                        let detail = format!("leader {author} missing at round {cursor}");
                         eprintln!(
-                            "node {index} reseed: hard leader trigger at round {cursor}: leader {author} is missing, every peer floor covers the round ({peers})"
+                            "node {index} reseed: hard leader trigger at round {cursor}: {detail}, every peer floor covers the round ({peers})"
                         );
+                        attempt = Some(ReseedAttempt {
+                            reason: "leader-missing",
+                            detail,
+                            trigger_round: cursor,
+                            from_height,
+                            from_round,
+                            from_committed,
+                            lambda: lambda_now,
+                            mu: mu_now,
+                            backlog: backlog_now,
+                            estimate_ms: estimate_now,
+                        });
                     } else if finality_gap {
                         let highest = node.dag().highest_round().unwrap_or(0);
-                        eprintln!(
-                            "node {index} reseed: hard finality trigger: certified head {certified_height}/{certified_round} has not moved for {} ms while the DAG reached round {highest}",
+                        let detail = format!(
+                            "certified head {certified_height}/{certified_round} still for {} ms while the DAG reached round {highest}",
                             certified_since.elapsed().as_millis()
                         );
-                    }
-                    if history.is_some()
-                        || votes.is_some()
-                        || leader.is_some()
-                        || finality_gap
-                    {
-                        let min_height = last_certified
-                            .as_ref()
-                            .map_or(0, |(header, _)| header.height);
-                        eprintln!(
-                            "node {index} reseed: fetching a snapshot above height {min_height}"
+                        eprintln!("node {index} reseed: hard finality trigger: {detail}");
+                        attempt = Some(ReseedAttempt {
+                            reason: "finality-gap",
+                            detail,
+                            trigger_round: cursor,
+                            from_height,
+                            from_round,
+                            from_committed,
+                            lambda: lambda_now,
+                            mu: mu_now,
+                            backlog: backlog_now,
+                            estimate_ms: estimate_now,
+                        });
+                    } else {
+                        let pressure = soft_catchup_needed(
+                            backlog_now,
+                            lambda_now,
+                            mu_now,
+                            estimate_now,
                         );
+                        let report = rates(lambda_now, mu_now);
+                        if pressure {
+                            match soft_since {
+                                None => {
+                                    soft_since = Some(Instant::now());
+                                    if !soft_reported {
+                                        soft_reported = true;
+                                        eprintln!(
+                                            "node {index} reseed: soft catch-up pressure at round {cursor}: {report}; needs {} ms above threshold",
+                                            RESEED_SOFT_SUSTAIN.as_millis()
+                                        );
+                                    }
+                                }
+                                Some(since) if since.elapsed() >= RESEED_SOFT_SUSTAIN => {
+                                    eprintln!(
+                                        "node {index} reseed: soft catch-up trigger at round {cursor}: {report}, sustained {} ms",
+                                        since.elapsed().as_millis()
+                                    );
+                                    attempt = Some(ReseedAttempt {
+                                        reason: "catchup-soft",
+                                        detail: report,
+                                        trigger_round: cursor,
+                                        from_height,
+                                        from_round,
+                                        from_committed,
+                                        lambda: lambda_now,
+                                        mu: mu_now,
+                                        backlog: backlog_now,
+                                        estimate_ms: estimate_now,
+                                    });
+                                }
+                                Some(_) => {}
+                            }
+                        } else {
+                            soft_since = None;
+                            soft_reported = false;
+                        }
+                    }
+                    if let Some(attempt) = attempt {
+                        eprintln!(
+                            "node {index} reseed: fetching a snapshot above height {} (reason {}, committed {})",
+                            attempt.from_height, attempt.reason, attempt.from_committed
+                        );
+                        reseed_attempt = Some(attempt);
                         let chain = chain_id.clone();
                         let port = config.snapshot_port;
                         reseed_fetch = Some(tokio::spawn(async move {
@@ -5149,7 +5469,7 @@ async fn node_task(
                                 index,
                                 total,
                                 &chain,
-                                min_height,
+                                from_height,
                                 RESEED_FETCH_WAIT,
                             )
                             .await
@@ -6702,6 +7022,61 @@ mod tests {
     }
 
     #[test]
+    fn the_catchup_rate_is_the_slope_of_the_cursor_window() {
+        let start = Instant::now();
+        let mut window = VecDeque::new();
+        sample_rate(&mut window, start, 10);
+        sample_rate(&mut window, start + Duration::from_secs(1), 30);
+        sample_rate(&mut window, start + Duration::from_secs(2), 50);
+        assert_eq!(window_rate(&window), Some(20.0), "40 rounds over 2 s");
+
+        // A frozen counter still contributes samples, so its rate decays to zero
+        // instead of holding the slope from before it froze.
+        let mut frozen = VecDeque::new();
+        for second in 0..=5u64 {
+            sample_rate(&mut frozen, start + Duration::from_secs(second), 7);
+        }
+        assert_eq!(window_rate(&frozen), Some(0.0));
+        assert_eq!(window_rate(&VecDeque::new()), None);
+
+        // A single sample is unknown, not zero.
+        let mut one = VecDeque::new();
+        sample_rate(&mut one, start, 1);
+        assert_eq!(window_rate(&one), None);
+    }
+
+    #[test]
+    fn the_catchup_estimate_is_backlog_over_the_rate_difference() {
+        assert_eq!(catchup_estimate(0, Some(50.0), Some(60.0)), Some(0));
+        assert_eq!(catchup_estimate(600, Some(50.0), Some(60.0)), Some(60_000));
+        assert_eq!(
+            catchup_estimate(600, Some(60.0), Some(60.0)),
+            None,
+            "mu <= lambda never closes the backlog"
+        );
+        assert_eq!(catchup_estimate(600, None, Some(60.0)), None);
+    }
+
+    #[test]
+    fn a_soft_reseed_needs_a_backlog_a_live_network_and_a_slow_estimate() {
+        assert!(soft_catchup_needed(1_000, Some(60.0), Some(50.0), None));
+        assert!(!soft_catchup_needed(100, Some(60.0), Some(50.0), None));
+        assert!(
+            !soft_catchup_needed(1_000, Some(60.0), Some(60.2), Some(40_000)),
+            "keeping pace with a short estimate is not pressure"
+        );
+        assert!(
+            soft_catchup_needed(1_000, Some(60.0), Some(60.2), Some(90_000)),
+            "a long estimate is pressure even at equal rates"
+        );
+        assert!(
+            !soft_catchup_needed(1_000, Some(0.0), Some(0.0), None),
+            "a globally stalled chain is not this node's catch-up problem"
+        );
+        assert!(!soft_catchup_needed(1_000, None, None, None));
+    }
+
+    #[test]
     fn a_missing_leader_triggers_a_reseed_only_when_every_peer_pruned_it() {
         let membership = chain::membership(4, None).expect("a demo committee");
         let chain_id = b"karsa-missing-leader".to_vec();
@@ -7541,23 +7916,21 @@ mod tests {
         phantom.round = top.header.round.saturating_add(1);
         phantom.previous = top.header.id().unwrap();
         phantom.dag_root[0] ^= 0xff;
+        let phantom_id = phantom.id().unwrap();
         let mut certificate = top.certificate.clone();
         certificate.round = phantom.round;
-        certificate.vertex_id = phantom.id().unwrap().to_vec();
+        certificate.vertex_id = phantom_id.to_vec();
         store.put_header(&phantom, &certificate).unwrap();
-        let phantom_height = phantom.height;
 
         let second = run(mesh_config(&dir, a_free_port_base(4), 5, 0));
         assert!(second.is_ok(), "the restart failed: {second:?}");
 
         let store = Store::open(dir.0.join("val-0")).unwrap();
-        let after = store
-            .headers()
-            .unwrap()
-            .pop()
-            .expect("the restart kept a certified head");
+        let headers = store.headers().unwrap();
         assert!(
-            after.header.height < phantom_height,
+            !headers
+                .iter()
+                .any(|record| record.header.id().unwrap() == phantom_id),
             "the unprovable head must not survive the restart"
         );
         crate::audit::run(dir.0.join("val-0"), 4, None)

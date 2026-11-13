@@ -2440,6 +2440,60 @@ the next restart, but a crash can leave one unprovable interval until that
 restart. Filtering at write time needs the coverage stored in the header record
 (a store-format change) and a gapless-log story for audit.
 
+## D81 — A rate estimate can release a soft reseed
+
+**Decided.** Besides the four hard triggers, the live loop estimates whether
+waiting can close its backlog. `mu` is the cursor's decisions per second, `lambda`
+is how fast the DAG tip moves, and `B` is the rounds observed above the cursor.
+Both rates come from a 10 s moving window sampled every 200 ms; repeated samples
+are kept so a frozen counter decays to zero instead of holding an old rate. The
+estimate is `T = B / (mu - lambda)` when `mu > lambda`, and unbounded when it is
+not. A soft reseed needs `B >= 256`, a live network (`lambda > 0`), and either
+`mu + 0.5 < lambda` (losing ground) or `T >= 60 s`; the condition must hold for
+5 s (hysteresis). It shares the one-fetch slot and the 10 s cooldown with the
+hard triggers, and hard triggers win when both are true. The pressure clock is
+reset when an attempt starts or ends, and after an adopted snapshot.
+
+**Why.** The hard triggers only fire after repair has failed: a dependency below
+every peer's floor, a pruned vote quorum, a missing leader slot, or a certified
+head that has not moved. A node can instead be committing steadily but slower
+than the network, with a backlog that will never close; waiting for one of those
+failures wastes the window in which a snapshot is cheap. Measuring the rates also
+keeps the loop from reseeding for a **globally** stalled chain (`lambda = 0`),
+where a snapshot cannot help, and from firing on the normal one-round authoring
+lead.
+
+**Observability.** Before a fetch the node logs either the hard trigger or
+`soft catch-up pressure` with `B`, `lambda`, `mu`, and `T`, then the fetch line
+carries the reason and the local committed index. On adoption the log names the
+serving peer, anchor height/round, floor, snapshot committed index, the local
+height/round and committed index from trigger time, the rates, the estimate, and
+the install time. `/status` reports the live `catchup` estimate
+(`backlog_rounds`, `lambda_rounds_per_s`, `mu_rounds_per_s`, `catchup_ms`,
+`soft_pending_ms`) and the last adopted `reseed` with reason, detail, boundary,
+local committed index, rates, backlog, estimate, serving peer, and install time.
+
+**Measured.** Four validators, `CHECKPOINT_EVERY=32 FAILURE_ROUNDS=15
+--fence-silent`; node 3 killed at 10 s and restarted 20 s later. It replayed 5845
+entries, then a hard vote trigger at round 1463 reported `votes 2 of quorum 3`
+with `lambda 684.0/s`, `mu 0.0/s`, backlog 2561. It adopted a snapshot at height
+3380 round 4193, floor 4191, committed 14044 (local was 5849), install 4 ms; the
+same fields appeared under `/status.reseed`. The other three nodes reported
+backlog 0..1, `lambda == mu`, and no reseed during the normal part of the run.
+A normal 90 s devnet with the same flags produced no `soft catch-up` line, so the
+soft path did not misfire on ordinary jitter. An 80 ms stop / 20 ms run duty
+cycle on one validator lowered `lambda` to 22/s and `mu` to 18.9/s, but the
+backlog only reached 29 rounds and the committee itself slowed; 256 rounds was
+not reachable that way. The soft threshold itself was not observed end-to-end:
+in every measured stall a hard trigger fired first. Its window, estimate, and
+threshold decisions are unit-tested.
+
+**Open.** No run has produced a backlog where the hard triggers stay false while
+the rate estimate says catch-up is hopeless. That is the scenario the soft
+trigger exists for; the constants (10 s window, 256 rounds, 60 s, 5 s sustain,
+0.5 rounds/s margin) are chosen conservatively and may need one measured
+adjustment once such a run exists.
+
 ## Open decisions
 
 1. **Does a node serve history it does not hold?** Model B says no beyond the
