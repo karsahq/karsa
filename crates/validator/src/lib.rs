@@ -19,6 +19,7 @@ mod round_skip;
 mod schedule;
 mod set_change;
 mod slot_decision;
+mod slot_proposal;
 mod vertex;
 
 pub use address::validator_address;
@@ -50,4 +51,5 @@ pub use slot_decision::{
     SLOT_DECISION_ID_DOMAIN, SLOT_DECISION_SIGNING_DOMAIN, SLOT_DECISION_VERSION_V1, SlotDecision,
     SlotDecisionCertificate, SlotDecisionTip, SlotOutcome,
 };
+pub use slot_proposal::{SLOT_PROPOSAL_DOMAIN, SLOT_PROPOSAL_VERSION_V1, SlotProposal};
 pub use vertex::{VERTEX_VERSION_V1, Vertex, VertexId, tally_votes};

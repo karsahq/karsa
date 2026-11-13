@@ -1022,6 +1022,20 @@ impl Dag {
     /// [`CryptoErrorKind::MissingReference`] when committing a leader whose
     /// history is incomplete.
     pub fn try_commit(&mut self, round: u64) -> Result<Decision, CryptoError> {
+        let decision = self.inspect_commit(round)?;
+        self.apply_inspected_decision(round, &decision)?;
+        Ok(decision)
+    }
+
+    /// Inspects the direct rule without changing the order or recording a skip.
+    ///
+    /// A result describes only the current view, not authorization to apply it later.
+    /// Repeated commits may return an empty history. This does not check slot-decision
+    /// certificates or resolve conflicts between direct, indirect, and fence rules.
+    ///
+    /// # Errors
+    /// Propagates vote tally, vertex encoding, and missing-history errors.
+    pub fn inspect_commit(&self, round: u64) -> Result<Decision, CryptoError> {
         let Some(leader) = self.leader(round) else {
             return Ok(Decision::Undecided);
         };
@@ -1036,7 +1050,7 @@ impl Dag {
         let voters = tally_votes(voter_set, &leader_id, &candidates, &self.schedule)?;
 
         if voter_set.has_supermajority(voters.len()) {
-            let history = self.commit_history(&leader_id)?;
+            let history = self.collect_uncommitted_history(&leader_id)?;
             return Ok(Decision::Commit(history));
         }
 
@@ -1044,10 +1058,151 @@ impl Dag {
         // unknown, not against the leader, so it cannot produce a skip.
         let non_voters = candidates.len() - voters.len();
         if voter_set.has_supermajority(non_voters) {
-            self.record_skip(round, leader_id.author.clone(), Some(leader_id.digest));
             return Ok(Decision::Skip);
         }
         Ok(Decision::Undecided)
+    }
+
+    /// Inspects an inactive direct-rule proposal bound to a held signed carrier.
+    ///
+    /// Checks a fixed-set quorum of explicit vote/nonvote vertices in the carrier's
+    /// causal history, exact vertex digests, elected leadership, trusted-tip continuity,
+    /// and the proposed frontier effect. Fence eligibility is deliberately not consulted.
+    /// All references must point to strictly older rounds. All retained causal history
+    /// must be available; pruned history is a trusted boundary,
+    /// but the carrier, leader, and voters themselves must be retained. A set/epoch change
+    /// in retained history is unsupported and rejected.
+    ///
+    /// This neither signs nor applies a decision. It does not authenticate the bootstrap
+    /// tip, bind its predecessor to a previous carrier, verify a QC, provide a view-change
+    /// rule, or activate live consensus. Its result is only a current-view inspection.
+    /// Work scales with the entire retained causal cone (including signature checks)
+    /// and committed tail, not merely the bounded proposal body. Callers must budget
+    /// this work before exposing inspection to untrusted request-driven processing.
+    ///
+    /// # Errors
+    /// Rejects malformed proposals, missing or inconsistent history, invalid signatures,
+    /// noncausal evidence, unsupported contexts, and incorrect frontier effects.
+    pub fn inspect_slot_proposal(
+        &self,
+        proposal: &crate::SlotProposal,
+        carrier: &VertexId,
+        tip: &crate::SlotDecisionTip,
+    ) -> Result<Decision, CryptoError> {
+        use crate::SlotOutcome;
+
+        let invalid =
+            |message: &str| CryptoError::new(CryptoErrorKind::MalformedCertificate, message);
+        let d = &proposal.decision;
+        let digest = proposal.digest()?;
+        let set = self.set_for_round(d.round);
+        d.validate(set)?;
+        if d.round == 0 || d.round == u64::MAX {
+            return Err(invalid("unsupported slot proposal round"));
+        }
+        if d.chain_id != self.chain_id
+            || d.chain_id != tip.chain_id()
+            || d.validator_set_id != *tip.set_id()
+            || d.epoch != tip.epoch()
+            || d.round != tip.next_round()
+            || d.previous != *tip.previous_id()
+            || d.before_len != tip.order_len()
+            || d.before_root != *tip.order_root()
+            || d.before_len != self.order_len() as u64
+            || d.before_root != self.commit_root()
+        {
+            return Err(invalid("slot proposal context or continuity mismatch"));
+        }
+        let voting_round = d.round + 1;
+        if self.set_for_round(voting_round).id()? != d.validator_set_id
+            || self.epoch_of(d.round) != d.epoch
+            || self.epoch_of(voting_round) != d.epoch
+            || carrier.round <= voting_round
+            || proposal.voters.len() != set.quorum_size()
+        {
+            return Err(invalid("slot proposal needs a fixed-set direct quorum"));
+        }
+
+        // Do not use is_ancestor here: it may return early and does not establish
+        // that every signed reference matches the exact vertex held for that slot.
+        let mut causal = HashSet::new();
+        let mut stack = vec![carrier.clone()];
+        while let Some(current) = stack.pop() {
+            if self.is_pruned(current.round) || !causal.insert(current.clone()) {
+                continue;
+            }
+            let vertex = self
+                .get(current.round, &current.author)
+                .ok_or_else(|| missing(&current))?;
+            if vertex.id()? != current || vertex.chain_id != d.chain_id {
+                return Err(invalid("slot proposal causal vertex mismatch"));
+            }
+            if self.set_for_round(current.round).id()? != d.validator_set_id
+                || self.epoch_of(current.round) != d.epoch
+            {
+                return Err(invalid("slot proposal causal history changes set or epoch"));
+            }
+            vertex.verify(set, d.epoch)?;
+            self.check_round_references(vertex)?;
+            if vertex
+                .references
+                .iter()
+                .any(|reference| reference.round >= vertex.round)
+            {
+                return Err(invalid("slot proposal contains a noncausal reference"));
+            }
+            if current == *carrier && vertex.payload_hash != digest {
+                return Err(invalid("slot proposal is not bound to its carrier"));
+            }
+            stack.extend(vertex.references.iter().cloned());
+        }
+        if self.is_pruned(carrier.round) {
+            return Err(invalid("slot proposal carrier is pruned"));
+        }
+        let leader = self
+            .leader(d.round)
+            .ok_or_else(|| invalid("slot proposal requires the retained elected leader"))?;
+        let leader_id = leader.id()?;
+        if leader.chain_id != d.chain_id {
+            return Err(invalid("slot proposal leader chain mismatch"));
+        }
+        leader.verify(set, d.epoch)?;
+        let committing = match &d.outcome {
+            SlotOutcome::Commit { leader } if *leader == leader_id => true,
+            SlotOutcome::Skip { leader_author } if *leader_author == leader_id.author => false,
+            _ => return Err(invalid("slot proposal names the wrong elected leader")),
+        };
+        let mut authors = HashSet::new();
+        for voter in &proposal.voters {
+            if voter.round != voting_round
+                || !causal.contains(voter)
+                || !authors.insert(&voter.author)
+            {
+                return Err(invalid("slot proposal has noncausal or duplicate voters"));
+            }
+            let vertex = self
+                .get(voter.round, &voter.author)
+                .ok_or_else(|| missing(voter))?;
+            if vertex.references.contains(&leader_id) != committing {
+                return Err(invalid("slot proposal evidence contradicts its outcome"));
+            }
+        }
+        let history = if committing {
+            self.collect_uncommitted_history(&leader_id)?
+        } else {
+            Vec::new()
+        };
+        let mut frontier = self.prefix.clone();
+        frontier.extend(&self.order);
+        frontier.extend(&history);
+        if d.after_len != frontier.len() as u64 || d.after_root != frontier.root() {
+            return Err(invalid("slot proposal frontier effect mismatch"));
+        }
+        Ok(if committing {
+            Decision::Commit(history)
+        } else {
+            Decision::Skip
+        })
     }
 
     /// Number of held vertices in `round + 1` that vote for the leader of
@@ -1202,7 +1357,7 @@ impl Dag {
 
     /// Collects `id` and its ancestors that are not yet committed, in a
     /// deterministic order.
-    fn commit_history(&mut self, id: &VertexId) -> Result<Vec<VertexId>, CryptoError> {
+    fn collect_uncommitted_history(&self, id: &VertexId) -> Result<Vec<VertexId>, CryptoError> {
         let mut collected: Vec<VertexId> = Vec::new();
         let mut seen: HashSet<VertexId> = HashSet::new();
         let mut stack = vec![id.clone()];
@@ -1237,11 +1392,33 @@ impl Dag {
         collected.sort_by(|a, b| a.round.cmp(&b.round).then_with(|| a.author.cmp(&b.author)));
         collected.dedup();
 
-        for vertex in &collected {
-            self.committed.insert(vertex.digest);
-            self.order.push(vertex.clone());
-        }
         Ok(collected)
+    }
+
+    // Apply only the inspection result for this same round and unchanged DAG.
+    // Keeping application private prevents external callers from applying stale candidates.
+    fn apply_inspected_decision(
+        &mut self,
+        round: u64,
+        decision: &Decision,
+    ) -> Result<(), CryptoError> {
+        match decision {
+            Decision::Commit(history) => {
+                for vertex in history {
+                    self.committed.insert(vertex.digest);
+                    self.order.push(vertex.clone());
+                }
+            }
+            Decision::Skip => {
+                let leader = self
+                    .leader(round)
+                    .expect("inspection found a held leader")
+                    .id()?;
+                self.record_skip(round, leader.author, Some(leader.digest));
+            }
+            Decision::Undecided => {}
+        }
+        Ok(())
     }
 
     /// The committed sequence above the retained prefix, in commit order.
@@ -1425,9 +1602,27 @@ impl Dag {
     ///
     /// # Errors
     ///
-    /// Propagates [`Dag::is_ancestor`] and [`Dag::commit_history`].
+    /// Propagates ancestry, vertex encoding, and missing-history errors.
     pub fn try_indirect_decide(
         &mut self,
+        round: u64,
+        anchor: &VertexId,
+    ) -> Result<Decision, CryptoError> {
+        let decision = self.inspect_indirect_decide(round, anchor)?;
+        self.apply_inspected_decision(round, &decision)?;
+        Ok(decision)
+    }
+
+    /// Inspects the indirect rule without changing the order or recording a skip.
+    ///
+    /// The caller must establish anchor eligibility and any additional voting gates.
+    /// This method does not check that the anchor is committed or quorum-supported.
+    /// Results describe the current view only and are not durable authorizations.
+    ///
+    /// # Errors
+    /// Propagates ancestry, vertex encoding, and missing-history errors.
+    pub fn inspect_indirect_decide(
+        &self,
         round: u64,
         anchor: &VertexId,
     ) -> Result<Decision, CryptoError> {
@@ -1441,10 +1636,9 @@ impl Dag {
         }
         let leader_id = leader.id()?;
         if self.is_ancestor(&leader_id, anchor)? {
-            let history = self.commit_history(&leader_id)?;
+            let history = self.collect_uncommitted_history(&leader_id)?;
             return Ok(Decision::Commit(history));
         }
-        self.record_skip(round, leader_id.author.clone(), Some(leader_id.digest));
         Ok(Decision::Skip)
     }
 }
@@ -2337,6 +2531,460 @@ mod tests {
         );
     }
 
+    fn bind_slot_proposal(fixture: &mut Fixture, proposal: &crate::SlotProposal) -> VertexId {
+        let carrier = vertex_with_payload(
+            fixture,
+            0,
+            LEADER_ROUND + 2,
+            fixture.ids(LEADER_ROUND + 1),
+            proposal.digest().unwrap(),
+        );
+        fixture
+            .dag
+            .vertices
+            .remove(&(carrier.round, carrier.author.clone()));
+        fixture.dag.insert(carrier).unwrap()
+    }
+
+    fn direct_slot_proposal(
+        committing: bool,
+    ) -> (
+        Fixture,
+        crate::SlotProposal,
+        VertexId,
+        crate::SlotDecisionTip,
+    ) {
+        let mut fixture = bootstrapped(4);
+        let references = if committing {
+            fixture.ids(LEADER_ROUND)
+        } else {
+            fixture.ids_without_leader(LEADER_ROUND)
+        };
+        fixture.full_round(LEADER_ROUND + 1, &references).unwrap();
+        let leader = fixture.dag.leader(LEADER_ROUND).unwrap().id().unwrap();
+        let history = if committing {
+            fixture.dag.collect_uncommitted_history(&leader).unwrap()
+        } else {
+            Vec::new()
+        };
+        let root = fixture.dag.commit_root();
+        let tip = crate::SlotDecisionTip::from_checkpoint(
+            fixture.dag.chain_id().to_vec(),
+            fixture.dag.set(),
+            LEADER_ROUND,
+            [7; 32],
+            0,
+            root,
+        )
+        .unwrap();
+        let proposal = crate::SlotProposal {
+            decision: crate::SlotDecision {
+                chain_id: fixture.dag.chain_id().to_vec(),
+                validator_set_id: fixture.dag.set().id().unwrap(),
+                epoch: EPOCH,
+                round: LEADER_ROUND,
+                previous: [7; 32],
+                before_len: 0,
+                before_root: root,
+                after_len: history.len() as u64,
+                after_root: commit_root(&history),
+                outcome: if committing {
+                    crate::SlotOutcome::Commit { leader }
+                } else {
+                    crate::SlotOutcome::Skip {
+                        leader_author: leader.author,
+                    }
+                },
+            },
+            voters: fixture.ids(LEADER_ROUND + 1)[..3].to_vec(),
+        };
+        let carrier = bind_slot_proposal(&mut fixture, &proposal);
+        (fixture, proposal, carrier, tip)
+    }
+
+    #[test]
+    fn slot_proposal_validates_explicit_direct_evidence_without_mutation() {
+        for committing in [false, true] {
+            let (fixture, proposal, carrier, tip) = direct_slot_proposal(committing);
+            let inspected = inspect_without_effects(&fixture.dag, |dag| {
+                dag.inspect_slot_proposal(&proposal, &carrier, &tip)
+            });
+            assert_eq!(matches!(inspected, Decision::Commit(_)), committing);
+            assert_eq!(inspected, fixture.dag.inspect_commit(LEADER_ROUND).unwrap());
+        }
+    }
+
+    #[test]
+    fn slot_proposal_rejects_changed_effect_context_and_evidence() {
+        for committing in [false, true] {
+            let (mut fixture, original, _, tip) = direct_slot_proposal(committing);
+            for mutation in 0..14 {
+                let mut proposal = original.clone();
+                match mutation {
+                    0 => proposal.decision.previous[0] ^= 1,
+                    1 => proposal.decision.after_root[0] ^= 1,
+                    2 => proposal.decision.before_root[0] ^= 1,
+                    3 => {
+                        proposal.voters.pop();
+                    }
+                    4 => proposal.voters[0].digest[0] ^= 1,
+                    5 => proposal.voters[0].round = LEADER_ROUND,
+                    6 => {
+                        proposal.decision.outcome = if committing {
+                            crate::SlotOutcome::Skip {
+                                leader_author: b"val-1".to_vec(),
+                            }
+                        } else {
+                            crate::SlotOutcome::Commit {
+                                leader: fixture.dag.leader(LEADER_ROUND).unwrap().id().unwrap(),
+                            }
+                        }
+                    }
+                    7 => proposal.decision.chain_id = b"another-chain".to_vec(),
+                    8 => proposal.decision.validator_set_id[0] ^= 1,
+                    9 => proposal.decision.epoch += 1,
+                    10 => proposal.decision.round = 0,
+                    11 => proposal.decision.round = u64::MAX,
+                    12 => proposal.decision.after_len += 1,
+                    13 => {
+                        proposal.decision.outcome = crate::SlotOutcome::Skip {
+                            leader_author: b"val-2".to_vec(),
+                        }
+                    }
+                    _ => unreachable!("bounded mutations"),
+                }
+                let carrier = bind_slot_proposal(&mut fixture, &proposal);
+                assert!(
+                    fixture
+                        .dag
+                        .inspect_slot_proposal(&proposal, &carrier, &tip)
+                        .is_err(),
+                    "mutation {mutation}, committing {committing}"
+                );
+                assert!(fixture.dag.order().is_empty());
+                assert!(fixture.dag.committed.is_empty());
+                assert!(fixture.dag.skipped().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn slot_proposal_requires_exact_held_carrier_and_complete_causal_history() {
+        let (mut fixture, proposal, carrier, tip) = direct_slot_proposal(true);
+        let mut forged = carrier.clone();
+        forged.digest[0] ^= 1;
+        assert!(
+            fixture
+                .dag
+                .inspect_slot_proposal(&proposal, &forged, &tip)
+                .is_err()
+        );
+        let mut unbound = proposal.clone();
+        unbound.voters[2] = fixture.ids(LEADER_ROUND + 1)[3].clone();
+        assert!(
+            fixture
+                .dag
+                .inspect_slot_proposal(&unbound, &carrier, &tip)
+                .is_err()
+        );
+        let victim = fixture.ids(0)[0].clone();
+        fixture.dag.vertices.remove(&(victim.round, victim.author));
+        assert_eq!(
+            fixture
+                .dag
+                .inspect_slot_proposal(&proposal, &carrier, &tip)
+                .unwrap_err()
+                .kind(),
+            CryptoErrorKind::MissingReference
+        );
+        assert!(fixture.dag.order().is_empty());
+    }
+
+    #[test]
+    fn slot_proposal_does_not_accept_held_but_noncausal_voters() {
+        let (mut fixture, mut proposal, _, tip) = direct_slot_proposal(true);
+        proposal.voters = fixture.ids(LEADER_ROUND + 1)[1..].to_vec();
+        let references = fixture.ids(LEADER_ROUND + 1)[..3].to_vec();
+        let carrier = vertex_with_payload(
+            &fixture,
+            0,
+            LEADER_ROUND + 2,
+            references,
+            proposal.digest().unwrap(),
+        );
+        fixture
+            .dag
+            .vertices
+            .remove(&(carrier.round, carrier.author.clone()));
+        let carrier = fixture.dag.insert(carrier).unwrap();
+        assert!(
+            fixture
+                .dag
+                .inspect_slot_proposal(&proposal, &carrier, &tip)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn slot_proposal_checks_the_full_cone_not_just_its_selected_voters() {
+        for bad_signature in [false, true] {
+            let (mut fixture, proposal, _, tip) = direct_slot_proposal(true);
+            if bad_signature {
+                fixture
+                    .dag
+                    .vertices
+                    .get_mut(&(0, b"val-3".to_vec()))
+                    .unwrap()
+                    .signature[0] ^= 1;
+            }
+            let mut references = fixture.ids(LEADER_ROUND + 1);
+            if !bad_signature {
+                let mut unrelated = fixture.ids(0)[3].clone();
+                unrelated.digest[0] ^= 1;
+                references.push(unrelated);
+            }
+            let carrier = vertex_with_payload(
+                &fixture,
+                0,
+                LEADER_ROUND + 2,
+                references,
+                proposal.digest().unwrap(),
+            );
+            fixture
+                .dag
+                .vertices
+                .remove(&(carrier.round, carrier.author.clone()));
+            let carrier = fixture.dag.insert(carrier).unwrap();
+            assert!(
+                fixture
+                    .dag
+                    .inspect_slot_proposal(&proposal, &carrier, &tip)
+                    .is_err()
+            );
+            assert!(fixture.dag.committed.is_empty());
+        }
+    }
+
+    #[test]
+    fn slot_proposal_extends_a_trusted_pruned_prefix() {
+        for committing in [false, true] {
+            let (mut fixture, mut proposal, _, _) = direct_slot_proposal(committing);
+            let prefix = CommitFrontier::from_order(&fixture.ids(0));
+            fixture.dag.seed_prefix(prefix.clone(), Vec::new());
+            fixture.dag.set_floor(0);
+            let leader = fixture.dag.leader(LEADER_ROUND).unwrap().id().unwrap();
+            let history = if committing {
+                fixture.dag.collect_uncommitted_history(&leader).unwrap()
+            } else {
+                Vec::new()
+            };
+            let mut after = prefix.clone();
+            after.extend(&history);
+            proposal.decision.before_len = prefix.len() as u64;
+            proposal.decision.before_root = prefix.root();
+            proposal.decision.after_len = after.len() as u64;
+            proposal.decision.after_root = after.root();
+            let tip = crate::SlotDecisionTip::from_checkpoint(
+                fixture.dag.chain_id().to_vec(),
+                fixture.dag.set(),
+                LEADER_ROUND,
+                proposal.decision.previous,
+                prefix.len() as u64,
+                prefix.root(),
+            )
+            .unwrap();
+            let carrier = bind_slot_proposal(&mut fixture, &proposal);
+            inspect_without_effects(&fixture.dag, |dag| {
+                dag.inspect_slot_proposal(&proposal, &carrier, &tip)
+            });
+            fixture.dag.set_floor(LEADER_ROUND);
+            assert!(
+                fixture
+                    .dag
+                    .inspect_slot_proposal(&proposal, &carrier, &tip)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn slot_proposal_rejects_same_round_and_forward_weak_references() {
+        for referenced_round in [LEADER_ROUND + 2, LEADER_ROUND + 3] {
+            let (mut fixture, proposal, _, tip) = direct_slot_proposal(true);
+            let references = fixture.ids(LEADER_ROUND + 1);
+            // These authors do not depend on the proposal carrier (author zero).
+            for author in 1..4 {
+                let vertex = vertex(&fixture, author, LEADER_ROUND + 2, references.clone());
+                fixture.dag.insert(vertex).unwrap();
+            }
+            if referenced_round == LEADER_ROUND + 3 {
+                let references = fixture.ids(LEADER_ROUND + 2)[1..].to_vec();
+                let vertex = vertex(&fixture, 1, referenced_round, references);
+                fixture.dag.insert(vertex).unwrap();
+            }
+            let weak = fixture
+                .dag
+                .get(referenced_round, b"val-1")
+                .unwrap()
+                .id()
+                .unwrap();
+            let mut references = fixture.ids(LEADER_ROUND + 1);
+            references.push(weak);
+            let carrier = vertex_with_payload(
+                &fixture,
+                0,
+                LEADER_ROUND + 2,
+                references,
+                proposal.digest().unwrap(),
+            );
+            fixture
+                .dag
+                .vertices
+                .remove(&(carrier.round, carrier.author.clone()));
+            let carrier = fixture.dag.insert(carrier).unwrap();
+            assert!(
+                fixture
+                    .dag
+                    .inspect_slot_proposal(&proposal, &carrier, &tip)
+                    .is_err(),
+                "noncausal edge to round {referenced_round} must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn slot_proposal_evidence_does_not_change_when_a_fence_arrives() {
+        for committing in [false, true] {
+            let (mut fixture, proposal, carrier, tip) = direct_slot_proposal(committing);
+            let before = fixture
+                .dag
+                .inspect_slot_proposal(&proposal, &carrier, &tip)
+                .unwrap();
+            let fence = fence_certificate(&fixture, LEADER_ROUND + 1, b"val-0");
+            fixture.dag.apply_fence(b"karsa-dag-1", &fence).unwrap();
+            assert_eq!(
+                fixture
+                    .dag
+                    .inspect_slot_proposal(&proposal, &carrier, &tip)
+                    .unwrap(),
+                before
+            );
+        }
+    }
+
+    fn inspect_without_effects(
+        dag: &Dag,
+        inspect: impl Fn(&Dag) -> Result<Decision, CryptoError>,
+    ) -> Decision {
+        let order = dag.order().to_vec();
+        let committed = dag.committed.clone();
+        let skipped = dag.skipped().to_vec();
+        let len = dag.order_len();
+        let root = dag.commit_root();
+        let decision = inspect(dag).unwrap();
+        assert_eq!(inspect(dag).unwrap(), decision);
+        assert_eq!(dag.order(), order);
+        assert_eq!(dag.committed, committed);
+        assert_eq!(dag.skipped(), skipped);
+        assert_eq!(dag.order_len(), len);
+        assert_eq!(dag.commit_root(), root);
+        decision
+    }
+
+    #[test]
+    fn inspection_preserves_direct_commit_skip_and_undecided_state() {
+        for positive_votes in [0, 2, 4] {
+            let mut fixture = bootstrapped(4);
+            let votes = fixture.ids(LEADER_ROUND);
+            let non_votes = fixture.ids_without_leader(LEADER_ROUND);
+            for author in 0..4 {
+                let references = if author < positive_votes {
+                    votes.clone()
+                } else {
+                    non_votes.clone()
+                };
+                let vertex = vertex(&fixture, author, LEADER_ROUND + 1, references);
+                fixture.dag.insert(vertex).unwrap();
+            }
+            let inspected =
+                inspect_without_effects(&fixture.dag, |dag| dag.inspect_commit(LEADER_ROUND));
+            match positive_votes {
+                0 => assert_eq!(inspected, Decision::Skip),
+                2 => assert_eq!(inspected, Decision::Undecided),
+                4 => assert!(matches!(inspected, Decision::Commit(_))),
+                _ => unreachable!("fixture uses only three vote counts"),
+            }
+            assert_eq!(fixture.dag.try_commit(LEADER_ROUND).unwrap(), inspected);
+            if inspected == Decision::Skip {
+                let leader = fixture.dag.leader(LEADER_ROUND).unwrap().id().unwrap();
+                assert_eq!(fixture.dag.skipped().len(), 1);
+                assert_eq!(fixture.dag.skipped()[0].round, LEADER_ROUND);
+                assert_eq!(fixture.dag.skipped()[0].author, leader.author);
+                assert_eq!(fixture.dag.skipped()[0].digest, Some(leader.digest));
+            }
+            if let Decision::Commit(history) = inspected {
+                assert_eq!(fixture.dag.order(), history);
+                assert_eq!(fixture.dag.commit_root(), commit_root(&history));
+                assert_eq!(
+                    inspect_without_effects(&fixture.dag, |dag| dag.inspect_commit(LEADER_ROUND)),
+                    Decision::Commit(Vec::new())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inspection_preserves_indirect_commit_skip_and_undecided_state() {
+        for includes_leader in [false, true] {
+            let mut fixture = bootstrapped(4);
+            let references = if includes_leader {
+                fixture.ids(LEADER_ROUND)
+            } else {
+                fixture.ids_without_leader(LEADER_ROUND)
+            };
+            fixture.full_round(LEADER_ROUND + 1, &references).unwrap();
+            let references = fixture.ids(LEADER_ROUND + 1);
+            fixture.full_round(LEADER_ROUND + 2, &references).unwrap();
+            let anchor = fixture.dag.leader(LEADER_ROUND + 2).unwrap().id().unwrap();
+            let inspected = inspect_without_effects(&fixture.dag, |dag| {
+                dag.inspect_indirect_decide(LEADER_ROUND, &anchor)
+            });
+            if includes_leader {
+                assert!(matches!(inspected, Decision::Commit(_)));
+            } else {
+                assert_eq!(inspected, Decision::Skip);
+            }
+            assert_eq!(
+                fixture
+                    .dag
+                    .try_indirect_decide(LEADER_ROUND, &anchor)
+                    .unwrap(),
+                inspected
+            );
+            match inspected {
+                Decision::Commit(history) => {
+                    assert_eq!(fixture.dag.order(), history);
+                    assert_eq!(fixture.dag.commit_root(), commit_root(&history));
+                }
+                Decision::Skip => {
+                    let leader = fixture.dag.leader(LEADER_ROUND).unwrap().id().unwrap();
+                    assert_eq!(fixture.dag.skipped().len(), 1);
+                    assert_eq!(fixture.dag.skipped()[0].round, LEADER_ROUND);
+                    assert_eq!(fixture.dag.skipped()[0].author, leader.author);
+                    assert_eq!(fixture.dag.skipped()[0].digest, Some(leader.digest));
+                }
+                Decision::Undecided => panic!("complete fixture must decide"),
+            }
+            let too_recent = fixture.dag.leader(LEADER_ROUND).unwrap().id().unwrap();
+            assert_eq!(
+                inspect_without_effects(&fixture.dag, |dag| {
+                    dag.inspect_indirect_decide(LEADER_ROUND, &too_recent)
+                }),
+                Decision::Undecided
+            );
+        }
+    }
+
     #[test]
     fn history_is_committed_once_and_in_a_stable_order() {
         let mut fixture = bootstrapped(4);
@@ -2383,9 +3031,53 @@ mod tests {
         let votes = fixture.ids(LEADER_ROUND);
         fixture.full_round(LEADER_ROUND + 1, &votes).unwrap();
 
+        let root = fixture.dag.commit_root();
+        for _ in 0..2 {
+            let error = fixture.dag.inspect_commit(LEADER_ROUND).unwrap_err();
+            assert_eq!(error.kind(), CryptoErrorKind::MissingReference);
+            assert!(fixture.dag.order().is_empty());
+            assert!(fixture.dag.committed.is_empty());
+            assert!(fixture.dag.skipped().is_empty());
+            assert_eq!(fixture.dag.commit_root(), root);
+        }
         let error = fixture.dag.try_commit(LEADER_ROUND).unwrap_err();
         assert_eq!(error.kind(), CryptoErrorKind::MissingReference);
         assert!(fixture.dag.order().is_empty());
+
+        let references = fixture.ids(LEADER_ROUND + 1);
+        fixture.full_round(LEADER_ROUND + 2, &references).unwrap();
+        let held_anchor = fixture.dag.leader(LEADER_ROUND + 2).unwrap().id().unwrap();
+        let missing_anchor = VertexId {
+            round: LEADER_ROUND + 2,
+            author: b"val-9".to_vec(),
+            digest: [9; 32],
+        };
+        let leader = fixture.dag.leader(LEADER_ROUND).unwrap().id().unwrap();
+        assert!(fixture.dag.is_ancestor(&leader, &held_anchor).unwrap());
+        // A missing anchor fails during traversal; a reachable leader with missing
+        // history fails during collection. Neither may partially apply a decision.
+        for anchor in [missing_anchor, held_anchor] {
+            for _ in 0..2 {
+                let error = fixture
+                    .dag
+                    .inspect_indirect_decide(LEADER_ROUND, &anchor)
+                    .unwrap_err();
+                assert_eq!(error.kind(), CryptoErrorKind::MissingReference);
+                assert!(fixture.dag.order().is_empty());
+                assert!(fixture.dag.committed.is_empty());
+                assert!(fixture.dag.skipped().is_empty());
+                assert_eq!(fixture.dag.commit_root(), root);
+            }
+            let error = fixture
+                .dag
+                .try_indirect_decide(LEADER_ROUND, &anchor)
+                .unwrap_err();
+            assert_eq!(error.kind(), CryptoErrorKind::MissingReference);
+            assert!(fixture.dag.order().is_empty());
+            assert!(fixture.dag.committed.is_empty());
+            assert!(fixture.dag.skipped().is_empty());
+            assert_eq!(fixture.dag.commit_root(), root);
+        }
     }
 
     #[test]
