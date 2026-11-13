@@ -23,6 +23,8 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crypto::CryptoError;
 use crypto::encoding::{Decoder, Encoder};
@@ -299,9 +301,75 @@ pub struct CertifiedHeader {
 }
 
 /// A directory holding a node's append-only state.
+///
+/// This is a single-owner, single-writer store, not a concurrent database.
+/// An OS-backed exclusive lock excludes independently opened handles (including
+/// other processes) for the lifetime of the owner and all its clones. Callers
+/// must still serialize compound operations and must not use owner clones during
+/// staging or activation. Clones follow activation, but the path lock does not
+/// make compound operations concurrent-safe.
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
+    active: Arc<RwLock<PathBuf>>,
+    // Closing the last owner, clone, or private view releases the OS lock.
+    lock: Arc<File>,
+}
+
+/// An unpublished private copy, borrowing its owner until activation or drop.
+/// Dropping without activation removes the copy best-effort. Neither this view
+/// nor its clones may be retained or used after activation or drop: they are
+/// private flat handles, not owner clones, and do not follow publication.
+#[derive(Debug)]
+pub struct StagedStore<'a> {
+    owner: &'a mut Store,
+    view: Store,
+    generation: String,
+    published: bool,
+}
+
+impl StagedStore<'_> {
+    /// The flat private store on which to perform adoption writes.
+    pub fn store(&self) -> &Store {
+        &self.view
+    }
+
+    /// Publishes the complete generation by atomically replacing `CURRENT`.
+    ///
+    /// # Errors
+    /// Returns filesystem errors before publication. Cleanup after publication
+    /// is best-effort and cannot turn successful publication into an error.
+    pub fn activate(mut self) -> Result<(), StoreError> {
+        validate_generation(&self.view.root)?;
+        validate_pointer_file(&self.owner.root.join("CURRENT"))?;
+        let temporary = self.owner.root.join("CURRENT.tmp");
+        // Remove only a regular abandoned pointer, never follow a symlink.
+        validate_pointer_file(&temporary)?;
+        if temporary.try_exists()? {
+            fs::remove_file(&temporary)?;
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(self.generation.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, self.owner.root.join("CURRENT"))?;
+        // Publication is irreversible: even a poisoned path lock must not make
+        // Drop remove the generation now selected by CURRENT.
+        self.published = true;
+        *self.owner.active.write().expect("store path lock poisoned") = self.view.root.clone();
+        cleanup_generations(&self.owner.root, Some(&self.generation));
+        Ok(())
+    }
+}
+
+impl Drop for StagedStore<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = remove_generation(&self.view.root);
+        }
+    }
 }
 
 impl Store {
@@ -309,21 +377,144 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Io`] when the directory cannot be created.
+    /// [`StoreError::Io`] when the directory cannot be created, or when `CURRENT`
+    /// is malformed, not a regular file, or names a missing or invalid generation.
+    /// An absent pointer selects the legacy flat store; an invalid one never does.
+    /// Returns an actionable [`StoreError::Io`] if another handle holds the
+    /// exclusive directory lock. The `.lock` entry must be a regular file.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        let lock_path = root.join(".lock");
+        match fs::symlink_metadata(&lock_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => return Err(invalid_layout("store .lock is not a regular file")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        fs2::FileExt::try_lock_exclusive(&lock).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("cannot exclusively lock store {}: {error}; close other store handles or stop the process using this directory", root.display()),
+            )
+        })?;
+        let lock = Arc::new(lock);
+        let pointer = root.join("CURRENT");
+        validate_pointer_file(&pointer)?;
+        let generation = match fs::read_to_string(&pointer) {
+            Ok(name) if generation_name(&name) => Some(name),
+            Ok(_) => return Err(invalid_layout("malformed CURRENT")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let active = if let Some(name) = &generation {
+            let path = root.join(name);
+            validate_generation(&path)?;
+            path
+        } else {
+            root.clone()
+        };
+        cleanup_generations(&root, generation.as_deref());
+        Ok(Self {
+            root,
+            active: Arc::new(RwLock::new(active)),
+            lock,
+        })
     }
 
-    /// The directory this store writes to.
+    /// The stable logical root, independent of the active generation.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.root
     }
 
     fn path_of(&self, name: &str) -> PathBuf {
-        self.root.join(name)
+        self.active
+            .read()
+            .expect("store path lock poisoned")
+            .join(name)
+    }
+
+    /// Copies the active files into an unpublished generation on the same filesystem.
+    ///
+    /// No other handles or clones may be used until this stage is dropped or
+    /// activated. The borrowed owner cannot be used in the meantime.
+    ///
+    /// # Errors
+    /// Returns filesystem errors for invalid layouts or failed copies, and decode
+    /// errors for complete corrupt log records. The active files are unchanged.
+    pub fn stage(&mut self) -> Result<StagedStore<'_>, StoreError> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let source = self
+            .active
+            .read()
+            .expect("store path lock poisoned")
+            .clone();
+        let (generation, path) = loop {
+            let name = format!(
+                "generation-{}{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            );
+            let path = self.root.join(&name);
+            match fs::create_dir(&path) {
+                Ok(()) => break (name, path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let lock = Arc::clone(&self.lock);
+        let stage = StagedStore {
+            owner: self,
+            view: Store {
+                root: path.clone(),
+                active: Arc::new(RwLock::new(path.clone())),
+                lock,
+            },
+            generation,
+            published: false,
+        };
+        for entry in fs::read_dir(&source)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == ".lock"
+                || name == "CURRENT"
+                || name == "CURRENT.tmp"
+                || name.ends_with(".tmp")
+                || generation_name(&name)
+            {
+                continue;
+            }
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                return Err(invalid_layout("symlink in active store"));
+            }
+            if kind.is_file() {
+                fs::copy(entry.path(), path.join(name.as_ref()))?;
+            } else if source != stage.owner.root {
+                return Err(invalid_layout("directory in active generation"));
+            }
+        }
+        // Validate complete records before trimming framing-only torn tails.
+        stage.view.vertices()?;
+        stage.view.batches()?;
+        stage.view.shards()?;
+        stage.view.headers()?;
+        stage.view.fences()?;
+        stage.view.round_skips()?;
+        stage.view.fence_shares()?;
+        stage.view.clock_samples()?;
+        for name in LOG_FILES {
+            trim_torn_tail(&path.join(name))?;
+        }
+        Ok(stage)
     }
 
     /// Flushes both logs to the operating system.
@@ -1261,15 +1452,7 @@ impl Store {
     ///
     /// [`StoreError::Io`] when the directory cannot be read.
     pub fn disk_bytes(&self) -> Result<u64, StoreError> {
-        let mut total = 0u64;
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            let metadata = entry.metadata()?;
-            if metadata.is_file() {
-                total = total.saturating_add(metadata.len());
-            }
-        }
-        Ok(total)
+        directory_bytes(&self.root)
     }
 
     /// Records that the node's head was at `round` at `unix_seconds`.
@@ -1778,6 +1961,144 @@ fn decode_live_order(
     Ok(order)
 }
 
+const LOG_FILES: &[&str] = &[
+    VERTICES_FILE,
+    BATCHES_FILE,
+    SHARDS_FILE,
+    HEADERS_FILE,
+    FENCES_FILE,
+    ROUND_SKIPS_FILE,
+    FENCE_SHARES_FILE,
+    CLOCK_FILE,
+];
+const LEGACY_FILES: &[&str] = &[
+    ROOTS_FILE,
+    VERTICES_FILE,
+    BATCHES_FILE,
+    SNAPSHOT_FILE,
+    SHARDS_FILE,
+    SET_CHANGE_FILE,
+    FENCES_FILE,
+    ROUND_SKIPS_FILE,
+    FENCE_SHARES_FILE,
+    FENCE_FILE,
+    GENESIS_FILE,
+    GENESIS_HEADER_FILE,
+    GENESIS_STATE_FILE,
+    HEADERS_FILE,
+    CLOCK_FILE,
+    LIVE_SNAPSHOT_FILE,
+];
+
+fn invalid_layout(message: &str) -> StoreError {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message).into()
+}
+
+fn generation_name(name: &str) -> bool {
+    name.strip_prefix("generation-")
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn validate_pointer_file(path: &Path) -> Result<(), StoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(invalid_layout("pointer is not a regular file")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_generation(path: &Path) -> Result<(), StoreError> {
+    if !fs::symlink_metadata(path)?.file_type().is_dir() {
+        return Err(invalid_layout("generation is not a directory"));
+    }
+    for entry in fs::read_dir(path)? {
+        if !entry?.file_type()?.is_file() {
+            return Err(invalid_layout("generation contains a non-regular file"));
+        }
+    }
+    Ok(())
+}
+
+fn remove_generation(path: &Path) -> Result<(), StoreError> {
+    if !fs::symlink_metadata(path)?.file_type().is_dir() {
+        return Err(invalid_layout("generation is not a directory"));
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            remove_generation(&entry.path())?;
+        } else {
+            // Unlink symlinks themselves; never traverse their targets.
+            fs::remove_file(entry.path())?;
+        }
+    }
+    fs::remove_dir(path)?;
+    Ok(())
+}
+
+fn cleanup_generations(root: &Path, active: Option<&str>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if generation_name(name) && Some(name) != active {
+            let _ = remove_generation(&entry.path());
+        } else if active.is_some()
+            && LEGACY_FILES.contains(&name)
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn directory_bytes(path: &Path) -> Result<u64, StoreError> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_file() {
+            total = total.saturating_add(entry.metadata()?.len());
+        } else if kind.is_dir() {
+            total = total.saturating_add(directory_bytes(&entry.path())?);
+        }
+    }
+    Ok(total)
+}
+
+fn trim_torn_tail(path: &Path) -> Result<(), StoreError> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut cursor = 0usize;
+    while bytes.len() - cursor >= 4 {
+        let length = u32::from_le_bytes(
+            bytes[cursor..cursor + 4]
+                .try_into()
+                .expect("four-byte length"),
+        ) as usize;
+        let Some(end) = (cursor + 4).checked_add(length) else {
+            break;
+        };
+        if end > bytes.len() {
+            break;
+        }
+        cursor = end;
+    }
+    if cursor != bytes.len() {
+        OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .set_len(cursor as u64)?;
+    }
+    Ok(())
+}
+
 fn rewrite(path: &Path, contents: &[u8]) -> Result<(), StoreError> {
     let temporary = path.with_extension("tmp");
     {
@@ -1926,6 +2247,363 @@ mod tests {
         Fence, FenceCertificate, NO_EXPIRY, NoVoteAttestation, RoundSkip, RoundSkipProof,
         SetChange, ValidatorKey, ValidatorRecord, ValidatorSet, VertexId,
     };
+
+    #[test]
+    fn staged_generations_publish_and_clones_follow() {
+        let dir = TempDir::new();
+        let mut owner = Store::open(&dir.0).unwrap();
+        owner.put_batch(&batch(1)).unwrap();
+        let logical = owner.path().to_path_buf();
+        {
+            let stage = owner.stage().unwrap();
+            stage.store().put_batch(&batch(2)).unwrap();
+            assert_eq!(fs::read_dir(&logical).unwrap().count(), 3);
+            let stage_path = stage.store().path().to_path_buf();
+            assert!(Store::open(&logical).is_err());
+            assert!(
+                stage_path.is_dir(),
+                "failed second open must not clean a live stage"
+            );
+            assert!(!stage_path.join(".lock").exists());
+        }
+        // An abandoned generation as left by process loss, without leaking a lock FD.
+        fs::create_dir(logical.join("generation-888")).unwrap();
+        fs::copy(
+            owner.path_of(BATCHES_FILE),
+            logical.join("generation-888/batches.log"),
+        )
+        .unwrap();
+        drop(owner);
+        let mut owner = Store::open(&logical).unwrap();
+        assert!(!logical.join("generation-888").exists());
+        assert_eq!(owner.batches().unwrap().len(), 1);
+        let stage = owner.stage().unwrap();
+        stage.store().put_batch(&batch(2)).unwrap();
+        stage.activate().unwrap();
+        assert!(Store::open(&logical).is_err());
+        assert_eq!(owner.batches().unwrap().len(), 2);
+        // A clone of this owner shares routing, unlike independently opened handles.
+        let clone = owner.clone();
+        let stage = owner.stage().unwrap();
+        stage.store().put_batch(&batch(3)).unwrap();
+        stage.activate().unwrap();
+        assert_eq!(clone.batches().unwrap().len(), 3);
+        assert_eq!(owner.path(), logical);
+        assert_eq!(
+            owner.disk_bytes().unwrap(),
+            directory_bytes(&logical).unwrap()
+        );
+        assert_eq!(
+            fs::read_dir(&logical)
+                .unwrap()
+                .filter(|e| generation_name(e.as_ref().unwrap().file_name().to_str().unwrap()))
+                .count(),
+            1
+        );
+        drop(clone);
+    }
+
+    #[test]
+    fn staged_drop_and_failed_write_leave_old_store_untouched() {
+        let dir = TempDir::new();
+        let mut owner = Store::open(&dir.0).unwrap();
+        owner.put_batch(&batch(1)).unwrap();
+        {
+            let stage = owner.stage().unwrap();
+            fs::create_dir(stage.store().path_of(ROOTS_FILE)).unwrap();
+            assert!(
+                stage
+                    .store()
+                    .put_roots(Roots {
+                        commit_root: [1; 32],
+                        state_root: [2; 32]
+                    })
+                    .is_err()
+            );
+        }
+        assert!(owner.roots().unwrap().is_none());
+        drop(owner);
+        assert_eq!(Store::open(&dir.0).unwrap().batches().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn staged_torn_tail_is_trimmed_before_append() {
+        let dir = TempDir::new();
+        let mut owner = Store::open(&dir.0).unwrap();
+        owner.put_batch(&batch(1)).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(owner.path_of(BATCHES_FILE))
+            .unwrap()
+            .write_all(&[255, 255])
+            .unwrap();
+        let original = fs::read(owner.path_of(BATCHES_FILE)).unwrap();
+        let stage = owner.stage().unwrap();
+        stage.store().put_batch(&batch(2)).unwrap();
+        assert_eq!(stage.store().batches().unwrap().len(), 2);
+        stage.activate().unwrap();
+        assert_eq!(owner.batches().unwrap().len(), 2);
+        assert!(original.ends_with(&[255, 255]));
+    }
+
+    #[test]
+    fn invalid_current_never_falls_back() {
+        for pointer in [
+            "",
+            "../generation-1",
+            "generation-1/",
+            "generation-1\n",
+            "generation-999",
+        ] {
+            let dir = TempDir::new();
+            fs::write(dir.0.join("CURRENT"), pointer).unwrap();
+            assert!(Store::open(&dir.0).is_err(), "pointer {pointer:?}");
+        }
+    }
+
+    #[test]
+    fn staged_snapshot_and_vertex_cuts_preserve_auxiliary_records() {
+        let dir = TempDir::new();
+        let mut owner = Store::open(&dir.0).unwrap();
+        let old = live_snapshot_fixture();
+        let mut new = old.clone();
+        new.round += 10;
+        new.state = b"new encoded state".to_vec();
+        let first = vertex(1, &batch(1));
+        let second = vertex(2, &batch(2));
+        owner.put_live_snapshot(&old).unwrap();
+        owner.append_vertex(&first).unwrap();
+        owner.bind_genesis(&[42; 32]).unwrap();
+        owner.put_shard(&[7; 32], 2, b"shard bytes").unwrap();
+        owner.put_fence_share(&fence_certificate()).unwrap();
+        owner.clear_fence_share(b"val-0").unwrap();
+        owner.record_clock(1, 1234).unwrap();
+        let preserved: Vec<_> = [GENESIS_FILE, SHARDS_FILE, FENCE_SHARES_FILE, CLOCK_FILE]
+            .iter()
+            .map(|name| (*name, fs::read(owner.path_of(name)).unwrap()))
+            .collect();
+        let clone = owner.clone();
+        let old_snapshot_bytes = fs::read(owner.path_of(LIVE_SNAPSHOT_FILE)).unwrap();
+        {
+            let stage = owner.stage().unwrap();
+            stage.store().put_live_snapshot(&new).unwrap();
+            stage.store().append_vertex(&second).unwrap();
+            assert_eq!(stage.store().live_snapshot().unwrap(), Some(new.clone()));
+            assert_eq!(
+                stage.store().vertices().unwrap(),
+                vec![first.clone(), second.clone()]
+            );
+            // Inspect the logical root without opening a second cleanup-capable handle.
+            assert!(!dir.0.join("CURRENT").exists());
+            assert_eq!(
+                fs::read(dir.0.join(LIVE_SNAPSHOT_FILE)).unwrap(),
+                old_snapshot_bytes
+            );
+        }
+        assert!(Store::open(&dir.0).is_err());
+        assert_eq!(owner.live_snapshot().unwrap(), Some(old.clone()));
+        assert_eq!(owner.vertices().unwrap(), vec![first.clone()]);
+        let stage = owner.stage().unwrap();
+        stage.store().put_live_snapshot(&new).unwrap();
+        stage.store().append_vertex(&second).unwrap();
+        stage.activate().unwrap();
+        assert_eq!(clone.live_snapshot().unwrap(), Some(new.clone()));
+        assert_eq!(
+            clone.vertices().unwrap(),
+            vec![first.clone(), second.clone()]
+        );
+        drop(clone);
+        drop(owner);
+        let reopened = Store::open(&dir.0).unwrap();
+        assert_eq!(reopened.live_snapshot().unwrap(), Some(new));
+        assert_eq!(reopened.vertices().unwrap(), vec![first, second]);
+        assert_eq!(reopened.genesis().unwrap(), Some([42; 32]));
+        assert_eq!(reopened.shards().unwrap()[0].bytes, b"shard bytes");
+        assert!(reopened.fence_shares().unwrap().is_empty());
+        for (name, bytes) in preserved {
+            assert_eq!(
+                fs::read(reopened.path_of(name)).unwrap(),
+                bytes,
+                "preserve {name} verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_corrupt_log_rejects_stage_without_changing_active() {
+        let dir = TempDir::new();
+        let mut owner = Store::open(&dir.0).unwrap();
+        owner.put_live_snapshot(&live_snapshot_fixture()).unwrap();
+        owner.append_vertex(&vertex(1, &batch(1))).unwrap();
+        append_record(&owner.path_of(VERTICES_FILE), b"invalid complete vertex").unwrap();
+        let before = fs::read(owner.path_of(VERTICES_FILE)).unwrap();
+        assert!(matches!(owner.stage(), Err(StoreError::Decode(_))));
+        assert_eq!(fs::read(owner.path_of(VERTICES_FILE)).unwrap(), before);
+        assert_eq!(
+            owner.live_snapshot().unwrap(),
+            Some(live_snapshot_fixture())
+        );
+        assert!(!dir.0.join("CURRENT").exists());
+        assert!(
+            !fs::read_dir(&dir.0)
+                .unwrap()
+                .any(|entry| generation_name(entry.unwrap().file_name().to_str().unwrap()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_pointers_and_generations_are_rejected_without_traversal() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new();
+        let outside = TempDir::new();
+        fs::write(outside.0.join("pointer"), "generation-1").unwrap();
+        fs::write(outside.0.join("keep"), b"untouched").unwrap();
+        symlink(outside.0.join("pointer"), dir.0.join("CURRENT")).unwrap();
+        assert!(Store::open(&dir.0).is_err());
+        fs::remove_file(dir.0.join("CURRENT")).unwrap();
+        symlink(&outside.0, dir.0.join("generation-1")).unwrap();
+        fs::write(dir.0.join("CURRENT"), "generation-1").unwrap();
+        assert!(Store::open(&dir.0).is_err());
+        fs::remove_file(dir.0.join("generation-1")).unwrap();
+        fs::create_dir(dir.0.join("generation-1")).unwrap();
+        symlink(
+            outside.0.join("keep"),
+            dir.0.join("generation-1/vertices.log"),
+        )
+        .unwrap();
+        assert!(Store::open(&dir.0).is_err());
+        assert_eq!(fs::read(outside.0.join("keep")).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn cleanup_failure_does_not_reject_publication_or_remove_unrelated_names() {
+        let dir = TempDir::new();
+        let mut owner = Store::open(&dir.0).unwrap();
+        owner.put_live_snapshot(&live_snapshot_fixture()).unwrap();
+        // An owned-looking regular file cannot be removed as a generation.
+        fs::write(dir.0.join("generation-999"), b"cleanup obstacle").unwrap();
+        fs::write(dir.0.join("notes"), b"keep file").unwrap();
+        fs::create_dir(dir.0.join("generation-not-owned")).unwrap();
+        fs::write(dir.0.join("generation-not-owned/keep"), b"keep directory").unwrap();
+        let stage = owner.stage().unwrap();
+        stage.store().append_vertex(&vertex(2, &batch(2))).unwrap();
+        stage.activate().unwrap();
+        drop(owner);
+        let reopened = Store::open(&dir.0).unwrap();
+        assert_eq!(reopened.vertices().unwrap().len(), 1);
+        assert_eq!(
+            reopened.live_snapshot().unwrap(),
+            Some(live_snapshot_fixture())
+        );
+        assert_eq!(
+            fs::read(dir.0.join("generation-999")).unwrap(),
+            b"cleanup obstacle"
+        );
+        assert_eq!(fs::read(dir.0.join("notes")).unwrap(), b"keep file");
+        assert_eq!(
+            fs::read(dir.0.join("generation-not-owned/keep")).unwrap(),
+            b"keep directory"
+        );
+    }
+
+    #[test]
+    fn published_generation_survives_poisoned_routing_lock() {
+        let dir = TempDir::new();
+        let mut owner = Store::open(&dir.0).unwrap();
+        let stage = owner.stage().unwrap();
+        stage
+            .store()
+            .put_live_snapshot(&live_snapshot_fixture())
+            .unwrap();
+        let active = Arc::clone(&stage.owner.active);
+        let _ = std::thread::spawn(move || {
+            let _guard = active.write().unwrap();
+            panic!("poison routing lock for publication regression test");
+        })
+        .join();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stage.activate())).is_err()
+        );
+        drop(owner);
+        assert_eq!(
+            Store::open(&dir.0).unwrap().live_snapshot().unwrap(),
+            Some(live_snapshot_fixture())
+        );
+    }
+
+    #[test]
+    fn clone_retains_exclusive_directory_lock() {
+        let dir = TempDir::new();
+        let owner = Store::open(&dir.0).unwrap();
+        let clone = owner.clone();
+        drop(owner);
+        let error = Store::open(&dir.0).unwrap_err();
+        assert!(matches!(&error, StoreError::Io(_)));
+        assert!(error.to_string().contains(&dir.0.display().to_string()));
+        assert!(error.to_string().contains("close other store handles"));
+        drop(clone);
+        let reopened = Store::open(&dir.0).unwrap();
+        assert!(dir.0.join(".lock").is_file());
+        drop(reopened);
+        assert!(dir.0.join(".lock").is_file(), "never unlink the lock inode");
+    }
+
+    #[test]
+    fn exclusive_lock_excludes_subprocess() {
+        const CHILD_ROOT: &str = "KARSA_STORE_LOCK_TEST_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            assert!(matches!(
+                Store::open(PathBuf::from(root)),
+                Err(StoreError::Io(_))
+            ));
+            return;
+        }
+        let dir = TempDir::new();
+        let mut owner = Store::open(&dir.0).unwrap();
+        let stage = owner.stage().unwrap();
+        let staged_path = stage.store().path().to_path_buf();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::exclusive_lock_excludes_subprocess",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, &dir.0)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("lock subprocess exceeded 15 seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(staged_path.is_dir());
+        stage.activate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_lock_is_rejected_without_touching_target() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new();
+        let outside = TempDir::new();
+        let target = outside.0.join("keep");
+        fs::write(&target, b"do not truncate").unwrap();
+        symlink(&target, dir.0.join(".lock")).unwrap();
+        assert!(Store::open(&dir.0).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"do not truncate");
+        fs::remove_file(dir.0.join(".lock")).unwrap();
+        fs::create_dir(dir.0.join(".lock")).unwrap();
+        assert!(Store::open(&dir.0).is_err());
+    }
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -2108,6 +2786,16 @@ mod tests {
     #[test]
     fn a_live_snapshot_round_trips() {
         let dir = TempDir::new();
+        let snapshot = live_snapshot_fixture();
+        {
+            let store = Store::open(&dir.0).unwrap();
+            store.put_live_snapshot(&snapshot).unwrap();
+        }
+        let store = Store::open(&dir.0).unwrap();
+        assert_eq!(store.live_snapshot().unwrap(), Some(snapshot));
+    }
+
+    fn live_snapshot_fixture() -> LiveSnapshot {
         let header = Header::genesis(b"karsa-store-1".to_vec(), 0, [1; 32], [2; 32]);
         let first = VertexId {
             round: 1,
@@ -2119,7 +2807,7 @@ mod tests {
             author: b"val-1".to_vec(),
             digest: [4; 32],
         };
-        let snapshot = LiveSnapshot {
+        LiveSnapshot {
             round: 7,
             floor: Some(5),
             cursor: 8,
@@ -2140,13 +2828,7 @@ mod tests {
             },
             transition: Some(transition_certificate()),
             fences: vec![fence_certificate()],
-        };
-        {
-            let store = Store::open(&dir.0).unwrap();
-            store.put_live_snapshot(&snapshot).unwrap();
         }
-        let store = Store::open(&dir.0).unwrap();
-        assert_eq!(store.live_snapshot().unwrap(), Some(snapshot));
     }
 
     #[test]
@@ -2648,6 +3330,7 @@ mod tests {
         assert_eq!(read[2].header, header(3));
 
         // A rewrite is visible to a reopen, not just to the live handle.
+        drop(store);
         let reopened = Store::open(&dir.0).unwrap();
         assert_eq!(reopened.headers().unwrap().len(), 3);
         assert_eq!(reopened.truncate_headers(3).unwrap(), 0);
@@ -2663,6 +3346,7 @@ mod tests {
         assert_eq!(store.genesis_header().unwrap(), Some(header(0)));
 
         // The file is replaced atomically and survives a reopen.
+        drop(store);
         let reopened = Store::open(&dir.0).unwrap();
         assert_eq!(reopened.genesis_header().unwrap(), Some(header(0)));
     }
@@ -2679,6 +3363,7 @@ mod tests {
             Some(b"state-bytes".to_vec())
         );
 
+        drop(store);
         let reopened = Store::open(&dir.0).unwrap();
         assert_eq!(
             reopened.genesis_state().unwrap(),
@@ -2714,6 +3399,7 @@ mod tests {
 
         // Binding again to the same chain is harmless, and survives reopening.
         store.bind_genesis(&chain).unwrap();
+        drop(store);
         let reopened = Store::open(&dir.0).unwrap();
         reopened.require_genesis(&chain).unwrap();
     }

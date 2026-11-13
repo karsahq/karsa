@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Karsa append-only on-disk state for vertices, batches, and roots"
 
 [dependencies]
+fs2 = "0.4"
 crypto = { path = "../crypto" }
 tx = { path = "../tx" }
 validator = { path = "../validator" }

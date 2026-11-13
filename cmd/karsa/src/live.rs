@@ -2882,6 +2882,40 @@ fn load_local_fence_shares(
     Ok(shares)
 }
 
+fn snapshot_preserves_finality(anchor: &Header, certified: Option<&Header>) -> bool {
+    certified.is_none_or(|head| anchor.height > head.height || anchor == head)
+}
+
+#[derive(Debug)]
+enum AdoptionError {
+    Rejected(String),
+    Interrupted(String),
+}
+
+impl From<String> for AdoptionError {
+    fn from(message: String) -> Self {
+        Self::Rejected(message)
+    }
+}
+
+impl From<&str> for AdoptionError {
+    fn from(message: &str) -> Self {
+        Self::Rejected(message.into())
+    }
+}
+
+impl std::fmt::Display for AdoptionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(message) => f.write_str(message),
+            Self::Interrupted(message) => write!(
+                f,
+                "snapshot installation interrupted; restart required: {message}"
+            ),
+        }
+    }
+}
+
 /// Verifies a received snapshot and starts the node from its anchor.
 ///
 /// Nothing is trusted because it arrived: the state root must match the anchor,
@@ -2894,8 +2928,8 @@ fn adopt_snapshot(
     finalizer: &mut Option<Finalizer>,
     batches: &mut HashMap<[u8; 32], Batch>,
     chain_id: &[u8],
-    store: Option<&Store>,
-) -> Result<Adopted, String> {
+    store: Option<&mut Store>,
+) -> Result<Adopted, AdoptionError> {
     let wire::Snapshot {
         state,
         order,
@@ -2928,140 +2962,146 @@ fn adopt_snapshot(
     let finalizer = finalizer
         .as_mut()
         .ok_or("a snapshot join needs execution (--execute)")?;
-    if let Some(transition) = &transition {
-        // The finalizer checks the certified head and the built head against the
-        // activation epoch. Doing it first keeps a rejected transition from
-        // changing the DAG's schedule before the adoption is refused.
-        finalizer
-            .adopt_set_change(transition)
-            .map_err(|error| format!("snapshot set change cannot be activated: {error}"))?;
-        node.adopt_set_change(transition)
-            .map_err(|error| format!("snapshot set change is not authorized: {error}"))?;
-    }
-    // Installed before the tail so every replayed vertex is judged by the same
-    // rules the live sender applied. A tail vertex that arrived before the
-    // fence is inert, and a fresh DAG would reject it on insert. Nothing is
-    // written yet: a tail vertex that fails leaves only valid vertices and
-    // fences behind, never a half-seeded prefix.
-    apply_snapshot_fences(node, None, &fences)?;
-    let vertices: Vec<validator::Vertex> = vertices
-        .into_iter()
-        .filter(|vertex| !inert_under_fences(vertex, &fences))
-        .collect();
-    for vertex in &vertices {
-        node.receive(vertex.clone())
-            .map_err(|error| format!("cannot replay a snapshot tail vertex: {error}"))?;
-    }
-    // Round skips are decision inputs for the tail. Install them only after the
-    // vertices they name are held: a proof is verified against the leader and
-    // the voting-round vertices, so a proof that arrived before its evidence
-    // would be rejected rather than queued. A proof at or below the snapshot
-    // floor is already covered by the adopted prefix; its control payload still
-    // travels so a tail vertex naming it is not mistaken for a transaction
-    // batch.
-    let mut verified_skips = Vec::new();
-    for proof in round_skips {
-        let payload = ControlPayload::RoundSkip(Box::new(proof.clone()));
-        node.add_control(payload)
-            .map_err(|error| format!("snapshot round skip payload is invalid: {error}"))?;
-        if floor.is_none_or(|floor| proof.attestation.skip.round() > floor) {
-            node.apply_round_skip(proof.clone())
-                .map_err(|error| format!("snapshot round skip is not authorized: {error}"))?;
-        }
-        verified_skips.push(proof);
-    }
-    // Only now is the anchor switched: the certificate was verified against the
-    // schedule the transition installed, and every record the new prefix needs
-    // has already been accepted by the DAG.
-    finalizer
-        .adopt_anchor(anchor.clone(), &certificate, order_len)
-        .map_err(|error| format!("snapshot anchor is not certified: {error}"))?;
-    let stored_order = order.clone();
-    let stored_prefix = prefix.clone();
-    node.seed_prefix(prefix, order);
-    if let Some(floor) = floor {
-        node.set_floor(floor);
-    }
-    node.set_cursor(cursor);
-    let batch_count = incoming.len();
-    if let Some(store) = store {
+    // Once installation mutates consensus state, an error must stop this task.
+    // The disk stage can roll back, but the node and finalizer cannot.
+    (|| -> Result<Adopted, String> {
         if let Some(transition) = &transition {
-            store
-                .put_set_change(transition)
-                .map_err(|error| error.to_string())?;
+            // The finalizer checks the certified head and the built head against the
+            // activation epoch. Doing it first keeps a rejected transition from
+            // changing the DAG's schedule before the adoption is refused.
+            finalizer
+                .adopt_set_change(transition)
+                .map_err(|error| format!("snapshot set change cannot be activated: {error}"))?;
+            node.adopt_set_change(transition)
+                .map_err(|error| format!("snapshot set change is not authorized: {error}"))?;
         }
-        for certificate in &fences {
-            store
-                .put_fence(certificate)
-                .map_err(|error| error.to_string())?;
-        }
-        store
-            .put_header(&anchor, &certificate)
-            .map_err(|error| error.to_string())?;
+        // Installed before the tail so every replayed vertex is judged by the same
+        // rules the live sender applied. A tail vertex that arrived before the
+        // fence is inert, and a fresh DAG would reject it on insert. Disk writes
+        // remain private until the complete adoption is ready to publish.
+        apply_snapshot_fences(node, None, &fences)?;
+        let vertices: Vec<validator::Vertex> = vertices
+            .into_iter()
+            .filter(|vertex| !inert_under_fences(vertex, &fences))
+            .collect();
         for vertex in &vertices {
+            node.receive(vertex.clone())
+                .map_err(|error| format!("cannot replay a snapshot tail vertex: {error}"))?;
+        }
+        // Round skips are decision inputs for the tail. Install them only after the
+        // vertices they name are held: a proof is verified against the leader and
+        // the voting-round vertices, so a proof that arrived before its evidence
+        // would be rejected rather than queued. A proof at or below the snapshot
+        // floor is already covered by the adopted prefix; its control payload still
+        // travels so a tail vertex naming it is not mistaken for a transaction
+        // batch.
+        let mut verified_skips = Vec::new();
+        for proof in round_skips {
+            let payload = ControlPayload::RoundSkip(Box::new(proof.clone()));
+            node.add_control(payload)
+                .map_err(|error| format!("snapshot round skip payload is invalid: {error}"))?;
+            if floor.is_none_or(|floor| proof.attestation.skip.round() > floor) {
+                node.apply_round_skip(proof.clone())
+                    .map_err(|error| format!("snapshot round skip is not authorized: {error}"))?;
+            }
+            verified_skips.push(proof);
+        }
+        // Only now is the anchor switched: the certificate was verified against the
+        // schedule the transition installed, and every record the new prefix needs
+        // has already been accepted by the DAG.
+        finalizer
+            .adopt_anchor(anchor.clone(), &certificate, order_len)
+            .map_err(|error| format!("snapshot anchor is not certified: {error}"))?;
+        let stored_order = order.clone();
+        let stored_prefix = prefix.clone();
+        node.seed_prefix(prefix, order);
+        if let Some(floor) = floor {
+            node.set_floor(floor);
+        }
+        node.set_cursor(cursor);
+        let batch_count = incoming.len();
+        let applied = usize::try_from(anchor.applied)
+            .map_err(|_| format!("{} applied transactions do not fit", anchor.applied))?;
+        if let Some(owner) = store {
+            let staged = owner.stage().map_err(|error| error.to_string())?;
+            let store = staged.store();
+            if let Some(transition) = &transition {
+                store
+                    .put_set_change(transition)
+                    .map_err(|error| error.to_string())?;
+            }
+            for certificate in &fences {
+                store
+                    .put_fence(certificate)
+                    .map_err(|error| error.to_string())?;
+            }
             store
-                .append_vertex(vertex)
+                .put_header(&anchor, &certificate)
                 .map_err(|error| error.to_string())?;
-        }
-        for batch in &incoming {
-            store.put_batch(batch).map_err(|error| error.to_string())?;
-        }
-        for proof in &verified_skips {
+            for vertex in &vertices {
+                store
+                    .append_vertex(vertex)
+                    .map_err(|error| error.to_string())?;
+            }
+            for batch in &incoming {
+                store.put_batch(batch).map_err(|error| error.to_string())?;
+            }
+            for proof in &verified_skips {
+                store
+                    .put_round_skip(proof)
+                    .map_err(|error| error.to_string())?;
+            }
+            // The snapshot and its tail stay private until CURRENT selects this
+            // generation. A prepublication crash leaves the old restart cut intact.
             store
-                .put_round_skip(proof)
+                .put_live_snapshot(&store::LiveSnapshot {
+                    round: anchor.round,
+                    floor,
+                    cursor,
+                    applied: anchor.applied,
+                    state: state.clone(),
+                    order: stored_order,
+                    order_len,
+                    prefix: stored_prefix,
+                    header: anchor.clone(),
+                    certificate: certificate.clone(),
+                    transition: transition.clone(),
+                    fences: fences.clone(),
+                })
                 .map_err(|error| error.to_string())?;
+            store
+                .truncate_headers(anchor.height)
+                .map_err(|error| error.to_string())?;
+            staged.activate().map_err(|error| error.to_string())?;
         }
-        // The live snapshot is the activation point: all records the restart
-        // needs are already on disk before this file appears. A crash before
-        // the write leaves valid tail records without an adopted snapshot, so
-        // the node resumes from its previous anchor and replays them; a crash
-        // after it leaves a complete snapshot. Writing it first would make a
-        // crash leave a snapshot whose tail was never stored.
-        store
-            .put_live_snapshot(&store::LiveSnapshot {
-                round: anchor.round,
-                floor,
-                cursor,
-                applied: anchor.applied,
-                state: state.clone(),
-                order: stored_order,
-                order_len,
-                prefix: stored_prefix,
-                header: anchor.clone(),
-                certificate: certificate.clone(),
-                transition: transition.clone(),
-                fences: fences.clone(),
-            })
-            .map_err(|error| error.to_string())?;
-    }
-    for batch in incoming {
-        if let Ok(digest) = batch.digest() {
-            batches.insert(digest, batch);
+        for batch in incoming {
+            if let Ok(digest) = batch.digest() {
+                batches.insert(digest, batch);
+            }
         }
-    }
-    let highest = node.dag().highest_round().unwrap_or(anchor.round);
-    let authored_top = node.dag().get(highest, node.id()).is_some();
-    let round = if authored_top {
-        highest.saturating_add(1)
-    } else {
-        highest
-    }
-    .max(cursor);
-    node.set_round(round);
-    let applied = usize::try_from(anchor.applied)
-        .map_err(|_| format!("{} applied transactions do not fit", anchor.applied))?;
-    Ok(Adopted {
-        state: decoded,
-        applied,
-        order_len,
-        anchor,
-        certificate,
-        floor,
-        vertices: vertices.len(),
-        batches: batch_count,
-        fences,
-        round_skips: verified_skips,
-    })
+        let highest = node.dag().highest_round().unwrap_or(anchor.round);
+        let authored_top = node.dag().get(highest, node.id()).is_some();
+        let round = if authored_top {
+            highest.saturating_add(1)
+        } else {
+            highest
+        }
+        .max(cursor);
+        node.set_round(round);
+        Ok(Adopted {
+            state: decoded,
+            applied,
+            order_len,
+            anchor,
+            certificate,
+            floor,
+            vertices: vertices.len(),
+            batches: batch_count,
+            fences,
+            round_skips: verified_skips,
+        })
+    })()
+    .map_err(AdoptionError::Interrupted)
 }
 
 async fn node_task(
@@ -3098,7 +3138,7 @@ async fn node_task(
         chain_id.clone(),
     );
     let accounts = committee.accounts.clone();
-    let store = if config.store.as_os_str().is_empty() {
+    let mut store = if config.store.as_os_str().is_empty() {
         None
     } else {
         Some(
@@ -3513,8 +3553,9 @@ async fn node_task(
             &mut finalizer,
             &mut batches,
             &chain_id,
-            store.as_ref(),
-        )?;
+            store.as_mut(),
+        )
+        .map_err(|error| error.to_string())?;
         let install_ms = u64::try_from(install_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let state_root = adopted.state.state_root();
         println!(
@@ -3543,12 +3584,6 @@ async fn node_task(
             install_ms,
         });
         if let Some(store) = &store {
-            // A store that was started from an older view may still hold headers
-            // above the adopted anchor. Those records can never extend the new
-            // chain, so they go before the log starts accepting new heights.
-            store
-                .truncate_headers(adopted.anchor.height)
-                .map_err(|error| error.to_string())?;
             // A resync moves a store that already has history forward. The data
             // below the adopted floor can no longer be reached by a restart, so
             // dropping it here is what keeps the directory from growing with a
@@ -4477,12 +4512,15 @@ async fn node_task(
                             // it refuses a shorter snapshot rather than risk
                             // dropping entries that were already final.
                             .unwrap_or_else(|| node.dag().order_len());
-                        if snapshot.anchor.height <= certified {
-                            // The node kept certifying while the fetch was in
-                            // flight. Moving the chain to an older anchor would
-                            // roll back finality, so the snapshot is useless.
+                        if !snapshot_preserves_finality(
+                            &snapshot.anchor,
+                            last_certified.as_ref().map(|(header, _)| header),
+                        ) {
+                            // A fetch may arrive just as its anchor is certified
+                            // locally. The identical header can still supply its
+                            // missing prefix; an older or conflicting head cannot.
                             eprintln!(
-                                "node {index} reseed: snapshot from {served_by} at height {} is not above the certified head {certified}; ignored (reason {})",
+                                "node {index} reseed: snapshot from {served_by} at height {} is older than or conflicts with certified head {certified}; ignored (reason {})",
                                 snapshot.anchor.height,
                                 attempt.as_ref().map_or("unknown", |attempt| attempt.reason)
                             );
@@ -4500,13 +4538,14 @@ async fn node_task(
                             let saved_round = node.round();
                             let saved_cursor = node.cursor();
                             let install_started = Instant::now();
+                            let release_floor = snapshot.floor;
                             match adopt_snapshot(
                                 snapshot,
                                 &mut node,
                                 &mut finalizer,
                                 &mut batches,
                                 &chain_id,
-                                store.as_ref(),
+                                store.as_mut(),
                             ) {
                                 Ok(adopted) => Some((
                                     served_by,
@@ -4515,7 +4554,11 @@ async fn node_task(
                                     saved_cursor,
                                     install_started,
                                 )),
-                                Err(error) => {
+                                Err(error @ AdoptionError::Interrupted(_)) => {
+                                    release_served_snapshot(index, served_by, &chain_id, release_floor);
+                                    return Err(error.to_string());
+                                }
+                                Err(error @ AdoptionError::Rejected(_)) => {
                                     eprintln!(
                                         "node {index} reseed: snapshot from {served_by} was rejected: {error} (reason {})",
                                         attempt.as_ref().map_or("unknown", |attempt| attempt.reason)
@@ -4637,12 +4680,6 @@ async fn node_task(
                     coverage_lower = coverage_lower.max(adopted.order_len);
                     header_writes.rebase(adopted.anchor.height, adopted.order_len);
                     if let Some(store) = &store {
-                        // Headers above the anchor were certified under the view
-                        // this snapshot replaces: the anchor's chain continues
-                        // above it, so those records can never be adopted again.
-                        store
-                            .truncate_headers(adopted.anchor.height)
-                            .map_err(|error| error.to_string())?;
                         // Everything below the adopted floor is now reachable
                         // only through the snapshot, exactly as after a startup
                         // join.
@@ -6048,7 +6085,7 @@ async fn node_task(
         reseeded,
         disk_bytes: store
             .as_ref()
-            .map_or(0, |store| directory_bytes(store.path())),
+            .map_or(0, |store| store.disk_bytes().unwrap_or(0)),
         rejected,
         committed: node.dag().order_len(),
         bytes_in: bytes_in.load(Ordering::Relaxed),
@@ -6231,7 +6268,7 @@ async fn archive_task(
         reseeded: 0,
         disk_bytes: store
             .as_ref()
-            .map_or(0, |store| directory_bytes(store.path())),
+            .map_or(0, |store| store.disk_bytes().unwrap_or(0)),
         rejected,
         committed: 0,
         bytes_in: bytes_in.load(Ordering::Relaxed),
@@ -6242,22 +6279,6 @@ async fn archive_task(
         prefix: CommitFrontier::empty(),
         profile: Profile::default(),
     })
-}
-
-/// Total bytes of the files directly inside a store directory.
-///
-/// This is what the node actually wrote, record headers included, so it is the
-/// number a disk budget should use rather than a model of one.
-fn directory_bytes(path: &std::path::Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.metadata().ok())
-        .filter(|meta| meta.is_file())
-        .map(|meta| meta.len())
-        .sum()
 }
 
 /// Writes one batch to a store, whole or as this node's erasure shard.
@@ -7521,6 +7542,21 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_at_the_identical_certified_head_can_supply_missing_coverage() {
+        let head = Header::genesis(b"snapshot-race".to_vec(), 0, [1; 32], [2; 32]);
+        assert!(snapshot_preserves_finality(&head, Some(&head)));
+        assert!(snapshot_preserves_finality(&head, None));
+        let mut conflicting = head.clone();
+        conflicting.dag_root[0] ^= 1;
+        assert!(!snapshot_preserves_finality(&conflicting, Some(&head)));
+        let mut newer = head.clone();
+        newer.height += 1;
+        newer.previous = head.id().unwrap();
+        assert!(snapshot_preserves_finality(&newer, Some(&head)));
+        assert!(!snapshot_preserves_finality(&head, Some(&newer)));
+    }
+
+    #[test]
     fn coverage_gap_trigger_boundaries() {
         let ready = Duration::from_secs(10);
         assert!(!coverage_gap_needed(
@@ -8045,7 +8081,7 @@ mod tests {
             batches: Vec::new(),
         };
         let dir = TestDir::new("snapshot-fence");
-        let store = Store::open(&dir.0).unwrap();
+        let mut store = Store::open(&dir.0).unwrap();
         let signer = 1;
         let mut node = Node::with_chain_id_and_epoch_length(
             set.clone(),
@@ -8066,15 +8102,38 @@ mod tests {
             )
             .unwrap(),
         );
+        // Publication failure must leave every imported record private, and
+        // must be distinguished from a rejection safe for the live loop to skip.
+        std::fs::create_dir(dir.0.join("CURRENT.tmp")).unwrap();
+        let error = adopt_snapshot(
+            snapshot.clone(),
+            &mut node,
+            &mut finalizer,
+            &mut HashMap::new(),
+            &chain_id,
+            Some(&mut store),
+        )
+        .err()
+        .expect("a directory cannot be replaced as the publication pointer");
+        assert!(matches!(error, AdoptionError::Interrupted(_)));
+        assert!(store.vertices().unwrap().is_empty());
+        assert!(store.headers().unwrap().is_empty());
+        assert!(store.fences().unwrap().is_empty());
+        assert!(store.round_skips().unwrap().is_empty());
+        assert!(store.live_snapshot().unwrap().is_none());
+        std::fs::remove_dir(dir.0.join("CURRENT.tmp")).unwrap();
+
         let adopted = adopt_snapshot(
             snapshot,
             &mut node,
             &mut finalizer,
             &mut HashMap::new(),
             &chain_id,
-            Some(&store),
+            Some(&mut store),
         )
         .expect("the fenced snapshot must be adopted");
+
+        assert!(dir.0.join("CURRENT").is_file());
 
         assert_eq!(adopted.vertices, 7, "four genesis vertices and three votes");
         assert!(node.dag().is_fenced(&fenced, 1));
@@ -8091,6 +8150,11 @@ mod tests {
             store.live_snapshot().unwrap().unwrap().fences,
             vec![fence_certificate]
         );
+        drop(store);
+        let reopened = Store::open(&dir.0).unwrap();
+        assert_eq!(reopened.vertices().unwrap().len(), 7);
+        assert_eq!(reopened.headers().unwrap().len(), 1);
+        assert_eq!(reopened.live_snapshot().unwrap().unwrap().header.height, 1);
     }
 
     #[test]
@@ -8495,6 +8559,7 @@ mod tests {
             store.live_snapshot().unwrap().is_some(),
             "the restart must not discard the checkpoint"
         );
+        drop(store);
         crate::audit::run(dir.0.join("val-0"), 4, None)
             .expect("a checkpoint-pruned store must audit above its anchor");
     }
@@ -8526,6 +8591,7 @@ mod tests {
         certificate.round = phantom.round;
         certificate.vertex_id = phantom_id.to_vec();
         store.put_header(&phantom, &certificate).unwrap();
+        drop(store);
 
         let second = run(mesh_config(&dir, a_free_port_base(4), 5, 0));
         assert!(second.is_ok(), "the restart failed: {second:?}");
@@ -8538,6 +8604,7 @@ mod tests {
                 .any(|record| record.header.id().unwrap() == phantom_id),
             "the unprovable head must not survive the restart"
         );
+        drop(store);
         crate::audit::run(dir.0.join("val-0"), 4, None)
             .expect("a store healed by the replay must audit");
     }
@@ -8569,6 +8636,7 @@ mod tests {
         certificate.round = skipped.round;
         certificate.vertex_id = skipped_id.to_vec();
         store.put_header(&skipped, &certificate).unwrap();
+        drop(store);
 
         let second = run(mesh_config(&dir, a_free_port_base(4), 5, 0));
         assert!(second.is_ok(), "the restart failed: {second:?}");
@@ -8582,6 +8650,7 @@ mod tests {
                 .any(|record| record.header.id().unwrap() == skipped_id),
             "the header above the gap must not survive the restart"
         );
+        drop(store);
         crate::audit::run(dir.0.join("val-0"), 4, None)
             .expect("a store healed at the gap must audit");
     }

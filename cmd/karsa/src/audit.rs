@@ -626,6 +626,16 @@ mod tests {
     }
 
     #[test]
+    fn an_owned_store_cannot_be_audited_concurrently() {
+        let dir = TempDir::new();
+        let store = write_store(&dir, true);
+        let error = run(dir.0.clone(), 4, None).unwrap_err().to_string();
+        assert!(error.contains("cannot exclusively lock store"), "{error}");
+        drop(store);
+        assert!(run(dir.0.clone(), 4, None).is_ok());
+    }
+
+    #[test]
     fn a_forged_certified_root_is_caught() {
         let dir = TempDir::new();
         let store = write_store(&dir, true);
@@ -646,6 +656,7 @@ mod tests {
         forged.state_root = [0xAB; 32];
         let certificate = chain::certify(&consensus, &forged).unwrap();
         store.put_header(&forged, &certificate).unwrap();
+        drop(store);
 
         let error = run(dir.0.clone(), 4, None).unwrap_err().to_string();
         assert!(
