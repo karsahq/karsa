@@ -967,6 +967,209 @@ struct ProvableHead {
     top: u64,
 }
 
+/// Certified headers the store has not accepted yet.
+///
+/// A peer can certify a header before the vertices behind its `dag_root` arrive.
+/// Writing it then leaves a header the retained order cannot reproduce, so a
+/// crash followed by a restart has to drop it. The queue writes a header only
+/// once its committed prefix is in the local order, and only in height order:
+/// the stored log then stays a chain the next restart can adopt without repair.
+struct HeaderWrites {
+    /// Height of the last header the store holds.
+    height: u64,
+    /// Committed prefix that header covers.
+    coverage: usize,
+    /// Headers above `height` waiting for their covered prefix.
+    pending: VecDeque<(Header, Certificate)>,
+    /// The front header and order length of the last scan that found nothing.
+    /// Retrying while neither changed would only burn the tick on the same
+    /// unprovable prefix.
+    scanned: Option<(u64, usize)>,
+}
+
+impl HeaderWrites {
+    /// Starts writing above the last header the store holds.
+    fn resume(height: u64, coverage: usize) -> Self {
+        Self {
+            height,
+            coverage,
+            pending: VecDeque::new(),
+            scanned: None,
+        }
+    }
+
+    /// Adopts a snapshot boundary, discarding headers from the old view.
+    fn rebase(&mut self, height: u64, coverage: usize) {
+        self.height = height;
+        self.coverage = coverage;
+        self.pending.clear();
+        self.scanned = None;
+    }
+
+    /// Queues a newly certified header and writes the ones already provable.
+    fn push(
+        &mut self,
+        store: Option<&Store>,
+        finalizer: &mut Finalizer,
+        header: Header,
+        certificate: Certificate,
+    ) -> Result<(), String> {
+        if store.is_none() {
+            return Ok(());
+        }
+        self.pending.push_back((header, certificate));
+        self.write_ready(store, finalizer).map(|_| ())
+    }
+
+    /// Writes queued headers whose coverage the finalizer already knows.
+    ///
+    /// This is the hot path: a header this node built carries its own order
+    /// length, so writing it stays immediate. A peer header waits for the scan
+    /// below rather than paying a prefix walk on every share.
+    fn write_ready(
+        &mut self,
+        store: Option<&Store>,
+        finalizer: &mut Finalizer,
+    ) -> Result<usize, String> {
+        let Some(store) = store else { return Ok(0) };
+        let mut written = 0;
+        while let Some(height) = self.pending.front().map(|(header, _)| header.height) {
+            if height <= self.height {
+                self.pending.pop_front();
+                continue;
+            }
+            if height != self.height.saturating_add(1) {
+                break;
+            }
+            let Some(coverage) = finalizer.certified_order(height) else {
+                break;
+            };
+            if coverage < self.coverage {
+                break;
+            }
+            let (header, certificate) = self.pending.pop_front().expect("the front was read");
+            store
+                .put_header(&header, &certificate)
+                .map_err(|error| error.to_string())?;
+            self.height = height;
+            self.coverage = coverage;
+            self.scanned = None;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    /// Writes queued headers whose `dag_root` the committed order now contains.
+    ///
+    /// The scan builds one frontier at the last written coverage and then walks
+    /// the order forward across the headers in this flush. Rebuilding the root
+    /// from the prefix for every header would make draining a backlog quadratic
+    /// in exactly the case the queue exists to handle. A header whose root is
+    /// absent blocks the queue: a later height cannot be written above a gap
+    /// without breaking the chain a restart adopts. A failed scan is cached so
+    /// the same unprovable prefix is not walked twice at the same order length.
+    fn write_scanned(
+        &mut self,
+        store: Option<&Store>,
+        node: &Node,
+        finalizer: &mut Finalizer,
+    ) -> Result<usize, String> {
+        let Some(store) = store else { return Ok(0) };
+        let dag = node.dag();
+        let base = dag.prefix().len();
+        let upper = dag.order_len();
+        let mut frontier = dag.prefix().clone();
+        let mut at = base;
+        // The frontier is usable only when the last written coverage is one of
+        // the retained order lengths. Known coverage stays writable regardless;
+        // an unknown one waits until the order can be walked again.
+        let mut ready = self.coverage >= base && self.coverage <= upper;
+        if ready {
+            while at < self.coverage {
+                frontier.push(&dag.order()[at - base]);
+                at += 1;
+            }
+        }
+        let mut written = 0;
+        while let Some((height, dag_root)) = self
+            .pending
+            .front()
+            .map(|(header, _)| (header.height, header.dag_root))
+        {
+            if height <= self.height {
+                self.pending.pop_front();
+                continue;
+            }
+            if height != self.height.saturating_add(1) {
+                break;
+            }
+            let coverage = match finalizer.certified_order(height) {
+                Some(coverage) if coverage >= self.coverage => {
+                    if ready {
+                        while at < coverage {
+                            frontier.push(&dag.order()[at - base]);
+                            at += 1;
+                        }
+                    }
+                    coverage
+                }
+                Some(_) => break,
+                None => {
+                    if self.scanned == Some((height, upper)) {
+                        break;
+                    }
+                    if !ready {
+                        self.scanned = Some((height, upper));
+                        break;
+                    }
+                    let mut len = at;
+                    let mut root = frontier.root();
+                    let mut found = None;
+                    loop {
+                        if root == dag_root {
+                            found = Some(len);
+                            break;
+                        }
+                        if len >= upper {
+                            break;
+                        }
+                        frontier.push(&dag.order()[len - base]);
+                        len += 1;
+                        at = len;
+                        root = frontier.root();
+                    }
+                    if found.is_none() {
+                        self.scanned = Some((height, upper));
+                    }
+                    match found {
+                        Some(coverage) => coverage,
+                        None => break,
+                    }
+                }
+            };
+            // Keep the frontier at the prefix just written so the next header
+            // continues from there instead of rebuilding from the start.
+            if ready {
+                while at < coverage {
+                    frontier.push(&dag.order()[at - base]);
+                    at += 1;
+                }
+            }
+            let (header, certificate) = self.pending.pop_front().expect("the front was read");
+            store
+                .put_header(&header, &certificate)
+                .map_err(|error| error.to_string())?;
+            finalizer.note_certified_order(height, coverage);
+            self.height = height;
+            self.coverage = coverage;
+            self.scanned = None;
+            written += 1;
+            ready = self.coverage >= base && self.coverage <= upper;
+        }
+        Ok(written)
+    }
+}
+
 /// Replays the stored DAG and finds the longest stored header prefix it proves.
 ///
 /// The pacemaker starts at the current cursor, so this is the same decision
@@ -1011,13 +1214,19 @@ fn replay_to_provable_head(
     }
 
     // Headers are sorted by height. A header whose root the replay never reached
-    // ends the provable prefix: a gap cannot be skipped, because the finalizer
-    // adopts each stored header as the next link in one chain.
+    // ends the provable prefix, and so does a height gap: the finalizer adopts
+    // each stored header as the next link in one chain, so it cannot skip a
+    // height even when a later header's root happens to be in the retained
+    // order. A crashed adoption can leave exactly that shape.
     let mut from = 0usize;
+    let mut expected = base_height.saturating_add(1);
     let mut matched: Option<(u64, usize, u64)> = None;
     for record in headers {
         if record.header.height <= base_height {
             continue;
+        }
+        if record.header.height != expected {
+            break;
         }
         let Some(index) = boundaries[from..]
             .iter()
@@ -1032,6 +1241,7 @@ fn replay_to_provable_head(
             boundaries[index].0,
             boundaries[index].1,
         ));
+        expected = record.header.height.saturating_add(1);
     }
 
     let (height, len, cursor) = matched.unwrap_or((base_height, boundaries[0].0, boundaries[0].1));
@@ -3290,6 +3500,12 @@ async fn node_task(
             install_ms,
         });
         if let Some(store) = &store {
+            // A store that was started from an older view may still hold headers
+            // above the adopted anchor. Those records can never extend the new
+            // chain, so they go before the log starts accepting new heights.
+            store
+                .truncate_headers(adopted.anchor.height)
+                .map_err(|error| error.to_string())?;
             // A resync moves a store that already has history forward. The data
             // below the adopted floor can no longer be reached by a restart, so
             // dropping it here is what keeps the directory from growing with a
@@ -3513,6 +3729,28 @@ async fn node_task(
                 .is_some_and(|finalizer| finalizer.certified_order(header.height).is_some())
         })
         .map(|(header, certificate)| (header.clone(), certificate.clone()));
+    // Header writes resume above the last record the previous run left. When
+    // that run was interrupted between a checkpoint and its anchor record, the
+    // log can end below the live snapshot; the snapshot's height is the floor
+    // then, because every later header extends that anchor.
+    let write_floor = restored
+        .as_ref()
+        .and_then(|restored| restored.checkpoint)
+        .or_else(|| snapshot_report.as_ref().map(|report| report.height))
+        .unwrap_or(0);
+    let mut header_writes = HeaderWrites::resume(
+        last_certified
+            .as_ref()
+            .map_or(write_floor, |(header, _)| header.height),
+        last_certified
+            .as_ref()
+            .and_then(|(header, _)| {
+                finalizer
+                    .as_ref()
+                    .and_then(|finalizer| finalizer.certified_order(header.height))
+            })
+            .unwrap_or(coverage_lower),
+    );
 
     let mut state_history: VecDeque<(u64, State)> = VecDeque::new();
     if config.snapshot_port > 0 || config.checkpoint_every > 0 {
@@ -3811,11 +4049,15 @@ async fn node_task(
                                         finalizer.certified_order(certified.header.height),
                                     );
                                 }
-                                if let Some(store) = &store {
-                                    store
-                                        .put_header(&certified.header, &certified.certificate)
-                                        .map_err(|error| error.to_string())?;
-                                }
+                                // A peer header is written only once the committed
+                                // prefix its `dag_root` names is local. Writing it
+                                // earlier leaves a store the restart has to repair.
+                                header_writes.push(
+                                    store.as_ref(),
+                                    finalizer,
+                                    certified.header,
+                                    certified.certificate,
+                                )?;
                             }
                         }
                     }
@@ -4334,7 +4576,14 @@ async fn node_task(
                     announced_floor = None;
                     last_checkpoint = adopted.anchor.height;
                     coverage_lower = coverage_lower.max(adopted.order_len);
+                    header_writes.rebase(adopted.anchor.height, adopted.order_len);
                     if let Some(store) = &store {
+                        // Headers above the anchor were certified under the view
+                        // this snapshot replaces: the anchor's chain continues
+                        // above it, so those records can never be adopted again.
+                        store
+                            .truncate_headers(adopted.anchor.height)
+                            .map_err(|error| error.to_string())?;
                         // Everything below the adopted floor is now reachable
                         // only through the snapshot, exactly as after a startup
                         // join.
@@ -4931,11 +5180,15 @@ async fn node_task(
                                 finalizer.certified_order(certified.header.height),
                             );
                         }
-                        if let Some(store) = &store {
-                            store
-                                .put_header(&certified.header, &certified.certificate)
-                                .map_err(|error| error.to_string())?;
-                        }
+                        // A header this node built carries its own coverage, so
+                        // this writes immediately; a peer header waits until its
+                        // prefix is proved instead of forcing a repair on restart.
+                        header_writes.push(
+                            store.as_ref(),
+                            finalizer,
+                            certified.header,
+                            certified.certificate,
+                        )?;
                     }
                 }
                 // The active set can change at a set-change boundary. Rebuild the
@@ -5277,6 +5530,19 @@ async fn node_task(
                     coverage_lower = coverage_lower.max(coverage);
                     last_provable = Some((header.clone(), certificate.clone()));
                 }
+                // A queued peer header becomes writable once the committed order
+                // contains its root. Scan at this cadence rather than on every
+                // share: a lagging node would otherwise walk its whole prefix
+                // for each certification it adopts.
+                if ticks % CHECKPOINT_TICKS == 0
+                    && let Some(finalizer) = finalizer.as_mut()
+                {
+                    let written =
+                        header_writes.write_scanned(store.as_ref(), &node, finalizer)?;
+                    if written > 0 {
+                        coverage_lower = coverage_lower.max(header_writes.coverage);
+                    }
+                }
                 if config.checkpoint_every > 0
                     && ticks % CHECKPOINT_TICKS == 0
                     && let Some(store) = &store
@@ -5297,6 +5563,8 @@ async fn node_task(
                 {
                     let height = snapshot.anchor.height;
                     let coverage = snapshot.order_len;
+                    let anchor = snapshot.anchor.clone();
+                    let certificate = snapshot.certificate.clone();
                     store
                         .put_live_snapshot(&store::LiveSnapshot {
                             round: snapshot.anchor.round,
@@ -5328,6 +5596,20 @@ async fn node_task(
                     let pruned = store
                         .prune_to_checkpoint(usize::from(config.shard))
                         .map_err(|error| error.to_string())?;
+                    // An older peer header can still be waiting for the vertices
+                    // that prove it, so the header log may not have reached the
+                    // checkpoint anchor. Write the anchor alone rather than a
+                    // chain with a gap: records below it may be sparse, while
+                    // everything written above it stays contiguous.
+                    if header_writes.height < height {
+                        store
+                            .put_header(&anchor, &certificate)
+                            .map_err(|error| error.to_string())?;
+                        eprintln!(
+                            "node {index} checkpoint at height {height}: wrote the anchor alone, the header log is at {}",
+                            header_writes.height
+                        );
+                    }
                     last_checkpoint = height;
                     coverage_lower = coverage_lower.max(coverage);
                     eprintln!(
@@ -8092,6 +8374,50 @@ mod tests {
     }
 
     #[test]
+    fn a_mesh_drops_a_stored_header_that_skips_a_height() {
+        let _mesh = mesh_test_lock();
+        let dir = TestDir::new("header-gap");
+        let first = run(mesh_config(&dir, a_free_port_base(4), 30, 2));
+        assert!(first.is_ok(), "the first run failed: {first:?}");
+
+        // A crashed snapshot adoption writes its anchor before the live snapshot
+        // is activated. The old anchor then has a record above it with a height
+        // gap, and that record's root can still be reachable: the replay must
+        // stop at the gap rather than hand the finalizer a height it cannot
+        // adopt.
+        let store = Store::open(dir.0.join("val-0")).unwrap();
+        let top = store
+            .headers()
+            .unwrap()
+            .pop()
+            .expect("the first run certified at least one header");
+        let mut skipped = top.header.clone();
+        skipped.height = top.header.height.saturating_add(5);
+        skipped.round = top.header.round.saturating_add(5);
+        skipped.previous = top.header.id().unwrap();
+        let skipped_id = skipped.id().unwrap();
+        let mut certificate = top.certificate.clone();
+        certificate.round = skipped.round;
+        certificate.vertex_id = skipped_id.to_vec();
+        store.put_header(&skipped, &certificate).unwrap();
+
+        let second = run(mesh_config(&dir, a_free_port_base(4), 5, 0));
+        assert!(second.is_ok(), "the restart failed: {second:?}");
+
+        let store = Store::open(dir.0.join("val-0")).unwrap();
+        assert!(
+            !store
+                .headers()
+                .unwrap()
+                .iter()
+                .any(|record| record.header.id().unwrap() == skipped_id),
+            "the header above the gap must not survive the restart"
+        );
+        crate::audit::run(dir.0.join("val-0"), 4, None)
+            .expect("a store healed at the gap must audit");
+    }
+
+    #[test]
     fn the_checkpoint_interval_continues_from_the_resumed_head() {
         let restored = Restored {
             state_root: [0; 32],
@@ -8112,6 +8438,73 @@ mod tests {
         assert_eq!(resumed_checkpoint_height(Some(&full_store), Some(176)), 176);
         assert_eq!(resumed_checkpoint_height(None, Some(42)), 42);
         assert_eq!(resumed_checkpoint_height(None, None), 0);
+    }
+
+    #[test]
+    fn a_certified_header_waits_for_the_prefix_it_covers() {
+        use validator::EpochSchedule;
+
+        let membership = chain::membership(4, None).expect("a demo committee");
+        let set = membership.set.clone();
+        let chain_id = b"karsa-header-write".to_vec();
+        let genesis = Header::genesis(chain_id.clone(), set.epoch, [1u8; 32], commit_root(&[]));
+        let signer = 0;
+        let mut finalizer = Finalizer::new(
+            SetSchedule::single(set.clone()),
+            EpochSchedule::single(set.epoch),
+            chain_id.clone(),
+            membership.consensus[signer].id.clone(),
+            membership.consensus[signer].private_key.clone(),
+            genesis.clone(),
+            0,
+        )
+        .unwrap();
+        let dir = TestDir::new("header-writes");
+        let store = Store::open(&dir.0).unwrap();
+        let header = Header {
+            chain_id: chain_id.clone(),
+            epoch: genesis.epoch,
+            height: 1,
+            round: 1,
+            state_root: [2u8; 32],
+            dag_root: [3u8; 32],
+            previous: genesis.id().unwrap(),
+            applied: 0,
+        };
+        let certificate = Certificate {
+            chain_id: header.chain_id.clone(),
+            epoch: header.epoch,
+            round: header.round,
+            vertex_id: header.id().unwrap().to_vec(),
+            validator_set_id: Vec::new(),
+            signer_bitmap: vec![0u8; bitmap_len(set.validators.len())],
+            signatures: Vec::new(),
+        };
+
+        let mut writes = HeaderWrites::resume(0, 0);
+        writes
+            .push(
+                Some(&store),
+                &mut finalizer,
+                header.clone(),
+                certificate.clone(),
+            )
+            .unwrap();
+        assert!(
+            store.headers().unwrap().is_empty(),
+            "a header without a local prefix must not be written"
+        );
+        assert_eq!(writes.pending.len(), 1);
+
+        // The finalizer learns the coverage, so the same header now extends the
+        // last record and is safe to persist.
+        finalizer.note_certified_order(header.height, 0);
+        writes.write_ready(Some(&store), &mut finalizer).unwrap();
+        let records = store.headers().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].header.id().unwrap(), header.id().unwrap());
+        assert_eq!(records[0].certificate, certificate);
+        assert_eq!(writes.height, 1);
     }
 
     #[test]

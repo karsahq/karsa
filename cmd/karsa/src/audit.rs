@@ -79,14 +79,18 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
         store.require_genesis(&hash)?;
     }
     let certified: Vec<CertifiedHeader> = store.headers()?;
-    let Some(first) = certified.first() else {
+    let live = store.live_snapshot()?;
+    // A checkpoint whose anchor record was never appended (a crash between the
+    // snapshot activation and the header write) still has a verifiable trust
+    // anchor: the snapshot carries the anchor's certificate and state. Only a
+    // store with neither a header log nor a snapshot has nothing to audit.
+    if certified.is_empty() && live.is_none() {
         return Err(
             "this store holds no certified headers, so there is nothing to audit; \
              write one with `karsa persist --keep-history`"
                 .into(),
         );
-    };
-    let live = store.live_snapshot()?;
+    }
     let transition_certificate = store.set_change()?.or_else(|| {
         live.as_ref()
             .and_then(|snapshot| snapshot.transition.clone())
@@ -98,12 +102,24 @@ pub fn run(path: PathBuf, validators: usize, home: Option<PathBuf>) -> Result<()
     let accounts = committee.accounts.clone();
     let genesis = match store.genesis_header()? {
         Some(header) => header,
-        None => Header::genesis(
-            first.header.chain_id.clone(),
-            first.header.epoch,
-            chain::genesis_state(&accounts)?.state_root(),
-            commit_root(&[]),
-        ),
+        None => {
+            // Only the origin of a full replay. A live snapshot supplies its own
+            // anchor, so an empty header log still audits above it.
+            let (chain_id, epoch) = certified
+                .first()
+                .map(|entry| (entry.header.chain_id.clone(), entry.header.epoch))
+                .or_else(|| {
+                    live.as_ref()
+                        .map(|snapshot| (snapshot.header.chain_id.clone(), snapshot.header.epoch))
+                })
+                .ok_or("this store holds no header to derive a genesis from")?;
+            Header::genesis(
+                chain_id,
+                epoch,
+                chain::genesis_state(&accounts)?.state_root(),
+                commit_root(&[]),
+            )
+        }
     };
 
     // Every height must extend the one before it and carry a quorum. This needs no

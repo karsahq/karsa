@@ -2585,6 +2585,74 @@ the peer head's coverage; `last_provable` stops advancing and it needs a reseed
 to catch up. The bounded scan is still a walk rather than a frontier lookup;
 that would remove the remaining cost.
 
+## D85 — The header log only stores a prefix this node can reproduce
+
+**Decided.** A newly certified header is persisted only when the committed
+prefix its `dag_root` names is in the local order, and only as the next height
+above the last record on disk. A header this node built carries that coverage in
+the finalizer and is written immediately. A peer-built header usually does not:
+it waits in a `HeaderWrites` backlog and is written at the checkpoint cadence,
+where the committed order is scanned once from the last written coverage (an
+incremental frontier, not `commit_root_at` per index) and the coverage is
+recorded with `note_certified_order`. A failed scan is cached by (front height,
+order length), so an unprovable header does not rescan the same prefix every
+tick. A header whose root never appears blocks the queue: writing a later height
+above the gap would make the log impossible to adopt. On snapshot adoption the
+queue is rebased at the new anchor and stored headers above it are truncated. A
+checkpoint whose anchor the queue could not reach writes the anchor record alone
+after the snapshot is active, so the log stays auditable without a gap above the
+live anchor.
+
+Replay (`replay_to_provable_head`) now also requires ascending heights: headers
+above the anchor must start at `anchor + 1` and be contiguous. A height gap ends
+the provable prefix even when a later header's root is reachable. `audit` accepts
+a store whose only header is the live snapshot anchor, and a snapshot-joined
+store with no header record at all, because the anchor's certificate and state
+are verified from the snapshot itself.
+
+**Why.** D80 healed an unprovable stored head only on the next restart. Between
+the write and that restart the store could not be replayed or audited, which is
+exactly the state a SIGKILL during a checkpoint produced. Gating the write keeps
+the invariant at the source. Height continuity is needed because the finalizer
+adopts one link per height; root reachability alone is not enough. The anchor
+written by an unactivated snapshot adoption is the one known gap: activation is
+deliberately last, so a crash before it leaves an anchor record above the old
+snapshot that replay must drop.
+
+**Measured.** Four processes, `--checkpoint-every 4`, `FENCE_SILENT=1`; node 3
+was killed with SIGKILL exactly while `live.snapshot.tmp` existed (196608 bytes
+of the next snapshot written; the previous 906560-byte snapshot and its anchor
+at height 3084 remained). The store also held the stopped adoption's anchor
+record at height 3445. Before the continuity check, restart and `karsa audit`
+both failed with `header height 3445 does not follow 3084`. After it, restart
+printed `the retained order reproduces height 3084, dropped 1 stored headers
+above it (top 3445)`, replayed 12601 committed entries in 10048 ms, caught a
+finality gap (`certified head 3084/4093`, lambda 1218.3/s, mu 0), reseeded from
+`127.0.0.1:7621` at height 3445/round 4574 (install 1773 ms), and finished at
+committed 14044, `state_root 690cb32b…`, `commit_root 9756e1b6…`. `karsa audit`
+then passed (anchor verified, 104771 stored vertices, no certified heights above
+the anchor in that run). A random SIGKILL after an ordinary checkpoint restarted
+with no drop: replay 2758 entries in 4693 ms, certified head 623, no repair.
+Unit test `a_certified_header_waits_for_the_prefix_it_covers`; mesh test
+`a_mesh_drops_a_stored_header_that_skips_a_height` (37.99 s, audit passed).
+The first scan implementation rebuilt the frontier per header; a follower that
+wrote about 50 headers/s from a backlog then spun at 99% CPU without logging for
+minutes. The flush now builds one frontier per call and reuses it across the
+queue, and the official 120 s four-process devnet finished with all four nodes:
+nodes 0..2 at committed 23243, `state_root 690cb32b…`, `commit_root c41cf579…`;
+node 3 at committed 23045 with the same state root (it authored only 353 rounds
+and lagged), and both val-0 and val-3 audited above their anchors.
+
+**Open.** An adoption that dies before activation leaves its tail vertices and
+batches in the store; replay treats them as old-run data. In the measured store
+this added 33241 tail vertices (25.8 MB) and made the next replay 10 s. Staging
+the tail beside the snapshot and activating both with one rename would avoid
+that. The queue scan is still a walk from the last written coverage, and a header
+the local order never covers blocks the log until a reseed rebases it. Audit
+still refuses a height gap on a store that has not been restarted; `restore_live`
+is what drops the record above the gap, so the supported sequence is restart,
+then audit.
+
 ## Open decisions
 
 1. **Does a node serve history it does not hold?** Model B says no beyond the
