@@ -2335,6 +2335,64 @@ An end-to-end `--sync-from-peers` run that observes the server's release line is
 still pending; the manual attempt was cut short by a stale process holding a
 snapshot port, not by a release failure.
 
+## D79 — A running node reseeds when repair cannot succeed
+
+**Decided.** A node that executes and has a snapshot port now acts on a hard
+trigger instead of only logging it. The fetch runs in a separate task so the
+loop keeps serving; one attempt at a time, with a 10 s cooldown after a failure.
+The snapshot is verified by the same `adopt_snapshot` path as a cold join, and
+the live snapshot is written last. Four triggers qualify:
+
+- a missing history vertex that has exhausted its want budget and sits at or
+  below every current-set peer's floor (D76's trigger);
+- a missing leader slot: `missing_history` cannot name a leader it never held,
+  so the slot is checked by round and author against the same floors;
+- a missing vote quorum: `missing_history` walks the leader's causal history,
+  which does not contain the voting round's vertices; the slot requests are the
+  repair path, and the trigger fires once the cursor has stood still for 1.5 s
+  and every peer's floor covers the voting round;
+- a finality gap: the certified head has not moved for 5 s while the DAG is at
+  least 256 rounds ahead. This is what a node that missed a certificate share
+  while it was down actually hits: the DAG catches up through vertices, but the
+  first missing height cannot advance, so no later share helps.
+
+**Safety rule.** A snapshot may be shorter than this node's committed *DAG*
+order, but never shorter than its **certified** order. Entries above the
+certified prefix are committed but not final; their vertices and batches stay
+in the DAG and the store, so the live loop can commit them again. Refusing a
+shorter ordered snapshot was measured to leave finality stuck behind a share
+gap. The authoring round only moves forward (`max(saved, adopted)`) so a reseed
+cannot make the node sign a second vertex for a round it already voted in; the
+decision cursor follows the snapshot, which is the consistent cut every peer
+decides from.
+
+**Measured.** Four validators, `CHECKPOINT_EVERY=32 FAILURE_ROUNDS=15
+--fence-silent`, node 3 exited gracefully after 20 s, the survivors fenced it
+from round 2282, node 3 restarted 50 s later:
+
+- hard vote trigger at round 2277: `votes 0 of quorum 3`, peer floors
+  4491/4492/4495;
+- snapshot from a peer: height 4790 round 5872, floor 5870, committed 19,854,
+  tail 13 vertices, install 5 ms; the server's pin was released after install;
+- final state on all four nodes: committed 23,592, certified head 5,725/7,118,
+  `commit_root 8617a033…`, `state_root 690cb32b…`, conflicts 0. The restarted
+  node authored 0 (it adopted its own fence) and followed; its store ended at
+  35 KB after pruning 7,373 vertices below the adopted floor.
+
+Two operational notes came out of the runs. The floor gossip is control traffic
+and can be stale while a node drains a large vertex backlog (one restart saw
+floors 504/778/779 while the peers were past round 5,000); the finality-gap and
+1.5 s slot triggers are what released that node. A snapshot server can decline
+at its own certified head when it lacks the committed order length
+(`the certified head has no committed order length`); the joiner failed over to
+another peer, which is the intended behaviour.
+
+**Open.** A process killed with SIGTERM during a checkpoint can leave a store
+whose latest header is not reproducible from the retained tail
+(`the certified head does not match any committed prefix`). The measured reseed
+used a graceful `--timeout-seconds` exit; crash-consistent recovery from a
+mid-checkpoint kill is still open.
+
 ## Open decisions
 
 1. **Does a node serve history it does not hold?** Model B says no beyond the

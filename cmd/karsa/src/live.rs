@@ -139,6 +139,25 @@ const SNAPSHOT_STARTUP_WAIT: Duration = Duration::from_secs(15);
 const SNAPSHOT_READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a serving node waits for the node loop to build a snapshot.
 const SNAPSHOT_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a live reseed keeps asking peers for a snapshot.
+///
+/// A node that hits the hard trigger is already stalled, but its loop still
+/// serves the mesh; the startup wait is too long to spend here. The per-peer
+/// connect and read timeouts still bound one attempt.
+const RESEED_FETCH_WAIT: Duration = Duration::from_secs(5);
+/// Ticks between checks for a hard reseed trigger.
+const RESEED_CHECK_TICKS: u32 = 100;
+/// How long a failed reseed attempt waits before trying again.
+const RESEED_COOLDOWN: Duration = Duration::from_secs(10);
+/// How long a certified head may stand still while the DAG keeps growing.
+///
+/// A node that missed a certificate share while it was down cannot advance,
+/// even when its DAG has caught up through vertices. The recent-share window
+/// covers a short outage; a longer one needs the snapshot.
+const RESEED_FINALITY_STALL: Duration = Duration::from_secs(5);
+/// Rounds the DAG may run ahead of the certified head before the gap is a stall
+/// rather than the ordinary authoring lead.
+const RESEED_CERT_GAP_ROUNDS: u64 = 256;
 /// How long a served snapshot's floor stays pinned against pruning after the
 /// last request.
 ///
@@ -384,6 +403,8 @@ struct NodeResult {
     conflicts: usize,
     restored: Option<Restored>,
     snapshot: Option<SnapshotReport>,
+    /// Live reseeds this node completed during the run.
+    reseeded: usize,
     disk_bytes: u64,
     rejected: usize,
     committed: usize,
@@ -1828,6 +1849,133 @@ fn peers_cannot_serve(
     Some(covering)
 }
 
+/// Whether every required peer has reported a floor at or above `round`.
+///
+/// [`peers_cannot_serve`] answers the same question for whichever peers happened
+/// to gossip. A reseed acts on the answer, so it also requires the peers that
+/// have not spoken: a validator that never reported might still hold the history.
+fn every_peer_floor_covers(
+    required: &[Vec<u8>],
+    peer_floors: &BTreeMap<Vec<u8>, Option<u64>>,
+    round: u64,
+) -> bool {
+    !required.is_empty()
+        && required.iter().all(|peer| {
+            peer_floors
+                .get(peer)
+                .is_some_and(|floor| floor.is_some_and(|floor| floor >= round))
+        })
+}
+
+/// The vote-quorum half of a hard reseed trigger.
+struct MissingVotes {
+    held: usize,
+    quorum: usize,
+    covering: Vec<(Vec<u8>, u64)>,
+}
+
+/// The leader slot for `round` is missing and every peer has pruned its round.
+///
+/// [`Dag::missing_history`] cannot name a leader it never held, and a vote proof
+/// needs a leader to point at. The slot request is the repair path; this is the
+/// trigger that says the request cannot succeed because every peer's floor is
+/// at or above the leader's round. A fenced leader is excluded: the pacemaker
+/// can skip it without a snapshot.
+fn missing_leader_trigger(
+    node: &Node,
+    round: u64,
+    peer_floors: &BTreeMap<Vec<u8>, Option<u64>>,
+) -> Option<Vec<(Vec<u8>, u64)>> {
+    if node.dag().leader(round).is_some() {
+        return None;
+    }
+    let author = node.dag().leader_author(round)?.to_vec();
+    if node.dag().is_fenced(&author, round) {
+        return None;
+    }
+    let set = node.dag().set_for_round(round);
+    let required: Vec<Vec<u8>> = set
+        .validators
+        .iter()
+        .map(|record| record.validator_id.clone())
+        .filter(|validator| {
+            validator.as_slice() != node.id() && !node.dag().is_fenced(validator, round)
+        })
+        .collect();
+    if !every_peer_floor_covers(&required, peer_floors, round) {
+        return None;
+    }
+    Some(
+        required
+            .iter()
+            .filter_map(|peer| {
+                peer_floors
+                    .get(peer)
+                    .and_then(|floor| floor.map(|floor| (peer.clone(), floor)))
+            })
+            .collect(),
+    )
+}
+
+/// The missing vote quorum for `round`'s leader when every peer has pruned
+/// the voting round.
+///
+/// [`Dag::missing_history`] walks the leader's causal history; a vote is not in
+/// that history. A node that was down for a vote can hold a complete leader and
+/// still lack a quorum forever. The slot request is the repair path; this is
+/// the trigger that says the repair cannot succeed because every peer's floor
+/// is at or above the voting round.
+fn missing_vote_trigger(
+    node: &Node,
+    round: u64,
+    peer_floors: &BTreeMap<Vec<u8>, Option<u64>>,
+) -> Option<MissingVotes> {
+    node.dag().leader(round)?;
+    let voting = round.saturating_add(1);
+    let set = node.dag().set_for_round(voting);
+    let quorum = set.quorum_size();
+    let held = node.dag().held_voters(round).unwrap_or(0);
+    if held >= quorum {
+        return None;
+    }
+    let required: Vec<Vec<u8>> = set
+        .validators
+        .iter()
+        .map(|record| record.validator_id.clone())
+        .filter(|validator| {
+            validator.as_slice() != node.id() && !node.dag().is_fenced(validator, voting)
+        })
+        .collect();
+    if !every_peer_floor_covers(&required, peer_floors, voting) {
+        return None;
+    }
+    let covering = required
+        .iter()
+        .filter_map(|peer| {
+            peer_floors
+                .get(peer)
+                .and_then(|floor| floor.map(|floor| (peer.clone(), floor)))
+        })
+        .collect();
+    Some(MissingVotes {
+        held,
+        quorum,
+        covering,
+    })
+}
+
+/// Keeps a reseed from re-authoring a round this node already voted in.
+///
+/// The snapshot carries a round derived from its tail, but this node may have
+/// authored above it before the reseed. Signing a second, different vertex for
+/// one of those rounds would be equivocation, so the authoring round only ever
+/// moves forward. The decision cursor is *not* kept: the snapshot is a
+/// consistent cut, and re-deciding rounds above its anchor is what makes the
+/// committed order converge with the peer's.
+fn reseed_round_high_water(saved_round: u64, adopted_round: u64) -> u64 {
+    saved_round.max(adopted_round)
+}
+
 /// The history one served snapshot keeps alive.
 ///
 /// The pin keeps the lowest floor served in the window, the bytes and requests
@@ -2106,6 +2254,24 @@ async fn release_snapshot(target: &str, chain_id: &[u8], floor: u64) -> Result<(
         .map_err(|error| format!("snapshot release to {target}: {error}"))
 }
 
+/// Releases a served snapshot floor without making the joiner wait on it.
+///
+/// A failed release only leaves the server's pin to expire by its own bounds.
+fn release_served_snapshot(index: usize, served_by: String, chain_id: &[u8], floor: Option<u64>) {
+    let Some(floor) = floor else {
+        return;
+    };
+    let chain = chain_id.to_vec();
+    tokio::spawn(async move {
+        match release_snapshot(&served_by, &chain, floor).await {
+            Ok(()) => println!("  node val-{index} released snapshot floor {floor} at {served_by}"),
+            Err(error) => {
+                eprintln!("node {index} snapshot release to {served_by} failed: {error}");
+            }
+        }
+    });
+}
+
 /// Tries every peer's snapshot port until one answers.
 async fn fetch_snapshot(
     port_base: u16,
@@ -2113,8 +2279,9 @@ async fn fetch_snapshot(
     total: usize,
     chain_id: &[u8],
     min_height: u64,
+    wait: Duration,
 ) -> Result<(String, wire::Snapshot), String> {
-    let deadline = tokio::time::Instant::now() + SNAPSHOT_STARTUP_WAIT;
+    let deadline = tokio::time::Instant::now() + wait;
     let mut last = String::from("no peers were tried");
     loop {
         for peer in 0..total {
@@ -2173,6 +2340,10 @@ struct Adopted {
     floor: Option<u64>,
     vertices: usize,
     batches: usize,
+    /// Fences the snapshot carried, for the live loop to rebroadcast.
+    fences: Vec<FenceCertificate>,
+    /// Round-skip proofs the snapshot carried, for the live loop to rebroadcast.
+    round_skips: Vec<RoundSkipProof>,
 }
 
 /// Whether `vertex` can no longer be inserted once `fences` are installed.
@@ -2283,31 +2454,21 @@ fn adopt_snapshot(
         .as_mut()
         .ok_or("a snapshot join needs execution (--execute)")?;
     if let Some(transition) = &transition {
-        node.adopt_set_change(transition)
-            .map_err(|error| format!("snapshot set change is not authorized: {error}"))?;
+        // The finalizer checks the certified head and the built head against the
+        // activation epoch. Doing it first keeps a rejected transition from
+        // changing the DAG's schedule before the adoption is refused.
         finalizer
             .adopt_set_change(transition)
             .map_err(|error| format!("snapshot set change cannot be activated: {error}"))?;
-        if let Some(store) = store {
-            store
-                .put_set_change(transition)
-                .map_err(|error| error.to_string())?;
-        }
+        node.adopt_set_change(transition)
+            .map_err(|error| format!("snapshot set change is not authorized: {error}"))?;
     }
-    finalizer
-        .adopt_anchor(anchor.clone(), &certificate, order_len)
-        .map_err(|error| format!("snapshot anchor is not certified: {error}"))?;
-    let stored_order = order.clone();
-    let stored_prefix = prefix.clone();
-    node.seed_prefix(prefix, order);
-    if let Some(floor) = floor {
-        node.set_floor(floor);
-    }
-    node.set_cursor(cursor);
     // Installed before the tail so every replayed vertex is judged by the same
     // rules the live sender applied. A tail vertex that arrived before the
-    // fence is inert, and a fresh DAG would reject it on insert.
-    apply_snapshot_fences(node, store, &fences)?;
+    // fence is inert, and a fresh DAG would reject it on insert. Nothing is
+    // written yet: a tail vertex that fails leaves only valid vertices and
+    // fences behind, never a half-seeded prefix.
+    apply_snapshot_fences(node, None, &fences)?;
     let vertices: Vec<validator::Vertex> = vertices
         .into_iter()
         .filter(|vertex| !inert_under_fences(vertex, &fences))
@@ -2319,19 +2480,46 @@ fn adopt_snapshot(
     // Round skips are decision inputs for the tail. Install them only after the
     // vertices they name are held: a proof is verified against the leader and
     // the voting-round vertices, so a proof that arrived before its evidence
-    // would be rejected rather than queued. The proofs are persisted with the
-    // rest of the snapshot, after their evidence is on disk.
+    // would be rejected rather than queued. A proof at or below the snapshot
+    // floor is already covered by the adopted prefix; its control payload still
+    // travels so a tail vertex naming it is not mistaken for a transaction
+    // batch.
     let mut verified_skips = Vec::new();
     for proof in round_skips {
         let payload = ControlPayload::RoundSkip(Box::new(proof.clone()));
         node.add_control(payload)
             .map_err(|error| format!("snapshot round skip payload is invalid: {error}"))?;
-        node.apply_round_skip(proof.clone())
-            .map_err(|error| format!("snapshot round skip is not authorized: {error}"))?;
+        if floor.is_none_or(|floor| proof.attestation.skip.round() > floor) {
+            node.apply_round_skip(proof.clone())
+                .map_err(|error| format!("snapshot round skip is not authorized: {error}"))?;
+        }
         verified_skips.push(proof);
     }
+    // Only now is the anchor switched: the certificate was verified against the
+    // schedule the transition installed, and every record the new prefix needs
+    // has already been accepted by the DAG.
+    finalizer
+        .adopt_anchor(anchor.clone(), &certificate, order_len)
+        .map_err(|error| format!("snapshot anchor is not certified: {error}"))?;
+    let stored_order = order.clone();
+    let stored_prefix = prefix.clone();
+    node.seed_prefix(prefix, order);
+    if let Some(floor) = floor {
+        node.set_floor(floor);
+    }
+    node.set_cursor(cursor);
     let batch_count = incoming.len();
     if let Some(store) = store {
+        if let Some(transition) = &transition {
+            store
+                .put_set_change(transition)
+                .map_err(|error| error.to_string())?;
+        }
+        for certificate in &fences {
+            store
+                .put_fence(certificate)
+                .map_err(|error| error.to_string())?;
+        }
         store
             .put_header(&anchor, &certificate)
             .map_err(|error| error.to_string())?;
@@ -2396,6 +2584,8 @@ fn adopt_snapshot(
         floor,
         vertices: vertices.len(),
         batches: batch_count,
+        fences,
+        round_skips: verified_skips,
     })
 }
 
@@ -2529,7 +2719,17 @@ async fn node_task(
                 "  node val-{index} has history to height {stored_head}; --sync-from-peers adopts a peer snapshot above it"
             );
         }
-        Some(fetch_snapshot(config.snapshot_port, index, total, &chain_id, stored_head).await?)
+        Some(
+            fetch_snapshot(
+                config.snapshot_port,
+                index,
+                total,
+                &chain_id,
+                stored_head,
+                SNAPSHOT_STARTUP_WAIT,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -2893,19 +3093,7 @@ async fn node_task(
         // The install is complete, so the server can prune after its grace
         // window. Release in the background: the joiner should not wait on a
         // courtesy frame, and a failed release only leaves the TTL in charge.
-        if let Some(floor) = release_floor {
-            let chain = chain_id.clone();
-            tokio::spawn(async move {
-                match release_snapshot(&served_by, &chain, floor).await {
-                    Ok(()) => println!(
-                        "  node val-{index} released snapshot floor {floor} at {served_by}"
-                    ),
-                    Err(error) => {
-                        eprintln!("node {index} snapshot release to {served_by} failed: {error}");
-                    }
-                }
-            });
-        }
+        release_served_snapshot(index, served_by, &chain_id, release_floor);
     }
 
     let restore_started = Instant::now();
@@ -3128,12 +3316,27 @@ async fn node_task(
     let mut cursor_since = Instant::now();
     let mut reported_stall: Option<u64> = None;
     // What each peer says it has pruned, keyed by the validator id in its frame.
-    // Diagnostic only: the gossip names its sender, so it is not trusted for any
-    // decision, and a hard reseed trigger is logged rather than acted on.
+    // Diagnostic input to a reseed: the gossip names its sender, so it is not
+    // trusted for consensus, but it is the only way to tell a pruned peer from a
+    // silent one.
     let mut peer_floors: BTreeMap<Vec<u8>, Option<u64>> = BTreeMap::new();
     let mut announced_floor: Option<Option<u64>> = None;
     // The last (cursor, dependency) a hard trigger was logged for.
     let mut reported_hard_trigger: Option<(u64, [u8; 32])> = None;
+    // One live reseed fetch at a time, and the end of the last attempt. A failed
+    // attempt leaves the loop running; the trigger stays true and the cooldown
+    // keeps it from hammering every peer.
+    let mut reseed_fetch: Option<
+        tokio::task::JoinHandle<Result<(String, wire::Snapshot), String>>,
+    > = None;
+    let mut last_reseed_attempt: Option<Instant> = None;
+    let mut reseeded = 0usize;
+    // The certified height and when it last moved. A node that missed a
+    // certificate share cannot advance, even if its DAG is caught up.
+    let mut certified_height = last_certified
+        .as_ref()
+        .map_or(0, |(header, _)| header.height);
+    let mut certified_since = Instant::now();
     // Local lambda: committed entries over the last few seconds. A frozen cursor
     // with a healthy rate means this node is behind; a frozen cursor with a zero
     // rate means the chain itself stopped producing commits.
@@ -3647,6 +3850,229 @@ async fn node_task(
                 if pinned_floor.is_some_and(|pin| pin.floor == floor) {
                     pinned_floor = release_pin(pinned_floor, floor, Instant::now());
                     eprintln!("node {index} snapshot pin released at floor {floor}");
+                }
+            }
+            fetched = async {
+                match reseed_fetch.as_mut() {
+                    Some(handle) => handle.await,
+                    None => std::future::pending::<
+                        Result<Result<(String, wire::Snapshot), String>, tokio::task::JoinError>,
+                    >()
+                    .await,
+                }
+            }, if reseed_fetch.is_some() => {
+                reseed_fetch = None;
+                last_reseed_attempt = Some(Instant::now());
+                let outcome = match fetched {
+                    Ok(Ok((served_by, snapshot))) => {
+                        let certified = last_certified
+                            .as_ref()
+                            .map_or(0, |(header, _)| header.height);
+                        // A certified prefix is the invariant that must be
+                        // preserved. Entries above it are committed but not
+                        // final: the local DAG keeps their vertices, so the live
+                        // loop can commit them again. Refusing a shorter
+                        // *ordered* snapshot would instead leave finality stuck
+                        // behind a share gap forever.
+                        let certified_order = last_certified
+                            .as_ref()
+                            .and_then(|(header, _)| {
+                                finalizer.as_ref().and_then(|finalizer| {
+                                    finalizer.certified_order(header.height)
+                                })
+                            })
+                            // A stored header adopted on restart may not have its
+                            // order length in the finalizer's map. Falling back
+                            // to the full local order is the conservative answer:
+                            // it refuses a shorter snapshot rather than risk
+                            // dropping entries that were already final.
+                            .unwrap_or_else(|| node.dag().order_len());
+                        if snapshot.anchor.height <= certified {
+                            // The node kept certifying while the fetch was in
+                            // flight. Moving the chain to an older anchor would
+                            // roll back finality, so the snapshot is useless.
+                            eprintln!(
+                                "node {index} reseed: snapshot from {served_by} at height {} is not above the certified head {certified}; ignored",
+                                snapshot.anchor.height
+                            );
+                            release_served_snapshot(index, served_by, &chain_id, snapshot.floor);
+                            None
+                        } else if snapshot.order_len < certified_order {
+                            eprintln!(
+                                "node {index} reseed: snapshot from {served_by} commits {} entries but this node's certified prefix needs {certified_order}; ignored",
+                                snapshot.order_len
+                            );
+                            release_served_snapshot(index, served_by, &chain_id, snapshot.floor);
+                            None
+                        } else {
+                            let saved_round = node.round();
+                            let saved_cursor = node.cursor();
+                            let install_started = Instant::now();
+                            match adopt_snapshot(
+                                snapshot,
+                                &mut node,
+                                &mut finalizer,
+                                &mut batches,
+                                &chain_id,
+                                store.as_ref(),
+                            ) {
+                                Ok(adopted) => Some((
+                                    served_by,
+                                    adopted,
+                                    saved_round,
+                                    saved_cursor,
+                                    install_started,
+                                )),
+                                Err(error) => {
+                                    eprintln!(
+                                        "node {index} reseed: snapshot from {served_by} was rejected: {error}"
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        eprintln!("node {index} reseed: no snapshot available: {error}");
+                        None
+                    }
+                    Err(error) => {
+                        eprintln!("node {index} reseed: fetch task failed: {error}");
+                        None
+                    }
+                };
+                if let Some((served_by, adopted, saved_round, saved_cursor, install_started)) =
+                    outcome
+                {
+                    let install_ms = u64::try_from(install_started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX);
+                    let round_after = reseed_round_high_water(saved_round, node.round());
+                    node.set_round(round_after);
+                    // The snapshot is the consistent cut; the cursor follows it
+                    // rather than the old view, so every round above the anchor
+                    // is decided again from the same DAG the peer decided from.
+                    cursor = node.cursor();
+                    state = adopted.state;
+                    applied = adopted.applied;
+                    applied_cursor = adopted.order_len;
+                    last_certified =
+                        Some((adopted.anchor.clone(), adopted.certificate.clone()));
+                    certified_height = adopted.anchor.height;
+                    certified_since = Instant::now();
+
+                    // The old view's repair work points at history the snapshot
+                    // has replaced.
+                    wanted.clear();
+                    abandoned.clear();
+                    pending_control = None;
+                    reported_stall = None;
+                    reported_hard_trigger = None;
+                    cursor_since = Instant::now();
+                    commit_rate.clear();
+                    last_order = node.dag().order_len();
+                    stable_ticks = 0;
+
+                    // The snapshot's decision inputs are this node's from now on.
+                    // Rebuilding them from the adopted records keeps a tail
+                    // vertex that names a control payload from being mistaken for
+                    // a transaction batch.
+                    for proof in &adopted.round_skips {
+                        let round = proof.attestation.skip.round();
+                        round_skips.insert(round, proof.clone());
+                        if let Ok(digest) =
+                            ControlPayload::RoundSkip(Box::new(proof.clone())).digest()
+                        {
+                            control_payloads.insert(digest, round);
+                        }
+                    }
+                    round_skip_dirty = !round_skips.is_empty();
+                    for certificate in &adopted.fences {
+                        fences.insert(
+                            certificate.fence.validator_id.clone(),
+                            certificate.clone(),
+                        );
+                        fence_adopted.insert(certificate.fence.validator_id.clone());
+                    }
+                    fence_dirty = !fences.is_empty();
+
+                    // A transition the snapshot carried is already active; a
+                    // local proposal belonged to the old schedule.
+                    pending_change = node.dag().set_schedule().certificate().cloned();
+                    set_change_adopted = pending_change.is_some();
+                    pending_dirty = pending_change.is_some();
+
+                    // The detector measured the old view. Rebuilding it from the
+                    // adopted tail keeps a validator the reseed skipped from
+                    // being reported silent.
+                    failure_epoch = node.dag().set_for_round(node.round()).epoch;
+                    failures = (config.failure_rounds > 0).then(|| {
+                        let mut detector = FailureDetector::new(
+                            node.dag().set_for_round(node.round()),
+                            config.failure_rounds,
+                        );
+                        for vertex in held_vertices(&node) {
+                            detector.observe(vertex.round, &vertex.author);
+                        }
+                        detector
+                    });
+                    reported_silent.clear();
+
+                    state_history.clear();
+                    if config.snapshot_port > 0 || config.checkpoint_every > 0 {
+                        remember_state(
+                            &mut state_history,
+                            u64::try_from(applied).unwrap_or(u64::MAX),
+                            &state,
+                        );
+                    }
+                    announced_floor = None;
+                    last_checkpoint = adopted.anchor.height;
+                    if let Some(store) = &store {
+                        // Everything below the adopted floor is now reachable
+                        // only through the snapshot, exactly as after a startup
+                        // join.
+                        let pruned = store
+                            .prune_to_checkpoint(usize::from(config.shard))
+                            .map_err(|error| error.to_string())?;
+                        if pruned.vertices > 0 || pruned.headers > 0 {
+                            eprintln!(
+                                "node {index} reseed: pruned {} vertices, {} headers, {} batches below the adopted floor",
+                                pruned.vertices, pruned.headers, pruned.batches_dropped
+                            );
+                        }
+                    }
+
+                    if let Some(rpc) = &rpc {
+                        let mut core = rpc.lock().expect("rpc lock poisoned");
+                        core.note_state(u64::try_from(applied).unwrap_or(u64::MAX), &state);
+                        if let Some(finalizer) = &finalizer {
+                            let head = finalizer.head();
+                            core.note_order_from(node.dag().prefix(), node.dag().order());
+                            core.note_certified(head, finalizer.certified_order(head.height));
+                            core.note_certified_heights(finalizer.certified_ids().len());
+                        }
+                        core.note_floor(node.dag().floor());
+                        core.set_run(
+                            node.round(),
+                            node.dag().order_len(),
+                            u64::try_from(applied).unwrap_or(u64::MAX),
+                            outbound.len(),
+                            finalizer.as_ref().map_or(0, Finalizer::conflicts),
+                            node.skip_counts(),
+                        );
+                    }
+                    reseeded = reseeded.saturating_add(1);
+                    eprintln!(
+                        "node {index} reseed: adopted snapshot from {served_by} at height {} round {}, floor {:?}, committed {}, tail {} vertices / {} batches, state {}, install {install_ms} ms; round {saved_round}->{round_after}, cursor {saved_cursor}->{cursor}, total {reseeded}",
+                        adopted.anchor.height,
+                        adopted.anchor.round,
+                        adopted.floor,
+                        adopted.order_len,
+                        adopted.vertices,
+                        adopted.batches,
+                        hex::encode(&state.state_root()[..6]),
+                    );
+                    release_served_snapshot(index, served_by, &chain_id, adopted.floor);
                 }
             }
             _ = ticker.tick() => {
@@ -4509,6 +4935,157 @@ async fn node_task(
                         pruned.vertices, pruned.headers, pruned.batches_dropped, pruned.bytes_freed
                     );
                 }
+
+                // Track the certified head separately from the commit cursor:
+                // a node can be caught up in the DAG and still be unable to
+                // advance finality because it missed a share while it was down.
+                let current_certified = last_certified
+                    .as_ref()
+                    .map_or(0, |(header, _)| header.height);
+                if current_certified != certified_height {
+                    certified_height = current_certified;
+                    certified_since = Instant::now();
+                }
+
+                // A hard trigger is a stall no want can repair: either a
+                // dependency below every current-set peer's floor, or a vote
+                // quorum the peers have already pruned. Start one fetch at a
+                // time and back off after a failure. The fetch runs off the
+                // loop so the node keeps serving the mesh while the snapshot
+                // travels.
+                if ticks % RESEED_CHECK_TICKS == 0
+                    && reseed_fetch.is_none()
+                    && config.snapshot_port > 0
+                    && finalizer.is_some()
+                    && last_reseed_attempt
+                        .is_none_or(|at| at.elapsed() >= RESEED_COOLDOWN)
+                {
+                    let current = node.dag().set_for_round(node.round()).clone();
+                    let required: Vec<Vec<u8>> = current
+                        .validators
+                        .iter()
+                        .map(|record| record.validator_id.clone())
+                        .filter(|validator| {
+                            validator.as_slice() != node.id()
+                                && !node.dag().is_fenced(validator, node.round())
+                        })
+                        .collect();
+                    let history = node
+                        .dag()
+                        .missing_history(cursor)
+                        .filter(|missing| abandoned.contains(missing))
+                        .filter(|missing| {
+                            every_peer_floor_covers(&required, &peer_floors, missing.round)
+                        });
+                    // A missed vote has no digest to want, so it is only
+                    // abandoned after the cursor has stood still long enough
+                    // for the slot sweep to have asked every peer.
+                    let votes = if history.is_none()
+                        && cursor_since.elapsed() >= STALL_REPORT_AFTER
+                    {
+                        missing_vote_trigger(&node, cursor, &peer_floors)
+                    } else {
+                        None
+                    };
+                    // `missing_history` cannot name a leader it never held, so
+                    // the leader slot is its own trigger. Without it a node
+                    // restarted below a pruned leader could wait forever.
+                    let leader = if history.is_none()
+                        && votes.is_none()
+                        && cursor_since.elapsed() >= STALL_REPORT_AFTER
+                    {
+                        missing_leader_trigger(&node, cursor, &peer_floors)
+                    } else {
+                        None
+                    };
+                    let certified_round = last_certified
+                        .as_ref()
+                        .map_or(0, |(header, _)| header.round);
+                    let finality_gap = finalizer.is_some()
+                        && certified_since.elapsed() >= RESEED_FINALITY_STALL
+                        && node.dag().highest_round().is_some_and(|highest| {
+                            highest >= certified_round.saturating_add(RESEED_CERT_GAP_ROUNDS)
+                        });
+                    if let Some(missing) = &history {
+                        let covering: Vec<(Vec<u8>, u64)> = required
+                            .iter()
+                            .filter_map(|peer| {
+                                peer_floors
+                                    .get(peer)
+                                    .and_then(|floor| floor.map(|floor| (peer.clone(), floor)))
+                            })
+                            .collect();
+                        report_hard_trigger(
+                            index,
+                            cursor,
+                            missing,
+                            &covering,
+                            &mut reported_hard_trigger,
+                        );
+                    } else if let Some(votes) = &votes {
+                        let peers = votes
+                            .covering
+                            .iter()
+                            .map(|(peer, floor)| {
+                                format!("{}={floor}", hex::encode(&peer[..peer.len().min(8)]))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        eprintln!(
+                            "node {index} reseed: hard vote trigger at round {cursor}: votes {} of quorum {}, every peer floor covers round {} ({peers})",
+                            votes.held,
+                            votes.quorum,
+                            cursor.saturating_add(1)
+                        );
+                    } else if let Some(covering) = &leader {
+                        let author = node.dag().leader_author(cursor).map_or_else(
+                            || String::from("unknown"),
+                            |author| hex::encode(&author[..author.len().min(8)]),
+                        );
+                        let peers = covering
+                            .iter()
+                            .map(|(peer, floor)| {
+                                format!("{}={floor}", hex::encode(&peer[..peer.len().min(8)]))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        eprintln!(
+                            "node {index} reseed: hard leader trigger at round {cursor}: leader {author} is missing, every peer floor covers the round ({peers})"
+                        );
+                    } else if finality_gap {
+                        let highest = node.dag().highest_round().unwrap_or(0);
+                        eprintln!(
+                            "node {index} reseed: hard finality trigger: certified head {certified_height}/{certified_round} has not moved for {} ms while the DAG reached round {highest}",
+                            certified_since.elapsed().as_millis()
+                        );
+                    }
+                    if history.is_some()
+                        || votes.is_some()
+                        || leader.is_some()
+                        || finality_gap
+                    {
+                        let min_height = last_certified
+                            .as_ref()
+                            .map_or(0, |(header, _)| header.height);
+                        eprintln!(
+                            "node {index} reseed: fetching a snapshot above height {min_height}"
+                        );
+                        let chain = chain_id.clone();
+                        let port = config.snapshot_port;
+                        reseed_fetch = Some(tokio::spawn(async move {
+                            fetch_snapshot(
+                                port,
+                                index,
+                                total,
+                                &chain,
+                                min_height,
+                                RESEED_FETCH_WAIT,
+                            )
+                            .await
+                        }));
+                        last_reseed_attempt = Some(Instant::now());
+                    }
+                }
             }
             _ = shutdown.changed() => break,
         }
@@ -4574,6 +5151,7 @@ async fn node_task(
             .map_or(0, |finalizer| finalizer.conflicts()),
         restored,
         snapshot: snapshot_report,
+        reseeded,
         disk_bytes: store
             .as_ref()
             .map_or(0, |store| directory_bytes(store.path())),
@@ -4756,6 +5334,7 @@ async fn archive_task(
         conflicts: 0,
         restored: None,
         snapshot: None,
+        reseeded: 0,
         disk_bytes: store
             .as_ref()
             .map_or(0, |store| directory_bytes(store.path())),
@@ -4996,6 +5575,9 @@ fn run_one_node(
             snapshot.fetch_ms,
             snapshot.install_ms
         );
+    }
+    if result.reseeded > 0 {
+        println!("  reseed            {} live reseed(s)", result.reseeded);
     }
     if let Some(authoring) = authoring {
         println!(
@@ -6005,6 +6587,74 @@ mod tests {
         assert!(
             peers_cannot_serve(&floors, 0).is_none(),
             "a peer with no floor still holds full history"
+        );
+    }
+
+    #[test]
+    fn a_reseed_requires_every_current_peer_to_report_a_covering_floor() {
+        let required = vec![b"val-1".to_vec(), b"val-2".to_vec()];
+        let mut floors = BTreeMap::new();
+        assert!(
+            !every_peer_floor_covers(&required, &floors, 7),
+            "a peer that never reported might still hold the round"
+        );
+        floors.insert(b"val-1".to_vec(), Some(7));
+        assert!(!every_peer_floor_covers(&required, &floors, 7));
+        floors.insert(b"val-2".to_vec(), Some(9));
+        assert!(every_peer_floor_covers(&required, &floors, 7));
+        floors.insert(b"val-2".to_vec(), Some(6));
+        assert!(
+            !every_peer_floor_covers(&required, &floors, 7),
+            "one peer still holds the dependency"
+        );
+        floors.insert(b"val-2".to_vec(), None);
+        assert!(!every_peer_floor_covers(&required, &floors, 7));
+        assert!(
+            !every_peer_floor_covers(&[], &floors, 7),
+            "a node with no required peers has no hard trigger"
+        );
+    }
+
+    #[test]
+    fn a_reseed_keeps_the_authoring_round_high_water() {
+        assert_eq!(
+            reseed_round_high_water(5, 9),
+            9,
+            "the adopted snapshot is ahead"
+        );
+        assert_eq!(
+            reseed_round_high_water(9, 5),
+            9,
+            "the node already voted above the snapshot"
+        );
+        assert_eq!(reseed_round_high_water(7, 7), 7);
+    }
+
+    #[test]
+    fn a_missing_leader_triggers_a_reseed_only_when_every_peer_pruned_it() {
+        let membership = chain::membership(4, None).expect("a demo committee");
+        let chain_id = b"karsa-missing-leader".to_vec();
+        // Node 3 is not the round-zero leader, and it holds no vertices, so the
+        // leader slot is genuinely missing from its view.
+        let node = Node::with_chain_id_and_epoch_length(
+            membership.set.clone(),
+            2,
+            membership.consensus[3].id.clone(),
+            membership.consensus[3].private_key.clone(),
+            chain_id,
+        );
+        let mut floors = BTreeMap::new();
+        for author in 0..3 {
+            floors.insert(membership.consensus[author].id.clone(), Some(0));
+        }
+        assert!(
+            missing_leader_trigger(&node, 0, &floors).is_some(),
+            "every peer has pruned round zero"
+        );
+        floors.insert(membership.consensus[1].id.clone(), None);
+        assert!(
+            missing_leader_trigger(&node, 0, &floors).is_none(),
+            "a peer with no floor may still serve the leader"
         );
     }
 
