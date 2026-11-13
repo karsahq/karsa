@@ -1335,6 +1335,8 @@ struct StatusView {
 /// `soft_pending_ms` is how long the soft trigger has been above its thresholds.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub(crate) struct CatchupView {
+    pub(crate) provable_height: u64,
+    pub(crate) certified_gap: u64,
     pub(crate) backlog_rounds: u64,
     pub(crate) lambda_rounds_per_s: Option<f64>,
     pub(crate) mu_rounds_per_s: Option<f64>,
@@ -2090,6 +2092,19 @@ mod tests {
         assert_eq!(view.status, "finalized");
         assert_eq!(view.finalized_height, Some(2));
         assert!(view.commit_proof.is_some());
+    }
+
+    #[test]
+    fn the_status_reports_provable_height_and_certified_gap() {
+        let (mut core, _accounts, _chain_id) = fixture();
+        core.note_catchup(CatchupView {
+            provable_height: 100,
+            certified_gap: 64,
+            ..CatchupView::default()
+        });
+        let status = serde_json::to_value(core.status()).unwrap();
+        assert_eq!(status["catchup"]["provable_height"], 100);
+        assert_eq!(status["catchup"]["certified_gap"], 64);
     }
 
     #[test]

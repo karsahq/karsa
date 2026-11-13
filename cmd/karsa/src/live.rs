@@ -173,13 +173,9 @@ const RESEED_SOFT_CATCHUP_MS: u64 = 60_000;
 const RESEED_SOFT_SUSTAIN: Duration = Duration::from_secs(5);
 /// Rate margin that separates keeping pace from losing ground, in rounds/s.
 const RESEED_SOFT_RATE_MARGIN: f64 = 0.5;
-/// Prefix roots one coverage derivation may scan.
-///
-/// A node that keeps up has a certified head within a few dozen committed
-/// entries of its order tip. Scanning more than this usually means the node is
-/// behind the header, which a reseed fixes; walking its whole order on every
-/// certification would make the search quadratic in a lagging run.
-const COVERAGE_SCAN_LIMIT: usize = 4096;
+/// A stalled provable head needs a material certified gap before reseeding.
+const RESEED_COVERAGE_STALL: Duration = Duration::from_secs(10);
+const RESEED_COVERAGE_GAP: u64 = 64;
 /// How long a served snapshot's floor stays pinned against pruning after the
 /// last request.
 ///
@@ -1076,20 +1072,16 @@ impl HeaderWrites {
     ) -> Result<usize, String> {
         let Some(store) = store else { return Ok(0) };
         let dag = node.dag();
-        let base = dag.prefix().len();
         let upper = dag.order_len();
-        let mut frontier = dag.prefix().clone();
-        let mut at = base;
-        // The frontier is usable only when the last written coverage is one of
-        // the retained order lengths. Known coverage stays writable regardless;
-        // an unknown one waits until the order can be walked again.
-        let mut ready = self.coverage >= base && self.coverage <= upper;
-        if ready {
-            while at < self.coverage {
-                frontier.push(&dag.order()[at - base]);
-                at += 1;
-            }
+        if self.pending.is_empty()
+            || self.pending.front().is_some_and(|(header, _)| {
+                self.scanned == Some((header.height, upper))
+                    && finalizer.certified_order(header.height).is_none()
+            })
+        {
+            return Ok(0);
         }
+        let mut scanner = CoverageScanner::new(dag.prefix(), dag.order(), self.coverage);
         let mut written = 0;
         while let Some((height, dag_root)) = self
             .pending
@@ -1104,40 +1096,13 @@ impl HeaderWrites {
                 break;
             }
             let coverage = match finalizer.certified_order(height) {
-                Some(coverage) if coverage >= self.coverage => {
-                    if ready {
-                        while at < coverage {
-                            frontier.push(&dag.order()[at - base]);
-                            at += 1;
-                        }
-                    }
-                    coverage
-                }
+                Some(coverage) if coverage >= self.coverage => coverage,
                 Some(_) => break,
                 None => {
                     if self.scanned == Some((height, upper)) {
                         break;
                     }
-                    if !ready {
-                        self.scanned = Some((height, upper));
-                        break;
-                    }
-                    let mut len = at;
-                    let mut root = frontier.root();
-                    let mut found = None;
-                    loop {
-                        if root == dag_root {
-                            found = Some(len);
-                            break;
-                        }
-                        if len >= upper {
-                            break;
-                        }
-                        frontier.push(&dag.order()[len - base]);
-                        len += 1;
-                        at = len;
-                        root = frontier.root();
-                    }
+                    let found = scanner.as_mut().and_then(|scan| scan.find(dag_root));
                     if found.is_none() {
                         self.scanned = Some((height, upper));
                     }
@@ -1147,13 +1112,15 @@ impl HeaderWrites {
                     }
                 }
             };
-            // Keep the frontier at the prefix just written so the next header
-            // continues from there instead of rebuilding from the start.
-            if ready {
-                while at < coverage {
-                    frontier.push(&dag.order()[at - base]);
-                    at += 1;
+            // Known coverage can cross from below the compacted base into the
+            // retained tail. Start the frontier there, then reuse it for the
+            // remaining headers in this flush.
+            if let Some(scan) = scanner.as_mut() {
+                if !scan.advance(coverage) {
+                    scanner = None;
                 }
+            } else {
+                scanner = CoverageScanner::new(dag.prefix(), dag.order(), coverage);
             }
             let (header, certificate) = self.pending.pop_front().expect("the front was read");
             store
@@ -1164,7 +1131,6 @@ impl HeaderWrites {
             self.coverage = coverage;
             self.scanned = None;
             written += 1;
-            ready = self.coverage >= base && self.coverage <= upper;
         }
         Ok(written)
     }
@@ -2383,29 +2349,106 @@ struct ReseedAttempt {
     estimate_ms: Option<u64>,
 }
 
-/// Finds the committed prefix a certified header covers in the local order.
-///
-/// A header this node built already carries its coverage in the finalizer. A
-/// peer-built header does not, but if its `dag_root` is a prefix root of this
-/// node's order, that length is the coverage. Scanning starts at `lower`, the
-/// last coverage the node proved, so repeated derivations walk each order entry
-/// at most once across a run rather than once per header.
+/// Walks retained prefixes once, reusing the frontier across adjacent headers.
+struct CoverageScanner<'a> {
+    frontier: CommitFrontier,
+    order: &'a [VertexId],
+    base: usize,
+    at: usize,
+}
+
+impl<'a> CoverageScanner<'a> {
+    fn new(prefix: &CommitFrontier, order: &'a [VertexId], lower: usize) -> Option<Self> {
+        let base = prefix.len();
+        if lower < base || lower > base + order.len() {
+            return None;
+        }
+        let mut scan = Self {
+            frontier: prefix.clone(),
+            order,
+            base,
+            at: base,
+        };
+        scan.advance(lower).then_some(scan)
+    }
+
+    fn advance(&mut self, target: usize) -> bool {
+        if target < self.at || target > self.base + self.order.len() {
+            return false;
+        }
+        while self.at < target {
+            self.frontier.push(&self.order[self.at - self.base]);
+            self.at += 1;
+        }
+        true
+    }
+
+    fn find(&mut self, root: [u8; 32]) -> Option<usize> {
+        loop {
+            if self.frontier.root() == root {
+                return Some(self.at);
+            }
+            if !self.advance(self.at + 1) {
+                return None;
+            }
+        }
+    }
+}
+
+fn coverage_gap_needed(provable: u64, certified: u64, stalled: Duration) -> bool {
+    stalled >= RESEED_COVERAGE_STALL && certified.saturating_sub(provable) >= RESEED_COVERAGE_GAP
+}
+
+/// Failed scans are valid only for this height and retained order upper bound.
+#[derive(Default)]
+struct CertifiedCoverageScan {
+    failed: Option<(u64, usize)>,
+}
+
+impl CertifiedCoverageScan {
+    fn find(
+        &mut self,
+        prefix: &CommitFrontier,
+        order: &[VertexId],
+        height: u64,
+        root: [u8; 32],
+        lower: usize,
+    ) -> Option<usize> {
+        let key = (height, prefix.len() + order.len());
+        if self.failed == Some(key) {
+            return None;
+        }
+        let started = Instant::now();
+        let found = CoverageScanner::new(prefix, order, lower).and_then(|mut scan| scan.find(root));
+        self.failed = found.is_none().then_some(key);
+        if let Some(found) = found {
+            eprintln!(
+                "coverage found: height {height}, {lower}->{found}, elapsed {} ms",
+                started.elapsed().as_millis()
+            );
+        }
+        found
+    }
+}
+
 fn certified_coverage(
     node: &Node,
     finalizer: &Finalizer,
     header: &Header,
     lower: usize,
+    scan: &mut CertifiedCoverageScan,
 ) -> Option<usize> {
     if let Some(coverage) = finalizer.certified_order(header.height) {
         return Some(coverage);
     }
     let dag = node.dag();
-    let upper = dag.order_len();
-    let start = lower.max(upper.saturating_sub(COVERAGE_SCAN_LIMIT));
-    if start > upper {
-        return None;
-    }
-    (start..=upper).find(|len| dag.commit_root_at(*len) == Some(header.dag_root))
+    scan.find(
+        dag.prefix(),
+        dag.order(),
+        header.height,
+        header.dag_root,
+        lower,
+    )
 }
 
 /// The history one served snapshot keeps alive.
@@ -3558,8 +3601,7 @@ async fn node_task(
     };
     let restore_ms = u64::try_from(restore_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     // The last committed prefix this node proved. A peer-certified header's
-    // coverage is derived by scanning forward from here, so the order entries
-    // below it are never rescanned for every later peer header.
+    // coverage searches start here after rebuilding the retained frontier once.
     let mut coverage_lower = restored.as_ref().map_or(0, |restored| restored.order_len);
     if let Some(report) = &snapshot_report {
         coverage_lower = coverage_lower.max(report.order_len);
@@ -3818,6 +3860,11 @@ async fn node_task(
         .as_ref()
         .map_or(0, |(header, _)| header.height);
     let mut certified_since = Instant::now();
+    let mut coverage_scan = CertifiedCoverageScan::default();
+    let mut provable_height = last_provable
+        .as_ref()
+        .map_or(0, |(header, _)| header.height);
+    let mut provable_since = Instant::now();
     // Local rates for the catch-up estimate. `cursor_rate` is mu (rounds this
     // node decides per second); `highest_rate` is lambda (rounds the network
     // produces per second, as seen in the DAG tip). Repeated samples matter: a
@@ -4039,6 +4086,11 @@ async fn node_task(
                                             certified.header.clone(),
                                             certified.certificate.clone(),
                                         ));
+                                        let height = last_provable.as_ref().map_or(0, |(header, _)| header.height);
+                                        if height != provable_height {
+                                            provable_height = height;
+                                            provable_since = Instant::now();
+                                        }
                                     }
                                 }
                                 if let Some(rpc) = &rpc {
@@ -4304,19 +4356,23 @@ async fn node_task(
             Some(reply) = snapshot_rx.recv() => {
                 // A joiner wants the freshest provable boundary, not necessarily
                 // the latest certified height. Deriving the peer head's coverage
-                // here is bounded by COVERAGE_SCAN_LIMIT and happens only when
-                // there is a request to answer.
+                // here shares the failed-scan cache with checkpoint requests.
                 if let Some(finalizer) = finalizer.as_mut()
                     && let Some((header, certificate)) = last_certified.as_ref()
                     && last_provable
                         .as_ref()
                         .is_none_or(|(current, _)| current.height < header.height)
                     && let Some(coverage) =
-                        certified_coverage(&node, &*finalizer, header, coverage_lower)
+                        certified_coverage(&node, &*finalizer, header, coverage_lower, &mut coverage_scan)
                 {
                     finalizer.note_certified_order(header.height, coverage);
                     coverage_lower = coverage_lower.max(coverage);
                     last_provable = Some((header.clone(), certificate.clone()));
+                    let height = last_provable.as_ref().map_or(0, |(header, _)| header.height);
+                    if height != provable_height {
+                        provable_height = height;
+                        provable_since = Instant::now();
+                    }
                 }
                 // Refuse a spent pin before cloning the state and the tail for a
                 // snapshot that would be thrown away. The exact byte check still
@@ -4503,6 +4559,9 @@ async fn node_task(
                     last_provable = Some((adopted.anchor.clone(), adopted.certificate.clone()));
                     certified_height = adopted.anchor.height;
                     certified_since = Instant::now();
+                    coverage_scan = CertifiedCoverageScan::default();
+                    provable_height = adopted.anchor.height;
+                    provable_since = Instant::now();
 
                     // The old view's repair work points at history the snapshot
                     // has replaced.
@@ -5170,6 +5229,11 @@ async fn node_task(
                                     certified.header.clone(),
                                     certified.certificate.clone(),
                                 ));
+                                let height = last_provable.as_ref().map_or(0, |(header, _)| header.height);
+                                if height != provable_height {
+                                    provable_height = height;
+                                    provable_since = Instant::now();
+                                }
                             }
                         }
                         if let Some(rpc) = &rpc {
@@ -5357,6 +5421,11 @@ async fn node_task(
                     core.note_order_from(node.dag().prefix(), node.dag().order());
                     core.note_failures(&silent);
                     core.note_catchup(rpc::CatchupView {
+                        provable_height,
+                        certified_gap: last_certified
+                            .as_ref()
+                            .map_or(0, |(header, _)| header.height)
+                            .saturating_sub(provable_height),
                         backlog_rounds: backlog_now,
                         lambda_rounds_per_s: lambda_now,
                         mu_rounds_per_s: mu_now,
@@ -5524,11 +5593,16 @@ async fn node_task(
                         .as_ref()
                         .is_none_or(|(current, _)| current.height < header.height)
                     && let Some(coverage) =
-                        certified_coverage(&node, &*finalizer, header, coverage_lower)
+                        certified_coverage(&node, &*finalizer, header, coverage_lower, &mut coverage_scan)
                 {
                     finalizer.note_certified_order(header.height, coverage);
                     coverage_lower = coverage_lower.max(coverage);
                     last_provable = Some((header.clone(), certificate.clone()));
+                    let height = last_provable.as_ref().map_or(0, |(header, _)| header.height);
+                    if height != provable_height {
+                        provable_height = height;
+                        provable_since = Instant::now();
+                    }
                 }
                 // A queued peer header becomes writable once the committed order
                 // contains its root. Scan at this cadence rather than on every
@@ -5791,6 +5865,25 @@ async fn node_task(
                         );
                         attempt = Some(ReseedAttempt {
                             reason: "leader-missing",
+                            detail,
+                            trigger_round: cursor,
+                            from_height,
+                            from_round,
+                            from_committed,
+                            lambda: lambda_now,
+                            mu: mu_now,
+                            backlog: backlog_now,
+                            estimate_ms: estimate_now,
+                        });
+                    } else if coverage_gap_needed(provable_height, certified_height, provable_since.elapsed()) {
+                        let detail = format!(
+                            "provable height {provable_height} still for {} ms, certified height {certified_height}, gap {}",
+                            provable_since.elapsed().as_millis(),
+                            certified_height.saturating_sub(provable_height)
+                        );
+                        eprintln!("node {index} reseed: coverage-gap trigger: {detail}");
+                        attempt = Some(ReseedAttempt {
+                            reason: "coverage-gap",
                             detail,
                             trigger_round: cursor,
                             from_height,
@@ -7371,6 +7464,82 @@ mod tests {
     }
 
     #[test]
+    fn coverage_scan_finds_roots_outside_the_old_capped_window() {
+        let order: Vec<_> = (0..5000)
+            .map(|round| VertexId {
+                round,
+                author: b"validator".to_vec(),
+                digest: [round as u8; 32],
+            })
+            .collect();
+        let prefix = CommitFrontier::empty();
+        let root = commit_root(&order[..64]);
+        let mut scan = CoverageScanner::new(&prefix, &order, 0).unwrap();
+        assert_eq!(scan.find(root), Some(64));
+        assert_eq!(scan.find(commit_root(&order[..128])), Some(128));
+        assert_eq!(scan.at, 128, "the same frontier continues across headers");
+        let mut cache = CertifiedCoverageScan::default();
+        assert_eq!(cache.find(&prefix, &order, 1, root, 0), Some(64));
+        assert_eq!(
+            cache.find(&prefix, &order, 2, commit_root(&order[..4500]), 128),
+            Some(4500),
+            "coverage must also be found more than 4096 entries above lower"
+        );
+        assert!(CoverageScanner::new(&prefix, &order, 5001).is_none());
+        let mut compacted = CommitFrontier::empty();
+        for id in &order[..32] {
+            compacted.push(id);
+        }
+        let mut scan = CoverageScanner::new(&compacted, &order[32..], 32).unwrap();
+        assert_eq!(scan.find(root), Some(64));
+        assert!(CoverageScanner::new(&compacted, &order[32..], 0).is_none());
+    }
+
+    #[test]
+    fn coverage_scan_caches_failures_until_height_order_or_adoption_changes() {
+        let prefix = CommitFrontier::empty();
+        let mut scan = CertifiedCoverageScan::default();
+        assert_eq!(scan.find(&prefix, &[], 7, [1; 32], 0), None);
+        assert_eq!(scan.failed, Some((7, 0)));
+        // A matching root would succeed if the failed key were scanned again.
+        assert_eq!(scan.find(&prefix, &[], 7, prefix.root(), 0), None);
+        assert_eq!(scan.find(&prefix, &[], 8, prefix.root(), 0), Some(0));
+        assert_eq!(scan.failed, None);
+        assert_eq!(scan.find(&prefix, &[], 8, [1; 32], 0), None);
+        let order = [VertexId {
+            round: 0,
+            author: vec![0],
+            digest: [0; 32],
+        }];
+        assert_eq!(
+            scan.find(&prefix, &order, 8, commit_root(&order), 0),
+            Some(1)
+        );
+        assert_eq!(scan.find(&prefix, &[], 8, [1; 32], 0), None);
+        scan = CertifiedCoverageScan::default();
+        assert_eq!(scan.find(&prefix, &[], 8, prefix.root(), 0), Some(0));
+    }
+
+    #[test]
+    fn coverage_gap_trigger_boundaries() {
+        let ready = Duration::from_secs(10);
+        assert!(!coverage_gap_needed(
+            100,
+            164,
+            ready - Duration::from_nanos(1)
+        ));
+        assert!(!coverage_gap_needed(100, 163, ready));
+        assert!(coverage_gap_needed(100, 164, ready));
+        assert!(coverage_gap_needed(
+            100,
+            165,
+            ready + Duration::from_secs(1)
+        ));
+        assert!(!coverage_gap_needed(100, 99, ready));
+        assert!(!coverage_gap_needed(u64::MAX - 1, u64::MAX, ready));
+    }
+
+    #[test]
     fn another_wire_protocol_is_refused() {
         let hello = wire::Hello {
             protocol: wire::WIRE_PROTOCOL + 1,
@@ -8438,6 +8607,83 @@ mod tests {
         assert_eq!(resumed_checkpoint_height(Some(&full_store), Some(176)), 176);
         assert_eq!(resumed_checkpoint_height(None, Some(42)), 42);
         assert_eq!(resumed_checkpoint_height(None, None), 0);
+    }
+
+    #[test]
+    fn coverage_scan_recovers_after_known_coverage_crosses_compacted_base() {
+        use validator::EpochSchedule;
+
+        let membership = chain::membership(4, None).expect("a demo committee");
+        let set = membership.set.clone();
+        let chain_id = b"karsa-header-write".to_vec();
+        let genesis = Header::genesis(chain_id.clone(), set.epoch, [1u8; 32], commit_root(&[]));
+        let signer = 0;
+        let mut finalizer = Finalizer::new(
+            SetSchedule::single(set.clone()),
+            EpochSchedule::single(set.epoch),
+            chain_id.clone(),
+            membership.consensus[signer].id.clone(),
+            membership.consensus[signer].private_key.clone(),
+            genesis.clone(),
+            0,
+        )
+        .unwrap();
+        let dir = TestDir::new("header-writes");
+        let store = Store::open(&dir.0).unwrap();
+        let order: Vec<_> = (0..5)
+            .map(|round| VertexId {
+                round,
+                author: b"validator".to_vec(),
+                digest: [round as u8; 32],
+            })
+            .collect();
+        let mut node = Node::with_chain_id_and_epoch_length(
+            set.clone(),
+            0,
+            membership.consensus[signer].id.clone(),
+            membership.consensus[signer].private_key.clone(),
+            chain_id.clone(),
+        );
+        node.seed_prefix(CommitFrontier::from_order(&order[..2]), order[2..].to_vec());
+        let mut writes = HeaderWrites::resume(0, 0);
+        let mut previous = genesis.id().unwrap();
+        for (height, coverage) in [(1, 1), (2, 3), (3, 4), (4, 5)] {
+            let header = Header {
+                chain_id: chain_id.clone(),
+                epoch: set.epoch,
+                height,
+                round: height,
+                state_root: [2; 32],
+                dag_root: commit_root(&order[..coverage]),
+                previous,
+                applied: 0,
+            };
+            previous = header.id().unwrap();
+            let certificate = Certificate {
+                chain_id: chain_id.clone(),
+                epoch: set.epoch,
+                round: height,
+                vertex_id: previous.to_vec(),
+                validator_set_id: Vec::new(),
+                signer_bitmap: vec![0; bitmap_len(set.validators.len())],
+                signatures: Vec::new(),
+            };
+            writes.pending.push_back((header, certificate));
+        }
+        finalizer.note_certified_order(1, 1);
+        finalizer.note_certified_order(2, 3);
+        assert_eq!(
+            writes
+                .write_scanned(Some(&store), &node, &mut finalizer)
+                .unwrap(),
+            4
+        );
+        assert_eq!(writes.height, 4);
+        assert_eq!(writes.coverage, 5);
+        assert_eq!(finalizer.certified_order(3), Some(4));
+        assert_eq!(finalizer.certified_order(4), Some(5));
+        assert!(writes.pending.is_empty());
+        assert_eq!(store.headers().unwrap().len(), 4);
     }
 
     #[test]
