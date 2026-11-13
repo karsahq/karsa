@@ -1089,6 +1089,16 @@ impl Dag {
         carrier: &VertexId,
         tip: &crate::SlotDecisionTip,
     ) -> Result<Decision, CryptoError> {
+        self.inspect_slot_proposal_with_causal(proposal, carrier, tip)
+            .map(|(decision, _)| decision)
+    }
+
+    fn inspect_slot_proposal_with_causal(
+        &self,
+        proposal: &crate::SlotProposal,
+        carrier: &VertexId,
+        tip: &crate::SlotDecisionTip,
+    ) -> Result<(Decision, HashSet<VertexId>), CryptoError> {
         use crate::SlotOutcome;
 
         let invalid =
@@ -1097,7 +1107,7 @@ impl Dag {
         let digest = proposal.digest()?;
         let set = self.set_for_round(d.round);
         d.validate(set)?;
-        if d.round == 0 || d.round == u64::MAX {
+        if d.round == 0 || d.round == u64::MAX || self.is_pruned(d.round) {
             return Err(invalid("unsupported slot proposal round"));
         }
         if d.chain_id != self.chain_id
@@ -1123,42 +1133,7 @@ impl Dag {
             return Err(invalid("slot proposal needs a fixed-set direct quorum"));
         }
 
-        // Do not use is_ancestor here: it may return early and does not establish
-        // that every signed reference matches the exact vertex held for that slot.
-        let mut causal = HashSet::new();
-        let mut stack = vec![carrier.clone()];
-        while let Some(current) = stack.pop() {
-            if self.is_pruned(current.round) || !causal.insert(current.clone()) {
-                continue;
-            }
-            let vertex = self
-                .get(current.round, &current.author)
-                .ok_or_else(|| missing(&current))?;
-            if vertex.id()? != current || vertex.chain_id != d.chain_id {
-                return Err(invalid("slot proposal causal vertex mismatch"));
-            }
-            if self.set_for_round(current.round).id()? != d.validator_set_id
-                || self.epoch_of(current.round) != d.epoch
-            {
-                return Err(invalid("slot proposal causal history changes set or epoch"));
-            }
-            vertex.verify(set, d.epoch)?;
-            self.check_round_references(vertex)?;
-            if vertex
-                .references
-                .iter()
-                .any(|reference| reference.round >= vertex.round)
-            {
-                return Err(invalid("slot proposal contains a noncausal reference"));
-            }
-            if current == *carrier && vertex.payload_hash != digest {
-                return Err(invalid("slot proposal is not bound to its carrier"));
-            }
-            stack.extend(vertex.references.iter().cloned());
-        }
-        if self.is_pruned(carrier.round) {
-            return Err(invalid("slot proposal carrier is pruned"));
-        }
+        let causal = self.slot_causal_history(carrier, digest, d)?;
         let leader = self
             .leader(d.round)
             .ok_or_else(|| invalid("slot proposal requires the retained elected leader"))?;
@@ -1198,11 +1173,121 @@ impl Dag {
         if d.after_len != frontier.len() as u64 || d.after_root != frontier.root() {
             return Err(invalid("slot proposal frontier effect mismatch"));
         }
-        Ok(if committing {
+        let decision = if committing {
             Decision::Commit(history)
         } else {
             Decision::Skip
-        })
+        };
+        Ok((decision, causal))
+    }
+
+    // Validate the complete retained cone, not an early-return ancestry predicate.
+    // Exact references at the trusted pruning boundary are retained in the result;
+    // they name boundary vertices but do not authenticate their pruned contents.
+    fn slot_causal_history(
+        &self,
+        carrier: &VertexId,
+        digest: [u8; 32],
+        decision: &crate::SlotDecision,
+    ) -> Result<HashSet<VertexId>, CryptoError> {
+        let invalid =
+            |message: &str| CryptoError::new(CryptoErrorKind::MalformedCertificate, message);
+        if self.is_pruned(carrier.round) {
+            return Err(invalid("slot carrier is pruned"));
+        }
+        let set = self.set_for_round(decision.round);
+        let mut causal = HashSet::new();
+        let mut stack = vec![carrier.clone()];
+        while let Some(current) = stack.pop() {
+            if !causal.insert(current.clone()) || self.is_pruned(current.round) {
+                continue;
+            }
+            let vertex = self
+                .get(current.round, &current.author)
+                .ok_or_else(|| missing(&current))?;
+            if vertex.id()? != current || vertex.chain_id != decision.chain_id {
+                return Err(invalid("slot causal vertex mismatch"));
+            }
+            if self.set_for_round(current.round).id()? != decision.validator_set_id
+                || self.epoch_of(current.round) != decision.epoch
+            {
+                return Err(invalid("slot causal history changes set or epoch"));
+            }
+            vertex.verify(set, decision.epoch)?;
+            self.check_round_references(vertex)?;
+            if vertex
+                .references
+                .iter()
+                .any(|reference| reference.round >= vertex.round)
+            {
+                return Err(invalid(
+                    "slot causal history contains a noncausal reference",
+                ));
+            }
+            if current == *carrier && vertex.payload_hash != digest {
+                return Err(invalid("slot payload is not bound to its carrier"));
+            }
+            stack.extend(vertex.references.iter().cloned());
+        }
+        Ok(causal)
+    }
+
+    /// Inspects an inactive QC payload with proposal and predecessor causal binding.
+    ///
+    /// The retained signed QC carrier must name the entire payload and descend from
+    /// its retained proposal carrier. The proposal must pass direct-rule evidence and
+    /// frontier checks and descend from the trusted binding's predecessor carrier,
+    /// if one exists. A pruned predecessor can be named by an exact signed boundary
+    /// reference, but its pruned payload is trusted rather than reauthenticated.
+    /// QC signatures authorize the exact decision, not a particular evidence or signer
+    /// subset; both payload and proposal carrier hashes bind the supplied evidence.
+    ///
+    /// This is read-only inspection, not application, signing permission, or an update
+    /// to the binding. Bootstrap authentication, durable progress, certified-only
+    /// application, view changes and live activation remain the caller's responsibility.
+    /// Full retained causal cones and the order are scanned; callers must budget work
+    /// before exposing this API to untrusted request-driven processing.
+    ///
+    /// # Errors
+    /// Rejects invalid QC signatures, context/effect mismatches, missing or inconsistent
+    /// retained history, and absent, unbound, or noncausal proposal/predecessor carriers.
+    pub fn inspect_slot_certificate(
+        &self,
+        payload: &crate::SlotCertificatePayload,
+        carrier: &VertexId,
+        binding: &crate::SlotDecisionBinding,
+    ) -> Result<Decision, CryptoError> {
+        let invalid =
+            |message: &str| CryptoError::new(CryptoErrorKind::MalformedCertificate, message);
+        let digest = payload.digest()?;
+        if carrier.round <= payload.proposal_carrier.round {
+            return Err(invalid("slot QC carrier must follow its proposal carrier"));
+        }
+        let (decision, proposal_causal) = self.inspect_slot_proposal_with_causal(
+            &payload.proposal,
+            &payload.proposal_carrier,
+            binding.tip(),
+        )?;
+        if let Some(previous) = binding.carrier()
+            && (previous.round >= payload.proposal_carrier.round
+                || !proposal_causal.contains(previous))
+        {
+            return Err(invalid(
+                "slot proposal does not causally extend its predecessor carrier",
+            ));
+        }
+        let set = self.set_for_round(payload.certificate.decision.round);
+        // Exercise the same QC and continuity preflight as the eventual tip update,
+        // but leave both the trusted binding and the DAG completely unchanged.
+        let mut tip = binding.tip().clone();
+        tip.advance_authorized(&payload.certificate, set)?;
+        let causal = self.slot_causal_history(carrier, digest, &payload.proposal.decision)?;
+        if !causal.contains(&payload.proposal_carrier) {
+            return Err(invalid(
+                "slot QC does not causally extend its proposal carrier",
+            ));
+        }
+        Ok(decision)
     }
 
     /// Number of held vertices in `round + 1` that vote for the leader of
@@ -2528,6 +2613,246 @@ mod tests {
         assert_eq!(
             fixture.dag.try_commit(LEADER_ROUND).unwrap(),
             Decision::Undecided
+        );
+    }
+
+    fn bind_slot_certificate(
+        fixture: &mut Fixture,
+        payload: &crate::SlotCertificatePayload,
+        references: Vec<VertexId>,
+    ) -> VertexId {
+        let carrier = vertex_with_payload(
+            fixture,
+            1,
+            LEADER_ROUND + 3,
+            references,
+            payload.digest().unwrap(),
+        );
+        fixture
+            .dag
+            .vertices
+            .remove(&(carrier.round, carrier.author.clone()));
+        fixture.dag.insert(carrier).unwrap()
+    }
+
+    fn slot_certificate_fixture(
+        committing: bool,
+    ) -> (
+        Fixture,
+        crate::SlotCertificatePayload,
+        VertexId,
+        crate::SlotDecisionBinding,
+    ) {
+        let (mut fixture, proposal, proposal_carrier, tip) = direct_slot_proposal(committing);
+        let signing_payload = proposal.decision.signing_payload().unwrap();
+        // Test-only QC construction: this does not exercise durable signing intents.
+        let signatures = (0..fixture.dag.set().quorum_size())
+            .map(|index| crate::ValidatorSignature {
+                validator_id: format!("val-{index}").into_bytes(),
+                key_id: format!("val-{index}-k0").into_bytes(),
+                signature: Ed25519Scheme
+                    .sign(&fixture.keys[index], &signing_payload)
+                    .unwrap(),
+            })
+            .collect();
+        let payload = crate::SlotCertificatePayload {
+            certificate: crate::SlotDecisionCertificate {
+                decision: proposal.decision.clone(),
+                signatures,
+            },
+            proposal,
+            proposal_carrier,
+        };
+        let references = fixture.ids(LEADER_ROUND + 1);
+        fixture.full_round(LEADER_ROUND + 2, &references).unwrap();
+        let previous = fixture.ids(0)[0].clone();
+        let binding = crate::SlotDecisionBinding::from_checkpoint(tip, Some(previous)).unwrap();
+        let references = fixture.ids(LEADER_ROUND + 2);
+        let carrier = bind_slot_certificate(&mut fixture, &payload, references);
+        (fixture, payload, carrier, binding)
+    }
+
+    #[test]
+    fn slot_certificate_requires_bound_proposal_evidence_and_valid_qc_without_mutation() {
+        for committing in [false, true] {
+            let (fixture, payload, carrier, binding) = slot_certificate_fixture(committing);
+            let before_binding = binding.clone();
+            let inspected = inspect_without_effects(&fixture.dag, |dag| {
+                dag.inspect_slot_certificate(&payload, &carrier, &binding)
+            });
+            assert_eq!(
+                inspected,
+                fixture
+                    .dag
+                    .inspect_slot_proposal(
+                        &payload.proposal,
+                        &payload.proposal_carrier,
+                        binding.tip()
+                    )
+                    .unwrap()
+            );
+            assert_eq!(binding, before_binding);
+        }
+    }
+
+    #[test]
+    fn slot_certificate_rejects_invalid_quorums_even_with_a_bound_carrier() {
+        let (mut fixture, original, _, binding) = slot_certificate_fixture(true);
+        for mutation in 0..3 {
+            let mut payload = original.clone();
+            match mutation {
+                0 => {
+                    payload.certificate.signatures.pop();
+                }
+                1 => payload.certificate.signatures[0].signature[0] ^= 1,
+                2 => payload.certificate.signatures[1] = payload.certificate.signatures[0].clone(),
+                _ => unreachable!("bounded mutations"),
+            }
+            let references = fixture.ids(LEADER_ROUND + 2);
+            let carrier = bind_slot_certificate(&mut fixture, &payload, references);
+            assert!(
+                fixture
+                    .dag
+                    .inspect_slot_certificate(&payload, &carrier, &binding)
+                    .is_err(),
+                "invalid quorum mutation {mutation}"
+            );
+            assert!(fixture.dag.order().is_empty());
+            assert!(fixture.dag.committed.is_empty());
+            assert!(fixture.dag.skipped().is_empty());
+        }
+    }
+
+    #[test]
+    fn slot_certificate_qc_transport_cannot_bypass_proposal_binding_or_evidence() {
+        let (mut fixture, mut payload, carrier, binding) = slot_certificate_fixture(true);
+        let mut forged = carrier.clone();
+        forged.digest[0] ^= 1;
+        assert!(
+            fixture
+                .dag
+                .inspect_slot_certificate(&payload, &forged, &binding)
+                .is_err()
+        );
+        // A valid decision QC is insufficient if its supplied proposal is not the
+        // one bound by the proposal carrier, even when that evidence is also valid.
+        payload.proposal.voters[2] = fixture.ids(LEADER_ROUND + 1)[3].clone();
+        let references = fixture.ids(LEADER_ROUND + 2);
+        let carrier = bind_slot_certificate(&mut fixture, &payload, references);
+        assert!(
+            fixture
+                .dag
+                .inspect_slot_certificate(&payload, &carrier, &binding)
+                .is_err()
+        );
+        assert!(fixture.dag.order().is_empty());
+    }
+
+    #[test]
+    fn slot_certificate_checks_side_branches_exclusive_to_the_qc_carrier() {
+        for missing_vertex in [false, true] {
+            let (mut fixture, payload, carrier, binding) = slot_certificate_fixture(true);
+            let key = (LEADER_ROUND + 2, b"val-3".to_vec());
+            if missing_vertex {
+                fixture.dag.vertices.remove(&key);
+            } else {
+                fixture.dag.vertices.get_mut(&key).unwrap().signature[0] ^= 1;
+            }
+            // This vertex is not in the proposal's cone, so proposal validation
+            // still succeeds. QC validation must inspect its own complete cone.
+            assert!(
+                fixture
+                    .dag
+                    .inspect_slot_proposal(
+                        &payload.proposal,
+                        &payload.proposal_carrier,
+                        binding.tip(),
+                    )
+                    .is_ok()
+            );
+            assert!(
+                fixture
+                    .dag
+                    .inspect_slot_certificate(&payload, &carrier, &binding)
+                    .is_err()
+            );
+            assert!(fixture.dag.order().is_empty());
+            assert!(fixture.dag.skipped().is_empty());
+        }
+    }
+
+    #[test]
+    fn slot_certificate_requires_proposal_carrier_in_qc_history() {
+        let (mut fixture, payload, _, binding) = slot_certificate_fixture(true);
+        let references = fixture.ids(LEADER_ROUND + 2)[1..].to_vec();
+        let carrier = bind_slot_certificate(&mut fixture, &payload, references);
+        // The carrier has a valid previous-round quorum, just not this proposal.
+        assert!(
+            fixture
+                .dag
+                .inspect_slot_certificate(&payload, &carrier, &binding)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn slot_certificate_predecessor_must_be_in_proposal_not_only_qc_history() {
+        let (mut fixture, mut payload, _, binding) = slot_certificate_fixture(true);
+        let previous = fixture.ids(LEADER_ROUND + 1)[3].clone();
+        let references = fixture.ids(LEADER_ROUND + 1)[..3].to_vec();
+        let proposal_carrier = vertex_with_payload(
+            &fixture,
+            0,
+            LEADER_ROUND + 2,
+            references,
+            payload.proposal.digest().unwrap(),
+        );
+        fixture
+            .dag
+            .vertices
+            .remove(&(proposal_carrier.round, proposal_carrier.author.clone()));
+        payload.proposal_carrier = fixture.dag.insert(proposal_carrier).unwrap();
+        let references = fixture.ids(LEADER_ROUND + 2);
+        let carrier = bind_slot_certificate(&mut fixture, &payload, references);
+        assert!(fixture.dag.is_ancestor(&previous, &carrier).unwrap());
+        assert!(
+            !fixture
+                .dag
+                .is_ancestor(&previous, &payload.proposal_carrier)
+                .unwrap()
+        );
+        let binding =
+            crate::SlotDecisionBinding::from_checkpoint(binding.tip().clone(), Some(previous))
+                .unwrap();
+        assert!(
+            fixture
+                .dag
+                .inspect_slot_certificate(&payload, &carrier, &binding)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn slot_certificate_can_reference_a_trusted_pruned_predecessor_exactly() {
+        let (mut fixture, payload, carrier, binding) = slot_certificate_fixture(false);
+        fixture.dag.set_floor(0);
+        assert_eq!(
+            fixture
+                .dag
+                .inspect_slot_certificate(&payload, &carrier, &binding)
+                .unwrap(),
+            Decision::Skip
+        );
+        let mut wrong = binding.carrier().unwrap().clone();
+        wrong.digest[0] ^= 1;
+        let binding =
+            crate::SlotDecisionBinding::from_checkpoint(binding.tip().clone(), Some(wrong))
+                .unwrap();
+        assert!(
+            fixture
+                .dag
+                .inspect_slot_certificate(&payload, &carrier, &binding)
+                .is_err()
         );
     }
 

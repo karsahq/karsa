@@ -18,6 +18,7 @@ mod pacemaker;
 mod round_skip;
 mod schedule;
 mod set_change;
+mod slot_certificate;
 mod slot_decision;
 mod slot_proposal;
 mod vertex;
@@ -46,6 +47,10 @@ pub use set_change::{
     SET_CHANGE_VERSION_V1, SetChange, SetChangeError, SetSchedule,
     TRANSITION_CERTIFICATE_VERSION_V1, Transition, TransitionCertificate, check_transition,
     min_intersection,
+};
+pub use slot_certificate::{
+    SLOT_CERTIFICATE_PAYLOAD_DOMAIN, SLOT_CERTIFICATE_PAYLOAD_VERSION_V1, SlotCertificatePayload,
+    SlotDecisionBinding,
 };
 pub use slot_decision::{
     SLOT_DECISION_ID_DOMAIN, SLOT_DECISION_SIGNING_DOMAIN, SLOT_DECISION_VERSION_V1, SlotDecision,
