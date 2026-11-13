@@ -2391,7 +2391,54 @@ another peer, which is the intended behaviour.
 whose latest header is not reproducible from the retained tail
 (`the certified head does not match any committed prefix`). The measured reseed
 used a graceful `--timeout-seconds` exit; crash-consistent recovery from a
-mid-checkpoint kill is still open.
+mid-checkpoint kill is still open. D80 decides the recovery.
+
+## D80 — A restart resumes only at a certified head the store can prove
+
+**Decided.** `restore_live` no longer requires the last stored certified header's
+`dag_root` to match a replayed prefix. It replays the retained tail once, walks
+the stored headers in height order, and keeps the longest prefix whose roots the
+replay reached. The header log is rewritten above that height through a
+temporary file and rename (`Store::truncate_headers`), the finalizer adopts only
+the kept headers, and the node resumes at that certified head. A drop is
+reported with the height, the number discarded, and the previous top. A store
+whose top header is reproducible takes the same path as before.
+
+**Why.** A node can certify a peer-built header faster than it receives the
+vertices behind that header's `dag_root`. `put_header` persisted the certificate
+as soon as the finalizer advanced, so an abrupt stop could leave a header log
+longer than the order the store could replay. `restore_live` then failed with
+`the certified head does not match any committed prefix`, and `karsa audit`
+could not re-derive those heights either. The committed entries above the last
+provable header are not lost: the node still holds their vertices and commits
+them as gossip or a reseed catches up. What must not happen is writing a head
+the store cannot re-derive. The live snapshot anchor is kept, so the fallback is
+deterministic across restarts; a new checkpoint still waits for a self-built
+certified head with known coverage, because a dropped peer header has no
+committed order length.
+
+**Measured.** Four validators, `CHECKPOINT_EVERY=32 FAILURE_ROUNDS=15
+--fence-silent`; node 3 paused 15 s, resumed 200 ms, then SIGKILL. Store:
+1.69 MB header log, 3303 certified heights 1953..=5255, live snapshot anchor
+1953. Before the change, a restart exited at the end of its lifetime with
+`the certified head does not match any committed prefix`; `karsa audit`
+re-derived 364 of 3302 heights and exited 1.
+
+The same store restarted with the change:
+`restart: the retained order reproduces height 2317, dropped 2938 stored headers
+above it (top 5255)`, `replay: 9960 committed entries in 1219 ms`, certified
+head 2317. With `--snapshot-port 0` (no reseed) the store ended at 365 headers
+(1953..=2317); `karsa audit` re-derived 364 of 364 heights above the anchor and
+exited 0. With a normal snapshot port the node then reseeded and adopted a peer
+snapshot at height 15872; `karsa audit` also exited 0. A unit test appends a
+certified header whose root the order cannot reproduce, restarts the mesh, and
+checks both the truncated header log and a successful audit.
+
+**Open.** The live loop still persists every certified header before checking
+that its `dag_root` is in the retained order. The fallback heals such a store on
+the next restart, but a crash can leave one unprovable interval until that
+restart. Filtering at write time needs the coverage stored in the header record
+(a store-format change) and a gapless-log story for audit.
 
 ## Open decisions
 

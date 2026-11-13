@@ -525,12 +525,50 @@ impl Store {
         Ok(by_height.into_values().collect())
     }
 
+    /// Drops certified headers above `height`.
+    ///
+    /// A restart that cannot reproduce a stored header's committed prefix
+    /// resumes from the highest header it can prove. Rewriting the log keeps the
+    /// next restart and audit from walking a head the retained order cannot
+    /// account for. Nothing below `height` is touched, so a store that never
+    /// crossed the point is left byte-for-byte alone.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] on read or write failure, [`StoreError::Decode`] when a
+    /// retained record does not encode.
+    pub fn truncate_headers(&self, height: u64) -> Result<usize, StoreError> {
+        let headers = self.headers()?;
+        let kept: Vec<&CertifiedHeader> = headers
+            .iter()
+            .filter(|record| record.header.height <= height)
+            .collect();
+        let dropped = headers.len() - kept.len();
+        if dropped == 0 {
+            return Ok(0);
+        }
+        let mut encoded = Vec::new();
+        for record in kept {
+            let bytes = encode_header_record(&record.header, &record.certificate)?;
+            let length = u32::try_from(bytes.len()).map_err(|_| {
+                StoreError::Decode(CryptoError::new(
+                    crypto::CryptoErrorKind::FieldTooLong,
+                    "header record does not fit a u32 length",
+                ))
+            })?;
+            encoded.extend_from_slice(&length.to_le_bytes());
+            encoded.extend_from_slice(&bytes);
+        }
+        rewrite(&self.path_of(HEADERS_FILE), &encoded)?;
+        Ok(dropped)
+    }
+
     /// Writes a state snapshot taken at `round`, replacing any previous one.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Io`] on write failure, [`StoreError::Decode`] when the state
-    /// does not fit the record length field.
+    /// [`StoreError::Io`] on write failure, [`StoreError::Decode`] when the
+    /// state does not fit the record length field.
     pub fn put_snapshot(&self, round: u64, state: &[u8]) -> Result<(), StoreError> {
         let length = u32::try_from(state.len()).map_err(|_| {
             StoreError::Decode(CryptoError::new(
@@ -2591,6 +2629,28 @@ mod tests {
         assert_eq!(read[0].header, header(1));
         assert_eq!(read[1].header, header(2));
         assert_eq!(read[1].certificate, certificate(2));
+    }
+
+    #[test]
+    fn truncating_headers_keeps_the_provable_prefix_on_disk() {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        for height in 1..=5u64 {
+            store
+                .put_header(&header(height), &certificate(height))
+                .unwrap();
+        }
+
+        let dropped = store.truncate_headers(3).unwrap();
+        assert_eq!(dropped, 2);
+        let read = store.headers().unwrap();
+        assert_eq!(read.len(), 3, "heights above the bound are gone");
+        assert_eq!(read[2].header, header(3));
+
+        // A rewrite is visible to a reopen, not just to the live handle.
+        let reopened = Store::open(&dir.0).unwrap();
+        assert_eq!(reopened.headers().unwrap().len(), 3);
+        assert_eq!(reopened.truncate_headers(3).unwrap(), 0);
     }
 
     #[test]

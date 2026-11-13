@@ -45,7 +45,7 @@ use erasure::Code;
 use exec::State;
 use net::Node;
 use net::wire::{self, Message};
-use store::{LiveSnapshot, Store};
+use store::{CertifiedHeader, LiveSnapshot, Store};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -932,26 +932,50 @@ fn credited_genesis(accounts: &[chain::Account]) -> Result<State, String> {
     Ok(state)
 }
 
-/// Replays the stored DAG up to the prefix the latest certificate covers.
+/// The stored certified head the replayed order can still prove.
+struct ProvableHead {
+    /// Height of the highest stored header the replay reproduced, or the trust
+    /// anchor when no header above it could be reproduced.
+    height: u64,
+    /// Stored headers above `height`, which the replay cannot account for.
+    dropped: usize,
+    /// Height of the last stored header, for the drop report.
+    top: u64,
+}
+
+/// Replays the stored DAG and finds the longest stored header prefix it proves.
 ///
 /// The pacemaker starts at the current cursor, so this is the same decision
-/// sequence the original run performed. It stops at the committed prefix named by
-/// `head_root`, not at the DAG tip: a header the finalizer builds later names the
-/// whole order prefix it covers, so replaying past the certificate would make the
-/// first header after restart cover several decisions at once, a header no other
-/// validator ever signed. The live loop redoes the decisions above that prefix and
-/// records one header per decision.
+/// sequence the original run performed. A certified header names the whole order
+/// prefix it covers, so a header the finalizer builds later must not cover several
+/// decisions at once; the live loop redoes the decisions above the proven prefix
+/// and records one header per decision.
+///
+/// A node can certify a peer-built header faster than it receives the vertices
+/// behind that header's `dag_root`. The store then holds certified headers the
+/// retained tail cannot reproduce. This walks the headers in ascending height and
+/// keeps the longest prefix whose roots the replay reached, exactly as
+/// `replay_to_head` used to do for one target root. Anything above that prefix is
+/// dropped by the caller rather than failing every later restart.
 ///
 /// The initial boundary is whatever order the node started with: empty for a full
 /// replay, and the snapshot's committed prefix for a snapshot restart.
-fn replay_to_head(node: &mut Node, head_root: [u8; 32]) -> Result<(), String> {
-    let mut boundaries: Vec<(usize, u64)> = vec![(node.dag().order_len(), node.cursor())];
+fn replay_to_provable_head(
+    node: &mut Node,
+    headers: &[CertifiedHeader],
+    base_height: u64,
+) -> Result<ProvableHead, String> {
+    let mut boundaries: Vec<(usize, u64, [u8; 32])> = vec![(
+        node.dag().order_len(),
+        node.cursor(),
+        node.dag().commit_root(),
+    )];
     loop {
         match node.commit_once() {
             Ok(Step::Advanced {
                 cursor, anchors, ..
             }) => {
-                boundaries.push((node.dag().order_len(), cursor));
+                boundaries.push((node.dag().order_len(), cursor, node.dag().commit_root()));
                 if anchors > 0 {
                     break;
                 }
@@ -961,18 +985,50 @@ fn replay_to_head(node: &mut Node, head_root: [u8; 32]) -> Result<(), String> {
             Err(error) => return Err(format!("cannot rebuild the committed order: {error}")),
         }
     }
-    let Some(index) = boundaries
-        .iter()
-        .rposition(|(len, _)| node.dag().commit_root_at(*len) == Some(head_root))
-    else {
-        return Err("the certified head does not match any committed prefix".into());
-    };
-    let (head_len, head_cursor) = boundaries[index];
-    if head_len < node.dag().order_len() {
-        node.truncate_order(head_len);
-        node.set_cursor(head_cursor);
+
+    // Headers are sorted by height. A header whose root the replay never reached
+    // ends the provable prefix: a gap cannot be skipped, because the finalizer
+    // adopts each stored header as the next link in one chain.
+    let mut from = 0usize;
+    let mut matched: Option<(u64, usize, u64)> = None;
+    for record in headers {
+        if record.header.height <= base_height {
+            continue;
+        }
+        let Some(index) = boundaries[from..]
+            .iter()
+            .rposition(|(_, _, root)| *root == record.header.dag_root)
+            .map(|offset| from + offset)
+        else {
+            break;
+        };
+        from = index;
+        matched = Some((
+            record.header.height,
+            boundaries[index].0,
+            boundaries[index].1,
+        ));
     }
-    Ok(())
+
+    let (height, len, cursor) = matched.unwrap_or((base_height, boundaries[0].0, boundaries[0].1));
+    if len < node.dag().order_len() {
+        node.truncate_order(len);
+        node.set_cursor(cursor);
+    } else if node.cursor() != cursor {
+        node.set_cursor(cursor);
+    }
+    let dropped = headers
+        .iter()
+        .filter(|record| record.header.height > height)
+        .count();
+    let top = headers
+        .last()
+        .map_or(base_height, |record| record.header.height);
+    Ok(ProvableHead {
+        height,
+        dropped,
+        top,
+    })
 }
 
 /// Rebuilds a node from its store before the live loop starts.
@@ -982,12 +1038,13 @@ fn replay_to_head(node: &mut Node, head_root: [u8; 32]) -> Result<(), String> {
 /// the committed order, and a header's `dag_root` needs that order to build the
 /// next header, so guessing would be worse than failing closed.
 fn restore(
+    index: usize,
     store: &Store,
     node: &mut Node,
     live: &mut Restorable<'_>,
 ) -> Result<Option<Restored>, String> {
     if let Some(snapshot) = store.live_snapshot().map_err(|error| error.to_string())? {
-        return restore_live(store, node, live, snapshot).map(Some);
+        return restore_live(index, store, node, live, snapshot).map(Some);
     }
     let snapshot = store.snapshot().map_err(|error| error.to_string())?;
     let mut vertices = store.vertices().map_err(|error| error.to_string())?;
@@ -1054,10 +1111,16 @@ fn restore(
             .map_err(|error| format!("stored round skip is not authorized: {error}"))?;
     }
 
-    let head_root = headers
-        .last()
-        .map_or_else(|| commit_root(&[]), |record| record.header.dag_root);
-    replay_to_head(node, head_root)?;
+    let provable = replay_to_provable_head(node, &headers, 0)?;
+    if provable.dropped > 0 {
+        let discarded = store
+            .truncate_headers(provable.height)
+            .map_err(|error| error.to_string())?;
+        eprintln!(
+            "node {index} restart: the retained order reproduces height {}, dropped {discarded} stored headers above it (top {})",
+            provable.height, provable.top
+        );
+    }
 
     for batch in store.batches().map_err(|error| error.to_string())? {
         let digest = batch.digest().map_err(|error| error.to_string())?;
@@ -1089,7 +1152,7 @@ fn restore(
         let mut stored = headers;
         stored.sort_by_key(|record| record.header.height);
         for record in stored {
-            if record.header.height == 0 {
+            if record.header.height == 0 || record.header.height > provable.height {
                 continue;
             }
             finalizer
@@ -1117,6 +1180,7 @@ fn restore(
 /// certified headers above the anchor advance the header chain; the anchor's own
 /// certificate is the trust root.
 fn restore_live(
+    index: usize,
     store: &Store,
     node: &mut Node,
     live: &mut Restorable<'_>,
@@ -1224,10 +1288,16 @@ fn restore_live(
     // it are redone by the live loop so every header covers one decision.
     let mut headers = store.headers().map_err(|error| error.to_string())?;
     headers.sort_by_key(|record| record.header.height);
-    let head_root = headers
-        .last()
-        .map_or(snapshot.header.dag_root, |record| record.header.dag_root);
-    replay_to_head(node, head_root)?;
+    let provable = replay_to_provable_head(node, &headers, anchor_height)?;
+    if provable.dropped > 0 {
+        let discarded = store
+            .truncate_headers(provable.height)
+            .map_err(|error| error.to_string())?;
+        eprintln!(
+            "node {index} restart: the retained order reproduces height {}, dropped {discarded} stored headers above it (top {})",
+            provable.height, provable.top
+        );
+    }
 
     let base = node.dag().prefix().len();
     let order = node.dag().order().to_vec();
@@ -1258,7 +1328,7 @@ fn restore_live(
     }
 
     for record in headers {
-        if record.header.height <= anchor_height {
+        if record.header.height <= anchor_height || record.header.height > provable.height {
             continue;
         }
         finalizer
@@ -3101,6 +3171,7 @@ async fn node_task(
         None
     } else if let Some(store) = &store {
         restore(
+            index,
             store,
             &mut node,
             &mut Restorable {
@@ -7446,6 +7517,51 @@ mod tests {
         );
         crate::audit::run(dir.0.join("val-0"), 4, None)
             .expect("a checkpoint-pruned store must audit above its anchor");
+    }
+
+    #[test]
+    fn a_mesh_restarts_past_a_certified_head_it_cannot_reproduce() {
+        let _mesh = mesh_test_lock();
+        let dir = TestDir::new("unprovable-head");
+        let first = run(mesh_config(&dir, a_free_port_base(4), 30, 2));
+        assert!(first.is_ok(), "the first run failed: {first:?}");
+
+        // A node can certify a peer-built header faster than it receives the
+        // vertices behind that header's dag_root. Append a header the retained
+        // order cannot reproduce: its certificate is never checked because the
+        // restart must drop it before adopting anything.
+        let store = Store::open(dir.0.join("val-0")).unwrap();
+        let top = store
+            .headers()
+            .unwrap()
+            .pop()
+            .expect("the first run certified at least one header");
+        let mut phantom = top.header.clone();
+        phantom.height = top.header.height.saturating_add(1);
+        phantom.round = top.header.round.saturating_add(1);
+        phantom.previous = top.header.id().unwrap();
+        phantom.dag_root[0] ^= 0xff;
+        let mut certificate = top.certificate.clone();
+        certificate.round = phantom.round;
+        certificate.vertex_id = phantom.id().unwrap().to_vec();
+        store.put_header(&phantom, &certificate).unwrap();
+        let phantom_height = phantom.height;
+
+        let second = run(mesh_config(&dir, a_free_port_base(4), 5, 0));
+        assert!(second.is_ok(), "the restart failed: {second:?}");
+
+        let store = Store::open(dir.0.join("val-0")).unwrap();
+        let after = store
+            .headers()
+            .unwrap()
+            .pop()
+            .expect("the restart kept a certified head");
+        assert!(
+            after.header.height < phantom_height,
+            "the unprovable head must not survive the restart"
+        );
+        crate::audit::run(dir.0.join("val-0"), 4, None)
+            .expect("a store healed by the replay must audit");
     }
 
     #[test]
