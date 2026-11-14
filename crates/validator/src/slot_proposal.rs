@@ -7,7 +7,7 @@
 //! (including signatures, membership, distinct authors, rounds, and thresholds),
 //! the evidence rule, and decision/frontier continuity. Legacy V1 proposals support
 //! only direct evidence; the unified envelope adds explicit indirect-positive
-//! evidence. Fence evidence is unsupported. Codecs perform no semantic validation.
+//! evidence and conservative skip partitions. Codecs perform no semantic validation.
 
 use crypto::encoding::{Decoder, Encoder, MAX_FIELD_LEN};
 use crypto::{CryptoError, CryptoErrorKind};
@@ -43,6 +43,11 @@ pub const SLOT_PROPOSAL_VERSION_V2: u16 = 2;
 /// Domain for explicit indirect-positive proposal evidence.
 pub const SLOT_PROPOSAL_INDIRECT_DOMAIN: &[u8] = b"KARSA/DAG/SLOT_PROPOSAL/v2";
 
+/// Independent conservative-skip encoding version.
+pub const SLOT_PROPOSAL_VERSION_V3: u16 = 3;
+/// Domain for self-contained conservative skip partitions.
+pub const SLOT_PROPOSAL_SKIP_DOMAIN: &[u8] = b"KARSA/DAG/SLOT_PROPOSAL/v3";
+
 /// Explicit evidence kind; indirect evidence admits only a positive commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotProposalEvidence {
@@ -50,6 +55,15 @@ pub enum SlotProposalEvidence {
     Direct {
         /// Canonically ordered signed vote/nonvote identities.
         voters: Vec<VertexId>,
+    },
+    /// Complete author partition bounding direct votes, not excluding indirect commits.
+    ConservativeSkip {
+        /// Signed voting-round vertices, classified by their references, not fences.
+        voters: Vec<VertexId>,
+        /// Unknown authors; each counts as a potential vote even if fenced.
+        missing: Vec<Vec<u8>>,
+        /// Optional authenticated annotations granting no additional skip authority.
+        fences: Vec<crate::FenceCertificate>,
     },
     /// Later elected anchor and exact signed vertices voting for it.
     IndirectCommit {
@@ -81,10 +95,65 @@ impl From<SlotProposal> for SlotProposalEnvelope {
 }
 
 impl SlotProposalEnvelope {
-    /// Encodes direct proposals byte-for-byte as V1, and indirect evidence as V2.
+    /// Encodes unchanged V1/V2 evidence or a self-contained V3 skip partition.
     pub fn encode(&self) -> Result<Vec<u8>, CryptoError> {
         match &self.evidence {
             SlotProposalEvidence::Direct { voters } => encode_parts(&self.decision, voters),
+            SlotProposalEvidence::ConservativeSkip {
+                voters,
+                missing,
+                fences,
+            } => {
+                check_bound(missing.len().saturating_add(voters.len()), MAX_VOTERS)?;
+                check_bound(fences.len(), MAX_VOTERS)?;
+                // Bound the entire nested payload before allocating certificate encodings.
+                let body = encode_parts(&self.decision, voters)?;
+                let mut size = 2usize.saturating_add(4 + body.len() + 8);
+                for author in missing {
+                    check_bound(author.len(), MAX_AUTHOR_BYTES)?;
+                    size = size.saturating_add(4 + author.len());
+                }
+                for certificate in fences {
+                    check_bound(certificate.signatures.len(), MAX_VOTERS)?;
+                    size = size.saturating_add(
+                        4 + 4
+                            + 2
+                            + 4
+                            + certificate.fence.chain_id.len()
+                            + 8
+                            + 4
+                            + certificate.fence.validator_id.len()
+                            + 4
+                            + certificate.signer_bitmap.len()
+                            + 4,
+                    );
+                    for signature in &certificate.signatures {
+                        size = size.saturating_add(4 + signature.len());
+                    }
+                }
+                check_bound(size, MAX_FIELD_LEN)?;
+                let mut e = Encoder::new();
+                e.put_u16(SLOT_PROPOSAL_VERSION_V3);
+                e.put_bytes(&body)?;
+                e.put_u32(missing.len() as u32);
+                for (i, author) in missing.iter().enumerate() {
+                    check_bound(author.len(), MAX_AUTHOR_BYTES)?;
+                    if i > 0 && missing[i - 1] >= *author {
+                        return Err(malformed("unknown authors are not strictly ordered"));
+                    }
+                    e.put_bytes(author)?;
+                }
+                e.put_u32(fences.len() as u32);
+                for (i, fence) in fences.iter().enumerate() {
+                    if i > 0 && fences[i - 1].fence.validator_id >= fence.fence.validator_id {
+                        return Err(malformed("fence subjects are not strictly ordered"));
+                    }
+                    e.put_bytes(&fence.encode()?)?;
+                }
+                let bytes = e.finish();
+                check_bound(bytes.len(), MAX_FIELD_LEN)?;
+                Ok(bytes)
+            }
             SlotProposalEvidence::IndirectCommit { anchor, support } => {
                 // Reuse the bounded canonical identity-list codec, without overloading
                 // its semantics: the V2 body explicitly separates anchor and support.
@@ -111,6 +180,34 @@ impl SlotProposalEnvelope {
         let mut d = Decoder::new(bytes);
         match d.read_u16()? {
             SLOT_PROPOSAL_VERSION_V1 => Ok(SlotProposal::decode(bytes)?.into()),
+            SLOT_PROPOSAL_VERSION_V3 => {
+                let body = SlotProposal::decode(d.read_bytes()?)?;
+                let count = d.read_u32()? as usize;
+                check_bound(count.saturating_add(body.voters.len()), MAX_VOTERS)?;
+                let mut missing = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let author = d.read_bytes()?;
+                    check_bound(author.len(), MAX_AUTHOR_BYTES)?;
+                    missing.push(author.to_vec());
+                }
+                let count = d.read_u32()? as usize;
+                check_bound(count, MAX_VOTERS)?;
+                let mut fences = Vec::with_capacity(count);
+                for _ in 0..count {
+                    fences.push(crate::FenceCertificate::decode(d.read_bytes()?)?);
+                }
+                d.finish()?;
+                let proposal = Self {
+                    decision: body.decision,
+                    evidence: SlotProposalEvidence::ConservativeSkip {
+                        voters: body.voters,
+                        missing,
+                        fences,
+                    },
+                };
+                proposal.encode()?;
+                Ok(proposal)
+            }
             SLOT_PROPOSAL_VERSION_V2 => {
                 let round = d.read_u64()?;
                 let author = d.read_bytes()?;
@@ -137,10 +234,11 @@ impl SlotProposalEnvelope {
         }
     }
 
-    /// Hashes direct bytes in the unchanged V1 domain, or indirect bytes in V2.
+    /// Hashes canonical bytes in the evidence version's separate domain.
     pub fn digest(&self) -> Result<[u8; 32], CryptoError> {
         let domain = match self.evidence {
             SlotProposalEvidence::Direct { .. } => SLOT_PROPOSAL_DOMAIN,
+            SlotProposalEvidence::ConservativeSkip { .. } => SLOT_PROPOSAL_SKIP_DOMAIN,
             SlotProposalEvidence::IndirectCommit { .. } => SLOT_PROPOSAL_INDIRECT_DOMAIN,
         };
         let mut e = Encoder::new();
@@ -315,6 +413,45 @@ mod tests {
     }
 
     #[test]
+    fn conservative_v3_codec_is_bounded_canonical_and_domain_separated() {
+        let legacy = proposal();
+        let p = SlotProposalEnvelope {
+            decision: legacy.decision.clone(),
+            evidence: SlotProposalEvidence::ConservativeSkip {
+                voters: legacy.voters.clone(),
+                missing: vec![b"unknown".to_vec()],
+                fences: vec![],
+            },
+        };
+        let bytes = p.encode().unwrap();
+        assert_eq!(SlotProposalEnvelope::decode(&bytes).unwrap(), p);
+        assert!(SlotProposal::decode(&bytes).is_err());
+        let mut e = Encoder::new();
+        e.put_bytes(SLOT_PROPOSAL_SKIP_DOMAIN).unwrap();
+        e.put_raw(&bytes);
+        assert_eq!(
+            p.digest().unwrap(),
+            <[u8; 32]>::from(Sha256::digest(e.finish()))
+        );
+        assert_ne!(p.digest().unwrap(), legacy.digest().unwrap());
+        for end in 0..bytes.len() {
+            assert!(
+                SlotProposalEnvelope::decode(&bytes[..end]).is_err(),
+                "prefix {end}"
+            );
+        }
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(SlotProposalEnvelope::decode(&trailing).is_err());
+        let mut bad = p;
+        let SlotProposalEvidence::ConservativeSkip { missing, .. } = &mut bad.evidence else {
+            unreachable!()
+        };
+        missing.push(missing[0].clone());
+        assert!(bad.encode().is_err());
+    }
+
+    #[test]
     fn envelope_preserves_v1_and_distinguishes_bounded_v2() {
         let legacy = proposal();
         let direct: SlotProposalEnvelope = legacy.clone().into();
@@ -349,7 +486,7 @@ mod tests {
         bad.push(0);
         assert!(SlotProposalEnvelope::decode(&bad).is_err());
         bad = bytes.clone();
-        bad[..2].copy_from_slice(&3u16.to_le_bytes());
+        bad[..2].copy_from_slice(&4u16.to_le_bytes());
         assert!(SlotProposalEnvelope::decode(&bad).is_err());
         let SlotProposalEvidence::IndirectCommit { support, .. } = &mut indirect.evidence else {
             unreachable!()

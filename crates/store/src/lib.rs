@@ -38,6 +38,8 @@ mod authenticated_checkpoint_tests;
 #[cfg(test)]
 mod authenticated_finalization_tests;
 #[cfg(test)]
+mod authenticated_indirect_tests;
+#[cfg(test)]
 mod authenticated_multislot_tests;
 #[cfg(test)]
 mod authenticated_reproposal_tests;

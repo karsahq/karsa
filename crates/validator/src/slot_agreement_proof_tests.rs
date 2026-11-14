@@ -2,6 +2,57 @@ use super::*;
 use crate::slot_agreement::AgreementInput;
 use crate::{SlotAgreementProof, SlotAgreementProofEntry, SlotAgreementProofPol};
 
+#[test]
+fn conservative_skip_and_indirect_commit_can_compete_without_direct_quorum() {
+    let (mut f, proof, _, binding) = fixture_with_evidence(true, true);
+    let entry = &proof.entries[0];
+    let all = f.ids(LEADER_ROUND + 1);
+    let mut decision = entry.proposal.decision.clone();
+    let crate::SlotOutcome::Commit { leader } = &decision.outcome else {
+        unreachable!()
+    };
+    decision.outcome = crate::SlotOutcome::Skip {
+        leader_author: leader.author.clone(),
+    };
+    decision.after_len = decision.before_len;
+    decision.after_root = decision.before_root;
+    // One signed vote, two signed nonvotes, one unknown: maximum two < three.
+    let skip = crate::SlotProposalEnvelope {
+        decision,
+        evidence: crate::SlotProposalEvidence::ConservativeSkip {
+            voters: all[..3].to_vec(),
+            missing: vec![all[3].author.clone()],
+            fences: vec![],
+        },
+    };
+    let round = f
+        .dag
+        .vertices
+        .keys()
+        .map(|(round, _)| *round)
+        .max()
+        .unwrap()
+        + 1;
+    let refs = f.ids(round - 1);
+    let carrier = bind_as(&mut f, 0, round, refs, skip.digest().unwrap());
+    assert_eq!(
+        inspect_without_effects(&f.dag, |dag| dag.inspect_slot_proposal_envelope(
+            &skip,
+            &carrier,
+            binding.tip()
+        )),
+        Decision::Skip
+    );
+    assert!(matches!(
+        inspect_without_effects(&f.dag, |dag| dag.inspect_slot_proposal_envelope(
+            &entry.proposal,
+            &entry.proposal_carrier,
+            binding.tip()
+        )),
+        Decision::Commit(_)
+    ));
+}
+
 fn fixture() -> (Fixture, SlotAgreementProof, VertexId, SlotAgreementBinding) {
     fixture_with_decision(true)
 }

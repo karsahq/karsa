@@ -83,7 +83,8 @@ pub use slot_decision::{
     SlotDecisionCertificate, SlotDecisionTip, SlotOutcome,
 };
 pub use slot_proposal::{
-    SLOT_PROPOSAL_DOMAIN, SLOT_PROPOSAL_INDIRECT_DOMAIN, SLOT_PROPOSAL_VERSION_V1,
-    SLOT_PROPOSAL_VERSION_V2, SlotProposal, SlotProposalEnvelope, SlotProposalEvidence,
+    SLOT_PROPOSAL_DOMAIN, SLOT_PROPOSAL_INDIRECT_DOMAIN, SLOT_PROPOSAL_SKIP_DOMAIN,
+    SLOT_PROPOSAL_VERSION_V1, SLOT_PROPOSAL_VERSION_V2, SLOT_PROPOSAL_VERSION_V3, SlotProposal,
+    SlotProposalEnvelope, SlotProposalEvidence,
 };
 pub use vertex::{VERTEX_VERSION_V1, Vertex, VertexId, tally_votes};

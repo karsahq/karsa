@@ -1413,8 +1413,8 @@ impl Dag {
         *budget = budget
             .checked_sub(self.order.len().saturating_add(self.prefix.peaks().len()))
             .ok_or_else(|| invalid("agreement frontier work budget exhausted"))?;
-        let digest = proposal.digest()?;
         self.preflight_slot_proposal_envelope(proposal, carrier)?;
+        let digest = proposal.digest()?;
         let set = self.set_for_round(d.round);
         d.validate(set)?;
         if d.round == 0 || d.round == u64::MAX || self.is_pruned(d.round) {
@@ -1434,7 +1434,8 @@ impl Dag {
             return Err(invalid("slot proposal context or continuity mismatch"));
         }
         let (evidence_target, voters) = match &proposal.evidence {
-            crate::SlotProposalEvidence::Direct { voters } => (None, voters),
+            crate::SlotProposalEvidence::Direct { voters }
+            | crate::SlotProposalEvidence::ConservativeSkip { voters, .. } => (None, voters),
             crate::SlotProposalEvidence::IndirectCommit { anchor, support } => {
                 (Some(anchor), support)
             }
@@ -1444,7 +1445,10 @@ impl Dag {
             || self.epoch_of(d.round) != d.epoch
             || self.epoch_of(voting_round) != d.epoch
             || carrier.round <= voting_round
-            || voters.len() != set.quorum_size()
+            || (!matches!(
+                proposal.evidence,
+                crate::SlotProposalEvidence::ConservativeSkip { .. }
+            ) && voters.len() != set.quorum_size())
         {
             return Err(invalid(
                 "slot proposal needs a fixed-set exact evidence quorum",
@@ -1496,6 +1500,11 @@ impl Dag {
         } else {
             &leader_id
         };
+        let conservative = matches!(
+            proposal.evidence,
+            crate::SlotProposalEvidence::ConservativeSkip { .. }
+        );
+        let mut signed_votes = 0usize;
         let mut authors = HashSet::new();
         for voter in voters {
             if voter.round != voting_round
@@ -1507,8 +1516,26 @@ impl Dag {
             let vertex = self
                 .get(voter.round, &voter.author)
                 .ok_or_else(|| missing(voter))?;
-            if vertex.references.contains(vote_target) != committing {
+            signed_votes += usize::from(vertex.references.contains(vote_target));
+            if !conservative && vertex.references.contains(vote_target) != committing {
                 return Err(invalid("slot proposal evidence contradicts its outcome"));
+            }
+        }
+        if let crate::SlotProposalEvidence::ConservativeSkip {
+            missing, fences, ..
+        } = &proposal.evidence
+        {
+            // Unknowns remain potential voters regardless of local holdings or fences.
+            if signed_votes.saturating_add(missing.len()) >= set.quorum_size() {
+                return Err(invalid("conservative skip still permits a direct quorum"));
+            }
+            for certificate in fences {
+                *budget = budget
+                    .checked_sub(certificate.signatures.len())
+                    .ok_or_else(|| invalid("agreement fence work budget exhausted"))?;
+                certificate
+                    .verify(&d.chain_id, set)
+                    .map_err(|_| invalid("invalid conservative skip fence certificate"))?;
             }
         }
         let history = if committing {
@@ -2180,6 +2207,57 @@ impl Dag {
     ) -> Result<(), CryptoError> {
         use crate::slot_agreement_phase::invalid;
         let set = self.set_for_round(proposal.decision.round);
+        if let crate::SlotProposalEvidence::ConservativeSkip {
+            voters,
+            missing,
+            fences,
+        } = &proposal.evidence
+        {
+            let d = &proposal.decision;
+            let voting_round = d
+                .round
+                .checked_add(1)
+                .ok_or_else(|| invalid("invalid skip round"))?;
+            let mut authors = HashSet::new();
+            if !matches!(d.outcome, crate::SlotOutcome::Skip { .. })
+                || carrier.round <= voting_round
+                || voters.len().saturating_add(missing.len()) != set.validators.len()
+                || fences.len() > set.validators.len().saturating_sub(1) / 3
+                || self.set_for_round(voting_round).id()? != d.validator_set_id
+                || self.epoch_of(voting_round) != d.epoch
+            {
+                return Err(invalid("invalid conservative skip partition bounds"));
+            }
+            for author in voters.iter().map(|v| &v.author).chain(missing.iter()) {
+                if !authors.insert(author)
+                    || !set.validators.iter().any(|v| v.validator_id == *author)
+                {
+                    return Err(invalid(
+                        "skip partition must name each set author exactly once",
+                    ));
+                }
+            }
+            if voters.iter().any(|v| v.round != voting_round) {
+                return Err(invalid("wrong conservative skip voting round"));
+            }
+            let mut subjects = HashSet::new();
+            for certificate in fences {
+                if certificate.fence.chain_id != d.chain_id
+                    || certificate.fence.from_round > voting_round
+                    || self.set_for_round(certificate.fence.from_round).id()? != d.validator_set_id
+                    || !authors.contains(&certificate.fence.validator_id)
+                    || !subjects.insert(&certificate.fence.validator_id)
+                    || certificate.signer_bitmap.len() != set.validators.len().div_ceil(8)
+                    || certificate.signatures.len() > set.validators.len()
+                    || certificate.signer_count() != certificate.signatures.len()
+                    || certificate.signer_count() < set.quorum_size()
+                {
+                    return Err(invalid(
+                        "invalid conservative skip fence shape or applicability",
+                    ));
+                }
+            }
+        }
         if let crate::SlotProposalEvidence::IndirectCommit { anchor, support } = &proposal.evidence
         {
             if !matches!(proposal.decision.outcome, crate::SlotOutcome::Commit { .. })
@@ -4106,6 +4184,136 @@ mod tests {
         };
         let carrier = bind_slot_proposal(&mut fixture, &proposal);
         (fixture, proposal, carrier, tip)
+    }
+
+    fn bind_conservative(f: &mut Fixture, p: &crate::SlotProposalEnvelope) -> VertexId {
+        let carrier = vertex_with_payload(
+            f,
+            0,
+            LEADER_ROUND + 2,
+            f.ids(LEADER_ROUND + 1),
+            p.digest().unwrap(),
+        );
+        f.dag
+            .vertices
+            .remove(&(carrier.round, carrier.author.clone()));
+        f.dag.insert(carrier).unwrap()
+    }
+
+    #[test]
+    fn conservative_skip_signed_partition_is_self_contained_and_fences_add_no_authority() {
+        let (mut f, direct, _, tip) = direct_slot_proposal(false);
+        let all = f.ids(LEADER_ROUND + 1);
+        let certificate = fence_certificate(&f, LEADER_ROUND + 1, &all[3].author);
+        let p = crate::SlotProposalEnvelope {
+            decision: direct.decision,
+            evidence: crate::SlotProposalEvidence::ConservativeSkip {
+                voters: all[..2].to_vec(),
+                missing: all[2..].iter().map(|v| v.author.clone()).collect(),
+                fences: vec![certificate.clone()],
+            },
+        };
+        assert_eq!(
+            crate::SlotProposalEnvelope::decode(&p.encode().unwrap()).unwrap(),
+            p
+        );
+        let carrier = bind_conservative(&mut f, &p);
+        assert_eq!(
+            inspect_without_effects(&f.dag, |dag| dag
+                .inspect_slot_proposal_envelope(&p, &carrier, &tip)),
+            Decision::Skip
+        );
+        // Extra local vertices are not evidence; unknown authors stay unknown.
+        let extra = f
+            .dag
+            .vertices
+            .remove(&(all[3].round, all[3].author.clone()))
+            .unwrap();
+        // Rebind a carrier whose cone does not require that extra local vertex.
+        let vertex = vertex_with_payload(
+            &f,
+            0,
+            LEADER_ROUND + 2,
+            all[..3].to_vec(),
+            p.digest().unwrap(),
+        );
+        f.dag
+            .vertices
+            .remove(&(vertex.round, vertex.author.clone()));
+        let carrier = f.dag.insert(vertex).unwrap();
+        assert!(
+            f.dag
+                .inspect_slot_proposal_envelope(&p, &carrier, &tip)
+                .is_ok()
+        );
+        f.dag
+            .vertices
+            .insert((extra.round, extra.author.clone()), extra);
+        f.dag.apply_fence(b"karsa-dag-1", &certificate).unwrap();
+        assert!(
+            f.dag
+                .inspect_slot_proposal_envelope(&p, &carrier, &tip)
+                .is_ok()
+        );
+        for mutation in 0..7 {
+            let mut bad = p.clone();
+            let crate::SlotProposalEvidence::ConservativeSkip {
+                voters,
+                missing,
+                fences,
+            } = &mut bad.evidence
+            else {
+                unreachable!()
+            };
+            match mutation {
+                0 => {
+                    missing.pop();
+                }
+                1 => missing[0] = voters[0].author.clone(),
+                2 => fences[0].signatures[0][0] ^= 1,
+                3 => fences[0].fence.from_round = LEADER_ROUND + 2,
+                4 => fences[0].fence.chain_id.push(0),
+                5 => voters[0].digest[0] ^= 1,
+                _ => {
+                    voters.pop();
+                    missing.insert(0, all[1].author.clone());
+                }
+            }
+            let carrier = bind_conservative(&mut f, &bad);
+            assert!(
+                f.dag
+                    .inspect_slot_proposal_envelope(&bad, &carrier, &tip)
+                    .is_err(),
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn conservative_skip_counts_fenced_signed_votes_and_unknowns() {
+        let (mut f, direct, _, tip) = direct_slot_proposal(true);
+        let all = f.ids(LEADER_ROUND + 1);
+        let mut decision = direct.decision;
+        decision.outcome = crate::SlotOutcome::Skip {
+            leader_author: f.dag.leader(LEADER_ROUND).unwrap().author.clone(),
+        };
+        decision.after_len = decision.before_len;
+        decision.after_root = decision.before_root;
+        let p = crate::SlotProposalEnvelope {
+            decision,
+            evidence: crate::SlotProposalEvidence::ConservativeSkip {
+                voters: all[..2].to_vec(),
+                missing: all[2..].iter().map(|v| v.author.clone()).collect(),
+                fences: vec![fence_certificate(&f, LEADER_ROUND + 1, &all[0].author)],
+            },
+        };
+        let carrier = bind_conservative(&mut f, &p);
+        assert!(
+            f.dag
+                .inspect_slot_proposal_envelope(&p, &carrier, &tip)
+                .is_err()
+        );
+        assert!(f.dag.committed.is_empty());
     }
 
     #[test]
