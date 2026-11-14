@@ -6,15 +6,28 @@ use validator::slot_agreement::{
     AgreementInput, AgreementPhase, AgreementQc, AgreementValue, AgreementView,
 };
 use validator::{
-    SlotAgreementProof, SlotAgreementProofEntry, SlotAgreementProofPol, SlotAgreementVotePayload,
-    SlotAgreementVoteWitness, SlotApplicationResult, ValidatorSignature,
+    SlotAgreementProof, SlotAgreementProofEntry, SlotAgreementProofPol, SlotAgreementViewLineage,
+    SlotAgreementVotePayload, SlotAgreementVoteWitness, SlotApplicationResult, ValidatorSignature,
 };
 
 // Each signature comes only from a successful durable apply. The semantic callback
-// pins both the complete proposal and its checkpoint, including during WAL recovery.
-fn emitted_qc(f: &Fixture, prevote: Option<&AgreementQc>) -> AgreementQc {
+// authenticates the elected view lineage and exact decision, including during WAL recovery.
+fn emitted_qc(
+    f: &Fixture,
+    lineage: &SlotAgreementViewLineage,
+    prevote: Option<&AgreementQc>,
+) -> AgreementQc {
     let state = f.state(f.vertices.clone());
+    let binding = validator::SlotAgreementBinding::from_checkpoint(
+        f.binding.tip().clone(),
+        f.binding.carrier().cloned(),
+    )
+    .unwrap();
     let proposal = &f.payload.proposal;
+    let input = state
+        .dag()
+        .inspect_slot_agreement_view_lineage(lineage, &binding)
+        .unwrap();
     let inspect = |decision: &validator::SlotDecision| {
         assert_eq!(
             decision, &proposal.decision,
@@ -22,7 +35,7 @@ fn emitted_qc(f: &Fixture, prevote: Option<&AgreementQc>) -> AgreementQc {
         );
         state
             .dag()
-            .inspect_slot_proposal(proposal, &f.payload.proposal_carrier, f.binding.tip())
+            .inspect_slot_agreement_view_lineage(lineage, &binding)
             .map(|_| ())
     };
     let mut votes = Vec::new();
@@ -36,17 +49,7 @@ fn emitted_qc(f: &Fixture, prevote: Option<&AgreementQc>) -> AgreementQc {
             local_validator: f.set.validators[id].validator_id.clone(),
         };
         let mut session = store.begin_slot_agreement(bootstrap.clone()).unwrap();
-        let proposed = session
-            .apply(
-                1,
-                AgreementInput::Propose {
-                    view: AgreementView(0),
-                    decision: proposal.decision.clone(),
-                    pol: None,
-                },
-                inspect,
-            )
-            .unwrap();
+        let proposed = session.apply(1, input.clone(), inspect).unwrap();
         let result = if let Some(qc) = prevote {
             let input = AgreementInput::Evidence { qc: qc.clone() };
             let persisted = session.apply(2, input.clone(), inspect).unwrap();
@@ -106,13 +109,84 @@ fn emitted_qc(f: &Fixture, prevote: Option<&AgreementQc>) -> AgreementQc {
     qc
 }
 
+fn reject_unauthorized_view(f: &Fixture, lineage: &SlotAgreementViewLineage) {
+    let mut unauthorized = lineage.clone();
+    let elected = &lineage.entries[0].view_carrier.author;
+    let wrong = f
+        .set
+        .validators
+        .iter()
+        .position(|v| &v.validator_id != elected)
+        .unwrap();
+    let refs = f
+        .vertices
+        .iter()
+        .filter(|v| v.round == 3)
+        .map(|v| v.id().unwrap())
+        .collect();
+    let carrier = signed_vertex(&f.keys, wrong, 4, refs, lineage.view_digest(0).unwrap());
+    unauthorized.entries[0].view_carrier = carrier.id().unwrap();
+    let mut vertices = f.vertices.clone();
+    vertices.retain(|v| v.round != 4 || v.author != carrier.author);
+    vertices.push(carrier);
+    let state = f.state(vertices);
+    let binding = validator::SlotAgreementBinding::from_checkpoint(
+        f.binding.tip().clone(),
+        f.binding.carrier().cloned(),
+    )
+    .unwrap();
+    assert!(
+        state
+            .dag()
+            .inspect_slot_agreement_view_lineage(&unauthorized, &binding)
+            .is_err()
+    );
+    let inspect = |decision: &validator::SlotDecision| {
+        assert_eq!(decision, &f.payload.proposal.decision);
+        state
+            .dag()
+            .inspect_slot_agreement_view_lineage(&unauthorized, &binding)
+            .map(|_| ())
+    };
+    let dir = TempDir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let bootstrap = SlotAgreementBootstrap {
+        context: f.binding.tip().clone(),
+        set: f.set.clone(),
+        local_validator: f.set.validators[0].validator_id.clone(),
+    };
+    let mut session = store.begin_slot_agreement(bootstrap.clone()).unwrap();
+    // Even a caller bypassing the owned-input inspection cannot release a vote.
+    assert!(
+        session
+            .apply(
+                1,
+                AgreementInput::Propose {
+                    view: AgreementView(0),
+                    decision: f.payload.proposal.decision.clone(),
+                    pol: None,
+                },
+                inspect,
+            )
+            .is_err()
+    );
+    assert_eq!(session.sequence(), 0);
+    drop(session);
+    drop(store);
+    let reopened = Store::open(&dir.0).unwrap();
+    let recovered = reopened.recover_slot_agreement(bootstrap, inspect).unwrap();
+    assert_eq!(
+        recovered.sequence(),
+        0,
+        "rejected view must not enter the WAL"
+    );
+}
+
 fn run(commit: bool) {
     let mut f = Fixture::new(commit);
     // Discard the legacy certificate carrier: it is not agreement evidence.
     f.vertices.retain(|v| v.round < 4);
-    let prevote = emitted_qc(&f, None);
-    assert_eq!(prevote.vote.phase, AgreementPhase::Prevote);
-    let mut proof = SlotAgreementProof {
+    let mut lineage = SlotAgreementViewLineage {
         entries: vec![SlotAgreementProofEntry {
             proposal: f.payload.proposal.clone(),
             proposal_carrier: f.payload.proposal_carrier.clone(),
@@ -121,9 +195,6 @@ fn run(commit: bool) {
             previous_pol: None,
             pol: None,
         }],
-        // Replaced by emitted precommits after the POL carrier exists.
-        certificate: prevote.clone(),
-        votes: vec![],
     };
     let proposer = validator::slot_agreement_view_proposer(&f.set, 1, AgreementView(0)).unwrap();
     let author = f
@@ -138,14 +209,30 @@ fn run(commit: bool) {
         .filter(|v| v.round == 3)
         .map(|v| v.id().unwrap())
         .collect();
-    for offset in 0..=4 {
+    let digest = lineage.view_digest(0).unwrap();
+    let mut next = Vec::new();
+    for i in 0..4 {
+        let hash = if i == author { digest } else { [9; 32] };
+        let vertex = signed_vertex(&f.keys, i, 4, refs.clone(), hash);
+        next.push(vertex.id().unwrap());
+        f.vertices.push(vertex);
+    }
+    lineage.entries[0].view_carrier = next[author].clone();
+    refs = next;
+    reject_unauthorized_view(&f, &lineage);
+    let prevote = emitted_qc(&f, &lineage, None);
+    assert_eq!(prevote.vote.phase, AgreementPhase::Prevote);
+    let mut proof = SlotAgreementProof {
+        entries: lineage.entries.clone(),
+        // Replaced by emitted precommits after the POL carrier exists.
+        certificate: prevote.clone(),
+        votes: vec![],
+    };
+    for offset in 1..=4 {
         let round = 4 + offset;
         let mut hashes = [[9; 32]; 4];
-        if offset == 0 {
-            hashes[author] = proof.view_digest(0).unwrap();
-        }
         if offset == 3 {
-            proof.certificate = emitted_qc(&f, Some(&prevote));
+            proof.certificate = emitted_qc(&f, &lineage, Some(&prevote));
             assert_eq!(proof.certificate.vote.phase, AgreementPhase::Precommit);
         }
         if offset == 1 || offset == 3 {
@@ -197,9 +284,7 @@ fn run(commit: bool) {
             next.push(vertex.id().unwrap());
             f.vertices.push(vertex);
         }
-        if offset == 0 {
-            proof.entries[0].view_carrier = next[author].clone();
-        }
+
         if offset == 2 {
             proof.entries[0].pol.as_mut().unwrap().carrier = next[0].clone();
         }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::slot_agreement::AgreementInput;
 use crate::{SlotAgreementProof, SlotAgreementProofEntry, SlotAgreementProofPol};
 
 fn fixture() -> (Fixture, SlotAgreementProof, VertexId, SlotAgreementBinding) {
@@ -468,4 +469,110 @@ fn unified_all_entry_preflight_precedes_authentication_and_cone_budget() {
             );
         }
     }
+}
+
+fn view_lineage(p: &SlotAgreementProof) -> crate::SlotAgreementViewLineage {
+    let mut entries = p.entries.clone();
+    entries.last_mut().unwrap().pol = None;
+    crate::SlotAgreementViewLineage { entries }
+}
+
+#[test]
+fn unified_view_lineage_signed_zero_before_pol_and_final_qc() {
+    let (mut f, p, _, b) = fixture();
+    let lineage = view_lineage(&p);
+    let last = lineage.entries.last().unwrap();
+    f.dag.vertices.retain(|(round, _), _| *round <= last.view_carrier.round);
+    assert_eq!(
+        f.dag.inspect_slot_agreement_view_lineage(&lineage, &b).unwrap(),
+        AgreementInput::Propose {
+            view: last.view,
+            decision: last.proposal.decision.clone(),
+            pol: None,
+        }
+    );
+    let bytes = lineage.encode(f.dag.set()).unwrap();
+    assert_eq!(crate::SlotAgreementViewLineage::decode(&bytes, f.dag.set()).unwrap(), lineage);
+    for end in 0..bytes.len() {
+        assert!(crate::SlotAgreementViewLineage::decode(&bytes[..end], f.dag.set()).is_err());
+    }
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert!(crate::SlotAgreementViewLineage::decode(&trailing, f.dag.set()).is_err());
+}
+
+#[test]
+fn unified_view_lineage_multiview_returns_exact_earlier_pol() {
+    let (mut f, mut p, _, b) = fixture();
+    extend(&mut f, &mut p, &b, LEADER_ROUND + 8, 3, false);
+    extend(&mut f, &mut p, &b, LEADER_ROUND + 13, 8, false);
+    let lineage = view_lineage(&p);
+    let last = lineage.entries.last().unwrap();
+    f.dag.vertices.retain(|(round, _), _| *round <= last.view_carrier.round);
+    assert_eq!(
+        f.dag.inspect_slot_agreement_view_lineage(&lineage, &b).unwrap(),
+        AgreementInput::Propose {
+            view: last.view,
+            decision: last.proposal.decision.clone(),
+            pol: Some(lineage.entries[1].pol.as_ref().unwrap().certificate.clone()),
+        }
+    );
+    let bytes = lineage.encode(f.dag.set()).unwrap();
+    assert_eq!(crate::SlotAgreementViewLineage::decode(&bytes, f.dag.set()).unwrap(), lineage);
+    let mut wrong = lineage.clone();
+    wrong.entries[2].previous_pol = Some(0);
+    assert!(f.dag.inspect_slot_agreement_view_lineage(&wrong, &b).is_err());
+    let mut wrong = lineage.clone();
+    wrong.entries[1].pol.as_mut().unwrap().certificate.vote.view = AgreementView(0);
+    assert!(f.dag.inspect_slot_agreement_view_lineage(&wrong, &b).is_err());
+    let pol = lineage.entries[0].pol.as_ref().unwrap();
+    f.dag.vertices.remove(&(pol.votes[0].carrier.round, pol.votes[0].carrier.author.clone()));
+    assert!(f.dag.inspect_slot_agreement_view_lineage(&lineage, &b).is_err());
+}
+
+#[test]
+fn unified_view_lineage_rejects_signed_unauthorized_proposer() {
+    let (mut f, p, _, b) = fixture();
+    let mut lineage = view_lineage(&p);
+    let elected = &lineage.entries[0].view_carrier.author;
+    let wrong = (0..f.count()).find(|i| &f.dag.set().validators[*i].validator_id != elected).unwrap();
+    let round = lineage.entries[0].view_carrier.round;
+    let refs = f.ids(round - 1);
+    let digest = lineage.view_digest(0).unwrap();
+    lineage.entries[0].view_carrier = bind_as(&mut f, wrong, round, refs, digest);
+    assert!(f.dag.inspect_slot_agreement_view_lineage(&lineage, &b).is_err());
+}
+
+#[test]
+fn unified_view_lineage_rejects_prior_pol_outside_view_cone() {
+    let (mut f, mut p, _, b) = fixture();
+    extend(&mut f, &mut p, &b, LEADER_ROUND + 8, 3, true);
+    assert!(f.dag.inspect_slot_agreement_view_lineage(&view_lineage(&p), &b).is_err());
+}
+
+#[test]
+fn unified_view_lineage_context_bounds_and_shared_budget() {
+    let (f, p, _, b) = fixture();
+    let lineage = view_lineage(&p);
+    let d = &lineage.entries[0].proposal.decision;
+    let wrong_tip = crate::SlotDecisionTip::from_checkpoint(
+        b"other-chain".to_vec(), f.dag.set(), d.round, [0; 32], 0, [0; 32],
+    ).unwrap();
+    let wrong = SlotAgreementBinding::from_checkpoint(wrong_tip, b.carrier().cloned()).unwrap();
+    assert!(f.dag.inspect_slot_agreement_view_lineage(&lineage, &wrong).is_err());
+    assert!(f.dag.inspect_agreement_lineage(&lineage.entries, &b, &mut 0).is_err());
+    let mut oversized = lineage.clone();
+    oversized.entries = vec![lineage.entries[0].clone(); crate::SLOT_AGREEMENT_PROOF_MAX_ENTRIES + 1];
+    assert!(oversized.encode(f.dag.set()).is_err());
+    assert!(crate::SlotAgreementViewLineage::decode(
+        &vec![0; crate::SLOT_AGREEMENT_PROOF_MAX_BYTES + 1], f.dag.set(),
+    ).is_err());
+    let mut bad = lineage.clone();
+    bad.entries[0].view_carrier.author = vec![255];
+    // Structural preflight fails even when the first direct signature is invalid.
+    let mut f = f;
+    let plain = &bad.entries[0].proposal_carrier;
+    f.dag.vertices.get_mut(&(plain.round, plain.author.clone())).unwrap().signature[0] ^= 1;
+    let error = f.dag.inspect_slot_agreement_view_lineage(&bad, &b).unwrap_err();
+    assert_eq!(error.to_string(), crate::slot_agreement_phase::invalid("wrong proposer or view carrier ordering").to_string());
 }

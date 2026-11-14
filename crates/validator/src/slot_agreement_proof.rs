@@ -60,8 +60,129 @@ fn hash(kind: u8, bytes: &[u8]) -> Result<[u8; 32], CryptoError> {
     Ok(Sha256::digest(e.finish()).into())
 }
 impl SlotAgreementProof {
+    /// Hashes view authorization using the shared lineage representation.
+    pub fn view_digest(&self, index: usize) -> Result<[u8; 32], CryptoError> {
+        Lineage(&self.entries).view_digest(index)
+    }
+    /// Hashes authenticated POL evidence using the shared lineage representation.
+    pub fn pol_digest(&self, index: usize, set: &ValidatorSet) -> Result<[u8; 32], CryptoError> {
+        Lineage(&self.entries).pol_digest(index, set)
+    }
+    fn check(&self) -> Result<(), CryptoError> {
+        Lineage(&self.entries).check()?;
+        let last = self
+            .entries
+            .last()
+            .ok_or_else(|| invalid("empty lineage"))?;
+        let final_vote = &self.certificate.vote;
+        if self
+            .entries
+            .iter()
+            .filter_map(|p| p.pol.as_ref())
+            .any(|pol| pol.certificate.vote.context != final_vote.context)
+        {
+            return Err(invalid("POL context mismatch"));
+        }
+        let pol = last
+            .pol
+            .as_ref()
+            .ok_or_else(|| invalid("selected entry lacks POL"))?;
+        if final_vote.phase != AgreementPhase::Precommit
+            || final_vote.view != last.view
+            || final_vote.value != pol.certificate.vote.value
+        {
+            return Err(invalid("final statement mismatch"));
+        }
+        check_witnesses(&self.votes, &self.certificate, &pol.carrier)
+    }
+    /// Encodes the complete bounded envelope without authenticating signatures.
+    pub fn encode(&self, set: &ValidatorSet) -> Result<Vec<u8>, CryptoError> {
+        self.check()?;
+        let mut e = Encoder::new();
+        e.put_u16(1);
+        Lineage(&self.entries).encode_into(&mut e, set)?;
+        e.put_bytes(&self.certificate.encode(set)?)?;
+        put_witnesses(&mut e, &self.votes, set)?;
+        if e.len() > MAX_FIELD_LEN {
+            return Err(invalid("proof exceeds one MiB"));
+        }
+        Ok(e.finish())
+    }
+    /// Decodes a flat envelope, checking all outer lengths before nested decoding.
+    pub fn decode(bytes: &[u8], set: &ValidatorSet) -> Result<Self, CryptoError> {
+        if bytes.len() > MAX_FIELD_LEN {
+            return Err(invalid("proof exceeds one MiB"));
+        }
+        let mut d = Decoder::new(bytes);
+        if d.read_u16()? != 1 {
+            return Err(invalid("unknown proof version"));
+        }
+        let raw = scan_entries(&mut d, bytes)?;
+        let qc = d.read_bytes()?;
+        let start = d.remaining();
+        scan_witnesses(&mut d)?;
+        d.finish()?;
+        let votes = read_witnesses(&mut Decoder::new(&bytes[bytes.len() - start..]), set)?;
+        let entries = decode_entries(raw, set)?;
+        let proof = Self {
+            entries,
+            certificate: AgreementQc::decode(qc, set)?,
+            votes,
+        };
+        proof.check()?;
+        Ok(proof)
+    }
+    /// Final carrier digest; only this final payload includes the full lineage.
+    pub fn digest(&self, set: &ValidatorSet) -> Result<[u8; 32], CryptoError> {
+        hash(2, &self.encode(set)?)
+    }
+}
+
+/// Bounded authenticated view prefix, independent of a final precommit QC.
+/// Inspection is read-only and does not establish local durability or signing authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotAgreementViewLineage {
+    /// Connected lineage selecting the last view; that view need not have a POL.
+    pub entries: Vec<SlotAgreementProofEntry>,
+}
+impl SlotAgreementViewLineage {
+    /// Hashes the same view authorization as the full proof, without a final QC.
+    pub fn view_digest(&self, index: usize) -> Result<[u8; 32], CryptoError> {
+        Lineage(&self.entries).view_digest(index)
+    }
+    /// Hashes the same POL authorization as the full proof.
+    pub fn pol_digest(&self, index: usize, set: &ValidatorSet) -> Result<[u8; 32], CryptoError> {
+        Lineage(&self.entries).pol_digest(index, set)
+    }
+    /// Encodes bounded canonical evidence without authenticating it.
+    pub fn encode(&self, set: &ValidatorSet) -> Result<Vec<u8>, CryptoError> {
+        let lineage = Lineage(&self.entries);
+        lineage.check()?;
+        let mut e = Encoder::new();
+        e.put_u16(1);
+        lineage.encode_into(&mut e, set)?;
+        Ok(e.finish())
+    }
+    /// Preflights the entire envelope before decoding nested evidence.
+    pub fn decode(bytes: &[u8], set: &ValidatorSet) -> Result<Self, CryptoError> {
+        if bytes.len() > MAX_FIELD_LEN {
+            return Err(invalid("lineage exceeds one MiB"));
+        }
+        let mut d = Decoder::new(bytes);
+        if d.read_u16()? != 1 {
+            return Err(invalid("unknown lineage version"));
+        }
+        let raw = scan_entries(&mut d, bytes)?;
+        d.finish()?;
+        let entries = decode_entries(raw, set)?;
+        Lineage(&entries).check()?;
+        Ok(Self { entries })
+    }
+}
+pub(crate) struct Lineage<'a>(pub(crate) &'a [SlotAgreementProofEntry]);
+impl Lineage<'_> {
     fn entry(&self, index: usize) -> Result<&SlotAgreementProofEntry, CryptoError> {
-        self.entries
+        self.0
             .get(index)
             .ok_or_else(|| invalid("invalid lineage index"))
     }
@@ -103,21 +224,17 @@ impl SlotAgreementProof {
         hash(1, &e.finish())
     }
     fn check(&self) -> Result<(), CryptoError> {
-        if self.entries.is_empty() || self.entries.len() > SLOT_AGREEMENT_PROOF_MAX_ENTRIES {
+        if self.0.is_empty() || self.0.len() > SLOT_AGREEMENT_PROOF_MAX_ENTRIES {
             return Err(invalid("lineage entry bound"));
         }
-        let last = self
-            .entries
-            .last()
-            .ok_or_else(|| invalid("empty lineage"))?;
-        let final_vote = &self.certificate.vote;
-        for (i, p) in self.entries.iter().enumerate() {
+        let last = self.0.last().ok_or_else(|| invalid("empty lineage"))?;
+        for (i, p) in self.0.iter().enumerate() {
             // A single-parent connected lineage has exactly this canonical shape.
             if p.previous_pol != i.checked_sub(1) || p.proposal.decision != last.proposal.decision {
                 return Err(invalid("unused, forward or mismatched lineage entry"));
             }
             if let Some(prior) = p.previous_pol
-                && self.entries[prior].view >= p.view
+                && self.0[prior].view >= p.view
             {
                 return Err(invalid("POL view is not earlier"));
             }
@@ -125,39 +242,24 @@ impl SlotAgreementProof {
                 let v = &pol.certificate.vote;
                 if v.phase != AgreementPhase::Prevote
                     || v.view != p.view
-                    || v.context != final_vote.context
                     || v.value != AgreementValue::Decision(p.proposal.decision.clone())
                 {
                     return Err(invalid("POL statement mismatch"));
                 }
                 check_witnesses(&pol.votes, &pol.certificate, &p.view_carrier)?;
-            } else if i + 1 < self.entries.len() {
+            } else if i + 1 < self.0.len() {
                 return Err(invalid("referenced entry lacks POL"));
             }
         }
-        let pol = last
-            .pol
-            .as_ref()
-            .ok_or_else(|| invalid("selected entry lacks POL"))?;
-        if final_vote.phase != AgreementPhase::Precommit
-            || final_vote.view != last.view
-            || final_vote.value != pol.certificate.vote.value
-        {
-            return Err(invalid("final statement mismatch"));
-        }
-        check_witnesses(&self.votes, &self.certificate, &pol.carrier)
+        Ok(())
     }
-    /// Encodes the complete bounded envelope without authenticating signatures.
-    pub fn encode(&self, set: &ValidatorSet) -> Result<Vec<u8>, CryptoError> {
-        self.check()?;
-        let mut e = Encoder::new();
-        e.put_u16(1);
-        e.put_u32(self.entries.len() as u32);
-        for p in &self.entries {
+    fn encode_into(&self, e: &mut Encoder, set: &ValidatorSet) -> Result<(), CryptoError> {
+        e.put_u32(self.0.len() as u32);
+        for p in self.0 {
             e.put_bytes(&p.proposal.encode()?)?;
-            put_id(&mut e, &p.proposal_carrier)?;
+            put_id(e, &p.proposal_carrier)?;
             e.put_u64(p.view.0);
-            put_id(&mut e, &p.view_carrier)?;
+            put_id(e, &p.view_carrier)?;
             match p.previous_pol {
                 None => e.put_u8(0),
                 Some(i) => {
@@ -170,94 +272,83 @@ impl SlotAgreementProof {
                 Some(pol) => {
                     e.put_u8(1);
                     e.put_bytes(&pol.certificate.encode(set)?)?;
-                    put_id(&mut e, &pol.carrier)?;
-                    put_witnesses(&mut e, &pol.votes, set)?;
+                    put_id(e, &pol.carrier)?;
+                    put_witnesses(e, &pol.votes, set)?;
                 }
             }
             if e.len() > MAX_FIELD_LEN {
                 return Err(invalid("proof exceeds one MiB"));
             }
         }
-        e.put_bytes(&self.certificate.encode(set)?)?;
-        put_witnesses(&mut e, &self.votes, set)?;
-        if e.len() > MAX_FIELD_LEN {
-            return Err(invalid("proof exceeds one MiB"));
-        }
-        Ok(e.finish())
+        Ok(())
     }
-    /// Decodes a flat envelope, checking all outer lengths before nested decoding.
-    pub fn decode(bytes: &[u8], set: &ValidatorSet) -> Result<Self, CryptoError> {
-        if bytes.len() > MAX_FIELD_LEN {
-            return Err(invalid("proof exceeds one MiB"));
-        }
-        let mut d = Decoder::new(bytes);
-        if d.read_u16()? != 1 {
-            return Err(invalid("unknown proof version"));
-        }
-        let n = d.read_u32()? as usize;
-        if n == 0 || n > SLOT_AGREEMENT_PROOF_MAX_ENTRIES {
-            return Err(invalid("lineage entry bound"));
-        }
-        let mut raw = Vec::with_capacity(n);
-        for _ in 0..n {
-            let proposal = d.read_bytes()?;
-            let plain = read_id(&mut d)?;
-            let view = AgreementView(d.read_u64()?);
-            let carrier = read_id(&mut d)?;
-            let prior = match d.read_u8()? {
-                0 => None,
-                1 => Some(d.read_u32()? as usize),
-                _ => return Err(invalid("invalid prior tag")),
-            };
-            let pol = match d.read_u8()? {
-                0 => None,
-                1 => {
-                    let qc = d.read_bytes()?;
-                    let id = read_id(&mut d)?;
-                    let start = d.remaining();
-                    scan_witnesses(&mut d)?;
-                    let end = d.remaining();
-                    Some((qc, id, &bytes[bytes.len() - start..bytes.len() - end]))
-                }
-                _ => return Err(invalid("invalid POL tag")),
-            };
-            raw.push((proposal, plain, view, carrier, prior, pol));
-        }
-        let qc = d.read_bytes()?;
-        let start = d.remaining();
-        scan_witnesses(&mut d)?;
-        d.finish()?;
-        let votes = read_witnesses(&mut Decoder::new(&bytes[bytes.len() - start..]), set)?;
-        let mut entries = Vec::with_capacity(n);
-        for (proposal, proposal_carrier, view, view_carrier, previous_pol, pol) in raw {
-            let pol = pol
-                .map(|(qc, carrier, w)| {
-                    Ok::<_, CryptoError>(SlotAgreementProofPol {
-                        certificate: AgreementQc::decode(qc, set)?,
-                        carrier,
-                        votes: read_witnesses(&mut Decoder::new(w), set)?,
-                    })
-                })
-                .transpose()?;
-            entries.push(SlotAgreementProofEntry {
-                proposal: SlotProposal::decode(proposal)?,
-                proposal_carrier,
-                view,
-                view_carrier,
-                previous_pol,
-                pol,
-            });
-        }
-        let proof = Self {
-            entries,
-            certificate: AgreementQc::decode(qc, set)?,
-            votes,
+}
+type RawEntry<'a> = (
+    &'a [u8],
+    VertexId,
+    AgreementView,
+    VertexId,
+    Option<usize>,
+    Option<(&'a [u8], VertexId, &'a [u8])>,
+);
+fn scan_entries<'a>(
+    d: &mut Decoder<'a>,
+    bytes: &'a [u8],
+) -> Result<Vec<RawEntry<'a>>, CryptoError> {
+    let n = d.read_u32()? as usize;
+    if n == 0 || n > SLOT_AGREEMENT_PROOF_MAX_ENTRIES {
+        return Err(invalid("lineage entry bound"));
+    }
+    let mut raw = Vec::with_capacity(n);
+    for _ in 0..n {
+        let proposal = d.read_bytes()?;
+        let plain = read_id(d)?;
+        let view = AgreementView(d.read_u64()?);
+        let carrier = read_id(d)?;
+        let prior = match d.read_u8()? {
+            0 => None,
+            1 => Some(d.read_u32()? as usize),
+            _ => return Err(invalid("invalid prior tag")),
         };
-        proof.check()?;
-        Ok(proof)
+        let pol = match d.read_u8()? {
+            0 => None,
+            1 => {
+                let qc = d.read_bytes()?;
+                let id = read_id(d)?;
+                let start = d.remaining();
+                scan_witnesses(d)?;
+                let end = d.remaining();
+                Some((qc, id, &bytes[bytes.len() - start..bytes.len() - end]))
+            }
+            _ => return Err(invalid("invalid POL tag")),
+        };
+        raw.push((proposal, plain, view, carrier, prior, pol));
     }
-    /// Final carrier digest; only this final payload includes the full lineage.
-    pub fn digest(&self, set: &ValidatorSet) -> Result<[u8; 32], CryptoError> {
-        hash(2, &self.encode(set)?)
+    Ok(raw)
+}
+fn decode_entries(
+    raw: Vec<RawEntry<'_>>,
+    set: &ValidatorSet,
+) -> Result<Vec<SlotAgreementProofEntry>, CryptoError> {
+    let mut entries = Vec::with_capacity(raw.len());
+    for (proposal, proposal_carrier, view, view_carrier, previous_pol, pol) in raw {
+        let pol = pol
+            .map(|(qc, carrier, w)| {
+                Ok::<_, CryptoError>(SlotAgreementProofPol {
+                    certificate: AgreementQc::decode(qc, set)?,
+                    carrier,
+                    votes: read_witnesses(&mut Decoder::new(w), set)?,
+                })
+            })
+            .transpose()?;
+        entries.push(SlotAgreementProofEntry {
+            proposal: SlotProposal::decode(proposal)?,
+            proposal_carrier,
+            view,
+            view_carrier,
+            previous_pol,
+            pol,
+        });
     }
+    Ok(entries)
 }

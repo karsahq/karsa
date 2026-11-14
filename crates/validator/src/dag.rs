@@ -1971,36 +1971,7 @@ impl Dag {
         let set = self.set_for_round(d.round);
         // Encoding checks every statement and exact witness relationship first.
         let digest = proof.digest(set)?;
-        // Preflight the entire lineage before authenticating even its first entry.
-        // This bounds structural work, not total cryptographic CPU time.
-        for p in &proof.entries {
-            if p.view_carrier.author != crate::slot_agreement_view_proposer(set, d.round, p.view)?
-                || p.proposal_carrier.round >= p.view_carrier.round
-            {
-                return Err(invalid("wrong proposer or view carrier ordering"));
-            }
-            if let Some(prior) = p.previous_pol {
-                let pol = proof.entries[prior]
-                    .pol
-                    .as_ref()
-                    .ok_or_else(|| invalid("missing POL"))?;
-                if pol.carrier.round >= p.view_carrier.round {
-                    return Err(invalid("prior POL must precede view carrier"));
-                }
-            }
-            if let Some(pol) = &p.pol {
-                if p.view_carrier.round >= pol.carrier.round {
-                    return Err(invalid("view carrier must precede own POL"));
-                }
-                if pol
-                    .votes
-                    .iter()
-                    .any(|w| w.carrier.round >= pol.carrier.round)
-                {
-                    return Err(invalid("prevote witness must precede POL carrier"));
-                }
-            }
-        }
+        self.preflight_agreement_lineage(&proof.entries, set, d.round)?;
         let selected_pol = last
             .pol
             .as_ref()
@@ -2011,66 +1982,7 @@ impl Dag {
         if proof.votes.iter().any(|w| w.carrier.round >= carrier.round) {
             return Err(invalid("precommit witness must precede final carrier"));
         }
-        let mut result = None;
-        for (i, p) in proof.entries.iter().enumerate() {
-            let (decision, plain_cone) = self.inspect_slot_proposal_with_budget(
-                &p.proposal,
-                &p.proposal_carrier,
-                binding.tip(),
-                &mut budget,
-            )?;
-            result = Some(decision);
-            if let Some(previous) = binding.carrier()
-                && (previous.round >= p.proposal_carrier.round || !plain_cone.contains(previous))
-            {
-                return Err(invalid("plain proposal lacks predecessor"));
-            }
-            let view_cone = self.slot_causal_history_with_budget(
-                &p.view_carrier,
-                proof.view_digest(i)?,
-                d,
-                &mut budget,
-            )?;
-            if !view_cone.contains(&p.proposal_carrier) {
-                return Err(invalid("view lacks plain proposal"));
-            }
-            if let Some(prior) = p.previous_pol {
-                let pol = proof.entries[prior]
-                    .pol
-                    .as_ref()
-                    .ok_or_else(|| invalid("missing POL"))?;
-                if !view_cone.contains(&pol.carrier) {
-                    return Err(invalid("view lacks exact prior POL"));
-                }
-            }
-            if let Some(pol) = &p.pol {
-                pol.certificate.verify(binding.tip(), set)?;
-                let cone = self.slot_causal_history_with_budget(
-                    &pol.carrier,
-                    proof.pol_digest(i, set)?,
-                    d,
-                    &mut budget,
-                )?;
-                if !cone.contains(&p.view_carrier) {
-                    return Err(invalid("POL lacks view proposal"));
-                }
-                for w in &pol.votes {
-                    if !cone.contains(&w.carrier) {
-                        return Err(invalid("POL lacks vote witness"));
-                    }
-                    w.payload.verify(binding.tip(), set)?;
-                    let c = self.slot_causal_history_with_budget(
-                        &w.carrier,
-                        w.payload.digest(set)?,
-                        d,
-                        &mut budget,
-                    )?;
-                    if !c.contains(&p.view_carrier) {
-                        return Err(invalid("prevote lacks view authorization"));
-                    }
-                }
-            }
-        }
+        let result = self.inspect_agreement_lineage(&proof.entries, binding, &mut budget)?;
         proof.certificate.verify(binding.tip(), set)?;
         let cone = self.slot_causal_history_with_budget(carrier, digest, d, &mut budget)?;
         let pol = last
@@ -2093,6 +2005,152 @@ impl Dag {
             )?;
             if !c.contains(&pol.carrier) {
                 return Err(invalid("precommit lacks selected POL"));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Inspects authenticated proposal/view/POL evidence before local durable signing.
+    /// Returns an owned simulation input, not proof of local WAL, locks, or signing authority.
+    /// The caller must separately enforce durable agreement transition policy.
+    pub fn inspect_slot_agreement_view_lineage(
+        &self,
+        lineage: &crate::SlotAgreementViewLineage,
+        binding: &crate::SlotAgreementBinding,
+    ) -> Result<crate::slot_agreement::AgreementInput, CryptoError> {
+        use crate::slot_agreement_phase::invalid;
+        let last = lineage
+            .entries
+            .last()
+            .ok_or_else(|| invalid("empty lineage"))?;
+        let set = self.set_for_round(last.proposal.decision.round);
+        lineage.encode(set)?;
+        self.preflight_agreement_lineage(&lineage.entries, set, last.proposal.decision.round)?;
+        let mut budget = crate::SLOT_AGREEMENT_PHASE_WORK_BUDGET;
+        self.inspect_agreement_lineage(&lineage.entries, binding, &mut budget)?;
+        Ok(crate::slot_agreement::AgreementInput::Propose {
+            view: last.view,
+            decision: last.proposal.decision.clone(),
+            pol: last.previous_pol.map(|i| {
+                lineage.entries[i]
+                    .pol
+                    .as_ref()
+                    .expect("checked earlier POL")
+                    .certificate
+                    .clone()
+            }),
+        })
+    }
+
+    fn preflight_agreement_lineage(
+        &self,
+        entries: &[crate::SlotAgreementProofEntry],
+        set: &ValidatorSet,
+        round: u64,
+    ) -> Result<(), CryptoError> {
+        use crate::slot_agreement_phase::invalid;
+        // Preflight the entire lineage before authenticating even its first entry.
+        // This bounds structural work, not total cryptographic CPU time.
+        for p in entries {
+            if p.view_carrier.author != crate::slot_agreement_view_proposer(set, round, p.view)?
+                || p.proposal_carrier.round >= p.view_carrier.round
+            {
+                return Err(invalid("wrong proposer or view carrier ordering"));
+            }
+            if let Some(prior) = p.previous_pol {
+                let pol = entries[prior]
+                    .pol
+                    .as_ref()
+                    .ok_or_else(|| invalid("missing POL"))?;
+                if pol.carrier.round >= p.view_carrier.round {
+                    return Err(invalid("prior POL must precede view carrier"));
+                }
+            }
+            if let Some(pol) = &p.pol {
+                if p.view_carrier.round >= pol.carrier.round {
+                    return Err(invalid("view carrier must precede own POL"));
+                }
+                if pol
+                    .votes
+                    .iter()
+                    .any(|w| w.carrier.round >= pol.carrier.round)
+                {
+                    return Err(invalid("prevote witness must precede POL carrier"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn inspect_agreement_lineage(
+        &self,
+        entries: &[crate::SlotAgreementProofEntry],
+        binding: &crate::SlotAgreementBinding,
+        budget: &mut usize,
+    ) -> Result<Decision, CryptoError> {
+        use crate::slot_agreement_phase::invalid;
+        let last = entries.last().ok_or_else(|| invalid("empty lineage"))?;
+        let d = &last.proposal.decision;
+        let set = self.set_for_round(d.round);
+        let lineage = crate::slot_agreement_proof::Lineage(entries);
+        let mut result = None;
+        for (i, p) in entries.iter().enumerate() {
+            let (decision, plain_cone) = self.inspect_slot_proposal_with_budget(
+                &p.proposal,
+                &p.proposal_carrier,
+                binding.tip(),
+                budget,
+            )?;
+            result = Some(decision);
+            if let Some(previous) = binding.carrier()
+                && (previous.round >= p.proposal_carrier.round || !plain_cone.contains(previous))
+            {
+                return Err(invalid("plain proposal lacks predecessor"));
+            }
+            let view_cone = self.slot_causal_history_with_budget(
+                &p.view_carrier,
+                lineage.view_digest(i)?,
+                d,
+                budget,
+            )?;
+            if !view_cone.contains(&p.proposal_carrier) {
+                return Err(invalid("view lacks plain proposal"));
+            }
+            if let Some(prior) = p.previous_pol {
+                let pol = entries[prior]
+                    .pol
+                    .as_ref()
+                    .ok_or_else(|| invalid("missing POL"))?;
+                if !view_cone.contains(&pol.carrier) {
+                    return Err(invalid("view lacks exact prior POL"));
+                }
+            }
+            if let Some(pol) = &p.pol {
+                pol.certificate.verify(binding.tip(), set)?;
+                let cone = self.slot_causal_history_with_budget(
+                    &pol.carrier,
+                    lineage.pol_digest(i, set)?,
+                    d,
+                    budget,
+                )?;
+                if !cone.contains(&p.view_carrier) {
+                    return Err(invalid("POL lacks view proposal"));
+                }
+                for w in &pol.votes {
+                    if !cone.contains(&w.carrier) {
+                        return Err(invalid("POL lacks vote witness"));
+                    }
+                    w.payload.verify(binding.tip(), set)?;
+                    let c = self.slot_causal_history_with_budget(
+                        &w.carrier,
+                        w.payload.digest(set)?,
+                        d,
+                        budget,
+                    )?;
+                    if !c.contains(&p.view_carrier) {
+                        return Err(invalid("prevote lacks view authorization"));
+                    }
+                }
             }
         }
         result.ok_or_else(|| invalid("empty lineage"))
