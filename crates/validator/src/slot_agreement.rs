@@ -2,12 +2,12 @@
 //!
 //! NOT FOR LIVE USE: resetting or cloning this state loses anti-equivocation history.
 //! There is no signer, persistence, recovery, pacemaker, network, or certificate conversion.
+//! Canonical inputs and prepared transitions are only volatile building blocks;
+//! callers must persist exact inputs themselves before apply if their policy requires it.
 //! Outputs are unsigned simulation intents, never authorization to sign durably.
 //! Signatures authenticate votes, not elected leadership, DAG evidence, ancestry, or
 //! application effects. Proposal semantics remain an explicit external trust boundary.
 //! Memory is bounded independently of the number of views: no vote history is retained.
-
-use std::collections::BTreeSet;
 
 use crypto::encoding::Encoder;
 use crypto::{CryptoError, CryptoErrorKind};
@@ -16,7 +16,101 @@ use crate::{SlotDecision, SlotDecisionTip, ValidatorSet, ValidatorSignature};
 
 /// Domain used only for agreement votes, never legacy slot certificates.
 pub const SLOT_AGREEMENT_VOTE_DOMAIN: &[u8] = b"KARSA/SLOT_AGREEMENT/VOTE/v1";
-const MAX_SIGNATURE_BYTES: usize = 1024 * 1024;
+
+#[path = "slot_agreement_codec.rs"]
+mod codec;
+
+/// Owned canonical event for a volatile agreement simulation.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "bounded events retain complete inline decisions and evidence"
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgreementInput {
+    /// Current-view proposal with optional earlier proof of lock.
+    Propose {
+        /// Exact current view.
+        view: AgreementView,
+        /// Complete proposed decision, not an arbitrary digest.
+        decision: SlotDecision,
+        /// Untrusted earlier prevote quorum evidence.
+        pol: Option<AgreementQc>,
+    },
+    /// Phase timeout bound to an exact view.
+    Timeout {
+        /// Exact current view.
+        view: AgreementView,
+        /// Phase in which to emit nil.
+        phase: AgreementPhase,
+    },
+    /// Advance exactly one view from the named current view.
+    AdvanceView {
+        /// Expected current view, guarding stale replay.
+        from: AgreementView,
+    },
+    /// Untrusted quorum evidence, reverified during preparation.
+    Evidence {
+        /// Full quorum statement and signatures.
+        qc: AgreementQc,
+    },
+}
+
+/// Observations released only after applying a prepared volatile transition.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AgreementTransitionResult {
+    /// Optional unsigned vote emitted by this transition.
+    pub vote: Option<AgreementVote>,
+    /// Current view after this transition.
+    pub view: AgreementView,
+    /// Current decision, including an already observed idempotent decision.
+    pub decision: Option<SlotDecision>,
+}
+
+/// Exclusive preparation guard; dropping it leaves the owner unchanged.
+///
+/// This is not a durable transaction. Persist [`Self::input`] externally before
+/// applying if required; this API provides no store, WAL, crash safety, or signer.
+/// The next state and output deliberately have no public access before apply.
+///
+/// ```compile_fail,E0499
+/// use validator::slot_agreement::{AgreementInput, AgreementView, SlotAgreement};
+/// fn exclusive(owner: &mut SlotAgreement) {
+///     let pending = owner.prepare(
+///         AgreementInput::AdvanceView { from: AgreementView(0) }, |_| Ok(())
+///     ).unwrap();
+///     owner.advance_view().unwrap(); // owner remains exclusively borrowed
+///     pending.apply();
+/// }
+/// ```
+#[must_use = "drop cancels preparation; apply installs the volatile transition"]
+pub struct PreparedAgreementTransition<'a> {
+    owner: &'a mut SlotAgreement,
+    input: AgreementInput,
+    next: SlotAgreement,
+    output: AgreementTransitionResult,
+}
+
+impl std::fmt::Debug for PreparedAgreementTransition<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedAgreementTransition")
+            .field("input", &self.input)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedAgreementTransition<'_> {
+    /// Exact immutable input validated by this preparation, suitable for encoding.
+    pub fn input(&self) -> &AgreementInput {
+        &self.input
+    }
+
+    /// Infallibly installs the private next state and releases simulation output.
+    /// No persistence, signing, or external side effects are performed.
+    pub fn apply(self) -> AgreementTransitionResult {
+        *self.owner = self.next;
+        self.output
+    }
+}
 
 fn invalid(message: &str) -> CryptoError {
     CryptoError::new(CryptoErrorKind::MalformedCertificate, message)
@@ -134,18 +228,7 @@ impl AgreementQc {
         if self.vote.context != *context || self.signatures.len() > set.validators.len() {
             return Err(invalid("agreement quorum context or signer bound mismatch"));
         }
-        let mut bytes = 0usize;
-        let mut seen = BTreeSet::new();
-        for s in &self.signatures {
-            for len in [s.validator_id.len(), s.key_id.len(), s.signature.len()] {
-                bytes = bytes
-                    .checked_add(len)
-                    .ok_or_else(|| invalid("quorum size overflow"))?;
-            }
-            if bytes > MAX_SIGNATURE_BYTES || !seen.insert(s.validator_id.as_slice()) {
-                return Err(invalid("oversized quorum or duplicate signer"));
-            }
-        }
+        self.encode(set)?;
         let signers = set.verify_signatures(
             &self.vote.signing_payload(set)?,
             context.epoch(),
@@ -171,6 +254,67 @@ pub struct SlotAgreement {
 }
 
 impl SlotAgreement {
+    fn copy_for_prepare(&self) -> Self {
+        Self {
+            context: self.context.clone(),
+            set: self.set.clone(),
+            view: self.view,
+            prevote: self.prevote.clone(),
+            precommit: self.precommit.clone(),
+            lock: self.lock.clone(),
+            decision: self.decision.clone(),
+        }
+    }
+
+    /// Validates a canonical input on a private deep copy, leaving this owner unchanged.
+    /// The exclusive guard prevents further owner access until drop or apply.
+    /// Replay uses this same API and MUST supply semantic validation again; callback
+    /// side effects are external and cannot be rolled back by this volatile kernel.
+    ///
+    /// # Errors
+    /// Rejects codec bounds, noncanonical signer order, incorrect exact views, and
+    /// all existing reducer validation errors. Failure leaves every owner field unchanged.
+    pub fn prepare(
+        &mut self,
+        input: AgreementInput,
+        validate_semantics: impl FnOnce(&SlotDecision) -> Result<(), CryptoError>,
+    ) -> Result<PreparedAgreementTransition<'_>, CryptoError> {
+        input.encode(&self.set)?;
+        let mut next = self.copy_for_prepare();
+        let vote = match &input {
+            AgreementInput::Propose {
+                view,
+                decision,
+                pol,
+            } => Some(next.propose(*view, decision.clone(), pol.as_ref(), validate_semantics)?),
+            AgreementInput::Timeout { view, phase } => {
+                if *view != next.view {
+                    return Err(invalid("timeout is not in current view"));
+                }
+                Some(next.timeout(*phase)?)
+            }
+            AgreementInput::AdvanceView { from } => {
+                if *from != next.view {
+                    return Err(invalid("advance from is not current view"));
+                }
+                next.advance_view()?;
+                None
+            }
+            AgreementInput::Evidence { qc } => next.evidence(qc, validate_semantics)?,
+        };
+        let output = AgreementTransitionResult {
+            vote,
+            view: next.view,
+            decision: next.decision.clone(),
+        };
+        Ok(PreparedAgreementTransition {
+            owner: self,
+            input,
+            next,
+            output,
+        })
+    }
+
     /// Starts a fresh simulation; this is NOT restart-safe restoration.
     ///
     /// # Errors
@@ -515,9 +659,11 @@ mod tests {
                 })
                 .collect();
             let first = matching.first()?;
+            let mut signatures: Vec<_> = matching.iter().map(|(_, _, s)| s.clone()).collect();
+            signatures.sort_by(|a, b| a.validator_id.cmp(&b.validator_id));
             let qc = AgreementQc {
                 vote: first.1.clone(),
-                signatures: matching.iter().map(|(_, _, s)| s.clone()).collect(),
+                signatures,
             };
             qc.verify(&self.nodes[0].context, &self.nodes[0].set).ok()?;
             Some(qc)
@@ -754,6 +900,421 @@ mod tests {
         );
         h.deliver(0, &old_commit);
         assert_eq!(h.nodes[0].decision(), Some(&conflict));
+    }
+
+    fn raw_qc(qc: &AgreementQc, set: &ValidatorSet) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.put_u16(1);
+        e.put_u8(2);
+        e.put_bytes(&qc.vote.encode(set).unwrap()).unwrap();
+        e.put_u32(u32::try_from(qc.signatures.len()).unwrap());
+        for s in &qc.signatures {
+            e.put_bytes(&s.validator_id).unwrap();
+            e.put_bytes(&s.key_id).unwrap();
+            e.put_bytes(&s.signature).unwrap();
+        }
+        e.finish()
+    }
+
+    #[test]
+    fn canonical_inputs_votes_and_qcs_roundtrip_and_reject_truncation() {
+        let (k, keys, d) = fixture();
+        let pol = qc(
+            &k,
+            &keys,
+            0,
+            AgreementPhase::Prevote,
+            AgreementValue::Decision(d.clone()),
+        );
+        let events = [
+            AgreementInput::Propose {
+                view: AgreementView(1),
+                decision: d.clone(),
+                pol: Some(pol.clone()),
+            },
+            AgreementInput::Propose {
+                view: AgreementView(0),
+                decision: d,
+                pol: None,
+            },
+            AgreementInput::Timeout {
+                view: AgreementView(0),
+                phase: AgreementPhase::Prevote,
+            },
+            AgreementInput::Timeout {
+                view: AgreementView(1),
+                phase: AgreementPhase::Precommit,
+            },
+            AgreementInput::AdvanceView {
+                from: AgreementView(0),
+            },
+            AgreementInput::Evidence { qc: pol.clone() },
+        ];
+        for event in events {
+            let bytes = event.encode(&k.set).unwrap();
+            let decoded = AgreementInput::decode(&bytes, &k.set).unwrap();
+            assert_eq!(decoded, event);
+            assert_eq!(decoded.encode(&k.set).unwrap(), bytes);
+            for end in 0..bytes.len() {
+                assert!(
+                    AgreementInput::decode(&bytes[..end], &k.set).is_err(),
+                    "accepted truncated input at {end}"
+                );
+            }
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert!(AgreementInput::decode(&trailing, &k.set).is_err());
+            for offset in [0, 2, 3] {
+                let mut bad = bytes.clone();
+                bad[offset] = 255;
+                assert!(AgreementInput::decode(&bad, &k.set).is_err());
+            }
+        }
+        for value in [AgreementValue::Nil, pol.vote.value.clone()] {
+            for phase in [AgreementPhase::Prevote, AgreementPhase::Precommit] {
+                let q = qc(&k, &keys, 0, phase, value.clone());
+                let bytes = q.vote.encode(&k.set).unwrap();
+                assert_eq!(AgreementVote::decode(&bytes, &k.set).unwrap(), q.vote);
+                assert_ne!(bytes, q.vote.signing_payload(&k.set).unwrap());
+                for end in 0..bytes.len() {
+                    assert!(AgreementVote::decode(&bytes[..end], &k.set).is_err());
+                }
+                let bytes = q.encode(&k.set).unwrap();
+                assert_eq!(AgreementQc::decode(&bytes, &k.set).unwrap(), q);
+                for end in 0..bytes.len() {
+                    assert!(AgreementQc::decode(&bytes[..end], &k.set).is_err());
+                }
+                let mut trailing = bytes;
+                trailing.push(0);
+                assert!(AgreementQc::decode(&trailing, &k.set).is_err());
+            }
+        }
+        let mut commit_vote = pol.vote.clone();
+        if let AgreementValue::Decision(d) = &mut commit_vote.value {
+            d.outcome = SlotOutcome::Commit {
+                leader: crate::VertexId {
+                    round: d.round,
+                    author: vec![0],
+                    digest: [9; 32],
+                },
+            };
+        }
+        assert_eq!(
+            AgreementVote::decode(&commit_vote.encode(&k.set).unwrap(), &k.set).unwrap(),
+            commit_vote
+        );
+        let timeout = AgreementInput::Timeout {
+            view: AgreementView(0),
+            phase: AgreementPhase::Prevote,
+        };
+        let mut bad_phase = timeout.encode(&k.set).unwrap();
+        *bad_phase.last_mut().unwrap() = 255;
+        assert!(AgreementInput::decode(&bad_phase, &k.set).is_err());
+        let nil = qc(&k, &keys, 0, AgreementPhase::Prevote, AgreementValue::Nil);
+        let vote = nil.vote.encode(&k.set).unwrap();
+        for offset in [0, 2, vote.len() - 2, vote.len() - 1] {
+            let mut bad = vote.clone();
+            bad[offset] = 255;
+            assert!(AgreementVote::decode(&bad, &k.set).is_err());
+        }
+        let mut trailing = vote;
+        trailing.push(0);
+        assert!(AgreementVote::decode(&trailing, &k.set).is_err());
+        let mut wrong_set = k.set.clone();
+        wrong_set.epoch += 1;
+        assert!(AgreementQc::decode(&pol.encode(&k.set).unwrap(), &wrong_set).is_err());
+        let mut proposal = AgreementInput::Propose {
+            view: AgreementView(0),
+            decision: other(match &pol.vote.value {
+                AgreementValue::Decision(d) => d,
+                _ => unreachable!(),
+            }),
+            pol: None,
+        }
+        .encode(&k.set)
+        .unwrap();
+        *proposal.last_mut().unwrap() = 2;
+        assert!(AgreementInput::decode(&proposal, &k.set).is_err());
+    }
+
+    #[test]
+    fn codec_enforces_total_count_field_bounds_and_strict_signer_order() {
+        const LIMIT: usize = 1 << 20;
+        let (k, keys, _) = fixture();
+        let base = qc(&k, &keys, 0, AgreementPhase::Prevote, AgreementValue::Nil);
+        for duplicate in [false, true] {
+            let mut bad = base.clone();
+            if duplicate {
+                bad.signatures[1] = bad.signatures[0].clone();
+            } else {
+                bad.signatures.swap(0, 1);
+            }
+            assert!(bad.encode(&k.set).is_err());
+            assert!(AgreementQc::decode(&raw_qc(&bad, &k.set), &k.set).is_err());
+            assert!(bad.verify(&k.context, &k.set).is_err());
+        }
+        for field in 0..3 {
+            let mut bad = base.clone();
+            let s = &mut bad.signatures[0];
+            match field {
+                0 => s.validator_id = vec![0; 1025],
+                1 => s.key_id = vec![0; 1025],
+                _ => s.signature = vec![0; LIMIT],
+            }
+            assert!(bad.encode(&k.set).is_err());
+            assert!(AgreementQc::decode(&raw_qc(&bad, &k.set), &k.set).is_err());
+        }
+        let mut maximum_count = base.clone();
+        maximum_count.signatures = (0..4096u16)
+            .map(|i| ValidatorSignature {
+                validator_id: i.to_be_bytes().to_vec(),
+                key_id: Vec::new(),
+                signature: Vec::new(),
+            })
+            .collect();
+        let bytes = maximum_count.encode(&k.set).unwrap();
+        assert_eq!(AgreementQc::decode(&bytes, &k.set).unwrap(), maximum_count);
+        // Codec acceptance is not quorum authentication or membership validation.
+        assert!(maximum_count.verify(&k.context, &k.set).is_err());
+        let mut huge = base.clone();
+        huge.signatures = vec![base.signatures[0].clone(); 4097];
+        assert!(huge.encode(&k.set).is_err());
+        let mut prefix = Encoder::new();
+        prefix.put_u16(1);
+        prefix.put_u8(2);
+        prefix
+            .put_bytes(&base.vote.encode(&k.set).unwrap())
+            .unwrap();
+        prefix.put_u32(4097);
+        assert!(AgreementQc::decode(&prefix.finish(), &k.set).is_err());
+        // The QC limit includes every framing byte, not just signature bytes.
+        let mut exact = base.clone();
+        let original_size = exact.encode(&k.set).unwrap().len();
+        let signature = &mut exact.signatures[0].signature;
+        signature.resize(signature.len() + LIMIT - original_size, 0);
+        let bytes = exact.encode(&k.set).unwrap();
+        assert_eq!(bytes.len(), LIMIT);
+        assert_eq!(AgreementQc::decode(&bytes, &k.set).unwrap(), exact);
+        assert!(
+            AgreementInput::Evidence { qc: exact.clone() }
+                .encode(&k.set)
+                .is_err()
+        );
+        let mut exact_input_qc = exact.clone();
+        let signature_len = exact_input_qc.signatures[0].signature.len();
+        exact_input_qc.signatures[0]
+            .signature
+            .truncate(signature_len - 8);
+        let exact_input = AgreementInput::Evidence { qc: exact_input_qc };
+        let bytes = exact_input.encode(&k.set).unwrap();
+        assert_eq!(bytes.len(), LIMIT);
+        assert_eq!(AgreementInput::decode(&bytes, &k.set).unwrap(), exact_input);
+        exact.signatures[0].signature.push(0);
+        assert!(exact.encode(&k.set).is_err());
+        let oversize = vec![0; LIMIT + 1];
+        assert!(AgreementInput::decode(&oversize, &k.set).is_err());
+        assert!(AgreementVote::decode(&oversize, &k.set).is_err());
+        assert!(AgreementQc::decode(&oversize, &k.set).is_err());
+        let mut claimed = base.encode(&k.set).unwrap();
+        claimed[3..7].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(AgreementQc::decode(&claimed, &k.set).is_err());
+    }
+
+    #[test]
+    fn prepare_drop_failure_and_exact_view_guards_preserve_full_state() {
+        let (mut k, keys, d) = fixture();
+        let before = snapshot(&k);
+        let input = AgreementInput::Propose {
+            view: k.view(),
+            decision: d.clone(),
+            pol: None,
+        };
+        {
+            let prepared = k.prepare(input.clone(), |_| Ok(())).unwrap();
+            assert_eq!(prepared.input(), &input);
+            assert_eq!(
+                prepared.input().encode(&before.set).unwrap(),
+                input.encode(&before.set).unwrap()
+            );
+        }
+        assert_eq!(snapshot(&k), before);
+        let mut calls = 0;
+        assert!(
+            k.prepare(input.clone(), |_| {
+                calls += 1;
+                Err(invalid("reject"))
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(snapshot(&k), before);
+        for input in [
+            AgreementInput::Timeout {
+                view: AgreementView(1),
+                phase: AgreementPhase::Prevote,
+            },
+            AgreementInput::AdvanceView {
+                from: AgreementView(1),
+            },
+        ] {
+            assert!(
+                k.prepare(input, |_| panic!("no semantic callback for view guards"))
+                    .is_err()
+            );
+            assert_eq!(snapshot(&k), before);
+        }
+        let mut wrong = d.clone();
+        wrong.chain_id = b"wrong-chain".to_vec();
+        assert!(
+            k.prepare(
+                AgreementInput::Propose {
+                    view: k.view(),
+                    decision: wrong,
+                    pol: None
+                },
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(snapshot(&k), before);
+        let mut wrong_qc = qc(
+            &k,
+            &keys,
+            0,
+            AgreementPhase::Prevote,
+            AgreementValue::Decision(d.clone()),
+        );
+        wrong_qc.vote.context = SlotDecisionTip::from_checkpoint(
+            b"wrong-chain".to_vec(),
+            &k.set,
+            d.round,
+            d.previous,
+            d.before_len,
+            d.before_root,
+        )
+        .unwrap();
+        assert!(
+            k.prepare(AgreementInput::Evidence { qc: wrong_qc }, |_| Ok(()))
+                .is_err()
+        );
+        assert_eq!(snapshot(&k), before);
+        k.prepare(
+            AgreementInput::AdvanceView {
+                from: AgreementView(0),
+            },
+            |_| Ok(()),
+        )
+        .unwrap()
+        .apply();
+        let advanced = snapshot(&k);
+        for stale in [
+            AgreementInput::AdvanceView {
+                from: AgreementView(0),
+            },
+            AgreementInput::Timeout {
+                view: AgreementView(0),
+                phase: AgreementPhase::Precommit,
+            },
+            input,
+        ] {
+            assert!(k.prepare(stale, |_| Ok(())).is_err());
+            assert_eq!(snapshot(&k), advanced);
+        }
+    }
+
+    #[test]
+    fn prepared_apply_matches_direct_reducer_and_replay_revalidates() {
+        let (mut prepared, keys, d) = fixture();
+        let mut direct = prepared.copy_for_prepare();
+        let proposal = AgreementInput::Propose {
+            view: AgreementView(0),
+            decision: d.clone(),
+            pol: None,
+        };
+        let pol = qc(
+            &prepared,
+            &keys,
+            0,
+            AgreementPhase::Prevote,
+            AgreementValue::Decision(d.clone()),
+        );
+        let commit = qc(
+            &prepared,
+            &keys,
+            0,
+            AgreementPhase::Precommit,
+            AgreementValue::Decision(d),
+        );
+        let events = [
+            proposal,
+            AgreementInput::Evidence { qc: pol },
+            AgreementInput::AdvanceView {
+                from: AgreementView(0),
+            },
+            AgreementInput::Timeout {
+                view: AgreementView(1),
+                phase: AgreementPhase::Prevote,
+            },
+            AgreementInput::Timeout {
+                view: AgreementView(1),
+                phase: AgreementPhase::Precommit,
+            },
+            AgreementInput::Evidence { qc: commit },
+        ];
+        for event in events {
+            let decoded =
+                AgreementInput::decode(&event.encode(&prepared.set).unwrap(), &prepared.set)
+                    .unwrap();
+            let before = snapshot(&prepared);
+            let needs_semantics = matches!(
+                event,
+                AgreementInput::Propose { .. } | AgreementInput::Evidence { .. }
+            );
+            if needs_semantics {
+                let mut calls = 0;
+                assert!(
+                    prepared
+                        .prepare(decoded.clone(), |_| {
+                            calls += 1;
+                            Err(invalid("replay rejection"))
+                        })
+                        .is_err()
+                );
+                assert_eq!(calls, 1);
+                assert_eq!(snapshot(&prepared), before);
+            }
+            let expected_vote = match &event {
+                AgreementInput::Propose {
+                    view,
+                    decision,
+                    pol,
+                } => Some(
+                    direct
+                        .propose(*view, decision.clone(), pol.as_ref(), |_| Ok(()))
+                        .unwrap(),
+                ),
+                AgreementInput::Timeout { phase, .. } => Some(direct.timeout(*phase).unwrap()),
+                AgreementInput::AdvanceView { .. } => {
+                    direct.advance_view().unwrap();
+                    None
+                }
+                AgreementInput::Evidence { qc } => direct.evidence(qc, |_| Ok(())).unwrap(),
+            };
+            let mut calls = 0;
+            let transition = prepared
+                .prepare(decoded, |_| {
+                    calls += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(transition.input(), &event);
+            let output = transition.apply();
+            assert_eq!(calls, usize::from(needs_semantics));
+            assert_eq!(output.vote, expected_vote);
+            assert_eq!(output.view, direct.view());
+            assert_eq!(output.decision.as_ref(), direct.decision());
+            assert_eq!(snapshot(&prepared), snapshot(&direct));
+        }
     }
 
     #[test]
