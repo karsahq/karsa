@@ -341,7 +341,26 @@ fn reject_unauthorized_view(f: &Fixture, lineage: &SlotAgreementViewLineage) {
     );
 }
 
+type EmitQc = fn(
+    &Fixture,
+    &SlotAgreementViewLineage,
+    &BTreeMap<AgreementView, SlotAgreementViewLineage>,
+    Option<&AgreementQc>,
+    &[TempDir],
+    AgreementView,
+    Option<&AgreementQc>,
+) -> AgreementQc;
+
 fn run(commit: bool, later_view: Option<AgreementView>) {
+    run_with_qc(commit, later_view, false, emitted_qc);
+}
+
+pub(super) fn run_with_qc(
+    commit: bool,
+    later_view: Option<AgreementView>,
+    authenticated: bool,
+    emit: EmitQc,
+) {
     let mut f = Fixture::new(commit);
     // Discard the legacy certificate carrier: it is not agreement evidence.
     f.vertices.retain(|v| v.round < 4);
@@ -384,16 +403,26 @@ fn run(commit: bool, later_view: Option<AgreementView>) {
     // validator that only joins the later signing quorum.
     for (id, dir) in dirs.iter().enumerate() {
         let store = Store::open(&dir.0).unwrap();
-        store
-            .begin_slot_agreement(SlotAgreementBootstrap {
-                context: f.binding.tip().clone(),
-                set: f.set.clone(),
-                local_validator: f.set.validators[id].validator_id.clone(),
-            })
-            .unwrap();
+        let agreement = SlotAgreementBootstrap {
+            context: f.binding.tip().clone(),
+            set: f.set.clone(),
+            local_validator: f.set.validators[id].validator_id.clone(),
+        };
+        if authenticated {
+            store
+                .begin_authenticated_slot_agreement(crate::AuthenticatedSlotAgreementBootstrap {
+                    agreement,
+                    predecessor: None,
+                    order: vec![],
+                    vertices: vec![],
+                })
+                .unwrap();
+        } else {
+            store.begin_slot_agreement(agreement).unwrap();
+        }
     }
     let mut history = BTreeMap::from([(AgreementView(0), lineage.clone())]);
-    let prevote = emitted_qc(&f, &lineage, &history, None, &dirs, AgreementView(0), None);
+    let prevote = emit(&f, &lineage, &history, None, &dirs, AgreementView(0), None);
     assert_eq!(prevote.vote.phase, AgreementPhase::Prevote);
     let mut proof = SlotAgreementProof {
         entries: lineage.entries.clone(),
@@ -438,7 +467,7 @@ fn run(commit: bool, later_view: Option<AgreementView>) {
         let prevote = if entry == 0 {
             prevote.clone()
         } else {
-            emitted_qc(
+            emit(
                 &f,
                 &lineage,
                 &history,
@@ -456,7 +485,7 @@ fn run(commit: bool, later_view: Option<AgreementView>) {
                     entries: proof.entries.clone(),
                 };
                 history.insert(view, authenticated_pol.clone());
-                proof.certificate = emitted_qc(
+                proof.certificate = emit(
                     &f,
                     &authenticated_pol,
                     &history,
@@ -583,6 +612,42 @@ fn run(commit: bool, later_view: Option<AgreementView>) {
         SlotApplicationResult::AlreadyApplied { round: 1 }
     );
     assert_eq!(store.slot_application_requests().unwrap().len(), 1);
+    if authenticated {
+        let bootstraps: Vec<_> = f
+            .set
+            .validators
+            .iter()
+            .map(|validator| crate::AuthenticatedSlotAgreementBootstrap {
+                agreement: SlotAgreementBootstrap {
+                    context: f.binding.tip().clone(),
+                    set: f.set.clone(),
+                    local_validator: validator.validator_id.clone(),
+                },
+                predecessor: None,
+                order: vec![],
+                vertices: vec![],
+            })
+            .collect();
+        drop(recovered);
+        drop(store);
+        drop(history);
+        drop(lineage);
+        drop(proof);
+        drop(prevote);
+        drop(f);
+        // No external DAG, lineage, semantic callback, or history survives here.
+        for (dir, bootstrap) in dirs.iter().zip(bootstraps) {
+            let path = dir.0.join(crate::authenticated_slot_agreement::FILE);
+            let bytes = std::fs::read(&path).unwrap();
+            let store = Store::open(&dir.0).unwrap();
+            assert!(store.vertices().unwrap().is_empty());
+            let session = store
+                .recover_authenticated_slot_agreement(bootstrap)
+                .unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+            assert!(session.sequence() > 0);
+        }
+    }
 }
 
 #[test]

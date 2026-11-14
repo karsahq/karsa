@@ -594,3 +594,172 @@ fn authenticated_generation_boundaries_validate_legacy_root_journals() {
         }
     }
 }
+
+// The shared harness builds signed multi-view DAGs and applies the final proof;
+// this driver authorizes every transition exclusively through the closed WAL API.
+fn authenticated_emitted_qc(
+    f: &Fixture,
+    lineage: &SlotAgreementViewLineage,
+    _history: &std::collections::BTreeMap<AgreementView, SlotAgreementViewLineage>,
+    prevote: Option<&validator::slot_agreement::AgreementQc>,
+    dirs: &[TempDir],
+    view: AgreementView,
+    _wrong_pol: Option<&validator::slot_agreement::AgreementQc>,
+) -> validator::slot_agreement::AgreementQc {
+    use crypto::scheme::Ed25519Scheme;
+    use validator::ValidatorSignature;
+    use validator::slot_agreement::AgreementQc;
+
+    let members = if view.0 == 0 { 0..3 } else { 1..4 };
+    let mut votes = Vec::new();
+    let mut signatures = Vec::new();
+    for id in members {
+        let bootstrap = AuthenticatedSlotAgreementBootstrap {
+            agreement: SlotAgreementBootstrap {
+                context: f.binding.tip().clone(),
+                set: f.set.clone(),
+                local_validator: f.set.validators[id].validator_id.clone(),
+            },
+            predecessor: None,
+            order: vec![],
+            vertices: vec![],
+        };
+        let store = Store::open(&dirs[id].0).unwrap();
+        let mut session = store
+            .recover_authenticated_slot_agreement(bootstrap.clone())
+            .unwrap();
+        if view.0 > 0 && prevote.is_none() {
+            for from in 0..view.0 {
+                session
+                    .apply(
+                        session.sequence() + 1,
+                        AuthenticatedSlotAgreementRequest::AdvanceView {
+                            from: AgreementView(from),
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        let request = if prevote.is_some() {
+            AuthenticatedSlotAgreementRequest::ObservePrevote {
+                lineage: lineage.clone(),
+                vertices: f.vertices.clone(),
+            }
+        } else {
+            AuthenticatedSlotAgreementRequest::Propose {
+                lineage: lineage.clone(),
+                vertices: f.vertices.clone(),
+            }
+        };
+        // Reopen after the earlier lock and view advancement, before reproposal.
+        drop(session);
+        drop(store);
+        let store = Store::open(&dirs[id].0).unwrap();
+        let mut session = store
+            .recover_authenticated_slot_agreement(bootstrap.clone())
+            .unwrap();
+        let path = dirs[id].0.join(authenticated_slot_agreement::FILE);
+        if view.0 > 0 && id < 3 {
+            let sequence = session.sequence();
+            let bytes = fs::read(&path).unwrap();
+            let mut original = SlotAgreementViewLineage {
+                entries: vec![lineage.entries[0].clone()],
+            };
+            original.entries[0].pol = None;
+            let original_vertices: Vec<_> = f
+                .vertices
+                .iter()
+                .filter(|vertex| vertex.round <= 4)
+                .cloned()
+                .collect();
+            // Only the latest sequence is retryable, even for the original envelope.
+            assert!(
+                session
+                    .apply(
+                        1,
+                        AuthenticatedSlotAgreementRequest::Propose {
+                            lineage: original,
+                            vertices: original_vertices.clone(),
+                        },
+                    )
+                    .is_err()
+            );
+            assert_eq!(session.sequence(), sequence);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            // Change only the lineage in the original sequence-one envelope.
+            assert!(
+                session
+                    .apply(
+                        1,
+                        AuthenticatedSlotAgreementRequest::Propose {
+                            lineage: lineage.clone(),
+                            vertices: original_vertices,
+                        }
+                    )
+                    .is_err()
+            );
+            assert_eq!(session.sequence(), sequence);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        let sequence = session.sequence() + 1;
+        let result = session.apply(sequence, request.clone()).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        // Crash after persisting the vote/lock, before producing any signature.
+        drop(session);
+        drop(store);
+        let store = Store::open(&dirs[id].0).unwrap();
+        let mut session = store
+            .recover_authenticated_slot_agreement(bootstrap)
+            .unwrap();
+        assert_eq!(session.sequence(), sequence);
+        let retried = session.apply(sequence, request).unwrap();
+        assert_eq!(retried, result);
+        assert_eq!(session.sequence(), sequence);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let vote = retried.vote.unwrap();
+        assert_eq!(vote.view, view);
+        assert_eq!(
+            vote.phase,
+            if prevote.is_some() {
+                AgreementPhase::Precommit
+            } else {
+                AgreementPhase::Prevote
+            }
+        );
+        signatures.push(ValidatorSignature {
+            validator_id: f.set.validators[id].validator_id.clone(),
+            key_id: f.set.validators[id].keys[0].key_id.clone(),
+            signature: Ed25519Scheme
+                .sign(&f.keys[id], &vote.signing_payload(&f.set).unwrap())
+                .unwrap(),
+        });
+        votes.push(vote);
+    }
+    assert!(votes.iter().all(|vote| vote == &votes[0]));
+    let qc = AgreementQc {
+        vote: votes.remove(0),
+        signatures,
+    };
+    qc.verify(f.binding.tip(), &f.set).unwrap();
+    qc
+}
+
+#[test]
+fn authenticated_multiview_commit_zero_to_one_root_wal_recovery() {
+    crate::signed_dag_agreement_tests::run_with_qc(
+        true,
+        Some(AgreementView(1)),
+        true,
+        authenticated_emitted_qc,
+    );
+}
+
+#[test]
+fn authenticated_multiview_skip_zero_to_three_root_wal_recovery() {
+    crate::signed_dag_agreement_tests::run_with_qc(
+        false,
+        Some(AgreementView(3)),
+        true,
+        authenticated_emitted_qc,
+    );
+}

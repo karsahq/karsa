@@ -33,6 +33,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+#[cfg(test)]
+mod authenticated_checkpoint_tests;
 mod authenticated_slot_agreement;
 #[cfg(test)]
 mod authenticated_slot_agreement_tests;
