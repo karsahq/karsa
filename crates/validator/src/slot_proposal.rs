@@ -5,8 +5,9 @@
 //! from their signed references, not asserted by this codec. Before locking or
 //! signing a decision, the proposer must validate DAG causal binding, evidence
 //! (including signatures, membership, distinct authors, rounds, and thresholds),
-//! the direct rule, and decision/frontier continuity. Fence and indirect rules
-//! are not supported. Encoding and decoding perform no semantic validation.
+//! the evidence rule, and decision/frontier continuity. Legacy V1 proposals support
+//! only direct evidence; the unified envelope adds explicit indirect-positive
+//! evidence. Fence evidence is unsupported. Codecs perform no semantic validation.
 
 use crypto::encoding::{Decoder, Encoder, MAX_FIELD_LEN};
 use crypto::{CryptoError, CryptoErrorKind};
@@ -37,6 +38,118 @@ pub struct SlotProposal {
     pub voters: Vec<VertexId>,
 }
 
+/// Independent indirect-positive proposal encoding version.
+pub const SLOT_PROPOSAL_VERSION_V2: u16 = 2;
+/// Domain for explicit indirect-positive proposal evidence.
+pub const SLOT_PROPOSAL_INDIRECT_DOMAIN: &[u8] = b"KARSA/DAG/SLOT_PROPOSAL/v2";
+
+/// Explicit evidence kind; indirect evidence admits only a positive commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotProposalEvidence {
+    /// Exact signed direct vote or nonvote vertices.
+    Direct {
+        /// Canonically ordered signed vote/nonvote identities.
+        voters: Vec<VertexId>,
+    },
+    /// Later elected anchor and exact signed vertices voting for it.
+    IndirectCommit {
+        /// Exact later elected leader identity.
+        anchor: VertexId,
+        /// Canonically ordered signed votes explicitly referencing the anchor.
+        support: Vec<VertexId>,
+    },
+}
+
+/// Versioned proposal used by unified agreement lineage and application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotProposalEnvelope {
+    /// Exact decision context and deterministic target effect.
+    pub decision: SlotDecision,
+    /// Explicit direct or indirect-positive evidence.
+    pub evidence: SlotProposalEvidence,
+}
+
+impl From<SlotProposal> for SlotProposalEnvelope {
+    fn from(proposal: SlotProposal) -> Self {
+        Self {
+            decision: proposal.decision,
+            evidence: SlotProposalEvidence::Direct {
+                voters: proposal.voters,
+            },
+        }
+    }
+}
+
+impl SlotProposalEnvelope {
+    /// Encodes direct proposals byte-for-byte as V1, and indirect evidence as V2.
+    pub fn encode(&self) -> Result<Vec<u8>, CryptoError> {
+        match &self.evidence {
+            SlotProposalEvidence::Direct { voters } => encode_parts(&self.decision, voters),
+            SlotProposalEvidence::IndirectCommit { anchor, support } => {
+                // Reuse the bounded canonical identity-list codec, without overloading
+                // its semantics: the V2 body explicitly separates anchor and support.
+                let body = encode_parts(&self.decision, support)?;
+                check_bound(anchor.author.len(), MAX_AUTHOR_BYTES)?;
+                check_bound(
+                    2 + 8 + 4 + anchor.author.len() + 4 + 32 + 4 + body.len(),
+                    MAX_FIELD_LEN,
+                )?;
+                let mut e = Encoder::new();
+                e.put_u16(SLOT_PROPOSAL_VERSION_V2);
+                e.put_u64(anchor.round);
+                e.put_bytes(&anchor.author)?;
+                e.put_bytes(&anchor.digest)?;
+                e.put_bytes(&body)?;
+                Ok(e.finish())
+            }
+        }
+    }
+
+    /// Decodes an explicitly versioned bounded proposal, without authentication.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CryptoError> {
+        check_bound(bytes.len(), MAX_FIELD_LEN)?;
+        let mut d = Decoder::new(bytes);
+        match d.read_u16()? {
+            SLOT_PROPOSAL_VERSION_V1 => Ok(SlotProposal::decode(bytes)?.into()),
+            SLOT_PROPOSAL_VERSION_V2 => {
+                let round = d.read_u64()?;
+                let author = d.read_bytes()?;
+                check_bound(author.len(), MAX_AUTHOR_BYTES)?;
+                let digest = d
+                    .read_bytes()?
+                    .try_into()
+                    .map_err(|_| malformed("expected a 32-byte anchor digest"))?;
+                let body = SlotProposal::decode(d.read_bytes()?)?;
+                d.finish()?;
+                Ok(Self {
+                    decision: body.decision,
+                    evidence: SlotProposalEvidence::IndirectCommit {
+                        anchor: VertexId {
+                            round,
+                            author: author.to_vec(),
+                            digest,
+                        },
+                        support: body.voters,
+                    },
+                })
+            }
+            _ => Err(malformed("unsupported slot proposal envelope version")),
+        }
+    }
+
+    /// Hashes direct bytes in the unchanged V1 domain, or indirect bytes in V2.
+    pub fn digest(&self) -> Result<[u8; 32], CryptoError> {
+        let domain = match self.evidence {
+            SlotProposalEvidence::Direct { .. } => SLOT_PROPOSAL_DOMAIN,
+            SlotProposalEvidence::IndirectCommit { .. } => SLOT_PROPOSAL_INDIRECT_DOMAIN,
+        };
+        let mut e = Encoder::new();
+        e.put_bytes(domain)?;
+        e.put_raw(&self.encode()?);
+        Ok(Sha256::digest(e.finish()).into())
+    }
+}
+
 fn check_bound(value: usize, limit: usize) -> Result<(), CryptoError> {
     if value > limit {
         return Err(CryptoError::new(
@@ -60,6 +173,31 @@ fn check_order(previous: &VertexId, next: &VertexId) -> Result<(), CryptoError> 
     Ok(())
 }
 
+fn encode_parts(decision: &SlotDecision, voters: &[VertexId]) -> Result<Vec<u8>, CryptoError> {
+    check_bound(voters.len(), MAX_VOTERS)?;
+    let decision = decision.encode()?;
+    let mut size = 2 + 4 + decision.len() + 4;
+    for (index, voter) in voters.iter().enumerate() {
+        check_bound(voter.author.len(), MAX_AUTHOR_BYTES)?;
+        if index > 0 {
+            check_order(&voters[index - 1], voter)?;
+        }
+        size += 8 + 4 + voter.author.len() + 4 + 32;
+        check_bound(size, MAX_FIELD_LEN)?;
+    }
+    check_bound(size, MAX_FIELD_LEN)?;
+    let mut e = Encoder::with_capacity(size);
+    e.put_u16(SLOT_PROPOSAL_VERSION_V1);
+    e.put_bytes(&decision)?;
+    e.put_u32(voters.len() as u32);
+    for voter in voters {
+        e.put_u64(voter.round);
+        e.put_bytes(&voter.author)?;
+        e.put_bytes(&voter.digest)?;
+    }
+    Ok(e.finish())
+}
+
 impl SlotProposal {
     /// Encodes version, length-prefixed decision, count, then voter identifiers.
     ///
@@ -69,28 +207,7 @@ impl SlotProposal {
     /// Rejects oversized bodies, fields or counts, noncanonical voter ordering,
     /// and any structural encoding error from [`SlotDecision::encode`].
     pub fn encode(&self) -> Result<Vec<u8>, CryptoError> {
-        check_bound(self.voters.len(), MAX_VOTERS)?;
-        let decision = self.decision.encode()?;
-        let mut size = 2 + 4 + decision.len() + 4;
-        for (index, voter) in self.voters.iter().enumerate() {
-            check_bound(voter.author.len(), MAX_AUTHOR_BYTES)?;
-            if index > 0 {
-                check_order(&self.voters[index - 1], voter)?;
-            }
-            size += 8 + 4 + voter.author.len() + 4 + 32;
-            check_bound(size, MAX_FIELD_LEN)?;
-        }
-        check_bound(size, MAX_FIELD_LEN)?;
-        let mut e = Encoder::with_capacity(size);
-        e.put_u16(SLOT_PROPOSAL_VERSION_V1);
-        e.put_bytes(&decision)?;
-        e.put_u32(self.voters.len() as u32);
-        for voter in &self.voters {
-            e.put_u64(voter.round);
-            e.put_bytes(&voter.author)?;
-            e.put_bytes(&voter.digest)?;
-        }
-        Ok(e.finish())
+        encode_parts(&self.decision, &self.voters)
     }
 
     /// Decodes a canonical proposal without validating decision or evidence semantics.
@@ -195,6 +312,55 @@ mod tests {
             e.put_bytes(&voter.digest).unwrap();
         }
         e.finish()
+    }
+
+    #[test]
+    fn envelope_preserves_v1_and_distinguishes_bounded_v2() {
+        let legacy = proposal();
+        let direct: SlotProposalEnvelope = legacy.clone().into();
+        assert_eq!(direct.encode().unwrap(), legacy.encode().unwrap());
+        assert_eq!(direct.digest().unwrap(), legacy.digest().unwrap());
+        assert_eq!(
+            SlotProposalEnvelope::decode(&legacy.encode().unwrap()).unwrap(),
+            direct
+        );
+        let mut indirect = SlotProposalEnvelope {
+            decision: legacy.decision,
+            evidence: SlotProposalEvidence::IndirectCommit {
+                anchor: legacy.voters[0].clone(),
+                support: legacy.voters,
+            },
+        };
+        let bytes = indirect.encode().unwrap();
+        assert_eq!(SlotProposalEnvelope::decode(&bytes).unwrap(), indirect);
+        assert!(SlotProposal::decode(&bytes).is_err());
+        let mut e = Encoder::new();
+        e.put_bytes(SLOT_PROPOSAL_INDIRECT_DOMAIN).unwrap();
+        e.put_raw(&bytes);
+        let digest: [u8; 32] = Sha256::digest(e.finish()).into();
+        assert_eq!(indirect.digest().unwrap(), digest);
+        for end in 0..bytes.len() {
+            assert!(
+                SlotProposalEnvelope::decode(&bytes[..end]).is_err(),
+                "prefix {end}"
+            );
+        }
+        let mut bad = bytes.clone();
+        bad.push(0);
+        assert!(SlotProposalEnvelope::decode(&bad).is_err());
+        bad = bytes.clone();
+        bad[..2].copy_from_slice(&3u16.to_le_bytes());
+        assert!(SlotProposalEnvelope::decode(&bad).is_err());
+        let SlotProposalEvidence::IndirectCommit { support, .. } = &mut indirect.evidence else {
+            unreachable!()
+        };
+        support.reverse();
+        assert!(indirect.encode().is_err());
+        let SlotProposalEvidence::IndirectCommit { anchor, .. } = &mut indirect.evidence else {
+            unreachable!()
+        };
+        anchor.author = vec![0; MAX_AUTHOR_BYTES + 1];
+        assert!(indirect.encode().is_err());
     }
 
     #[test]

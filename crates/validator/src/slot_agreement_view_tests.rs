@@ -475,9 +475,29 @@ fn shared_budget_equals_sum_of_all_individual_walks() {
         .iter()
         .map(|(id, digest)| {
             let mut budget = 100_000;
-            f.dag
-                .slot_causal_history_with_budget(id, *digest, d, &mut budget)
-                .unwrap();
+            if id == &p.proposal_carrier {
+                f.dag
+                    .inspect_slot_proposal_with_budget(
+                        &p.proposal.clone().into(),
+                        id,
+                        b.tip(),
+                        &mut budget,
+                    )
+                    .unwrap();
+            } else if id == &pol.payload.aggregate.proposal_carrier {
+                f.dag
+                    .inspect_slot_proposal_with_budget(
+                        &pol.payload.aggregate.proposal.clone().into(),
+                        id,
+                        b.tip(),
+                        &mut budget,
+                    )
+                    .unwrap();
+            } else {
+                f.dag
+                    .slot_causal_history_with_budget(id, *digest, d, &mut budget)
+                    .unwrap();
+            }
             100_000 - budget
         })
         .collect();

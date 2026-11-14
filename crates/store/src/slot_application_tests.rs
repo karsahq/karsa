@@ -844,7 +844,7 @@ pub(super) fn append_unified_proof(
     let prevote = qc(AgreementPhase::Prevote);
     let mut proof = SlotAgreementProof {
         entries: vec![SlotAgreementProofEntry {
-            proposal: proposal.clone(),
+            proposal: proposal.clone().into(),
             proposal_carrier,
             view: AgreementView(0),
             view_carrier: f.carrier.clone(),

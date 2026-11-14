@@ -4,7 +4,7 @@ use crate::slot_agreement::{AgreementPhase, AgreementQc, AgreementValue, Agreeme
 use crate::slot_agreement_phase::{
     check_witnesses, invalid, put_id, put_witnesses, read_id, read_witnesses, scan_witnesses,
 };
-use crate::{SlotAgreementVoteWitness, SlotProposal, ValidatorSet, VertexId};
+use crate::{SlotAgreementVoteWitness, SlotProposalEnvelope, ValidatorSet, VertexId};
 use crypto::CryptoError;
 use crypto::encoding::{Decoder, Encoder, MAX_FIELD_LEN};
 use sha2::{Digest, Sha256};
@@ -26,12 +26,12 @@ pub struct SlotAgreementProofPol {
     /// Exact signed carrier binding this evidence.
     pub carrier: VertexId,
 }
-/// One complete direct proposal and its view authorization.
+/// One complete versioned proposal and its view authorization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotAgreementProofEntry {
-    /// Complete direct-rule evidence.
-    pub proposal: SlotProposal,
-    /// Exact plain direct-proposal carrier.
+    /// Explicit direct or indirect-positive evidence.
+    pub proposal: SlotProposalEnvelope,
+    /// Exact plain proposal carrier.
     pub proposal_carrier: VertexId,
     /// Agreement view, independent of DAG round.
     pub view: AgreementView,
@@ -440,7 +440,7 @@ fn decode_entries(
             })
             .transpose()?;
         entries.push(SlotAgreementProofEntry {
-            proposal: SlotProposal::decode(proposal)?,
+            proposal: SlotProposalEnvelope::decode(proposal)?,
             proposal_carrier,
             view,
             view_carrier,

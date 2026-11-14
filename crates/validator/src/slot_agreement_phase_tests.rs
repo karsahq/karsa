@@ -310,10 +310,7 @@ fn strong_phase_budget_exact_shared_boundary_not_per_walk() {
     for w in p.prevote.votes.iter().chain(&p.votes) {
         walks.push((&w.carrier, w.payload.digest(set).unwrap()));
     }
-    walks.push((
-        &p.prevote.aggregate.proposal_carrier,
-        p.prevote.aggregate.proposal.digest().unwrap(),
-    ));
+
     let mut total = 0;
     let mut maximum = 0;
     for (carrier, digest) in &walks {
@@ -325,7 +322,20 @@ fn strong_phase_budget_exact_shared_boundary_not_per_walk() {
         total += used;
         maximum = maximum.max(used);
     }
+    let mut proposal_budget = usize::MAX;
+    f.dag
+        .inspect_slot_proposal_with_budget(
+            &p.prevote.aggregate.proposal.clone().into(),
+            &p.prevote.aggregate.proposal_carrier,
+            b.tip(),
+            &mut proposal_budget,
+        )
+        .unwrap();
+    let proposal_cost = usize::MAX - proposal_budget;
+    total += proposal_cost;
+    maximum = maximum.max(proposal_cost);
     assert!(total > maximum);
+    // Include target collection, ordering and frontier work, not just cone visits.
     // Every individual walk fits this budget, but their shared sum does not.
     for (carrier, digest) in &walks {
         let mut remaining = maximum;

@@ -14,7 +14,7 @@ pub(super) fn fixture(
     f.vertices.retain(|v| v.round < 4);
     let mut lineage = SlotAgreementViewLineage {
         entries: vec![SlotAgreementProofEntry {
-            proposal: f.payload.proposal.clone(),
+            proposal: f.payload.proposal.clone().into(),
             proposal_carrier: f.payload.proposal_carrier.clone(),
             view: AgreementView(0),
             view_carrier: f.payload.proposal_carrier.clone(),

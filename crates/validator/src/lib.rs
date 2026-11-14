@@ -82,5 +82,8 @@ pub use slot_decision::{
     SLOT_DECISION_ID_DOMAIN, SLOT_DECISION_SIGNING_DOMAIN, SLOT_DECISION_VERSION_V1, SlotDecision,
     SlotDecisionCertificate, SlotDecisionTip, SlotOutcome,
 };
-pub use slot_proposal::{SLOT_PROPOSAL_DOMAIN, SLOT_PROPOSAL_VERSION_V1, SlotProposal};
+pub use slot_proposal::{
+    SLOT_PROPOSAL_DOMAIN, SLOT_PROPOSAL_INDIRECT_DOMAIN, SLOT_PROPOSAL_VERSION_V1,
+    SLOT_PROPOSAL_VERSION_V2, SlotProposal, SlotProposalEnvelope, SlotProposalEvidence,
+};
 pub use vertex::{VERTEX_VERSION_V1, Vertex, VertexId, tally_votes};

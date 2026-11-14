@@ -9,10 +9,89 @@ fn fixture() -> (Fixture, SlotAgreementProof, VertexId, SlotAgreementBinding) {
 fn fixture_with_decision(
     commit: bool,
 ) -> (Fixture, SlotAgreementProof, VertexId, SlotAgreementBinding) {
+    fixture_with_evidence(commit, false)
+}
+
+fn fixture_with_evidence(
+    commit: bool,
+    indirect: bool,
+) -> (Fixture, SlotAgreementProof, VertexId, SlotAgreementBinding) {
+    fixture_with_signed_indirect_mutation(commit, indirect, 0)
+}
+
+fn fixture_with_signed_indirect_mutation(
+    commit: bool,
+    indirect: bool,
+    mutation: usize,
+) -> (Fixture, SlotAgreementProof, VertexId, SlotAgreementBinding) {
     let (mut f, proposal, plain, tip) = direct_slot_proposal(commit);
-    let refs = f.ids(LEADER_ROUND + 1);
+    let (mut f, proposal, plain) = if indirect {
+        let target_refs = f.ids(LEADER_ROUND);
+        let nonvotes = f.ids_without_leader(LEADER_ROUND);
+        f.dag
+            .vertices
+            .retain(|(round, _), _| *round <= LEADER_ROUND);
+        for author in 0..f.count() {
+            let refs = if author == 0 {
+                target_refs.clone()
+            } else {
+                nonvotes.clone()
+            };
+            let v = vertex(&f, author, LEADER_ROUND + 1, refs);
+            f.dag.insert(v).unwrap();
+        }
+        let refs = f.ids(LEADER_ROUND + 1);
+        f.full_round(LEADER_ROUND + 2, &refs).unwrap();
+        let anchor_author = f.dag.leader(LEADER_ROUND + 2).unwrap().author.clone();
+        if mutation == 1 {
+            // Other round-four vertices still reach the target, but this elected
+            // anchor has a complete authenticated cone containing only nonvoters.
+            let author = f
+                .dag
+                .set()
+                .validators
+                .iter()
+                .position(|v| v.validator_id == anchor_author)
+                .unwrap();
+            let refs = f.ids(LEADER_ROUND + 1)[1..].to_vec();
+            bind_as(&mut f, author, LEADER_ROUND + 2, refs, [19; 32]);
+        }
+        let anchor = f.dag.leader(LEADER_ROUND + 2).unwrap().id().unwrap();
+        let refs = f.ids(LEADER_ROUND + 2);
+        f.full_round(LEADER_ROUND + 3, &refs).unwrap();
+        if mutation == 2 {
+            let refs = f
+                .ids(LEADER_ROUND + 2)
+                .into_iter()
+                .filter(|v| v != &anchor)
+                .collect();
+            bind_as(&mut f, 0, LEADER_ROUND + 3, refs, [20; 32]);
+        }
+        let support = f.ids(LEADER_ROUND + 3)[..f.dag.set().quorum_size()].to_vec();
+        let proposal = crate::SlotProposalEnvelope {
+            decision: proposal.decision,
+            evidence: crate::SlotProposalEvidence::IndirectCommit { anchor, support },
+        };
+        let refs = if mutation == 3 {
+            f.ids(LEADER_ROUND + 3)[1..].to_vec()
+        } else {
+            f.ids(LEADER_ROUND + 3)
+        };
+        let plain = bind_as(
+            &mut f,
+            0,
+            LEADER_ROUND + 4,
+            refs,
+            proposal.digest().unwrap(),
+        );
+        (f, proposal, plain)
+    } else {
+        (f, proposal.into(), plain)
+    };
+    let base = plain.round;
+    let refs = f.ids(base - 1);
     for a in 1..f.count() {
-        let v = vertex(&f, a, LEADER_ROUND + 2, refs.clone());
+        let v = vertex(&f, a, base, refs.clone());
         f.dag.insert(v).unwrap();
     }
     let placeholder = plain.clone();
@@ -34,13 +113,13 @@ fn fixture_with_decision(
     let author = (0..f.count())
         .find(|i| f.dag.set().validators[*i].validator_id == author_id)
         .unwrap();
-    let refs = f.ids(LEADER_ROUND + 2);
-    f.full_round(LEADER_ROUND + 3, &refs).unwrap();
+    let refs = f.ids(base);
+    f.full_round(base + 1, &refs).unwrap();
     let digest = p.view_digest(0).unwrap();
-    p.entries[0].view_carrier = bind_as(&mut f, author, LEADER_ROUND + 3, refs, digest);
+    p.entries[0].view_carrier = bind_as(&mut f, author, base + 1, refs, digest);
     let certificate = proof_qc(&f, &tip, &proposal, AgreementPhase::Prevote);
-    let refs = f.ids(LEADER_ROUND + 3);
-    f.full_round(LEADER_ROUND + 4, &refs).unwrap();
+    let refs = f.ids(base + 1);
+    f.full_round(base + 2, &refs).unwrap();
     let mut votes = vec![];
     for (i, sig) in certificate.signatures.iter().enumerate() {
         let payload = SlotAgreementVotePayload {
@@ -49,7 +128,7 @@ fn fixture_with_decision(
             prerequisite: p.entries[0].view_carrier.clone(),
         };
         let digest = payload.digest(f.dag.set()).unwrap();
-        let carrier = bind_as(&mut f, i, LEADER_ROUND + 4, refs.clone(), digest);
+        let carrier = bind_as(&mut f, i, base + 2, refs.clone(), digest);
         votes.push(SlotAgreementVoteWitness { payload, carrier });
     }
     let candidate = crate::SlotAgreementViewLineage {
@@ -58,13 +137,13 @@ fn fixture_with_decision(
     .pol_candidate_digest(certificate, votes, f.dag.set())
     .unwrap();
     let digest = candidate.digest();
-    let refs = f.ids(LEADER_ROUND + 4);
-    f.full_round(LEADER_ROUND + 5, &refs).unwrap();
-    let carrier = bind_as(&mut f, 0, LEADER_ROUND + 5, refs, digest);
+    let refs = f.ids(base + 2);
+    f.full_round(base + 3, &refs).unwrap();
+    let carrier = bind_as(&mut f, 0, base + 3, refs, digest);
     p.entries = candidate.bind_carrier(carrier.clone()).entries;
     assert_eq!(digest, p.pol_digest(0, f.dag.set()).unwrap());
-    let refs = f.ids(LEADER_ROUND + 5);
-    f.full_round(LEADER_ROUND + 6, &refs).unwrap();
+    let refs = f.ids(base + 3);
+    f.full_round(base + 4, &refs).unwrap();
     for (i, sig) in p.certificate.signatures.iter().enumerate() {
         let payload = SlotAgreementVotePayload {
             vote: p.certificate.vote.clone(),
@@ -72,16 +151,324 @@ fn fixture_with_decision(
             prerequisite: carrier.clone(),
         };
         let digest = payload.digest(f.dag.set()).unwrap();
-        let carrier = bind_as(&mut f, i, LEADER_ROUND + 6, refs.clone(), digest);
+        let carrier = bind_as(&mut f, i, base + 4, refs.clone(), digest);
         p.votes.push(SlotAgreementVoteWitness { payload, carrier });
     }
-    let refs = f.ids(LEADER_ROUND + 6);
+    let refs = f.ids(base + 4);
     let digest = p.digest(f.dag.set()).unwrap();
-    f.full_round(LEADER_ROUND + 7, &refs).unwrap();
-    let c = bind_as(&mut f, 0, LEADER_ROUND + 7, refs, digest);
+    f.full_round(base + 5, &refs).unwrap();
+    let c = bind_as(&mut f, 0, base + 5, refs, digest);
     let b = SlotAgreementBinding::from_checkpoint(tip, Some(f.ids(0)[0].clone())).unwrap();
     (f, p, c, b)
 }
+#[test]
+fn indirect_positive_unified_view_proof_and_owned_application() {
+    let (f, p, c, b) = fixture_with_evidence(true, true);
+    let entry = &p.entries[0];
+    assert_eq!(f.dag.held_voters(LEADER_ROUND).unwrap(), 1);
+    let expected = f
+        .dag
+        .inspect_slot_proposal_envelope(&entry.proposal, &entry.proposal_carrier, b.tip())
+        .unwrap();
+    let Decision::Commit(history) = &expected else {
+        panic!("positive evidence must commit")
+    };
+    assert!(history.iter().all(|id| id.round <= LEADER_ROUND));
+    let lineage = crate::SlotAgreementViewLineage {
+        entries: p.entries.clone(),
+    };
+    let bytes = lineage.encode(f.dag.set()).unwrap();
+    assert_eq!(
+        crate::SlotAgreementViewLineage::decode(&bytes, f.dag.set()).unwrap(),
+        lineage
+    );
+    f.dag
+        .inspect_slot_agreement_view_lineage(&lineage, &b)
+        .unwrap();
+    let bytes = p.encode(f.dag.set()).unwrap();
+    assert_eq!(SlotAgreementProof::decode(&bytes, f.dag.set()).unwrap(), p);
+    assert_eq!(
+        f.dag.inspect_slot_agreement_proof(&p, &c, &b).unwrap(),
+        expected
+    );
+    for w in [&p.entries[0].pol.as_ref().unwrap().votes[0], &p.votes[0]] {
+        f.dag.inspect_slot_agreement_vote(&lineage, w, &b).unwrap();
+    }
+    let selected = entry.proposal.decision.clone();
+    let binding =
+        crate::SlotDecisionBinding::from_checkpoint(b.tip().clone(), b.carrier().cloned()).unwrap();
+    let mut dag = crate::CertifiedDag::from_checkpoint(f.dag, binding.clone()).unwrap();
+    drop(dag.prepare_agreement(&p, &c).unwrap());
+    assert_eq!(dag.binding(), &binding);
+    assert_eq!(
+        dag.prepare_agreement(&p, &c).unwrap().apply(),
+        crate::SlotApplicationResult::Applied {
+            round: selected.round,
+            decision: expected
+        }
+    );
+    assert_eq!(dag.dag().commit_root(), selected.after_root);
+    assert_eq!(dag.dag().order_len() as u64, selected.after_len);
+    assert_eq!(dag.binding().tip().previous_id(), &selected.id().unwrap());
+    assert_eq!(
+        dag.prepare_agreement(&p, &c).unwrap().apply(),
+        crate::SlotApplicationResult::AlreadyApplied {
+            round: selected.round
+        }
+    );
+}
+
+#[test]
+fn indirect_positive_reproposal_preserves_target_effect() {
+    let (mut f, mut p, c, b) = fixture_with_evidence(true, true);
+    let expected = f.dag.inspect_slot_agreement_proof(&p, &c, &b).unwrap();
+    let c = extend(&mut f, &mut p, &b, c.round + 1, 3, false);
+    assert_eq!(
+        f.dag.inspect_slot_agreement_proof(&p, &c, &b).unwrap(),
+        expected
+    );
+    let lineage = crate::SlotAgreementViewLineage {
+        entries: p.entries.clone(),
+    };
+    let bytes = lineage.encode(f.dag.set()).unwrap();
+    assert_eq!(
+        crate::SlotAgreementViewLineage::decode(&bytes, f.dag.set()).unwrap(),
+        lineage
+    );
+    f.dag
+        .inspect_slot_agreement_view_lineage(&lineage, &b)
+        .unwrap();
+}
+
+#[test]
+fn indirect_positive_preflights_entire_lineage_before_authentication() {
+    let (mut f, p, c, b) = fixture_with_evidence(true, true);
+    let mut lineage = crate::SlotAgreementViewLineage {
+        entries: p.entries.clone(),
+    };
+    let mut next = lineage.entries[0].clone();
+    next.view = AgreementView(1);
+    next.previous_pol = Some(0);
+    next.pol = None;
+    next.view_carrier = c;
+    next.view_carrier.author =
+        crate::slot_agreement_view_proposer(f.dag.set(), LEADER_ROUND, next.view)
+            .unwrap()
+            .to_vec();
+    if let crate::SlotProposalEvidence::IndirectCommit { support, .. } = &mut next.proposal.evidence
+    {
+        support[0].round -= 1;
+    }
+    lineage.entries.push(next);
+    let first = &lineage.entries[0].proposal_carrier;
+    f.dag
+        .vertices
+        .get_mut(&(first.round, first.author.clone()))
+        .unwrap()
+        .signature[0] ^= 1;
+    let error = f
+        .dag
+        .inspect_slot_agreement_view_lineage(&lineage, &b)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("invalid indirect-positive lineage evidence"),
+        "{error}"
+    );
+}
+
+#[test]
+fn indirect_positive_mutations_are_rejected_with_resigned_proposal_carriers() {
+    let (mut f, p, _, b) = fixture_with_evidence(true, true);
+    let original = &p.entries[0];
+    for mode in 0..19 {
+        let mut proposal = original.proposal.clone();
+        let crate::SlotProposalEvidence::IndirectCommit { anchor, support } =
+            &mut proposal.evidence
+        else {
+            unreachable!()
+        };
+        match mode {
+            0 => anchor.round = LEADER_ROUND + 1,
+            1 => anchor.digest[0] ^= 1,
+            2 => {
+                *anchor = f
+                    .ids(anchor.round)
+                    .into_iter()
+                    .find(|v| v.author != anchor.author)
+                    .unwrap()
+            }
+            3 => {
+                support.pop();
+            }
+            4 => support[1] = support[0].clone(),
+            5 => support[0].digest[0] ^= 1,
+            6 => support[0].round -= 1,
+            7 => {
+                proposal.decision.outcome = crate::SlotOutcome::Skip {
+                    leader_author: f.dag.leader(LEADER_ROUND).unwrap().author.clone(),
+                }
+            }
+            8 => proposal.decision.chain_id.push(1),
+            9 => proposal.decision.validator_set_id[0] ^= 1,
+            10 => proposal.decision.epoch += 1,
+            11 => proposal.decision.before_root[0] ^= 1,
+            12 => proposal.decision.after_root[0] ^= 1,
+            13 => proposal.decision.after_len += 1,
+            14 => {
+                if let crate::SlotOutcome::Commit { leader } = &mut proposal.decision.outcome {
+                    leader.digest[0] ^= 1;
+                }
+            }
+            15 => {
+                let history = f.dag.collect_uncommitted_history(anchor).unwrap();
+                proposal.decision.after_len = history.len() as u64;
+                proposal.decision.after_root = commit_root(&history);
+            }
+            16 => {
+                let other = f
+                    .ids(LEADER_ROUND)
+                    .into_iter()
+                    .find(|v| Some(v.author.as_slice()) != f.dag.leader_author(LEADER_ROUND))
+                    .unwrap();
+                proposal.decision.outcome = crate::SlotOutcome::Commit { leader: other };
+            }
+            17 => support.push(f.ids(support[0].round)[3].clone()),
+            _ => {
+                support[1].author = support[0].author.clone();
+                support[1].digest = [255; 32];
+            }
+        }
+        let Ok(digest) = proposal.digest() else {
+            continue;
+        };
+        let round = original.proposal_carrier.round;
+        let refs = f.ids(round - 1);
+        let carrier = bind_as(&mut f, 0, round, refs, digest);
+        assert!(
+            f.dag
+                .inspect_slot_proposal_envelope(&proposal, &carrier, b.tip())
+                .is_err(),
+            "mode {mode}"
+        );
+    }
+}
+
+#[test]
+fn indirect_positive_authenticated_nonreachability_nonvotes_and_noncausal_support_reject() {
+    for mutation in 1..=3 {
+        let (f, p, c, b) = fixture_with_signed_indirect_mutation(true, true, mutation);
+        let e = &p.entries[0];
+        assert!(
+            f.dag
+                .inspect_slot_proposal_envelope(&e.proposal, &e.proposal_carrier, b.tip())
+                .is_err(),
+            "mutation {mutation}"
+        );
+        let lineage = crate::SlotAgreementViewLineage {
+            entries: p.entries.clone(),
+        };
+        assert!(
+            f.dag
+                .inspect_slot_agreement_view_lineage(&lineage, &b)
+                .is_err(),
+            "mutation {mutation}"
+        );
+        assert!(
+            f.dag.inspect_slot_agreement_proof(&p, &c, &b).is_err(),
+            "mutation {mutation}"
+        );
+        let binding =
+            crate::SlotDecisionBinding::from_checkpoint(b.tip().clone(), b.carrier().cloned())
+                .unwrap();
+        let mut dag = crate::CertifiedDag::from_checkpoint(f.dag, binding.clone()).unwrap();
+        let root = dag.dag().commit_root();
+        assert!(
+            dag.prepare_agreement(&p, &c).is_err(),
+            "mutation {mutation}"
+        );
+        assert_eq!(dag.binding(), &binding);
+        assert_eq!(dag.dag().commit_root(), root);
+    }
+}
+
+#[test]
+fn indirect_positive_authenticates_every_retained_cone_vertex() {
+    let (mut f, p, c, b) = fixture_with_evidence(true, true);
+    let e = &p.entries[0];
+    let crate::SlotProposalEvidence::IndirectCommit { anchor, support } = &e.proposal.evidence
+    else {
+        unreachable!()
+    };
+    let target = f.dag.leader(LEADER_ROUND).unwrap().id().unwrap();
+    let other_branch = f
+        .ids(anchor.round)
+        .into_iter()
+        .find(|id| id != anchor)
+        .unwrap();
+    for id in [
+        target,
+        anchor.clone(),
+        support[0].clone(),
+        other_branch,
+        e.proposal_carrier.clone(),
+    ] {
+        let key = (id.round, id.author.clone());
+        f.dag.vertices.get_mut(&key).unwrap().signature[0] ^= 1;
+        assert!(
+            f.dag
+                .inspect_slot_proposal_envelope(&e.proposal, &e.proposal_carrier, b.tip())
+                .is_err(),
+            "tampered {id:?}"
+        );
+        assert!(
+            f.dag.inspect_slot_agreement_proof(&p, &c, &b).is_err(),
+            "tampered {id:?}"
+        );
+        f.dag.vertices.get_mut(&key).unwrap().signature[0] ^= 1;
+        let missing_vertex = f.dag.vertices.remove(&key).unwrap();
+        assert!(
+            f.dag
+                .inspect_slot_proposal_envelope(&e.proposal, &e.proposal_carrier, b.tip())
+                .is_err(),
+            "missing {id:?}"
+        );
+        f.dag.vertices.insert(key, missing_vertex);
+    }
+    f.dag.inspect_slot_agreement_proof(&p, &c, &b).unwrap();
+}
+
+#[test]
+fn indirect_positive_shared_budget_bounds_target_and_frontier_work() {
+    let (f, p, _, b) = fixture_with_evidence(true, true);
+    let e = &p.entries[0];
+    let mut full = crate::SLOT_AGREEMENT_PHASE_WORK_BUDGET;
+    f.dag
+        .inspect_slot_proposal_with_budget(&e.proposal, &e.proposal_carrier, b.tip(), &mut full)
+        .unwrap();
+    let used = crate::SLOT_AGREEMENT_PHASE_WORK_BUDGET - full;
+    for limit in [0, 1, used - 1] {
+        let mut budget = limit;
+        assert!(
+            f.dag
+                .inspect_slot_proposal_with_budget(
+                    &e.proposal,
+                    &e.proposal_carrier,
+                    b.tip(),
+                    &mut budget
+                )
+                .is_err(),
+            "limit {limit}"
+        );
+    }
+    let mut exact = used;
+    f.dag
+        .inspect_slot_proposal_with_budget(&e.proposal, &e.proposal_carrier, b.tip(), &mut exact)
+        .unwrap();
+    assert_eq!(exact, 0);
+}
+
 #[test]
 fn pol_candidate_preserves_digest_and_rejects_invalid_evidence() {
     let (f, p, _, _) = fixture();
@@ -379,10 +766,14 @@ fn unified_rejects_structural_and_authenticated_mutations() {
 fn proof_qc(
     f: &Fixture,
     tip: &crate::SlotDecisionTip,
-    proposal: &crate::SlotProposal,
+    proposal: &crate::SlotProposalEnvelope,
     phase: AgreementPhase,
 ) -> AgreementQc {
-    let mut q = qc(f, tip, proposal, phase);
+    let direct = crate::SlotProposal {
+        decision: proposal.decision.clone(),
+        voters: vec![],
+    };
+    let mut q = qc(f, tip, &direct, phase);
     q.vote.view = AgreementView(0);
     let bytes = q.vote.signing_payload(f.dag.set()).unwrap();
     for (i, s) in q.signatures.iter_mut().enumerate() {

@@ -1381,13 +1381,26 @@ impl Dag {
         carrier: &VertexId,
         tip: &crate::SlotDecisionTip,
     ) -> Result<(Decision, HashSet<VertexId>), CryptoError> {
+        proposal.encode()?;
         let mut budget = usize::MAX;
+        self.inspect_slot_proposal_with_budget(&proposal.clone().into(), carrier, tip, &mut budget)
+    }
+
+    /// Inspects explicit versioned proposal evidence without authorizing a decision.
+    pub fn inspect_slot_proposal_envelope(
+        &self,
+        proposal: &crate::SlotProposalEnvelope,
+        carrier: &VertexId,
+        tip: &crate::SlotDecisionTip,
+    ) -> Result<Decision, CryptoError> {
+        let mut budget = crate::SLOT_AGREEMENT_PHASE_WORK_BUDGET;
         self.inspect_slot_proposal_with_budget(proposal, carrier, tip, &mut budget)
+            .map(|(decision, _)| decision)
     }
 
     fn inspect_slot_proposal_with_budget(
         &self,
-        proposal: &crate::SlotProposal,
+        proposal: &crate::SlotProposalEnvelope,
         carrier: &VertexId,
         tip: &crate::SlotDecisionTip,
         budget: &mut usize,
@@ -1397,7 +1410,11 @@ impl Dag {
         let invalid =
             |message: &str| CryptoError::new(CryptoErrorKind::MalformedCertificate, message);
         let d = &proposal.decision;
+        *budget = budget
+            .checked_sub(self.order.len().saturating_add(self.prefix.peaks().len()))
+            .ok_or_else(|| invalid("agreement frontier work budget exhausted"))?;
         let digest = proposal.digest()?;
+        self.preflight_slot_proposal_envelope(proposal, carrier)?;
         let set = self.set_for_round(d.round);
         d.validate(set)?;
         if d.round == 0 || d.round == u64::MAX || self.is_pruned(d.round) {
@@ -1416,14 +1433,22 @@ impl Dag {
         {
             return Err(invalid("slot proposal context or continuity mismatch"));
         }
-        let voting_round = d.round + 1;
+        let (evidence_target, voters) = match &proposal.evidence {
+            crate::SlotProposalEvidence::Direct { voters } => (None, voters),
+            crate::SlotProposalEvidence::IndirectCommit { anchor, support } => {
+                (Some(anchor), support)
+            }
+        };
+        let voting_round = evidence_target.map_or(d.round + 1, |anchor| anchor.round + 1);
         if self.set_for_round(voting_round).id()? != d.validator_set_id
             || self.epoch_of(d.round) != d.epoch
             || self.epoch_of(voting_round) != d.epoch
             || carrier.round <= voting_round
-            || proposal.voters.len() != set.quorum_size()
+            || voters.len() != set.quorum_size()
         {
-            return Err(invalid("slot proposal needs a fixed-set direct quorum"));
+            return Err(invalid(
+                "slot proposal needs a fixed-set exact evidence quorum",
+            ));
         }
 
         let causal = self.slot_causal_history_with_budget(carrier, digest, d, budget)?;
@@ -1434,14 +1459,45 @@ impl Dag {
         if leader.chain_id != d.chain_id {
             return Err(invalid("slot proposal leader chain mismatch"));
         }
+        *budget = budget
+            .checked_sub(1)
+            .ok_or_else(|| invalid("agreement leader work budget exhausted"))?;
         leader.verify(set, d.epoch)?;
         let committing = match &d.outcome {
             SlotOutcome::Commit { leader } if *leader == leader_id => true,
             SlotOutcome::Skip { leader_author } if *leader_author == leader_id.author => false,
             _ => return Err(invalid("slot proposal names the wrong elected leader")),
         };
+        let vote_target = if let Some(anchor) = evidence_target {
+            if !causal.contains(&leader_id)
+                || !causal.contains(anchor)
+                || self
+                    .leader(anchor.round)
+                    .map(|v| v.id())
+                    .transpose()?
+                    .as_ref()
+                    != Some(anchor)
+            {
+                return Err(invalid(
+                    "indirect proposal lacks exact elected target or anchor",
+                ));
+            }
+            let vertex = self
+                .get(anchor.round, &anchor.author)
+                .ok_or_else(|| missing(anchor))?;
+            // Reauthenticate the complete anchor cone under the same shared budget;
+            // carrier authentication alone does not establish target reachability.
+            let anchor_cone =
+                self.slot_causal_history_with_budget(anchor, vertex.payload_hash, d, budget)?;
+            if !anchor_cone.contains(&leader_id) {
+                return Err(invalid("indirect target is outside anchor history"));
+            }
+            anchor
+        } else {
+            &leader_id
+        };
         let mut authors = HashSet::new();
-        for voter in &proposal.voters {
+        for voter in voters {
             if voter.round != voting_round
                 || !causal.contains(voter)
                 || !authors.insert(&voter.author)
@@ -1451,15 +1507,23 @@ impl Dag {
             let vertex = self
                 .get(voter.round, &voter.author)
                 .ok_or_else(|| missing(voter))?;
-            if vertex.references.contains(&leader_id) != committing {
+            if vertex.references.contains(vote_target) != committing {
                 return Err(invalid("slot proposal evidence contradicts its outcome"));
             }
         }
         let history = if committing {
-            self.collect_uncommitted_history(&leader_id)?
+            self.collect_uncommitted_history_with_budget(&leader_id, budget)?
         } else {
             Vec::new()
         };
+        *budget = budget
+            .checked_sub(
+                self.order
+                    .len()
+                    .saturating_add(history.len())
+                    .saturating_add(self.prefix.peaks().len()),
+            )
+            .ok_or_else(|| invalid("agreement frontier work budget exhausted"))?;
         let mut frontier = self.prefix.clone();
         frontier.extend(&self.order);
         frontier.extend(&history);
@@ -1813,7 +1877,7 @@ impl Dag {
             }
         }
         let (decision, proposal_cone) = self.inspect_slot_proposal_with_budget(
-            &p.proposal,
+            &p.proposal.clone().into(),
             &p.proposal_carrier,
             binding.tip(),
             &mut budget,
@@ -1869,7 +1933,7 @@ impl Dag {
         }
         let cone = self.slot_causal_history_with_budget(carrier, digest, d, &mut budget)?;
         let (decision, proposal_cone) = self.inspect_slot_proposal_with_budget(
-            &payload.proposal,
+            &payload.proposal.clone().into(),
             &payload.proposal_carrier,
             binding.tip(),
             &mut budget,
@@ -1905,7 +1969,7 @@ impl Dag {
                 &mut budget,
             )?;
             let (_, prior_cone) = self.inspect_slot_proposal_with_budget(
-                &p.proposal,
+                &p.proposal.clone().into(),
                 &p.proposal_carrier,
                 binding.tip(),
                 &mut budget,
@@ -2109,6 +2173,39 @@ impl Dag {
         Ok(())
     }
 
+    fn preflight_slot_proposal_envelope(
+        &self,
+        proposal: &crate::SlotProposalEnvelope,
+        carrier: &VertexId,
+    ) -> Result<(), CryptoError> {
+        use crate::slot_agreement_phase::invalid;
+        let set = self.set_for_round(proposal.decision.round);
+        if let crate::SlotProposalEvidence::IndirectCommit { anchor, support } = &proposal.evidence
+        {
+            if !matches!(proposal.decision.outcome, crate::SlotOutcome::Commit { .. })
+                || anchor.round < proposal.decision.round.saturating_add(2)
+                || anchor.round == u64::MAX
+                || self.is_pruned(anchor.round)
+                || carrier.round <= anchor.round + 1
+                || support.len() != set.quorum_size()
+                || support.iter().any(|v| v.round != anchor.round + 1)
+                || support
+                    .iter()
+                    .map(|v| &v.author)
+                    .collect::<HashSet<_>>()
+                    .len()
+                    != support.len()
+                || self.set_for_round(anchor.round).id()? != proposal.decision.validator_set_id
+                || self.set_for_round(anchor.round + 1).id()? != proposal.decision.validator_set_id
+                || self.epoch_of(anchor.round) != proposal.decision.epoch
+                || self.epoch_of(anchor.round + 1) != proposal.decision.epoch
+            {
+                return Err(invalid("invalid indirect-positive lineage evidence"));
+            }
+        }
+        Ok(())
+    }
+
     fn preflight_agreement_lineage(
         &self,
         entries: &[crate::SlotAgreementProofEntry],
@@ -2119,6 +2216,7 @@ impl Dag {
         // Preflight the entire lineage before authenticating even its first entry.
         // This bounds structural work, not total cryptographic CPU time.
         for p in entries {
+            self.preflight_slot_proposal_envelope(&p.proposal, &p.proposal_carrier)?;
             if p.view_carrier.author != crate::slot_agreement_view_proposer(set, round, p.view)?
                 || p.proposal_carrier.round >= p.view_carrier.round
             {
@@ -2376,10 +2474,25 @@ impl Dag {
     /// Collects `id` and its ancestors that are not yet committed, in a
     /// deterministic order.
     fn collect_uncommitted_history(&self, id: &VertexId) -> Result<Vec<VertexId>, CryptoError> {
+        let mut budget = usize::MAX;
+        self.collect_uncommitted_history_with_budget(id, &mut budget)
+    }
+
+    fn collect_uncommitted_history_with_budget(
+        &self,
+        id: &VertexId,
+        budget: &mut usize,
+    ) -> Result<Vec<VertexId>, CryptoError> {
         let mut collected: Vec<VertexId> = Vec::new();
         let mut seen: HashSet<VertexId> = HashSet::new();
         let mut stack = vec![id.clone()];
         while let Some(current) = stack.pop() {
+            *budget = budget.checked_sub(1).ok_or_else(|| {
+                CryptoError::new(
+                    CryptoErrorKind::MalformedCertificate,
+                    "agreement target history work budget exhausted",
+                )
+            })?;
             if !seen.insert(current.clone()) {
                 continue;
             }
@@ -2395,6 +2508,12 @@ impl Dag {
             if self.committed.contains(&current.digest) {
                 continue;
             }
+            if vertex.references.len() > budget.saturating_sub(stack.len()) {
+                return Err(CryptoError::new(
+                    CryptoErrorKind::MalformedCertificate,
+                    "agreement target history work budget exhausted",
+                ));
+            }
             collected.extend(vertex.references.iter().cloned());
             stack.extend(vertex.references.iter().cloned());
             collected.push(current);
@@ -2404,6 +2523,14 @@ impl Dag {
         // nodes with the same history commit the same sequence.
         // Pruned vertices reach `collected` through a reference list, so they have
         // to be dropped here as well as skipped in the walk.
+        let count = collected.len();
+        let sorting_work = count.saturating_mul((usize::BITS - count.leading_zeros()) as usize + 2);
+        *budget = budget.checked_sub(sorting_work).ok_or_else(|| {
+            CryptoError::new(
+                CryptoErrorKind::MalformedCertificate,
+                "agreement target ordering work budget exhausted",
+            )
+        })?;
         collected.retain(|vertex| {
             !self.committed.contains(&vertex.digest) && !self.is_pruned(vertex.round)
         });
@@ -3739,7 +3866,7 @@ mod tests {
                 fixture
                     .dag
                     .inspect_slot_proposal(
-                        &payload.proposal,
+                        &payload.proposal.clone().into(),
                         &payload.proposal_carrier,
                         binding.tip()
                     )
@@ -3818,7 +3945,7 @@ mod tests {
                 fixture
                     .dag
                     .inspect_slot_proposal(
-                        &payload.proposal,
+                        &payload.proposal.clone().into(),
                         &payload.proposal_carrier,
                         binding.tip(),
                     )

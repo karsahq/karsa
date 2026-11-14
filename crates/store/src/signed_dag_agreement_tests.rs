@@ -366,7 +366,7 @@ pub(super) fn run_with_qc(
     f.vertices.retain(|v| v.round < 4);
     let mut lineage = SlotAgreementViewLineage {
         entries: vec![SlotAgreementProofEntry {
-            proposal: f.payload.proposal.clone(),
+            proposal: f.payload.proposal.clone().into(),
             proposal_carrier: f.payload.proposal_carrier.clone(),
             view: AgreementView(0),
             view_carrier: f.payload.proposal_carrier.clone(),
@@ -438,7 +438,7 @@ pub(super) fn run_with_qc(
         if entry > 0 {
             lineage.entries = proof.entries.clone();
             lineage.entries.push(SlotAgreementProofEntry {
-                proposal: f.payload.proposal.clone(),
+                proposal: f.payload.proposal.clone().into(),
                 proposal_carrier: f.payload.proposal_carrier.clone(),
                 view,
                 view_carrier: f.payload.proposal_carrier.clone(),

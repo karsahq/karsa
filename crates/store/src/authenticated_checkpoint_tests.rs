@@ -95,7 +95,7 @@ fn later_proposal(
     }
     let mut lineage = SlotAgreementViewLineage {
         entries: vec![SlotAgreementProofEntry {
-            proposal,
+            proposal: proposal.into(),
             proposal_carrier: round_five[0].clone(),
             view: AgreementView(0),
             view_carrier: round_five[0].clone(),
