@@ -369,6 +369,77 @@ impl Node {
     ///
     /// Propagates signing and DAG insertion errors.
     pub fn author_with(&mut self, payload_hash: [u8; 32]) -> Result<Option<Vertex>, CryptoError> {
+        self.author_with_internal(payload_hash, &[])
+    }
+
+    /// Authors only when the selected references' complete retained cone contains every prerequisite.
+    ///
+    /// Uses exactly the same previous-round references as [`Self::author_with`];
+    /// prerequisites never add references. Nonempty prerequisites require a full,
+    /// strictly round-decreasing walk with exact vertex IDs. Missing or pruned
+    /// ancestors, unreachable prerequisites, and work exhaustion return `Ok(None)`
+    /// before signing or insertion, without consuming an active, unfenced member's
+    /// round. Empty prerequisites preserve legacy authoring behavior.
+    ///
+    /// This is local causal readiness only, not agreement authentication: it does
+    /// not authenticate agreement payloads, votes, certificates, or lineage.
+    ///
+    /// # Errors
+    ///
+    /// Propagates signing and DAG insertion errors.
+    pub fn author_with_prerequisites(
+        &mut self,
+        payload_hash: [u8; 32],
+        prerequisites: &[VertexId],
+    ) -> Result<Option<Vertex>, CryptoError> {
+        self.author_with_internal(payload_hash, prerequisites)
+    }
+
+    fn references_cover_prerequisites(
+        &self,
+        references: &[VertexId],
+        prerequisites: &[VertexId],
+        mut budget: usize,
+    ) -> bool {
+        if prerequisites.len() > budget || references.len() > budget {
+            return false;
+        }
+        budget -= prerequisites.len();
+        if references.len() > budget {
+            return false;
+        }
+        let mut stack = references.to_vec();
+        let mut visited = HashSet::new();
+        while let Some(id) = stack.pop() {
+            let Some(remaining) = budget.checked_sub(1) else {
+                return false;
+            };
+            budget = remaining;
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            let Some(vertex) = self.dag.get(id.round, &id.author) else {
+                return false;
+            };
+            if vertex.id().ok().as_ref() != Some(&id)
+                || vertex
+                    .references
+                    .iter()
+                    .any(|parent| parent.round >= id.round)
+                || vertex.references.len() > budget.saturating_sub(stack.len())
+            {
+                return false;
+            }
+            stack.extend(vertex.references.iter().cloned());
+        }
+        prerequisites.iter().all(|id| visited.contains(id))
+    }
+
+    fn author_with_internal(
+        &mut self,
+        payload_hash: [u8; 32],
+        prerequisites: &[VertexId],
+    ) -> Result<Option<Vertex>, CryptoError> {
         let round = self.round;
         let current = self.dag.set_for_round(round);
         if !current
@@ -417,6 +488,16 @@ impl Node {
             if authors.len() < current.quorum_size() {
                 return Ok(None);
             }
+        }
+
+        if !prerequisites.is_empty()
+            && !self.references_cover_prerequisites(
+                &references,
+                prerequisites,
+                validator::SLOT_AGREEMENT_PHASE_WORK_BUDGET,
+            )
+        {
+            return Ok(None);
         }
 
         let mut vertex = Vertex {
@@ -909,6 +990,129 @@ mod tests {
         assert_eq!(
             summary.committed[0], 0,
             "one node cannot form a quorum alone"
+        );
+    }
+
+    #[test]
+    fn causal_authoring_reachable_and_empty_prerequisites() {
+        let mut legacy = test_nodes(2);
+        let mut causal = test_nodes(2);
+        let payload = [7; 32];
+        for _ in 0..2 {
+            for index in 0..2 {
+                let vertex = legacy[index].author_with(payload).unwrap().unwrap();
+                let equivalent = causal[index]
+                    .author_with_prerequisites(payload, &[])
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(vertex.id().unwrap(), equivalent.id().unwrap());
+                assert_eq!(vertex.signature, equivalent.signature);
+                for node in &mut legacy {
+                    node.receive(vertex.clone()).unwrap();
+                }
+                for node in &mut causal {
+                    node.receive(equivalent.clone()).unwrap();
+                }
+            }
+        }
+        let prerequisite = causal[0].dag.get(0, causal[0].id()).unwrap().id().unwrap();
+        assert_eq!(prerequisite.round, 0);
+        assert_eq!(causal[0].round(), 2);
+        let mut wrong_digest = prerequisite.clone();
+        wrong_digest.digest[0] ^= 1;
+        let round_before = causal[0].round();
+        let authored_before = causal[0].authored();
+        assert!(
+            causal[0]
+                .author_with_prerequisites(payload, &[wrong_digest])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(causal[0].round(), round_before);
+        assert_eq!(causal[0].authored(), authored_before);
+        assert!(causal[0].dag.get(round_before, causal[0].id()).is_none());
+
+        let expected = legacy[0].author_with(payload).unwrap().unwrap();
+        assert_eq!(expected.round, 2);
+        assert!(
+            expected
+                .references
+                .iter()
+                .all(|reference| reference.round == 1)
+        );
+        let actual = causal[0]
+            .author_with_prerequisites(payload, &[prerequisite])
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.id().unwrap(), expected.id().unwrap());
+        assert_eq!(actual.references, expected.references);
+    }
+
+    #[test]
+    fn causal_authoring_rejects_unknown_and_known_outside_cone_without_mutation() {
+        let mut nodes = test_nodes(2);
+        let known = nodes[1].author().unwrap().unwrap();
+        nodes[0].receive(known.clone()).unwrap();
+        let mut unknown = known.id().unwrap();
+        unknown.author = b"unknown".to_vec();
+        // At round zero there are no prospective references, even though the
+        // other author's round-zero vertex is already retained.
+        for prerequisite in [known.id().unwrap(), unknown] {
+            assert!(
+                nodes[0]
+                    .author_with_prerequisites([9; 32], &[prerequisite])
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(nodes[0].round(), 0);
+            assert_eq!(nodes[0].authored(), 0);
+            assert!(nodes[0].dag.get(0, nodes[0].id()).is_none());
+        }
+        assert!(nodes[0].author().unwrap().is_some());
+    }
+
+    #[test]
+    fn causal_authoring_requires_full_cone_and_bounded_work() {
+        let mut nodes = test_nodes(2);
+        for _ in 0..2 {
+            let vertices: Vec<_> = nodes
+                .iter_mut()
+                .map(|node| node.author().unwrap().unwrap())
+                .collect();
+            for node in &mut nodes {
+                for vertex in &vertices {
+                    node.receive(vertex.clone()).unwrap();
+                }
+            }
+        }
+        let references = nodes[0].ids(1);
+        let prerequisite = references[0].clone();
+        assert!(!nodes[0].references_cover_prerequisites(
+            &references,
+            std::slice::from_ref(&prerequisite),
+            references.len() + 1,
+        ));
+        assert!(nodes[0].references_cover_prerequisites(
+            &references,
+            std::slice::from_ref(&prerequisite),
+            validator::SLOT_AGREEMENT_PHASE_WORK_BUDGET,
+        ));
+        // Finding the retained target must not hide a pruned ancestor.
+        nodes[0].set_floor(0);
+        assert!(
+            nodes[0]
+                .author_with_prerequisites([8; 32], &[prerequisite])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(nodes[0].round(), 2);
+        assert_eq!(nodes[0].authored(), 2);
+        assert!(nodes[0].dag.get(2, nodes[0].id()).is_none());
+        assert!(
+            nodes[0]
+                .author_with_prerequisites([8; 32], &[])
+                .unwrap()
+                .is_some()
         );
     }
 
