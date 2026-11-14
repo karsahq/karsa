@@ -229,16 +229,22 @@ fn exact_durable_signature_retention_and_recovery_boundary() {
             .is_none()
     );
     drop(adapter);
+    assert!(Adapter::recover(&store, bootstrap.clone(), &m, 1).is_err());
     let mut recovered = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
     assert_eq!(
         recovered.readiness(),
-        Readiness::RecoveryRequiredHistoricalIntentsUnavailable
+        Readiness::DisabledMissingCausalReadinessAndTransport
     );
-    assert!(recovered.pending().is_empty());
-    assert!(
-        recovered
-            .apply(AuthenticatedSlotAgreementRequest::AdvanceSlot)
-            .is_err()
+    let PendingIntent::Vote { payload, .. } = &recovered.pending()[0] else {
+        panic!("recovered historical vote")
+    };
+    assert_eq!(*payload, original);
+    let output = recovered.driver.output();
+    recovered.consume_durable_result(output, None).unwrap();
+    assert_eq!(
+        recovered.pending().len(),
+        1,
+        "outbox reads deduplicate by ID"
     );
 }
 
@@ -412,6 +418,32 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             witness
         })
         .collect();
+    for (i, adapter) in adapters.iter_mut().enumerate() {
+        let expected: Vec<_> = adapter
+            .pending()
+            .iter()
+            .filter_map(|p| match p {
+                PendingIntent::Vote { payload, .. } => Some(payload.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut b = bootstrap.clone();
+        b.agreement.local_validator = m.consensus[i].id.clone();
+        let recovered = Adapter::recover(&stores[i], b, &m, i).unwrap();
+        let actual: Vec<_> = recovered
+            .pending()
+            .iter()
+            .filter_map(|p| match p {
+                PendingIntent::Vote { payload, .. } => Some(payload.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "restart preserves prevote and locked precommit"
+        );
+        *adapter = recovered;
+    }
     for witness in &witnesses {
         adapters[0]
             .apply(AuthenticatedSlotAgreementRequest::ObserveVote {
@@ -449,14 +481,42 @@ fn nil_has_no_dummy_carrier_or_signature() {
     let (m, bootstrap, _) = fixture();
     let dir = Dir::new();
     let store = Store::open(&dir.0).unwrap();
-    let mut adapter = Adapter::begin(&store, bootstrap, &m, 0).unwrap();
-    let error = adapter
+    let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    adapter
         .apply(AuthenticatedSlotAgreementRequest::Timeout {
             view: AgreementView(0),
             phase: validator::slot_agreement::AgreementPhase::Prevote,
         })
-        .unwrap_err();
-    assert!(error.contains("nil vote carriers are unsupported"));
+        .unwrap();
     assert_eq!(adapter.driver.sequence(), 1);
-    assert!(adapter.pending().is_empty());
+    assert!(matches!(
+        &adapter.pending()[0],
+        PendingIntent::UnsupportedNil { .. }
+    ));
+    let recovered = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    assert!(matches!(
+        &recovered.pending()[0],
+        PendingIntent::UnsupportedNil { .. }
+    ));
+    assert_eq!(
+        recovered.readiness(),
+        Readiness::DisabledMissingCausalReadinessAndTransport
+    );
+}
+
+#[test]
+fn stale_owner_cannot_reconstruct_or_sign() {
+    let (m, bootstrap, request) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut stale = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    let mut current = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    current.apply(request.clone()).unwrap();
+    assert!(stale.apply(request).is_err());
+    assert!(stale.pending().is_empty());
+    assert!(stale.history.is_empty());
+    assert_eq!(
+        stale.readiness(),
+        Readiness::RecoveryRequiredHistoricalIntentsUnavailable
+    );
 }

@@ -65,6 +65,18 @@ fn signed_contiguous_slots_recover_and_do_not_leak_outputs() {
         owner
             .apply(
                 1,
+                AuthenticatedSlotAgreementRequest::Propose {
+                    lineage: SlotAgreementViewLineage {
+                        entries: first.entries.clone(),
+                    },
+                    vertices: f.vertices.clone(),
+                },
+            )
+            .unwrap();
+        let first_intent = owner.signing_outbox().unwrap().remove(0);
+        owner
+            .apply(
+                2,
                 AuthenticatedSlotAgreementRequest::ObservePrecommit {
                     proof: first,
                     carrier: first_carrier,
@@ -72,12 +84,12 @@ fn signed_contiguous_slots_recover_and_do_not_leak_outputs() {
                 },
             )
             .unwrap();
-        let transition = owner.advance_slot(2).unwrap();
+        let transition = owner.advance_slot(3).unwrap();
         assert!(transition.vote.is_none());
         assert!(transition.decision.is_none());
         assert_eq!(transition.view, AgreementView(0));
         let durable = fs::read(&path).unwrap();
-        assert_eq!(owner.advance_slot(2).unwrap(), transition);
+        assert_eq!(owner.advance_slot(3).unwrap(), transition);
         assert_eq!(fs::read(&path).unwrap(), durable);
         assert!(owner.quorum_candidates().unwrap().is_empty());
         assert_eq!(owner.driver_snapshot().unwrap().0.context, context);
@@ -93,7 +105,7 @@ fn signed_contiguous_slots_recover_and_do_not_leak_outputs() {
             },
             vertices: vec![],
         };
-        let vote = owner.apply(3, proposal.clone()).unwrap();
+        let vote = owner.apply(4, proposal.clone()).unwrap();
         assert!(vote.vote.is_some());
         drop(owner);
         drop(store);
@@ -101,10 +113,10 @@ fn signed_contiguous_slots_recover_and_do_not_leak_outputs() {
         let mut owner = store
             .recover_authenticated_slot_agreement(bootstrap)
             .unwrap();
-        assert_eq!(owner.apply(3, proposal).unwrap(), vote);
+        assert_eq!(owner.apply(4, proposal).unwrap(), vote);
         let result = owner
             .apply(
-                4,
+                5,
                 AuthenticatedSlotAgreementRequest::ObservePrecommit {
                     proof: next,
                     carrier: next_carrier,
@@ -113,7 +125,16 @@ fn signed_contiguous_slots_recover_and_do_not_leak_outputs() {
             )
             .unwrap();
         assert_eq!(result.decision, Some(second.proposal.decision));
-        owner.advance_slot(5).unwrap();
+        owner.advance_slot(6).unwrap();
+        let history = owner.signing_outbox().unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].id, first_intent.id);
+        assert_eq!(history[0].sequence, 1);
+        assert_eq!(history[1].sequence, 4);
+        assert_eq!(history[0].agreement.context, f.binding.tip().clone());
+        assert_eq!(history[1].agreement.context, context);
+        assert_ne!(history[0].id, history[1].id);
+        assert_eq!(history[1].vote, vote.vote.unwrap());
         assert!(owner.quorum_candidates().unwrap().is_empty());
         assert!(store.vertices().unwrap().is_empty());
     }
@@ -197,11 +218,13 @@ fn transition_rejects_unresolved_sessions_and_preserves_uncertainty() {
         );
         assert!(owner.advance_slot(4).is_err());
         assert!(owner.binding().is_err());
+        assert!(owner.signing_outbox().is_err());
         let mut recovered = store
             .recover_authenticated_slot_agreement(bootstrap)
             .unwrap();
         recovered.advance_slot(4).unwrap();
         assert!(stale.advance_slot(4).is_err());
+        assert!(stale.signing_outbox().is_err());
         let durable = fs::read(&path).unwrap();
         let mut barriers = 0;
         recovered

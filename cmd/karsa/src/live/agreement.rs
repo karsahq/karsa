@@ -2,6 +2,7 @@
 
 use crypto::registry::{self, ALG_ED25519};
 use crypto::scheme::{Ed25519Scheme, verify_signature};
+use store::{AgreementSigningIntent, AgreementSigningPrerequisite};
 use store::{
     AuthenticatedSlotAgreementBootstrap, AuthenticatedSlotAgreementRequest,
     SlotAgreementCarrierCandidate, SlotAgreementDriver, SlotAgreementDriverOutput, Store,
@@ -15,6 +16,11 @@ use validator::{SlotAgreementVotePayload, ValidatorSet, ValidatorSignature, Vert
 /// Carrier intent whose dependencies still require causal-readiness inspection.
 #[derive(Debug)]
 pub enum PendingIntent {
+    /// Durable nil obligation retained without a signature or fabricated carrier.
+    UnsupportedNil {
+        /// Full original immutable signing context.
+        intent: AgreementSigningIntent,
+    },
     /// A durable local vote, not yet causally ready for a carrier.
     Vote {
         /// Exact signed statement and authenticated prerequisite.
@@ -43,11 +49,11 @@ pub enum PendingIntent {
 pub enum Readiness {
     /// Signing boundary available, but live carrier authoring remains disabled.
     DisabledMissingCausalReadinessAndTransport,
-    /// No further signing: older unreleased output cannot be enumerated.
+    /// A driver or reconstruction failure requires a fresh durable recovery.
     RecoveryRequiredHistoricalIntentsUnavailable,
 }
 
-/// Exclusive driver owner; retained intents are process-local, not a recoverable outbox.
+/// Exclusive driver owner reconstructing historical obligations, never ready-to-send output.
 pub struct Adapter {
     driver: SlotAgreementDriver,
     set: ValidatorSet,
@@ -56,6 +62,7 @@ pub struct Adapter {
     public_key: Vec<u8>,
     private_key: Vec<u8>,
     pending: Vec<PendingIntent>,
+    history: Vec<AgreementSigningIntent>,
     readiness: Readiness,
 }
 
@@ -82,11 +89,12 @@ impl Adapter {
             public_key: key.1,
             private_key,
             pending: Vec::new(),
+            history: Vec::new(),
             readiness: Readiness::DisabledMissingCausalReadinessAndTransport,
         })
     }
 
-    /// Only an empty recovered session can accept requests: latest output cannot recover history.
+    /// Reconstructs full durable signing history; repeated recovery may sign identical bytes.
     pub fn recover(
         store: &Store,
         bootstrap: AuthenticatedSlotAgreementBootstrap,
@@ -100,12 +108,7 @@ impl Adapter {
         let session = store
             .recover_authenticated_slot_agreement(bootstrap)
             .map_err(|e| e.to_string())?;
-        let readiness = if session.sequence() == 0 {
-            Readiness::DisabledMissingCausalReadinessAndTransport
-        } else {
-            Readiness::RecoveryRequiredHistoricalIntentsUnavailable
-        };
-        Ok(Self {
+        let mut adapter = Self {
             driver: SlotAgreementDriver::new(session),
             set,
             validator_id,
@@ -113,8 +116,12 @@ impl Adapter {
             public_key: key.1,
             private_key,
             pending: Vec::new(),
-            readiness,
-        })
+            history: Vec::new(),
+            readiness: Readiness::RecoveryRequiredHistoricalIntentsUnavailable,
+        };
+        let output = adapter.driver.output();
+        adapter.consume_durable_result(output, None)?;
+        Ok(adapter)
     }
 
     /// Returns the activation/recovery barrier, never transport authorization.
@@ -122,42 +129,36 @@ impl Adapter {
         self.readiness
     }
 
+    /// Original contexts and stable IDs retained across slots, including unsupported nil.
+    /// No acknowledgement or removal is supported; this is not send authorization.
+    pub fn signing_history(&self) -> &[AgreementSigningIntent] {
+        &self.history
+    }
+
     /// Retained across later observations; reading never signs or releases anything.
     pub fn pending(&self) -> &[PendingIntent] {
         &self.pending
     }
 
-    /// Accepts only the closed authenticated request vocabulary; signs only immediate durable output.
+    /// Accepts only authenticated requests and reconstructs the durable signing outbox.
     /// Any driver/output failure requires recovery, even when persistence may have succeeded.
     pub fn apply(&mut self, request: AuthenticatedSlotAgreementRequest) -> Result<(), String> {
         if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
-            return Err("recovery cannot enumerate historical unreleased intents".into());
+            return Err("agreement owner requires recovery before further signing".into());
         }
-        // Pin the exact prerequisite from this authenticated request, never a cached transition.
-        let prerequisite: Option<VertexId> = match &request {
-            AuthenticatedSlotAgreementRequest::Propose { lineage, .. } => {
-                lineage.entries.last().map(|e| e.view_carrier.clone())
-            }
-            AuthenticatedSlotAgreementRequest::ObservePrevote { lineage, .. } => lineage
-                .entries
-                .last()
-                .and_then(|e| e.pol.as_ref())
-                .map(|p| p.carrier.clone()),
-            _ => None,
-        };
         let sequence = self
             .driver
             .sequence()
             .checked_add(1)
             .ok_or("agreement sequence exhausted")?;
         let result = self.driver.apply(sequence, request);
-        self.consume_durable_result(result, prerequisite)
+        self.consume_durable_result(result, None)
     }
 
     fn consume_durable_result(
         &mut self,
         result: Result<SlotAgreementDriverOutput, StoreError>,
-        prerequisite: Option<VertexId>,
+        _prerequisite: Option<VertexId>,
     ) -> Result<(), String> {
         let output = match result {
             Ok(output) => output,
@@ -168,33 +169,77 @@ impl Adapter {
         };
         // A post-durability encoding/signing failure must also block continued operation.
         self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
-        if let Some(vote) = output.transition.and_then(|t| t.vote) {
-            if matches!(vote.value, AgreementValue::Nil) {
-                return Err("nil vote carriers are unsupported; no signature produced".into());
+        let history = self.driver.signing_outbox().map_err(|e| e.to_string())?;
+        // Validate every historical identity before producing any signature. Nil is an
+        // unsupported obligation, not a reason to discard valid nonnil history.
+        for intent in &history {
+            if intent.agreement.set != self.set
+                || intent.agreement.local_validator != self.validator_id
+                || intent.vote.context != intent.agreement.context
+            {
+                return Err("historical signing identity or context mismatch".into());
             }
-
-            let prerequisite =
-                prerequisite.ok_or("durable vote has no authenticated request prerequisite")?;
-            let bytes = vote.signing_payload(&self.set).map_err(|e| e.to_string())?;
-            let signature = Ed25519Scheme
-                .sign(&self.private_key, &bytes)
-                .map_err(|e| e.to_string())?;
-            verify_signature(ALG_ED25519, &self.public_key, &bytes, &signature)
-                .map_err(|e| e.to_string())?;
-            let payload = SlotAgreementVotePayload {
-                vote,
-                signature: ValidatorSignature {
-                    validator_id: self.validator_id.clone(),
-                    key_id: self.key_id.clone(),
-                    signature,
-                },
-                prerequisite,
+            let bootstrap = AuthenticatedSlotAgreementBootstrap {
+                agreement: intent.agreement.clone(),
+                predecessor: None,
+                order: Vec::new(),
+                vertices: Vec::new(),
             };
-            payload
-                .verify(&payload.vote.context, &self.set)
-                .map_err(|e| e.to_string())?;
-            let digest = payload.digest(&self.set).map_err(|e| e.to_string())?;
-            self.pending.push(PendingIntent::Vote { payload, digest });
+            let key = checked_key(&bootstrap, &self.private_key)?;
+            if key != (self.key_id.clone(), self.public_key.clone()) {
+                return Err("historical active key mismatch".into());
+            }
+            match (&intent.prerequisite, &intent.vote.value) {
+                (AgreementSigningPrerequisite::UnsupportedNil, AgreementValue::Nil) => {}
+                (AgreementSigningPrerequisite::Carrier(_), AgreementValue::Nil)
+                | (AgreementSigningPrerequisite::UnsupportedNil, _) => {
+                    return Err("historical prerequisite mismatch".into());
+                }
+                (AgreementSigningPrerequisite::Carrier(_), _) => {
+                    intent
+                        .vote
+                        .signing_payload(&intent.agreement.set)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        for intent in history {
+            if self.history.iter().any(|old| old.id == intent.id) {
+                continue;
+            }
+            let pending = match &intent.prerequisite {
+                AgreementSigningPrerequisite::UnsupportedNil => PendingIntent::UnsupportedNil {
+                    intent: intent.clone(),
+                },
+                AgreementSigningPrerequisite::Carrier(prerequisite) => {
+                    let set = &intent.agreement.set;
+                    let bytes = intent
+                        .vote
+                        .signing_payload(set)
+                        .map_err(|e| e.to_string())?;
+                    let signature = Ed25519Scheme
+                        .sign(&self.private_key, &bytes)
+                        .map_err(|e| e.to_string())?;
+                    verify_signature(ALG_ED25519, &self.public_key, &bytes, &signature)
+                        .map_err(|e| e.to_string())?;
+                    let payload = SlotAgreementVotePayload {
+                        vote: intent.vote.clone(),
+                        signature: ValidatorSignature {
+                            validator_id: intent.agreement.local_validator.clone(),
+                            key_id: self.key_id.clone(),
+                            signature,
+                        },
+                        prerequisite: prerequisite.clone(),
+                    };
+                    payload
+                        .verify(&intent.agreement.context, set)
+                        .map_err(|e| e.to_string())?;
+                    let digest = payload.digest(set).map_err(|e| e.to_string())?;
+                    PendingIntent::Vote { payload, digest }
+                }
+            };
+            self.pending.push(pending);
+            self.history.push(intent);
         }
         for candidate in output.candidates {
             let intent = match candidate {

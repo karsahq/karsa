@@ -1,8 +1,8 @@
 use super::*;
 use std::collections::BTreeMap;
 use validator::slot_agreement::{
-    AgreementInput, AgreementPhase, AgreementQc, AgreementTransitionResult, AgreementView,
-    SlotAgreement,
+    AgreementInput, AgreementPhase, AgreementQc, AgreementTransitionResult, AgreementValue,
+    AgreementView, AgreementVote, SlotAgreement,
 };
 use validator::{
     CertifiedDag, Dag, SlotAgreementBinding, SlotAgreementProof, SlotAgreementViewLineage,
@@ -568,12 +568,37 @@ struct VoteBucket {
     candidate: Option<AgreementQuorumCandidate>,
 }
 
+/// Replay-derived signing intent. Entries are never acknowledged or removed.
+#[derive(Debug, Clone)]
+pub struct AgreementSigningIntent {
+    /// Stable identity binding the full statement, prerequisite and pinned local identity.
+    pub id: [u8; 32],
+    /// Original one-based durable request sequence that emitted this vote.
+    pub sequence: u64,
+    /// Original slot context, complete pinned set and local signing identity.
+    pub agreement: SlotAgreementBootstrap,
+    /// Exact unsigned statement emitted by the authenticated reducer.
+    pub vote: AgreementVote,
+    /// Authenticated carrier to bind, or explicit unsupported nil intent.
+    pub prerequisite: AgreementSigningPrerequisite,
+}
+
+/// Signing support derived exclusively from authenticated request lineage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgreementSigningPrerequisite {
+    /// Exact original proposal/view carrier for prevote, or POL carrier for precommit.
+    Carrier(VertexId),
+    /// Nil intent is retained, but has no supported signed carrier representation.
+    UnsupportedNil,
+}
+
 type ReplayState = (
     Option<AgreementTransitionResult>,
     Vec<AgreementQuorumCandidate>,
     SlotAgreementBootstrap,
     SlotAgreementBinding,
     Option<AgreementReproposalCandidate>,
+    Vec<AgreementSigningIntent>,
 );
 
 fn replay(
@@ -596,7 +621,8 @@ fn replay(
     let mut buckets: BTreeMap<Vec<u8>, VoteBucket> = BTreeMap::new();
     let mut witness_count = 0usize;
     let mut evidence_bytes = 0usize;
-    for event in events {
+    let mut outbox = Vec::new();
+    for (index, event) in events.iter().enumerate() {
         if matches!(event, AuthenticatedSlotAgreementRequest::AdvanceSlot) {
             if reducer.decision().is_none() {
                 return Err(invalid("cannot advance an undecided slot"));
@@ -799,6 +825,52 @@ fn replay(
                 })?
                 .apply(),
         );
+        if let Some(vote) = result
+            .as_ref()
+            .and_then(|transition| transition.vote.as_ref())
+        {
+            let prerequisite = if matches!(vote.value, AgreementValue::Nil) {
+                AgreementSigningPrerequisite::UnsupportedNil
+            } else {
+                let lineage = match event {
+                    AuthenticatedSlotAgreementRequest::Propose { lineage, .. }
+                    | AuthenticatedSlotAgreementRequest::ObservePrevote { lineage, .. } => lineage,
+                    _ => return Err(invalid("nonnil signing intent lacks authenticated lineage")),
+                };
+                let entry = lineage
+                    .entries
+                    .last()
+                    .ok_or_else(|| invalid("signing intent lacks lineage entry"))?;
+                let carrier = match vote.phase {
+                    AgreementPhase::Prevote => entry.view_carrier.clone(),
+                    AgreementPhase::Precommit => entry
+                        .pol
+                        .as_ref()
+                        .ok_or_else(|| invalid("precommit signing intent lacks POL"))?
+                        .carrier
+                        .clone(),
+                };
+                AgreementSigningPrerequisite::Carrier(carrier)
+            };
+            let mut statement = Encoder::new();
+            statement.put_bytes(b"KARSA/STORE/AGREEMENT_SIGNING_INTENT/v1")?;
+            statement.put_bytes(&vote.signing_payload(&active.set)?)?;
+            statement.put_bytes(&active.encode()?)?;
+            match &prerequisite {
+                AgreementSigningPrerequisite::Carrier(carrier) => {
+                    statement.put_u8(1);
+                    put_id(&mut statement, carrier)?;
+                }
+                AgreementSigningPrerequisite::UnsupportedNil => statement.put_u8(0),
+            }
+            outbox.push(AgreementSigningIntent {
+                id: digest(&[0; 32], 0, &statement.finish()),
+                sequence: index as u64 + 1,
+                agreement: active.clone(),
+                vote: vote.clone(),
+                prerequisite,
+            });
+        }
         if let AuthenticatedSlotAgreementRequest::ObservePrevote { lineage, .. } = event {
             let pol = &lineage
                 .entries
@@ -825,6 +897,7 @@ fn replay(
         active,
         binding,
         reproposal,
+        outbox,
     ))
 }
 pub(super) fn validate(root: &Path) -> Result<(), StoreError> {
@@ -910,6 +983,35 @@ type DriverSnapshot = (
 );
 
 impl AuthenticatedSlotAgreement {
+    /// Returns every durable signing intent in emission order, including unsupported nil votes.
+    ///
+    /// No acknowledgements or queue removal exist: repeated reads intentionally resend exact
+    /// statements. History is bounded by the WAL's 4096 requests and 64 MiB capacity;
+    /// capacity exhaustion rejects new requests rather than evicting signing obligations.
+    /// Recovery repeats fsync before constructing an owner that can expose this output.
+    ///
+    /// # Errors
+    /// Rejects uncertain or stale owners, corrupt journals and invalid historical evidence.
+    pub fn signing_outbox(&self) -> Result<Vec<AgreementSigningIntent>, StoreError> {
+        if self.uncertain {
+            return Err(invalid("uncertain authenticated write requires recovery"));
+        }
+        let root = self
+            .store
+            .slot_decisions
+            .lock()
+            .expect("slot decision lock poisoned");
+        exclusions(&root)?;
+        let journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
+        if journal.header != self.header
+            || journal.events.len() as u64 != self.sequence
+            || journal.tip != self.tip
+        {
+            return Err(invalid("stale authenticated owner"));
+        }
+        Ok(replay(&journal.bootstrap, &journal.events)?.5)
+    }
+
     /// Reauthenticates durable evidence and returns frozen candidates without mutable state access.
     ///
     /// # Errors
@@ -940,7 +1042,7 @@ impl AuthenticatedSlotAgreement {
         {
             return Err(invalid("stale authenticated owner"));
         }
-        let (transition, candidates, active, _, reproposal) =
+        let (transition, candidates, active, _, reproposal, _) =
             replay(&journal.bootstrap, &journal.events)?;
         Ok((active, transition, candidates, reproposal))
     }

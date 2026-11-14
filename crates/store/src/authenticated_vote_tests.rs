@@ -5,6 +5,143 @@ use validator::SlotAgreementViewLineage;
 use validator::slot_agreement::{AgreementPhase, AgreementView};
 
 #[test]
+fn durable_signing_history_survives_observation_and_bootstrap_only_recovery() {
+    let (f, proof, _) = unified_fixture(true);
+    let bootstrap = AuthenticatedSlotAgreementBootstrap {
+        agreement: SlotAgreementBootstrap {
+            context: f.binding.tip().clone(),
+            set: f.set.clone(),
+            local_validator: f.set.validators[0].validator_id.clone(),
+        },
+        predecessor: None,
+        order: vec![],
+        vertices: vec![],
+    };
+    let dir = TempDir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = store
+        .begin_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    assert!(owner.signing_outbox().unwrap().is_empty());
+    let mut lineage = SlotAgreementViewLineage {
+        entries: proof.entries.clone(),
+    };
+    let pol = lineage.entries[0].pol.take().unwrap();
+    let request = AuthenticatedSlotAgreementRequest::Propose {
+        lineage: lineage.clone(),
+        vertices: f.vertices.clone(),
+    };
+    let vote = owner.apply(1, request.clone()).unwrap().vote.unwrap();
+    owner.apply(1, request).unwrap();
+    let original = owner.signing_outbox().unwrap();
+    assert_eq!(original.len(), 1);
+    assert_eq!(original[0].vote, vote);
+    assert_eq!(original[0].sequence, 1);
+    assert_eq!(original[0].agreement.set, bootstrap.agreement.set);
+    assert_eq!(
+        original[0].prerequisite,
+        AgreementSigningPrerequisite::Carrier(lineage.entries[0].view_carrier.clone())
+    );
+    let result = owner
+        .apply(
+            2,
+            AuthenticatedSlotAgreementRequest::ObserveVote {
+                lineage,
+                witness: pol.votes[0].clone(),
+                vertices: vec![],
+            },
+        )
+        .unwrap();
+    assert!(result.vote.is_none());
+    assert_eq!(owner.signing_outbox().unwrap()[0].id, original[0].id);
+    let precommit = owner
+        .apply(
+            3,
+            AuthenticatedSlotAgreementRequest::ObservePrevote {
+                lineage: SlotAgreementViewLineage {
+                    entries: proof.entries.clone(),
+                },
+                vertices: vec![],
+            },
+        )
+        .unwrap()
+        .vote
+        .unwrap();
+    let history = owner.signing_outbox().unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1].sequence, 3);
+    assert_eq!(history[1].vote, precommit);
+    assert_eq!(
+        history[1].prerequisite,
+        AgreementSigningPrerequisite::Carrier(pol.carrier)
+    );
+    assert_ne!(history[0].id, history[1].id);
+    drop(owner);
+    drop(store);
+    let store = Store::open(&dir.0).unwrap();
+    assert!(store.vertices().unwrap().is_empty());
+    let owner = store
+        .recover_authenticated_slot_agreement(bootstrap)
+        .unwrap();
+    let recovered = owner.signing_outbox().unwrap();
+    assert_eq!(recovered.len(), 2);
+    assert_eq!(recovered[1].id, history[1].id);
+    assert_eq!(recovered[1].vote, precommit);
+    assert_eq!(recovered[0].id, original[0].id);
+    assert_eq!(recovered[0].vote, vote);
+}
+
+#[test]
+fn durable_signing_history_retains_explicit_unsupported_timeout_nil() {
+    let (f, _, _) = unified_fixture(true);
+    let bootstrap = AuthenticatedSlotAgreementBootstrap {
+        agreement: SlotAgreementBootstrap {
+            context: f.binding.tip().clone(),
+            set: f.set.clone(),
+            local_validator: f.set.validators[0].validator_id.clone(),
+        },
+        predecessor: None,
+        order: vec![],
+        vertices: vec![],
+    };
+    let dir = TempDir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = store
+        .begin_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    let vote = owner
+        .apply(
+            1,
+            AuthenticatedSlotAgreementRequest::Timeout {
+                view: AgreementView(0),
+                phase: AgreementPhase::Prevote,
+            },
+        )
+        .unwrap()
+        .vote
+        .unwrap();
+    owner
+        .apply(
+            2,
+            AuthenticatedSlotAgreementRequest::AdvanceView {
+                from: AgreementView(0),
+            },
+        )
+        .unwrap();
+    let history = owner.signing_outbox().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].vote, vote);
+    assert_eq!(
+        history[0].prerequisite,
+        AgreementSigningPrerequisite::UnsupportedNil
+    );
+    let recovered = store
+        .recover_authenticated_slot_agreement(bootstrap)
+        .unwrap();
+    assert_eq!(recovered.signing_outbox().unwrap()[0].id, history[0].id);
+}
+
+#[test]
 fn authenticated_vote_quorum_recovery_and_atomic_rejection() {
     for phase in [AgreementPhase::Prevote, AgreementPhase::Precommit] {
         let (f, proof, _) = unified_fixture(true);

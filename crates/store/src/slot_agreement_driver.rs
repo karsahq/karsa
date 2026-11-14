@@ -36,6 +36,16 @@ impl SlotAgreementDriver {
         Self { session }
     }
 
+    /// Returns the full bounded signing history, not merely the latest transition.
+    ///
+    /// Entries are never removed; unsupported nil intents remain explicit.
+    ///
+    /// # Errors
+    /// Rejects stale or uncertain sessions and invalid durable evidence.
+    pub fn signing_outbox(&self) -> Result<Vec<crate::AgreementSigningIntent>, StoreError> {
+        self.session.signing_outbox()
+    }
+
     /// Returns the number of durable requests installed by this owner.
     pub fn sequence(&self) -> u64 {
         self.session.sequence()
