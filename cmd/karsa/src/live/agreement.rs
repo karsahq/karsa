@@ -374,5 +374,8 @@ pub(super) fn disabled_guard(store: &Store) -> Result<(), String> {
     })
 }
 
+mod envelope;
+pub use envelope::{CarrierEnvelope, CarrierPayload, MAX_ENVELOPE_BYTES};
+
 #[cfg(test)]
 mod tests;

@@ -7,6 +7,51 @@ use validator::{
     SlotOutcome, SlotProposal, Vertex,
 };
 
+fn check_envelope(envelope: &CarrierEnvelope, set: &ValidatorSet) {
+    let bytes = envelope.encode(set).unwrap();
+    let decoded = CarrierEnvelope::decode(&bytes, set).unwrap();
+    assert_eq!(&decoded, envelope);
+    assert_eq!(decoded.encode(set).unwrap(), bytes);
+    assert_eq!(decoded.carrier(), envelope.carrier());
+    for end in 0..bytes.len() {
+        assert!(
+            CarrierEnvelope::decode(&bytes[..end], set).is_err(),
+            "prefix {end}"
+        );
+    }
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(CarrierEnvelope::decode(&trailing, set).is_err());
+    for offset in [0, 2] {
+        let mut unknown = bytes.clone();
+        unknown[offset] = 255;
+        assert!(CarrierEnvelope::decode(&unknown, set).is_err());
+    }
+    let mut oversized = bytes.clone();
+    oversized.resize(MAX_ENVELOPE_BYTES + 1, 0);
+    assert!(CarrierEnvelope::decode(&oversized, set).is_err());
+    let mut author_len = bytes.clone();
+    author_len[11..15].copy_from_slice(&1025u32.to_le_bytes());
+    assert!(CarrierEnvelope::decode(&author_len, set).is_err());
+    let digest_offset = 15 + envelope.carrier().author.len() + 32;
+    let mut wrong_digest = bytes.clone();
+    wrong_digest[digest_offset] ^= 1;
+    assert!(CarrierEnvelope::decode(&wrong_digest, set).is_err());
+    let body_len_offset = digest_offset + 32;
+    let mut body_len = bytes.clone();
+    body_len[body_len_offset..body_len_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(CarrierEnvelope::decode(&body_len, set).is_err());
+    let mut malformed_body = bytes.clone();
+    malformed_body[body_len_offset + 4] = 255;
+    assert!(CarrierEnvelope::decode(&malformed_body, set).is_err());
+    if matches!(envelope.payload(), CarrierPayload::Pol(_)) {
+        // Changing only the claimed outer ID cannot silently rebind the selected POL.
+        let mut wrong_carrier = bytes.clone();
+        wrong_carrier[3] ^= 1;
+        assert!(CarrierEnvelope::decode(&wrong_carrier, set).is_err());
+    }
+}
+
 struct Dir(std::path::PathBuf);
 impl Dir {
     fn new() -> Self {
@@ -352,9 +397,75 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
                 Err(PrerequisiteExtractionError::UnsupportedNil)
             );
             let v = signed(&m, i, 5, refs.clone(), *digest);
+            let carrier = v.id().unwrap();
+            let envelope = PendingIntent::Vote {
+                payload: payload.clone(),
+                digest: *digest,
+            }
+            .into_envelope(carrier.clone(), &m.set)
+            .unwrap();
+            assert_eq!(envelope.payload(), &CarrierPayload::Vote(payload.clone()));
+            check_envelope(&envelope, &m.set);
+            let mut oversized = payload.clone();
+            oversized
+                .signature
+                .signature
+                .resize(MAX_ENVELOPE_BYTES + 1, 0);
+            assert!(
+                PendingIntent::Vote {
+                    payload: oversized,
+                    digest: *digest
+                }
+                .into_envelope(carrier.clone(), &m.set)
+                .is_err()
+            );
+            // Structural construction must not be mistaken for signature verification.
+            let mut unauthenticated = payload.clone();
+            unauthenticated.signature.signature[0] ^= 1;
+            assert!(
+                unauthenticated
+                    .verify(&payload.vote.context, &m.set)
+                    .is_err()
+            );
+            let unauthenticated_digest = unauthenticated.digest(&m.set).unwrap();
+            let constructed = PendingIntent::Vote {
+                payload: unauthenticated,
+                digest: unauthenticated_digest,
+            }
+            .into_envelope(carrier.clone(), &m.set)
+            .unwrap();
+            assert!(CarrierEnvelope::decode(&constructed.encode(&m.set).unwrap(), &m.set).is_ok());
+            assert!(
+                PendingIntent::Vote {
+                    payload: payload.clone(),
+                    digest: [0; 32]
+                }
+                .into_envelope(carrier.clone(), &m.set)
+                .is_err()
+            );
+            let mut wrong_author = carrier.clone();
+            wrong_author.author = b"not-the-voter".to_vec();
+            assert!(
+                PendingIntent::Vote {
+                    payload: payload.clone(),
+                    digest: *digest
+                }
+                .into_envelope(wrong_author, &m.set)
+                .is_err()
+            );
+            let mut nil = payload.clone();
+            nil.vote.value = AgreementValue::Nil;
+            assert!(
+                PendingIntent::Vote {
+                    payload: nil,
+                    digest: *digest
+                }
+                .into_envelope(carrier.clone(), &m.set)
+                .is_err()
+            );
             let witness = validator::SlotAgreementVoteWitness {
                 payload: payload.clone(),
-                carrier: v.id().unwrap(),
+                carrier,
             };
             vote_vertices.push(v);
             witness
@@ -407,7 +518,24 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         .map(|i| signed(&m, i, 6, refs.clone(), pol_digest))
         .collect();
     let pol_carrier = pol_vertices[0].id().unwrap();
+    let envelope = PendingIntent::Pol {
+        candidate: candidate.clone(),
+        digest: pol_digest,
+    }
+    .into_envelope(pol_carrier.clone(), &m.set)
+    .unwrap();
+    check_envelope(&envelope, &m.set);
+    assert_eq!(envelope.payload_digest(), pol_digest);
+    assert!(
+        PendingIntent::Pol {
+            candidate: candidate.clone(),
+            digest: [0; 32]
+        }
+        .into_envelope(pol_carrier.clone(), &m.set)
+        .is_err()
+    );
     let lineage = candidate.bind_carrier(pol_carrier.clone());
+    assert_eq!(envelope.payload(), &CarrierPayload::Pol(lineage.clone()));
     assert_eq!(lineage.pol_digest(0, &m.set).unwrap(), pol_digest);
     let mut incoming = vote_vertices;
     incoming.extend(pol_vertices.clone());
@@ -532,6 +660,20 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         digest: *digest,
     };
     assert_eq!(intent.prerequisite_carriers().unwrap(), expected);
+    let refs = precommit_vertices.iter().map(|v| v.id().unwrap()).collect();
+    let final_carrier = signed(&m, 0, 8, refs, *digest).id().unwrap();
+    let envelope = intent.into_envelope(final_carrier.clone(), &m.set).unwrap();
+    assert_eq!(envelope.payload(), &CarrierPayload::Final(proof.clone()));
+    assert_eq!(envelope.payload_digest(), *digest);
+    check_envelope(&envelope, &m.set);
+    assert!(
+        PendingIntent::FinalProof {
+            proof: proof.clone(),
+            digest: [0; 32]
+        }
+        .into_envelope(final_carrier, &m.set)
+        .is_err()
+    );
     // Untrusted duplicate entries cannot duplicate a readiness requirement.
     let mut duplicate = proof.clone();
     duplicate.votes.push(duplicate.votes[0].clone());
@@ -564,7 +706,11 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
 
 #[test]
 fn nil_has_no_dummy_carrier_or_signature() {
-    let (m, bootstrap, _) = fixture();
+    let (m, bootstrap, request) = fixture();
+    let AuthenticatedSlotAgreementRequest::Propose { vertices, .. } = request else {
+        panic!("fixture proposal");
+    };
+    let actual_carrier = vertices.last().unwrap().id().unwrap();
     let dir = Dir::new();
     let store = Store::open(&dir.0).unwrap();
     let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
@@ -583,6 +729,16 @@ fn nil_has_no_dummy_carrier_or_signature() {
         &adapter.pending()[0],
         PendingIntent::UnsupportedNil { .. }
     ));
+    let PendingIntent::UnsupportedNil { intent } = &adapter.pending()[0] else {
+        panic!("durable nil obligation");
+    };
+    assert!(
+        PendingIntent::UnsupportedNil {
+            intent: intent.clone()
+        }
+        .into_envelope(actual_carrier, &m.set)
+        .is_err()
+    );
     let recovered = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
     assert!(matches!(
         &recovered.pending()[0],
