@@ -1324,6 +1324,17 @@ impl Dag {
         carrier: &VertexId,
         tip: &crate::SlotDecisionTip,
     ) -> Result<(Decision, HashSet<VertexId>), CryptoError> {
+        let mut budget = usize::MAX;
+        self.inspect_slot_proposal_with_budget(proposal, carrier, tip, &mut budget)
+    }
+
+    fn inspect_slot_proposal_with_budget(
+        &self,
+        proposal: &crate::SlotProposal,
+        carrier: &VertexId,
+        tip: &crate::SlotDecisionTip,
+        budget: &mut usize,
+    ) -> Result<(Decision, HashSet<VertexId>), CryptoError> {
         use crate::SlotOutcome;
 
         let invalid =
@@ -1358,7 +1369,7 @@ impl Dag {
             return Err(invalid("slot proposal needs a fixed-set direct quorum"));
         }
 
-        let causal = self.slot_causal_history(carrier, digest, d)?;
+        let causal = self.slot_causal_history_with_budget(carrier, digest, d, budget)?;
         let leader = self
             .leader(d.round)
             .ok_or_else(|| invalid("slot proposal requires the retained elected leader"))?;
@@ -1415,6 +1426,17 @@ impl Dag {
         digest: [u8; 32],
         decision: &crate::SlotDecision,
     ) -> Result<HashSet<VertexId>, CryptoError> {
+        let mut budget = usize::MAX;
+        self.slot_causal_history_with_budget(carrier, digest, decision, &mut budget)
+    }
+
+    fn slot_causal_history_with_budget(
+        &self,
+        carrier: &VertexId,
+        digest: [u8; 32],
+        decision: &crate::SlotDecision,
+        budget: &mut usize,
+    ) -> Result<HashSet<VertexId>, CryptoError> {
         let invalid =
             |message: &str| CryptoError::new(CryptoErrorKind::MalformedCertificate, message);
         if self.is_pruned(carrier.round) {
@@ -1424,12 +1446,18 @@ impl Dag {
         let mut causal = HashSet::new();
         let mut stack = vec![carrier.clone()];
         while let Some(current) = stack.pop() {
+            *budget = budget
+                .checked_sub(1)
+                .ok_or_else(|| invalid("agreement phase traversal work budget exhausted"))?;
             if !causal.insert(current.clone()) || self.is_pruned(current.round) {
                 continue;
             }
             let vertex = self
                 .get(current.round, &current.author)
                 .ok_or_else(|| missing(&current))?;
+            if vertex.references.len() > budget.saturating_sub(stack.len()) {
+                return Err(invalid("agreement phase traversal work budget exhausted"));
+            }
             if vertex.id()? != current || vertex.chain_id != decision.chain_id {
                 return Err(invalid("slot causal vertex mismatch"));
             }
@@ -1559,6 +1587,185 @@ impl Dag {
         if !causal.contains(&payload.proposal_carrier) {
             return Err(invalid(
                 "agreement QC does not causally extend proposal carrier",
+            ));
+        }
+        Ok(decision)
+    }
+
+    /// Inspects an inactive nonnil proposal → prevote QC → precommit QC chain.
+    ///
+    /// This separate, stronger-than-final-only API authenticates both QCs and their
+    /// exact carriers in strict causal order. Full retained cones are verified;
+    /// pruned boundary contents remain trusted. It does NOT prove individual vote
+    /// carriers, POL/view-proposal authorization, leader selection or reducer safety.
+    /// The caller must authorize the proposer externally. No live state is changed.
+    ///
+    /// # Errors
+    /// Rejects codec/statement bounds first, then carrier ordering, proposal/context
+    /// and predecessor errors, QC authentication failures and invalid causal cones.
+    pub fn inspect_slot_agreement_phase_chain(
+        &self,
+        payload: &crate::SlotAgreementPhaseChain,
+        carrier: &VertexId,
+        binding: &crate::SlotAgreementBinding,
+    ) -> Result<Decision, CryptoError> {
+        use crate::slot_agreement_phase::invalid;
+        let p = &payload.prevote;
+        let set = self.set_for_round(p.proposal.decision.round);
+        let digest = payload.digest(set)?;
+        if p.proposal_carrier.round >= payload.prevote_carrier.round
+            || payload.prevote_carrier.round >= carrier.round
+        {
+            return Err(invalid("agreement phase carriers must strictly increase"));
+        }
+        let (decision, proposal_cone) = self.inspect_slot_proposal_with_causal(
+            &p.proposal,
+            &p.proposal_carrier,
+            binding.tip(),
+        )?;
+        if let Some(previous) = binding.carrier()
+            && (previous.round >= p.proposal_carrier.round || !proposal_cone.contains(previous))
+        {
+            return Err(invalid(
+                "agreement proposal does not extend predecessor carrier",
+            ));
+        }
+        p.certificate.verify(binding.tip(), set)?;
+        payload.certificate.verify(binding.tip(), set)?;
+        let prevote_cone = self.slot_causal_history(
+            &payload.prevote_carrier,
+            p.digest(set)?,
+            &p.proposal.decision,
+        )?;
+        if !prevote_cone.contains(&p.proposal_carrier) {
+            return Err(invalid("prevote QC does not extend exact proposal carrier"));
+        }
+        let final_cone = self.slot_causal_history(carrier, digest, &p.proposal.decision)?;
+        if !final_cone.contains(&payload.prevote_carrier) {
+            return Err(invalid(
+                "precommit QC does not extend exact prevote QC carrier",
+            ));
+        }
+        Ok(decision)
+    }
+
+    /// Verifies an inactive individual-vote phase chain without changing live state.
+    ///
+    /// Both strong QC carriers bind complete witness lists. Every witness must match
+    /// its QC signature exactly, be authored by that signer, bind its vote payload,
+    /// and contain the exact earlier phase prerequisite in its verified cone.
+    /// No POL, view-proposal or proposer authorization is inferred; callers must
+    /// supply proposer authorization externally. Pruned boundary contents are trusted.
+    ///
+    /// All cone walks share [`crate::SLOT_AGREEMENT_PHASE_WORK_BUDGET`] visits,
+    /// counting repeated references and repeated walks of shared ancestors. Pending
+    /// references are also bounded by remaining work. Exhaustion rejects, not truncates.
+    /// This bounds traversal, not signature algorithm cost or direct-rule evaluation.
+    ///
+    /// # Errors
+    /// Rejects canonical bounds/statement mismatches first, then carrier ordering,
+    /// QC/vote authentication, invalid cones, context/predecessor errors or work exhaustion.
+    pub fn inspect_slot_agreement_strong_phase_chain(
+        &self,
+        payload: &crate::SlotAgreementStrongPhaseChain,
+        carrier: &VertexId,
+        binding: &crate::SlotAgreementBinding,
+    ) -> Result<Decision, CryptoError> {
+        self.inspect_slot_agreement_strong_with_budget(
+            payload,
+            carrier,
+            binding,
+            crate::SLOT_AGREEMENT_PHASE_WORK_BUDGET,
+        )
+    }
+
+    fn inspect_slot_agreement_strong_with_budget(
+        &self,
+        payload: &crate::SlotAgreementStrongPhaseChain,
+        carrier: &VertexId,
+        binding: &crate::SlotAgreementBinding,
+        mut budget: usize,
+    ) -> Result<Decision, CryptoError> {
+        use crate::slot_agreement_phase::invalid;
+        let p = &payload.prevote.aggregate;
+        let set = self.set_for_round(p.proposal.decision.round);
+        let digest = payload.digest(set)?;
+        if p.proposal_carrier.round >= payload.prevote_carrier.round
+            || payload.prevote_carrier.round >= carrier.round
+        {
+            return Err(invalid("strong phase carriers must strictly increase"));
+        }
+        p.certificate.verify(binding.tip(), set)?;
+        payload.certificate.verify(binding.tip(), set)?;
+        let final_cone = self.slot_causal_history_with_budget(
+            carrier,
+            digest,
+            &p.proposal.decision,
+            &mut budget,
+        )?;
+        if !final_cone.contains(&payload.prevote_carrier) {
+            return Err(invalid(
+                "strong final QC does not extend strong prevote carrier",
+            ));
+        }
+        let prevote_cone = self.slot_causal_history_with_budget(
+            &payload.prevote_carrier,
+            payload.prevote.digest(set)?,
+            &p.proposal.decision,
+            &mut budget,
+        )?;
+        if !prevote_cone.contains(&p.proposal_carrier) {
+            return Err(invalid(
+                "strong prevote QC does not extend exact proposal carrier",
+            ));
+        }
+        for (votes, prerequisite, qc_carrier, cone) in [
+            (
+                &payload.prevote.votes,
+                &p.proposal_carrier,
+                &payload.prevote_carrier,
+                &prevote_cone,
+            ),
+            (
+                &payload.votes,
+                &payload.prevote_carrier,
+                carrier,
+                &final_cone,
+            ),
+        ] {
+            for witness in votes {
+                // Structural encoding already checked exact QC vote/signature equality,
+                // canonical identity order, signer authorship and prerequisite identity.
+                if witness.carrier.round >= qc_carrier.round || !cone.contains(&witness.carrier) {
+                    return Err(invalid(
+                        "QC does not extend every exact individual vote carrier",
+                    ));
+                }
+                witness.payload.verify(binding.tip(), set)?;
+                let vote_cone = self.slot_causal_history_with_budget(
+                    &witness.carrier,
+                    witness.payload.digest(set)?,
+                    &p.proposal.decision,
+                    &mut budget,
+                )?;
+                if !vote_cone.contains(prerequisite) {
+                    return Err(invalid(
+                        "individual vote does not extend its exact prerequisite",
+                    ));
+                }
+            }
+        }
+        let (decision, proposal_cone) = self.inspect_slot_proposal_with_budget(
+            &p.proposal,
+            &p.proposal_carrier,
+            binding.tip(),
+            &mut budget,
+        )?;
+        if let Some(previous) = binding.carrier()
+            && (previous.round >= p.proposal_carrier.round || !proposal_cone.contains(previous))
+        {
+            return Err(invalid(
+                "strong proposal does not extend predecessor carrier",
             ));
         }
         Ok(decision)
@@ -2888,6 +3095,10 @@ mod tests {
             fixture.dag.try_commit(LEADER_ROUND).unwrap(),
             Decision::Undecided
         );
+    }
+
+    mod slot_agreement_phase_tests {
+        include!("slot_agreement_phase_tests.rs");
     }
 
     mod slot_agreement_certificate_tests {

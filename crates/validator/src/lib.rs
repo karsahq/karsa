@@ -20,6 +20,7 @@ mod schedule;
 mod set_change;
 pub mod slot_agreement;
 mod slot_agreement_certificate;
+mod slot_agreement_phase;
 mod slot_certificate;
 mod slot_decision;
 mod slot_proposal;
@@ -56,6 +57,11 @@ pub use set_change::{
 pub use slot_agreement_certificate::{
     SLOT_AGREEMENT_CERTIFICATE_DOMAIN, SLOT_AGREEMENT_CERTIFICATE_VERSION_V1, SlotAgreementBinding,
     SlotAgreementCertificatePayload,
+};
+pub use slot_agreement_phase::{
+    SLOT_AGREEMENT_PHASE_DOMAIN, SLOT_AGREEMENT_PHASE_VERSION_V1, SLOT_AGREEMENT_PHASE_WORK_BUDGET,
+    SlotAgreementPhaseChain, SlotAgreementPrevotePayload, SlotAgreementStrongPhaseChain,
+    SlotAgreementStrongPrevotePayload, SlotAgreementVotePayload, SlotAgreementVoteWitness,
 };
 pub use slot_certificate::{
     SLOT_CERTIFICATE_PAYLOAD_DOMAIN, SLOT_CERTIFICATE_PAYLOAD_VERSION_V1, SlotCertificatePayload,
