@@ -1,10 +1,12 @@
 use super::*;
 use std::collections::BTreeMap;
 use validator::slot_agreement::{
-    AgreementInput, AgreementPhase, AgreementTransitionResult, AgreementView, SlotAgreement,
+    AgreementInput, AgreementPhase, AgreementQc, AgreementTransitionResult, AgreementView,
+    SlotAgreement,
 };
 use validator::{
-    Dag, SlotAgreementBinding, SlotAgreementProof, SlotAgreementViewLineage, Vertex, VertexId,
+    Dag, SlotAgreementBinding, SlotAgreementProof, SlotAgreementViewLineage,
+    SlotAgreementVotePayload, SlotAgreementVoteWitness, Vertex, VertexId,
 };
 
 pub(super) const FILE: &str = "authenticated-slot-agreement";
@@ -33,10 +35,7 @@ pub struct AuthenticatedSlotAgreementBootstrap {
 
 /// Closed authenticated requests; no raw reducer input or semantic callback.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "bounded requests retain complete inline finalization proofs"
-)]
+
 pub enum AuthenticatedSlotAgreementRequest {
     /// Authenticate the exact lineage before emitting a prevote.
     Propose {
@@ -59,6 +58,15 @@ pub enum AuthenticatedSlotAgreementRequest {
         /// Exact signed carrier binding the complete proof.
         carrier: VertexId,
         /// Additional signed dependencies, retained without pruning.
+        vertices: Vec<Vertex>,
+    },
+    /// Retain authenticated individual evidence without driving the local reducer.
+    ObserveVote {
+        /// Complete authorization for the individual vote.
+        lineage: SlotAgreementViewLineage,
+        /// Exact signed vote and its retained carrier.
+        witness: SlotAgreementVoteWitness,
+        /// Additional signed dependencies.
         vertices: Vec<Vertex>,
     },
     /// Request a phase-bound nil vote.
@@ -204,6 +212,17 @@ impl AuthenticatedSlotAgreementRequest {
                 put_id(&mut e, carrier)?;
                 put_vertices(&mut e, vertices)?;
             }
+            Self::ObserveVote {
+                lineage,
+                witness,
+                vertices,
+            } => {
+                e.put_u8(5);
+                e.put_bytes(&lineage.encode(set)?)?;
+                e.put_bytes(&witness.payload.encode(set)?)?;
+                put_id(&mut e, &witness.carrier)?;
+                put_vertices(&mut e, vertices)?;
+            }
             Self::Timeout { view, phase } => {
                 e.put_u8(2);
                 e.put_u64(view.0);
@@ -249,6 +268,14 @@ impl AuthenticatedSlotAgreementRequest {
             4 => Self::ObservePrecommit {
                 proof: SlotAgreementProof::decode(d.read_bytes()?, set)?,
                 carrier: get_id(&mut d)?,
+                vertices: get_vertices(&mut d)?,
+            },
+            5 => Self::ObserveVote {
+                lineage: SlotAgreementViewLineage::decode(d.read_bytes()?, set)?,
+                witness: SlotAgreementVoteWitness {
+                    payload: SlotAgreementVotePayload::decode(d.read_bytes()?, set)?,
+                    carrier: get_id(&mut d)?,
+                },
                 vertices: get_vertices(&mut d)?,
             },
             _ => return Err(invalid("unknown authenticated request")),
@@ -433,10 +460,34 @@ fn add(
     }
     Ok(())
 }
+/// Frozen quorum evidence, not an authenticated POL or finalization carrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgreementQuorumCandidate {
+    /// Authorization retained with the first admitted witness in this bucket.
+    pub lineage: SlotAgreementViewLineage,
+    /// Canonically ordered signatures frozen at the first quorum crossing.
+    pub certificate: AgreementQc,
+    /// Exact carriers in the same canonical validator order.
+    pub witnesses: Vec<SlotAgreementVoteWitness>,
+}
+
+#[derive(Default)]
+struct VoteBucket {
+    lineage: Option<SlotAgreementViewLineage>,
+    witnesses: BTreeMap<Vec<u8>, SlotAgreementVoteWitness>,
+    candidate: Option<AgreementQuorumCandidate>,
+}
+
 fn replay(
     b: &AuthenticatedSlotAgreementBootstrap,
     events: &[AuthenticatedSlotAgreementRequest],
-) -> Result<Option<AgreementTransitionResult>, StoreError> {
+) -> Result<
+    (
+        Option<AgreementTransitionResult>,
+        Vec<AgreementQuorumCandidate>,
+    ),
+    StoreError,
+> {
     let binding =
         SlotAgreementBinding::from_checkpoint(b.agreement.context.clone(), b.predecessor.clone())?;
     let mut vertices = BTreeMap::new();
@@ -444,8 +495,95 @@ fn replay(
     build_dag(b, &vertices)?;
     let mut reducer = SlotAgreement::new(b.agreement.context.clone(), b.agreement.set.clone())?;
     let mut result = None;
+    let mut buckets: BTreeMap<Vec<u8>, VoteBucket> = BTreeMap::new();
+    let mut witness_count = 0usize;
+    let mut evidence_bytes = 0usize;
     for event in events {
+        if let AuthenticatedSlotAgreementRequest::ObserveVote {
+            lineage,
+            witness,
+            vertices: incoming,
+        } = event
+        {
+            if witness.payload.vote.view != reducer.view() || reducer.decision().is_some() {
+                return Err(invalid(
+                    "individual evidence is not for the active current view",
+                ));
+            }
+            add(&mut vertices, incoming)?;
+            build_dag(b, &vertices)?.inspect_slot_agreement_vote(lineage, witness, &binding)?;
+            // Authenticate the supplied POL before removing it: a prevote authorizes
+            // the selected view, not that view's subsequently assembled POL.
+            let mut retained_lineage = lineage.clone();
+            if witness.payload.vote.phase == AgreementPhase::Prevote {
+                retained_lineage
+                    .entries
+                    .last_mut()
+                    .ok_or_else(|| invalid("empty individual vote lineage"))?
+                    .pol = None;
+            }
+            let mut key = Encoder::new();
+            key.put_bytes(&witness.payload.vote.signing_payload(&b.agreement.set)?)?;
+            put_id(&mut key, &witness.payload.prerequisite)?;
+            let key = key.finish();
+            if !buckets.contains_key(&key) && buckets.len() >= MAX_EVENTS {
+                return Err(invalid("vote bucket bound exceeded"));
+            }
+            let bucket = buckets.entry(key).or_default();
+            if let Some(old) = &bucket.lineage {
+                if old.encode(&b.agreement.set)? != retained_lineage.encode(&b.agreement.set)? {
+                    return Err(invalid("conflicting individual vote lineage"));
+                }
+            }
+            let signer = witness.payload.signature.validator_id.clone();
+            if let Some(old) = bucket.witnesses.get(&signer) {
+                if old != witness {
+                    return Err(invalid("conflicting individual vote witness"));
+                }
+            } else {
+                witness_count += 1;
+                evidence_bytes =
+                    evidence_bytes.saturating_add(event.encode(&b.agreement.set)?.len());
+                if witness_count > MAX_EVENTS || evidence_bytes > MAX_BYTES as usize {
+                    return Err(invalid("retained vote evidence bound exceeded"));
+                }
+                bucket.lineage.get_or_insert(retained_lineage);
+                bucket.witnesses.insert(signer, witness.clone());
+                if bucket.candidate.is_none() {
+                    let certificate = AgreementQc {
+                        vote: witness.payload.vote.clone(),
+                        signatures: bucket
+                            .witnesses
+                            .values()
+                            .map(|w| w.payload.signature.clone())
+                            .collect(),
+                    };
+                    if certificate
+                        .verify(&b.agreement.context, &b.agreement.set)
+                        .is_ok()
+                    {
+                        bucket.candidate = Some(AgreementQuorumCandidate {
+                            lineage: bucket
+                                .lineage
+                                .clone()
+                                .ok_or_else(|| invalid("missing bucket lineage"))?,
+                            certificate,
+                            witnesses: bucket.witnesses.values().cloned().collect(),
+                        });
+                    }
+                }
+            }
+            result = Some(AgreementTransitionResult {
+                vote: None,
+                view: reducer.view(),
+                decision: reducer.decision().cloned(),
+            });
+            continue;
+        }
         let (input, decision) = match event {
+            AuthenticatedSlotAgreementRequest::ObserveVote { .. } => {
+                unreachable!("observations handled without reducer input")
+            }
             AuthenticatedSlotAgreementRequest::Propose {
                 lineage,
                 vertices: incoming,
@@ -530,7 +668,10 @@ fn replay(
                 .apply(),
         );
     }
-    Ok(result)
+    Ok((
+        result,
+        buckets.into_values().filter_map(|b| b.candidate).collect(),
+    ))
 }
 pub(super) fn validate(root: &Path) -> Result<(), StoreError> {
     if let Some(journal) = read(root)? {
@@ -608,6 +749,30 @@ impl Store {
     }
 }
 impl AuthenticatedSlotAgreement {
+    /// Reauthenticates durable evidence and returns frozen candidates without mutable state access.
+    ///
+    /// # Errors
+    /// Rejects uncertain or stale owners, corrupt journals and invalid evidence.
+    pub fn quorum_candidates(&self) -> Result<Vec<AgreementQuorumCandidate>, StoreError> {
+        if self.uncertain {
+            return Err(invalid("uncertain authenticated write requires recovery"));
+        }
+        let root = self
+            .store
+            .slot_decisions
+            .lock()
+            .expect("slot decision lock poisoned");
+        exclusions(&root)?;
+        let journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
+        if journal.header != self.header
+            || journal.events.len() as u64 != self.sequence
+            || journal.tip != self.tip
+        {
+            return Err(invalid("stale authenticated owner"));
+        }
+        Ok(replay(&journal.bootstrap, &journal.events)?.1)
+    }
+
     /// Number of durably installed requests.
     pub fn sequence(&self) -> u64 {
         self.sequence
@@ -660,6 +825,7 @@ impl AuthenticatedSlotAgreement {
             journal.events.push(request);
         }
         let result = replay(&journal.bootstrap, &journal.events)?
+            .0
             .ok_or_else(|| invalid("no authenticated transition"))?;
         self.uncertain = true;
         let mut file = OpenOptions::new().append(true).open(root.join(FILE))?;

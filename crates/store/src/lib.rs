@@ -41,10 +41,12 @@ mod authenticated_slot_agreement;
 #[cfg(test)]
 mod authenticated_slot_agreement_tests;
 #[cfg(test)]
+mod authenticated_vote_tests;
+#[cfg(test)]
 mod signed_dag_agreement_tests;
 mod slot_agreement_journal;
 pub use authenticated_slot_agreement::{
-    AuthenticatedSlotAgreement, AuthenticatedSlotAgreementBootstrap,
+    AgreementQuorumCandidate, AuthenticatedSlotAgreement, AuthenticatedSlotAgreementBootstrap,
     AuthenticatedSlotAgreementRequest,
 };
 #[cfg(test)]

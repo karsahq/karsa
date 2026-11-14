@@ -82,6 +82,100 @@ fn fixture_with_decision(
     (f, p, c, b)
 }
 #[test]
+fn individual_lineage_votes_authenticate_both_phases_and_reject_mutations() {
+    let (f, p, _, b) = fixture();
+    let lineage = crate::SlotAgreementViewLineage {
+        entries: p.entries.clone(),
+    };
+    for witness in [&p.entries[0].pol.as_ref().unwrap().votes[0], &p.votes[0]] {
+        f.dag
+            .inspect_slot_agreement_vote(&lineage, witness, &b)
+            .unwrap();
+        for mode in 0..8 {
+            let mut bad = witness.clone();
+            match mode {
+                0 => bad.carrier.author = vec![255],
+                1 => bad.payload.signature.signature[0] ^= 1,
+                2 => {
+                    bad.payload.vote.context = crate::SlotDecisionTip::from_checkpoint(
+                        b"wrong-chain".to_vec(),
+                        f.dag.set(),
+                        b.tip().next_round(),
+                        [7; 32],
+                        b.tip().order_len(),
+                        *b.tip().order_root(),
+                    )
+                    .unwrap()
+                }
+                3 => bad.payload.prerequisite = p.entries[0].proposal_carrier.clone(),
+                4 => bad.carrier.digest[0] ^= 1,
+                5 => bad.payload.vote.view = AgreementView(1),
+                6 => bad.payload.vote.value = AgreementValue::Nil,
+                _ => bad.carrier.round = bad.payload.prerequisite.round,
+            }
+            assert!(
+                f.dag
+                    .inspect_slot_agreement_vote(&lineage, &bad, &b)
+                    .is_err(),
+                "mode {mode}"
+            );
+        }
+        // Find the exact lineage-only cost. A fresh vote budget would incorrectly pass.
+        let mut remaining = 100_000;
+        f.dag
+            .inspect_agreement_lineage(&lineage.entries, &b, &mut remaining)
+            .unwrap();
+        let lineage_cost = 100_000 - remaining;
+        assert!(
+            f.dag
+                .inspect_slot_agreement_vote_with_budget(&lineage, witness, &b, lineage_cost,)
+                .is_err()
+        );
+        f.dag
+            .inspect_slot_agreement_vote_with_budget(&lineage, witness, &b, 100_000)
+            .unwrap();
+    }
+    let mut invalid_pol = lineage.clone();
+    invalid_pol.entries[0]
+        .pol
+        .as_mut()
+        .unwrap()
+        .certificate
+        .signatures[0]
+        .signature[0] ^= 1;
+    assert!(
+        f.dag
+            .inspect_slot_agreement_vote(&invalid_pol, &p.votes[0], &b)
+            .is_err()
+    );
+}
+
+#[test]
+fn individual_lineage_votes_require_causal_prerequisite_and_complete_cone() {
+    for precommit in [false, true] {
+        let (mut f, p, _, b) = fixture();
+        let lineage = crate::SlotAgreementViewLineage {
+            entries: p.entries.clone(),
+        };
+        let mut w = if precommit {
+            p.votes[0].clone()
+        } else {
+            p.entries[0].pol.as_ref().unwrap().votes[0].clone()
+        };
+        let round = w.carrier.round;
+        // Exclude the exact prerequisite while retaining a quorum of other authors.
+        let refs: Vec<_> = f
+            .ids(round - 1)
+            .into_iter()
+            .filter(|id| id != &w.payload.prerequisite)
+            .collect();
+        let digest = w.payload.digest(f.dag.set()).unwrap();
+        w.carrier = bind_as(&mut f, 0, round, refs, digest);
+        assert!(f.dag.inspect_slot_agreement_vote(&lineage, &w, &b).is_err());
+    }
+}
+
+#[test]
 fn unified_owned_skip_application() {
     let (f, p, c, b) = fixture_with_decision(false);
     let selected = &p.entries.last().unwrap().proposal.decision;

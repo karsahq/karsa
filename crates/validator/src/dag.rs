@@ -2042,6 +2042,73 @@ impl Dag {
         })
     }
 
+    /// Authenticates one selected-view vote and its complete retained lineage without granting signing authority.
+    ///
+    /// # Errors
+    /// Rejects malformed evidence, mismatched statements, invalid signatures or carriers,
+    /// missing causal prerequisites or retained history, and shared traversal-budget exhaustion.
+    pub fn inspect_slot_agreement_vote(
+        &self,
+        lineage: &crate::SlotAgreementViewLineage,
+        witness: &crate::SlotAgreementVoteWitness,
+        binding: &crate::SlotAgreementBinding,
+    ) -> Result<(), CryptoError> {
+        self.inspect_slot_agreement_vote_with_budget(
+            lineage,
+            witness,
+            binding,
+            crate::SLOT_AGREEMENT_PHASE_WORK_BUDGET,
+        )
+    }
+
+    fn inspect_slot_agreement_vote_with_budget(
+        &self,
+        lineage: &crate::SlotAgreementViewLineage,
+        witness: &crate::SlotAgreementVoteWitness,
+        binding: &crate::SlotAgreementBinding,
+        mut budget: usize,
+    ) -> Result<(), CryptoError> {
+        use crate::slot_agreement::{AgreementPhase, AgreementValue};
+        use crate::slot_agreement_phase::invalid;
+        let selected = lineage
+            .entries
+            .last()
+            .ok_or_else(|| invalid("empty lineage"))?;
+        let decision = &selected.proposal.decision;
+        let set = self.set_for_round(decision.round);
+        lineage.encode(set)?;
+        self.preflight_agreement_lineage(&lineage.entries, set, decision.round)?;
+        let payload = &witness.payload;
+        let digest = payload.digest(set)?;
+        let prerequisite = match payload.vote.phase {
+            AgreementPhase::Prevote => &selected.view_carrier,
+            AgreementPhase::Precommit => {
+                &selected
+                    .pol
+                    .as_ref()
+                    .ok_or_else(|| invalid("precommit requires selected POL"))?
+                    .carrier
+            }
+        };
+        if payload.vote.view != selected.view
+            || payload.vote.value != AgreementValue::Decision(decision.clone())
+            || payload.vote.context != *binding.tip()
+            || witness.carrier.author != payload.signature.validator_id
+            || payload.prerequisite != *prerequisite
+            || prerequisite.round >= witness.carrier.round
+        {
+            return Err(invalid("individual vote does not match selected lineage"));
+        }
+        self.inspect_agreement_lineage(&lineage.entries, binding, &mut budget)?;
+        payload.verify(binding.tip(), set)?;
+        let cone =
+            self.slot_causal_history_with_budget(&witness.carrier, digest, decision, &mut budget)?;
+        if !cone.contains(prerequisite) {
+            return Err(invalid("individual vote lacks selected prerequisite"));
+        }
+        Ok(())
+    }
+
     fn preflight_agreement_lineage(
         &self,
         entries: &[crate::SlotAgreementProofEntry],
