@@ -861,3 +861,6 @@ fn phase_chain_valid_alternate_signer_subset_requires_new_intermediate_binding()
             .is_err()
     );
 }
+
+#[path = "slot_agreement_proof_tests.rs"]
+mod proof_tests;

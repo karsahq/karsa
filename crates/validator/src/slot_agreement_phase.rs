@@ -512,7 +512,7 @@ fn put_bounded(e: &mut Encoder, bytes: &[u8]) -> Result<(), CryptoError> {
     e.put_bytes(bytes)
 }
 
-fn put_id(e: &mut Encoder, id: &VertexId) -> Result<(), CryptoError> {
+pub(crate) fn put_id(e: &mut Encoder, id: &VertexId) -> Result<(), CryptoError> {
     if id.author.len() > MAX_AUTHOR {
         return Err(invalid("agreement phase carrier author exceeds bound"));
     }
@@ -522,7 +522,7 @@ fn put_id(e: &mut Encoder, id: &VertexId) -> Result<(), CryptoError> {
     put_bounded(e, &id.digest)
 }
 
-fn read_id(d: &mut Decoder<'_>) -> Result<VertexId, CryptoError> {
+pub(crate) fn read_id(d: &mut Decoder<'_>) -> Result<VertexId, CryptoError> {
     let round = d.read_u64()?;
     let author = d.read_bytes()?;
     if author.len() > MAX_AUTHOR {
@@ -539,7 +539,7 @@ fn read_id(d: &mut Decoder<'_>) -> Result<VertexId, CryptoError> {
     })
 }
 
-fn check_witnesses(
+pub(crate) fn check_witnesses(
     votes: &[SlotAgreementVoteWitness],
     qc: &AgreementQc,
     prerequisite: &VertexId,
@@ -566,7 +566,7 @@ fn check_witnesses(
     Ok(())
 }
 
-fn put_witnesses(
+pub(crate) fn put_witnesses(
     e: &mut Encoder,
     votes: &[SlotAgreementVoteWitness],
     set: &ValidatorSet,
@@ -594,7 +594,7 @@ fn witness_count(d: &mut Decoder<'_>) -> Result<usize, CryptoError> {
     Ok(count)
 }
 
-fn scan_witnesses(d: &mut Decoder<'_>) -> Result<(), CryptoError> {
+pub(crate) fn scan_witnesses(d: &mut Decoder<'_>) -> Result<(), CryptoError> {
     let count = witness_count(d)?;
     for _ in 0..count {
         read_id(d)?;
@@ -603,7 +603,7 @@ fn scan_witnesses(d: &mut Decoder<'_>) -> Result<(), CryptoError> {
     Ok(())
 }
 
-fn read_witnesses(
+pub(crate) fn read_witnesses(
     d: &mut Decoder<'_>,
     set: &ValidatorSet,
 ) -> Result<Vec<SlotAgreementVoteWitness>, CryptoError> {
