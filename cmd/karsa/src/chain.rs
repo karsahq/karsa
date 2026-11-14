@@ -358,7 +358,7 @@ pub(crate) fn demo_chain_id() -> Vec<u8> {
 /// the keys beside it, which is what makes `--home` an actual chain membership
 /// rather than a different chain id over the same fixtures.
 #[derive(Clone)]
-pub(crate) struct Membership {
+pub struct Membership {
     pub(crate) set: ValidatorSet,
     pub(crate) consensus: Vec<Consensus>,
     pub(crate) accounts: Vec<Account>,

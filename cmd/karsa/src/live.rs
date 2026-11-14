@@ -31,6 +31,8 @@
 //! fixed by `--validators`. A link opens with a hello naming the chain, so two
 //! genesis hashes never get as far as exchanging a vertex.
 
+pub mod agreement;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::path::PathBuf;
@@ -3146,6 +3148,9 @@ async fn node_task(
                 .map_err(|error| error.to_string())?,
         )
     };
+    if let Some(store) = &store {
+        agreement::disabled_guard(store)?;
+    }
     let total = config.validators + config.archives;
 
     let listener = TcpListener::bind(address(config.port_base, index))

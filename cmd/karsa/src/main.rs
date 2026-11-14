@@ -40,6 +40,7 @@ mod genesis;
 mod home;
 mod keys;
 mod live;
+pub use live::agreement;
 mod loadtest;
 mod migrate;
 mod netrun;
