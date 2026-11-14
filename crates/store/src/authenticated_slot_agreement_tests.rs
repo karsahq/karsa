@@ -3,7 +3,7 @@ use crate::slot_application_tests::{Fixture, TempDir, signed_vertex};
 use validator::slot_agreement::{AgreementPhase, AgreementView};
 use validator::{SlotAgreementProofEntry, SlotAgreementViewLineage};
 
-fn fixture(
+pub(super) fn fixture(
     commit: bool,
 ) -> (
     Fixture,

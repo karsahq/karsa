@@ -25,7 +25,8 @@ mod slot_agreement_proof;
 mod slot_agreement_view;
 pub use slot_agreement_proof::{
     SLOT_AGREEMENT_PROOF_DOMAIN, SLOT_AGREEMENT_PROOF_MAX_BYTES, SLOT_AGREEMENT_PROOF_MAX_ENTRIES,
-    SlotAgreementProof, SlotAgreementProofEntry, SlotAgreementProofPol, SlotAgreementViewLineage,
+    SlotAgreementPolCandidate, SlotAgreementProof, SlotAgreementProofEntry, SlotAgreementProofPol,
+    SlotAgreementViewLineage,
 };
 pub use slot_agreement_view::{
     SLOT_AGREEMENT_VIEW_DOMAIN, SlotAgreementPreviousPol, SlotAgreementViewProposal,

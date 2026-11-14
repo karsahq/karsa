@@ -44,6 +44,12 @@ mod authenticated_slot_agreement_tests;
 mod authenticated_vote_tests;
 #[cfg(test)]
 mod signed_dag_agreement_tests;
+mod slot_agreement_driver;
+#[cfg(test)]
+mod slot_agreement_driver_tests;
+pub use slot_agreement_driver::{
+    SlotAgreementCarrierCandidate, SlotAgreementDriver, SlotAgreementDriverOutput,
+};
 mod slot_agreement_journal;
 pub use authenticated_slot_agreement::{
     AgreementQuorumCandidate, AuthenticatedSlotAgreement, AuthenticatedSlotAgreementBootstrap,

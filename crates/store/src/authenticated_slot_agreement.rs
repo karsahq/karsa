@@ -471,6 +471,31 @@ pub struct AgreementQuorumCandidate {
     pub witnesses: Vec<SlotAgreementVoteWitness>,
 }
 
+impl AgreementQuorumCandidate {
+    pub(super) fn validate_envelope(
+        &self,
+        set: &validator::ValidatorSet,
+    ) -> Result<(), StoreError> {
+        match self.certificate.vote.phase {
+            AgreementPhase::Prevote => {
+                self.lineage.pol_candidate_digest(
+                    self.certificate.clone(),
+                    self.witnesses.clone(),
+                    set,
+                )?;
+            }
+            AgreementPhase::Precommit => {
+                self.lineage.clone().into_proof(
+                    self.certificate.clone(),
+                    self.witnesses.clone(),
+                    set,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct VoteBucket {
     lineage: Option<SlotAgreementViewLineage>,
@@ -562,14 +587,18 @@ fn replay(
                         .verify(&b.agreement.context, &b.agreement.set)
                         .is_ok()
                     {
-                        bucket.candidate = Some(AgreementQuorumCandidate {
+                        let candidate = AgreementQuorumCandidate {
                             lineage: bucket
                                 .lineage
                                 .clone()
                                 .ok_or_else(|| invalid("missing bucket lineage"))?,
                             certificate,
                             witnesses: bucket.witnesses.values().cloned().collect(),
-                        });
+                        };
+                        // Replay runs before opening the WAL for append. A quorum that
+                        // cannot be exported must never become a frozen durable bucket.
+                        candidate.validate_envelope(&b.agreement.set)?;
+                        bucket.candidate = Some(candidate);
                     }
                 }
             }
@@ -754,6 +783,19 @@ impl AuthenticatedSlotAgreement {
     /// # Errors
     /// Rejects uncertain or stale owners, corrupt journals and invalid evidence.
     pub fn quorum_candidates(&self) -> Result<Vec<AgreementQuorumCandidate>, StoreError> {
+        Ok(self.driver_snapshot()?.2)
+    }
+
+    pub(super) fn driver_snapshot(
+        &self,
+    ) -> Result<
+        (
+            SlotAgreementBootstrap,
+            Option<AgreementTransitionResult>,
+            Vec<AgreementQuorumCandidate>,
+        ),
+        StoreError,
+    > {
         if self.uncertain {
             return Err(invalid("uncertain authenticated write requires recovery"));
         }
@@ -770,7 +812,8 @@ impl AuthenticatedSlotAgreement {
         {
             return Err(invalid("stale authenticated owner"));
         }
-        Ok(replay(&journal.bootstrap, &journal.events)?.1)
+        let (transition, candidates) = replay(&journal.bootstrap, &journal.events)?;
+        Ok((journal.bootstrap.agreement, transition, candidates))
     }
 
     /// Number of durably installed requests.
@@ -839,5 +882,180 @@ impl AuthenticatedSlotAgreement {
             self.tip = digest(&self.tip, sequence, &body);
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+    use crate::slot_application_tests::{TempDir, unified_fixture};
+    use crypto::scheme::Ed25519Scheme;
+    use validator::slot_agreement::AgreementValue;
+    use validator::{SlotAgreementProofPol, SlotDecisionTip, SlotOutcome, ValidatorSignature};
+
+    fn assembled(
+        count: usize,
+        phase: AgreementPhase,
+    ) -> (validator::ValidatorSet, AgreementQuorumCandidate) {
+        let (f, proof, _) = unified_fixture(false);
+        let mut keys = Vec::new();
+        let mut set = f.set.clone();
+        set.validators = (0..count)
+            .map(|i| {
+                let mut seed = [0; 32];
+                seed[..8].copy_from_slice(&i.to_le_bytes());
+                let public = Ed25519Scheme::public_key_from_seed(&seed).unwrap();
+                keys.push([seed.as_slice(), public.as_slice()].concat());
+                let mut record = f.set.validators[0].clone();
+                record.validator_id = format!("{i:04}").into_bytes();
+                record.validator_id.resize(1024, b'a');
+                record.keys[0].key_id = vec![b'k'; 1024];
+                record.keys[0].public_key = public.to_vec();
+                record
+            })
+            .collect();
+        let old = f.binding.tip();
+        let context = SlotDecisionTip::from_checkpoint(
+            old.chain_id().to_vec(),
+            &set,
+            old.next_round(),
+            *old.previous_id(),
+            old.order_len(),
+            *old.order_root(),
+        )
+        .unwrap();
+        let mut lineage = SlotAgreementViewLineage {
+            entries: proof.entries,
+        };
+        let entry = &mut lineage.entries[0];
+        entry.proposal.decision.validator_set_id = set.id().unwrap();
+        entry.proposal.decision.outcome = SlotOutcome::Skip {
+            leader_author: set.validators[0].validator_id.clone(),
+        };
+        entry.view_carrier.author = set.validators[0].validator_id.clone();
+        let pol_carrier = entry.pol.take().unwrap().carrier;
+        let quorum = count * 2 / 3 + 1;
+        let make = |phase, prerequisite: VertexId| {
+            let mut vote = proof.certificate.vote.clone();
+            vote.context = context.clone();
+            vote.value = AgreementValue::Decision(entry.proposal.decision.clone());
+            vote.phase = phase;
+            let payload = vote.signing_payload(&set).unwrap();
+            let signatures: Vec<_> = (0..quorum)
+                .map(|i| ValidatorSignature {
+                    validator_id: set.validators[i].validator_id.clone(),
+                    key_id: set.validators[i].keys[0].key_id.clone(),
+                    signature: Ed25519Scheme.sign(&keys[i], &payload).unwrap(),
+                })
+                .collect();
+            let witnesses = signatures
+                .iter()
+                .map(|signature| SlotAgreementVoteWitness {
+                    payload: SlotAgreementVotePayload {
+                        vote: vote.clone(),
+                        signature: signature.clone(),
+                        prerequisite: prerequisite.clone(),
+                    },
+                    carrier: VertexId {
+                        round: prerequisite.round + 1,
+                        author: signature.validator_id.clone(),
+                        digest: [7; 32],
+                    },
+                })
+                .collect();
+            (AgreementQc { vote, signatures }, witnesses)
+        };
+        let (certificate, witnesses) = make(AgreementPhase::Prevote, entry.view_carrier.clone());
+        let (certificate, witnesses) = if phase == AgreementPhase::Precommit {
+            let final_evidence = make(phase, pol_carrier.clone());
+            entry.pol = Some(SlotAgreementProofPol {
+                certificate,
+                votes: witnesses,
+                carrier: pol_carrier,
+            });
+            final_evidence
+        } else {
+            (certificate, witnesses)
+        };
+        (
+            set,
+            AgreementQuorumCandidate {
+                lineage,
+                certificate,
+                witnesses,
+            },
+        )
+    }
+
+    #[test]
+    fn aggregate_candidate_envelopes_are_bounded_before_admission() {
+        for phase in [AgreementPhase::Prevote, AgreementPhase::Precommit] {
+            let large = if phase == AgreementPhase::Prevote {
+                400
+            } else {
+                180
+            };
+            for (count, fits) in [(80, true), (large, false)] {
+                let (set, candidate) = assembled(count, phase);
+                candidate
+                    .certificate
+                    .verify(&candidate.certificate.vote.context, &set)
+                    .unwrap();
+                for witness in &candidate.witnesses {
+                    witness.payload.encode(&set).unwrap();
+                    let request = AuthenticatedSlotAgreementRequest::ObserveVote {
+                        lineage: candidate.lineage.clone(),
+                        witness: witness.clone(),
+                        vertices: vec![],
+                    };
+                    request.encode(&set).unwrap();
+                }
+                assert!(
+                    candidate.lineage.encode(&set).unwrap().len()
+                        < validator::SLOT_AGREEMENT_PROOF_MAX_BYTES
+                );
+                assert_eq!(
+                    candidate.validate_envelope(&set).is_ok(),
+                    fits,
+                    "phase {phase:?}, validator count {count}"
+                );
+                if !fits {
+                    let dir = TempDir::new();
+                    let store = Store::open(&dir.0).unwrap();
+                    let bootstrap = AuthenticatedSlotAgreementBootstrap {
+                        agreement: SlotAgreementBootstrap {
+                            context: candidate.certificate.vote.context.clone(),
+                            set: set.clone(),
+                            local_validator: set.validators[0].validator_id.clone(),
+                        },
+                        predecessor: None,
+                        order: vec![],
+                        vertices: vec![],
+                    };
+                    let mut owner = store.begin_authenticated_slot_agreement(bootstrap).unwrap();
+                    let path = dir.0.join(FILE);
+                    let before = fs::read(&path).unwrap();
+                    // The malformed DAG envelope must also fail closed through public
+                    // admission; pure aggregate validation above isolates the size cause.
+                    let request = AuthenticatedSlotAgreementRequest::ObserveVote {
+                        lineage: candidate.lineage,
+                        witness: candidate.witnesses[0].clone(),
+                        vertices: vec![],
+                    };
+                    assert!(
+                        owner
+                            .apply_with_io(
+                                1,
+                                request,
+                                |_, _| panic!("rejected admission must not append"),
+                                |_, _| panic!("rejected admission must not sync")
+                            )
+                            .is_err()
+                    );
+                    assert_eq!(owner.sequence(), 0);
+                    assert_eq!(fs::read(path).unwrap(), before);
+                }
+            }
+        }
     }
 }

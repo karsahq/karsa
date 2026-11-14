@@ -145,7 +145,95 @@ pub struct SlotAgreementViewLineage {
     /// Connected lineage selecting the last view; that view need not have a POL.
     pub entries: Vec<SlotAgreementProofEntry>,
 }
+/// Validated selected prevote evidence awaiting its actual signed DAG carrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotAgreementPolCandidate {
+    lineage: SlotAgreementViewLineage,
+    certificate: AgreementQc,
+    witnesses: Vec<SlotAgreementVoteWitness>,
+    digest: [u8; 32],
+}
+impl SlotAgreementPolCandidate {
+    /// Returns the existing POL payload digest, without a carrier placeholder.
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    /// Attaches the supplied ID; only DAG inspection authenticates the carrier.
+    pub fn bind_carrier(mut self, carrier: VertexId) -> SlotAgreementViewLineage {
+        let index = self.lineage.entries.len() - 1;
+        self.lineage.entries[index].pol = Some(SlotAgreementProofPol {
+            certificate: self.certificate,
+            votes: self.witnesses,
+            carrier,
+        });
+        self.lineage
+    }
+}
 impl SlotAgreementViewLineage {
+    /// Validates selected prevotes and computes their carrier-free POL payload digest.
+    /// This authenticates quorum signatures, not DAG carriers or proposal semantics.
+    pub fn pol_candidate_digest(
+        &self,
+        certificate: AgreementQc,
+        witnesses: Vec<SlotAgreementVoteWitness>,
+        set: &ValidatorSet,
+    ) -> Result<SlotAgreementPolCandidate, CryptoError> {
+        let lineage = Lineage(&self.entries);
+        lineage.check()?;
+        let index = self.entries.len() - 1;
+        let selected = &self.entries[index];
+        let vote = &certificate.vote;
+        if selected.pol.is_some()
+            || vote.phase != AgreementPhase::Prevote
+            || vote.view != selected.view
+            || vote.value != AgreementValue::Decision(selected.proposal.decision.clone())
+            || self
+                .entries
+                .iter()
+                .filter_map(|entry| entry.pol.as_ref())
+                .any(|pol| pol.certificate.vote.context != vote.context)
+        {
+            return Err(invalid("POL candidate statement or context mismatch"));
+        }
+        check_witnesses(&witnesses, &certificate, &selected.view_carrier)?;
+        certificate.verify(&vote.context, set)?;
+        // Bound the aggregate carrier-free envelope, not only its nested fields.
+        let mut envelope = Encoder::new();
+        envelope.put_raw(&self.encode(set)?);
+        envelope.put_bytes(&certificate.encode(set)?)?;
+        put_witnesses(&mut envelope, &witnesses, set)?;
+        if envelope.len() > SLOT_AGREEMENT_PROOF_MAX_BYTES {
+            return Err(invalid("POL candidate exceeds one MiB"));
+        }
+        let digest = lineage.pol_payload_digest(index, &certificate, &witnesses, set)?;
+        Ok(SlotAgreementPolCandidate {
+            lineage: self.clone(),
+            certificate,
+            witnesses,
+            digest,
+        })
+    }
+
+    /// Constructs final evidence; DAG inspection must authenticate all supplied carriers.
+    pub fn into_proof(
+        self,
+        certificate: AgreementQc,
+        votes: Vec<SlotAgreementVoteWitness>,
+        set: &ValidatorSet,
+    ) -> Result<SlotAgreementProof, CryptoError> {
+        let proof = SlotAgreementProof {
+            entries: self.entries,
+            certificate,
+            votes,
+        };
+        proof.encode(set)?;
+        proof
+            .certificate
+            .verify(&proof.certificate.vote.context, set)?;
+        Ok(proof)
+    }
+
     /// Hashes the same view authorization as the full proof, without a final QC.
     pub fn view_digest(&self, index: usize) -> Result<[u8; 32], CryptoError> {
         Lineage(&self.entries).view_digest(index)
@@ -215,12 +303,22 @@ impl Lineage<'_> {
     pub fn pol_digest(&self, index: usize, set: &ValidatorSet) -> Result<[u8; 32], CryptoError> {
         let p = self.entry(index)?;
         let pol = p.pol.as_ref().ok_or_else(|| invalid("missing POL"))?;
+        self.pol_payload_digest(index, &pol.certificate, &pol.votes, set)
+    }
+    fn pol_payload_digest(
+        &self,
+        index: usize,
+        certificate: &AgreementQc,
+        witnesses: &[SlotAgreementVoteWitness],
+        set: &ValidatorSet,
+    ) -> Result<[u8; 32], CryptoError> {
+        let p = self.entry(index)?;
         let mut e = Encoder::new();
         e.put_u64(p.view.0);
         put_id(&mut e, &p.view_carrier)?;
         e.put_raw(&self.view_digest(index)?);
-        e.put_bytes(&pol.certificate.encode(set)?)?;
-        put_witnesses(&mut e, &pol.votes, set)?;
+        e.put_bytes(&certificate.encode(set)?)?;
+        put_witnesses(&mut e, witnesses, set)?;
         hash(1, &e.finish())
     }
     fn check(&self) -> Result<(), CryptoError> {
