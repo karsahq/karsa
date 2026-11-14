@@ -798,7 +798,7 @@ fn staged_drop_and_activation_route_clones_without_changing_signing_lock() {
     );
 }
 
-fn unified_fixture(commit: bool) -> (Fixture, validator::SlotAgreementProof, VertexId) {
+pub(super) fn unified_fixture(commit: bool) -> (Fixture, validator::SlotAgreementProof, VertexId) {
     let mut f = Fixture::new(commit);
     let proposal = f.payload.proposal.clone();
     let proposal_carrier = f.payload.proposal_carrier.clone();

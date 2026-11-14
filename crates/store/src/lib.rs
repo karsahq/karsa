@@ -35,6 +35,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 #[cfg(test)]
 mod authenticated_checkpoint_tests;
+#[cfg(test)]
+mod authenticated_finalization_tests;
 mod authenticated_slot_agreement;
 #[cfg(test)]
 mod authenticated_slot_agreement_tests;

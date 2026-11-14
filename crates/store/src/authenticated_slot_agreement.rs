@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use validator::slot_agreement::{
     AgreementInput, AgreementPhase, AgreementTransitionResult, AgreementView, SlotAgreement,
 };
-use validator::{Dag, SlotAgreementBinding, SlotAgreementViewLineage, Vertex, VertexId};
+use validator::{
+    Dag, SlotAgreementBinding, SlotAgreementProof, SlotAgreementViewLineage, Vertex, VertexId,
+};
 
 pub(super) const FILE: &str = "authenticated-slot-agreement";
 const MAX_BODY: usize = 2 * 1024 * 1024;
@@ -31,6 +33,10 @@ pub struct AuthenticatedSlotAgreementBootstrap {
 
 /// Closed authenticated requests; no raw reducer input or semantic callback.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "bounded requests retain complete inline finalization proofs"
+)]
 pub enum AuthenticatedSlotAgreementRequest {
     /// Authenticate the exact lineage before emitting a prevote.
     Propose {
@@ -43,6 +49,15 @@ pub enum AuthenticatedSlotAgreementRequest {
     ObservePrevote {
         /// Complete historical authorization, including exact carriers.
         lineage: SlotAgreementViewLineage,
+        /// Additional signed dependencies, retained without pruning.
+        vertices: Vec<Vertex>,
+    },
+    /// Authenticate a complete precommit proof before deciding this pinned slot.
+    ObservePrecommit {
+        /// Complete signed lineage and both voting phases; a bare QC is insufficient.
+        proof: SlotAgreementProof,
+        /// Exact signed carrier binding the complete proof.
+        carrier: VertexId,
         /// Additional signed dependencies, retained without pruning.
         vertices: Vec<Vertex>,
     },
@@ -179,6 +194,16 @@ impl AuthenticatedSlotAgreementRequest {
                 e.put_bytes(&lineage.encode(set)?)?;
                 put_vertices(&mut e, vertices)?;
             }
+            Self::ObservePrecommit {
+                proof,
+                carrier,
+                vertices,
+            } => {
+                e.put_u8(4);
+                e.put_bytes(&proof.encode(set)?)?;
+                put_id(&mut e, carrier)?;
+                put_vertices(&mut e, vertices)?;
+            }
             Self::Timeout { view, phase } => {
                 e.put_u8(2);
                 e.put_u64(view.0);
@@ -220,6 +245,11 @@ impl AuthenticatedSlotAgreementRequest {
             },
             3 => Self::AdvanceView {
                 from: AgreementView(d.read_u64()?),
+            },
+            4 => Self::ObservePrecommit {
+                proof: SlotAgreementProof::decode(d.read_bytes()?, set)?,
+                carrier: get_id(&mut d)?,
+                vertices: get_vertices(&mut d)?,
             },
             _ => return Err(invalid("unknown authenticated request")),
         };
@@ -451,6 +481,29 @@ fn replay(
                 };
                 (input, Some(decision))
             }
+            AuthenticatedSlotAgreementRequest::ObservePrecommit {
+                proof,
+                carrier,
+                vertices: incoming,
+            } => {
+                add(&mut vertices, incoming)?;
+                let dag = build_dag(b, &vertices)?;
+                dag.inspect_slot_agreement_proof(proof, carrier, &binding)?;
+                (
+                    AgreementInput::Evidence {
+                        qc: proof.certificate.clone(),
+                    },
+                    Some(
+                        proof
+                            .entries
+                            .last()
+                            .ok_or_else(|| invalid("empty finalization lineage"))?
+                            .proposal
+                            .decision
+                            .clone(),
+                    ),
+                )
+            }
             AuthenticatedSlotAgreementRequest::Timeout { view, phase } => (
                 AgreementInput::Timeout {
                     view: *view,
@@ -470,7 +523,7 @@ fn replay(
                     } else {
                         Err(CryptoError::new(
                             crypto::CryptoErrorKind::MalformedCertificate,
-                            "reducer decision differs from authenticated lineage",
+                            "reducer decision differs from authenticated proof",
                         ))
                     }
                 })?
@@ -559,7 +612,7 @@ impl AuthenticatedSlotAgreement {
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
-    /// Persists the full canonical request before releasing an unsigned vote.
+    /// Persists the full canonical request before releasing a vote or session decision.
     ///
     /// # Errors
     /// Rejects stale owners, inexact retries, invalid evidence, bounds and uncertain I/O.
