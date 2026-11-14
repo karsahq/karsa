@@ -44,6 +44,61 @@ pub enum PendingIntent {
     },
 }
 
+/// Failure to extract carrier ancestry prerequisites from an intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrerequisiteExtractionError {
+    /// Nil has no supported carrier representation.
+    UnsupportedNil,
+    /// An externally constructed final intent lacks its selected POL.
+    MissingSelectedPol,
+}
+
+impl std::fmt::Display for PrerequisiteExtractionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UnsupportedNil => "nil carrier prerequisites are unsupported",
+            Self::MissingSelectedPol => "final intent lacks selected POL",
+        })
+    }
+}
+
+impl std::error::Error for PrerequisiteExtractionError {}
+
+impl PendingIntent {
+    /// Extracts sorted, unique direct prerequisite IDs for a future ancestry check.
+    /// This is not authentication, readiness, signing or publication authorization:
+    /// externally constructed intents remain untrusted, including their digests.
+    /// Nested evidence still requires unified DAG inspection.
+    ///
+    /// # Errors
+    /// Rejects nil votes/obligations and final evidence without a selected POL.
+    pub fn prerequisite_carriers(&self) -> Result<Vec<VertexId>, PrerequisiteExtractionError> {
+        let mut ids = match self {
+            Self::UnsupportedNil { .. } => return Err(PrerequisiteExtractionError::UnsupportedNil),
+            Self::Vote { payload, .. } => {
+                if payload.vote.value == AgreementValue::Nil {
+                    return Err(PrerequisiteExtractionError::UnsupportedNil);
+                }
+                vec![payload.prerequisite.clone()]
+            }
+            Self::Pol { candidate, .. } => candidate.prerequisite_carriers(),
+            Self::FinalProof { proof, .. } => {
+                let pol = proof
+                    .entries
+                    .last()
+                    .and_then(|entry| entry.pol.as_ref())
+                    .ok_or(PrerequisiteExtractionError::MissingSelectedPol)?;
+                let mut ids = vec![pol.carrier.clone()];
+                ids.extend(proof.votes.iter().map(|w| w.carrier.clone()));
+                ids
+            }
+        };
+        ids.sort_by(|a, b| (a.round, &a.author, a.digest).cmp(&(b.round, &b.author, b.digest)));
+        ids.dedup();
+        Ok(ids)
+    }
+}
+
 /// No live activation exists until pre-sign causal readiness and transport are implemented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Readiness {

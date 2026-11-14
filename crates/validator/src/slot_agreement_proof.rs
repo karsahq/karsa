@@ -159,6 +159,17 @@ impl SlotAgreementPolCandidate {
         self.digest
     }
 
+    /// Returns the exact direct ancestry prerequisites of the eventual POL carrier.
+    /// IDs are sorted and deduplicated; this does not establish local causal readiness.
+    pub fn prerequisite_carriers(&self) -> Vec<VertexId> {
+        let selected = &self.lineage.entries[self.lineage.entries.len() - 1];
+        let mut ids = vec![selected.view_carrier.clone()];
+        ids.extend(self.witnesses.iter().map(|w| w.carrier.clone()));
+        ids.sort_by(|a, b| (a.round, &a.author, a.digest).cmp(&(b.round, &b.author, b.digest)));
+        ids.dedup();
+        ids
+    }
+
     /// Attaches the supplied ID; only DAG inspection authenticates the carrier.
     pub fn bind_carrier(mut self, carrier: VertexId) -> SlotAgreementViewLineage {
         let index = self.lineage.entries.len() - 1;

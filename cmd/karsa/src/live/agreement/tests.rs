@@ -334,6 +334,23 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             let PendingIntent::Vote { payload, digest } = &a.pending()[0] else {
                 panic!("prevote")
             };
+            let before = payload.encode(&m.set).unwrap();
+            assert_eq!(
+                a.pending()[0].prerequisite_carriers().unwrap(),
+                vec![payload.prerequisite.clone()]
+            );
+            assert_eq!(payload.encode(&m.set).unwrap(), before);
+            assert_eq!(payload.digest(&m.set).unwrap(), *digest);
+            let mut nil = payload.clone();
+            nil.vote.value = AgreementValue::Nil;
+            assert_eq!(
+                PendingIntent::Vote {
+                    payload: nil,
+                    digest: *digest
+                }
+                .prerequisite_carriers(),
+                Err(PrerequisiteExtractionError::UnsupportedNil)
+            );
             let v = signed(&m, i, 5, refs.clone(), *digest);
             let witness = validator::SlotAgreementVoteWitness {
                 payload: payload.clone(),
@@ -363,6 +380,28 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         })
         .expect("quorum emits POL intent");
     assert_eq!(pol_digest, candidate.digest());
+    let before = candidate.clone();
+    let mut expected = vec![lineage.entries.last().unwrap().view_carrier.clone()];
+    expected.extend(witnesses.iter().map(|w| w.carrier.clone()));
+    expected.sort_by(|a, b| (a.round, &a.author, a.digest).cmp(&(b.round, &b.author, b.digest)));
+    expected.dedup();
+    assert_eq!(
+        expected.len(),
+        4,
+        "all three prevote witnesses plus selected view"
+    );
+    assert_eq!(candidate.prerequisite_carriers(), expected);
+    assert_eq!(
+        PendingIntent::Pol {
+            candidate: candidate.clone(),
+            digest: pol_digest
+        }
+        .prerequisite_carriers()
+        .unwrap(),
+        expected
+    );
+    assert_eq!(candidate, before);
+    assert_eq!(candidate.digest(), pol_digest);
     let refs: Vec<_> = vote_vertices.iter().map(|v| v.id().unwrap()).collect();
     let pol_vertices: Vec<_> = (0..4)
         .map(|i| signed(&m, i, 6, refs.clone(), pol_digest))
@@ -400,6 +439,15 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
                 })
                 .expect("durable precommit");
             assert_eq!(payload.prerequisite, pol_carrier);
+            assert_eq!(
+                PendingIntent::Vote {
+                    payload: payload.clone(),
+                    digest: *digest
+                }
+                .prerequisite_carriers()
+                .unwrap(),
+                vec![pol_carrier.clone()]
+            );
             assert_eq!(
                 payload.signature.signature,
                 Ed25519Scheme
@@ -469,6 +517,44 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             _ => None,
         })
         .expect("final proof intent");
+    let before = proof.encode(&m.set).unwrap();
+    let mut expected = vec![pol_carrier];
+    expected.extend(witnesses.iter().map(|w| w.carrier.clone()));
+    expected.sort_by(|a, b| (a.round, &a.author, a.digest).cmp(&(b.round, &b.author, b.digest)));
+    expected.dedup();
+    assert_eq!(
+        expected.len(),
+        4,
+        "all three precommit witnesses plus selected POL"
+    );
+    let intent = PendingIntent::FinalProof {
+        proof: proof.clone(),
+        digest: *digest,
+    };
+    assert_eq!(intent.prerequisite_carriers().unwrap(), expected);
+    // Untrusted duplicate entries cannot duplicate a readiness requirement.
+    let mut duplicate = proof.clone();
+    duplicate.votes.push(duplicate.votes[0].clone());
+    assert_eq!(
+        PendingIntent::FinalProof {
+            proof: duplicate,
+            digest: *digest
+        }
+        .prerequisite_carriers()
+        .unwrap(),
+        expected
+    );
+    let mut missing = proof.clone();
+    missing.entries.clear();
+    assert_eq!(
+        PendingIntent::FinalProof {
+            proof: missing,
+            digest: *digest
+        }
+        .prerequisite_carriers(),
+        Err(PrerequisiteExtractionError::MissingSelectedPol)
+    );
+    assert_eq!(proof.encode(&m.set).unwrap(), before);
     assert_eq!(*digest, proof.digest(&m.set).unwrap());
     assert_eq!(
         adapters[0].readiness(),
@@ -489,6 +575,10 @@ fn nil_has_no_dummy_carrier_or_signature() {
         })
         .unwrap();
     assert_eq!(adapter.driver.sequence(), 1);
+    assert_eq!(
+        adapter.pending()[0].prerequisite_carriers(),
+        Err(PrerequisiteExtractionError::UnsupportedNil)
+    );
     assert!(matches!(
         &adapter.pending()[0],
         PendingIntent::UnsupportedNil { .. }
