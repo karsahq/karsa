@@ -1,4 +1,6 @@
 use super::*;
+#[path = "slot_agreement_view_tests.rs"]
+mod view_tests;
 use crate::slot_agreement::{
     AgreementPhase, AgreementQc, AgreementValue, AgreementView, AgreementVote,
 };

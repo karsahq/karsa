@@ -21,6 +21,11 @@ mod set_change;
 pub mod slot_agreement;
 mod slot_agreement_certificate;
 mod slot_agreement_phase;
+mod slot_agreement_view;
+pub use slot_agreement_view::{
+    SLOT_AGREEMENT_VIEW_DOMAIN, SlotAgreementPreviousPol, SlotAgreementViewProposal,
+    slot_agreement_view_proposer,
+};
 mod slot_certificate;
 mod slot_decision;
 mod slot_proposal;

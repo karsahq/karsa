@@ -1771,6 +1771,117 @@ impl Dag {
         Ok(decision)
     }
 
+    /// Inspects an inactive authenticated view proposal with a legacy strong POL.
+    ///
+    /// Earlier POLs prove plain-proposal prerequisites, not earlier view authorization.
+    /// Does not inspect local locks, activate agreement, or authorize application.
+    /// All retained cones share one work budget; pruning retains its existing trust boundary.
+    ///
+    /// # Errors
+    /// Rejects wrong proposers, invalid direct evidence, non-earlier or mismatched
+    /// POLs, invalid signatures, noncausal evidence and exhausted traversal budgets.
+    pub fn inspect_slot_agreement_view_proposal(
+        &self,
+        payload: &crate::SlotAgreementViewProposal,
+        carrier: &VertexId,
+        binding: &crate::SlotAgreementBinding,
+    ) -> Result<Decision, CryptoError> {
+        self.inspect_slot_agreement_view_with_budget(
+            payload,
+            carrier,
+            binding,
+            crate::SLOT_AGREEMENT_PHASE_WORK_BUDGET,
+        )
+    }
+
+    fn inspect_slot_agreement_view_with_budget(
+        &self,
+        payload: &crate::SlotAgreementViewProposal,
+        carrier: &VertexId,
+        binding: &crate::SlotAgreementBinding,
+        mut budget: usize,
+    ) -> Result<Decision, CryptoError> {
+        use crate::slot_agreement_phase::invalid;
+        let d = &payload.proposal.decision;
+        let set = self.set_for_round(d.round);
+        let digest = payload.digest(set)?;
+        if carrier.author != crate::slot_agreement_view_proposer(set, d.round, payload.view)?
+            || payload.proposal_carrier.round >= carrier.round
+        {
+            return Err(invalid("wrong view proposer or noncausal proposal carrier"));
+        }
+        let cone = self.slot_causal_history_with_budget(carrier, digest, d, &mut budget)?;
+        let (decision, proposal_cone) = self.inspect_slot_proposal_with_budget(
+            &payload.proposal,
+            &payload.proposal_carrier,
+            binding.tip(),
+            &mut budget,
+        )?;
+        if !cone.contains(&payload.proposal_carrier) {
+            return Err(invalid(
+                "view proposal does not extend direct evidence carrier",
+            ));
+        }
+        if let Some(previous) = binding.carrier()
+            && (previous.round >= payload.proposal_carrier.round
+                || !proposal_cone.contains(previous))
+        {
+            return Err(invalid("view proposal does not extend predecessor"));
+        }
+        if let Some(pol) = &payload.previous_pol {
+            let p = &pol.payload.aggregate;
+            if p.certificate.vote.view >= payload.view
+                || p.proposal.decision != *d
+                || p.proposal_carrier.round >= pol.carrier.round
+                || pol.carrier.round >= carrier.round
+                || !cone.contains(&pol.carrier)
+            {
+                return Err(invalid(
+                    "view POL must be earlier, causal and for the exact decision",
+                ));
+            }
+            p.certificate.verify(binding.tip(), set)?;
+            let pol_cone = self.slot_causal_history_with_budget(
+                &pol.carrier,
+                pol.payload.digest(set)?,
+                d,
+                &mut budget,
+            )?;
+            let (_, prior_cone) = self.inspect_slot_proposal_with_budget(
+                &p.proposal,
+                &p.proposal_carrier,
+                binding.tip(),
+                &mut budget,
+            )?;
+            if !pol_cone.contains(&p.proposal_carrier) {
+                return Err(invalid("POL lacks direct proposal carrier"));
+            }
+            if let Some(previous) = binding.carrier()
+                && (previous.round >= p.proposal_carrier.round || !prior_cone.contains(previous))
+            {
+                return Err(invalid("POL proposal lacks predecessor"));
+            }
+            for witness in &pol.payload.votes {
+                if witness.carrier.round >= pol.carrier.round
+                    || !pol_cone.contains(&witness.carrier)
+                {
+                    return Err(invalid("POL lacks individual vote carrier"));
+                }
+                witness.payload.verify(binding.tip(), set)?;
+                let vote_cone = self.slot_causal_history_with_budget(
+                    &witness.carrier,
+                    witness.payload.digest(set)?,
+                    d,
+                    &mut budget,
+                )?;
+                if !vote_cone.contains(&p.proposal_carrier) {
+                    return Err(invalid("POL vote lacks plain proposal prerequisite"));
+                }
+            }
+        }
+        Ok(decision)
+    }
+
     /// Number of held vertices in `round + 1` that vote for the leader of
     /// `round`.
     ///
