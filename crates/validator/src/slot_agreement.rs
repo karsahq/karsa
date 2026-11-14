@@ -250,6 +250,7 @@ pub struct SlotAgreement {
     prevote: Option<AgreementValue>,
     precommit: Option<AgreementValue>,
     lock: Option<(AgreementView, SlotDecision)>,
+    valid: Option<AgreementQc>,
     decision: Option<SlotDecision>,
 }
 
@@ -262,6 +263,7 @@ impl SlotAgreement {
             prevote: self.prevote.clone(),
             precommit: self.precommit.clone(),
             lock: self.lock.clone(),
+            valid: self.valid.clone(),
             decision: self.decision.clone(),
         }
     }
@@ -334,6 +336,7 @@ impl SlotAgreement {
             prevote: None,
             precommit: None,
             lock: None,
+            valid: None,
             decision: None,
         })
     }
@@ -346,6 +349,15 @@ impl SlotAgreement {
     pub fn lock(&self) -> Option<&(AgreementView, SlotDecision)> {
         self.lock.as_ref()
     }
+    /// Highest authenticated, semantically validated nonnil prevote QC at or below this view.
+    /// The first QC at the retained view is preserved. Authenticated QCs for the same
+    /// exact vote statement are accepted regardless of signer subset; conflicting
+    /// statements are rejected. Lower-view QCs cannot replace it. This cache does not
+    /// authorize unlocking; proposals still require an explicit matching POL.
+    pub fn valid(&self) -> Option<&AgreementQc> {
+        self.valid.as_ref()
+    }
+
     /// Decided value, if a verified nonnil precommit quorum was received.
     pub fn decision(&self) -> Option<&SlotDecision> {
         self.decision.as_ref()
@@ -435,12 +447,15 @@ impl SlotAgreement {
 
     /// Applies authenticated evidence. Only current-view prevote QCs can lock and
     /// emit a precommit; after any precommit, late evidence cannot replace the lock.
+    /// Nonnil prevote QCs are retained independently of the lock even when old or
+    /// received after a precommit; these cases return no vote and preserve the lock.
     /// Old nonnil precommit QCs still decide this exact fixed context.
     /// QC decisions also cross the explicit semantic-validation trust boundary.
     ///
     /// # Errors
-    /// Rejects invalid evidence/semantics, future evidence, repeated precommits,
-    /// or evidence conflicting with an existing decision. Errors leave state unchanged.
+    /// Rejects invalid evidence/semantics, future evidence, conflicting statements at the retained
+    /// valid view, repeated nil precommits, or evidence conflicting with an existing
+    /// decision. Errors leave state unchanged.
     pub fn evidence(
         &mut self,
         qc: &AgreementQc,
@@ -466,11 +481,29 @@ impl SlotAgreement {
                 self.decision = Some(d.clone());
                 Ok(None)
             }
+            (AgreementPhase::Prevote, AgreementValue::Decision(d)) => {
+                if let Some(valid) = &self.valid
+                    && valid.vote.view == qc.vote.view
+                    && valid.vote != qc.vote
+                {
+                    return Err(invalid("conflicting QC at retained valid view"));
+                }
+                if self
+                    .valid
+                    .as_ref()
+                    .is_none_or(|valid| qc.vote.view > valid.vote.view)
+                {
+                    self.valid = Some(qc.clone());
+                }
+                if qc.vote.view < self.view || self.precommit.is_some() {
+                    return Ok(None);
+                }
+                let output = self.emit(AgreementPhase::Precommit, qc.vote.value.clone())?;
+                self.lock = Some((self.view, d.clone()));
+                Ok(Some(output))
+            }
             (AgreementPhase::Prevote, value) if qc.vote.view == self.view => {
                 let output = self.emit(AgreementPhase::Precommit, value.clone())?;
-                if let AgreementValue::Decision(d) = value {
-                    self.lock = Some((self.view, d.clone()));
-                }
                 Ok(Some(output))
             }
             _ => Ok(None),
@@ -796,6 +829,7 @@ mod tests {
         prevote: Option<AgreementValue>,
         precommit: Option<AgreementValue>,
         lock: Option<(AgreementView, SlotDecision)>,
+        valid: Option<AgreementQc>,
         decision: Option<SlotDecision>,
     }
 
@@ -807,6 +841,7 @@ mod tests {
             prevote: k.prevote.clone(),
             precommit: k.precommit.clone(),
             lock: k.lock.clone(),
+            valid: k.valid.clone(),
             decision: k.decision.clone(),
         }
     }
@@ -1245,6 +1280,13 @@ mod tests {
             AgreementPhase::Precommit,
             AgreementValue::Decision(d),
         );
+        let late = qc(
+            &prepared,
+            &keys,
+            1,
+            AgreementPhase::Prevote,
+            pol.vote.value.clone(),
+        );
         let events = [
             proposal,
             AgreementInput::Evidence { qc: pol },
@@ -1259,6 +1301,11 @@ mod tests {
                 view: AgreementView(1),
                 phase: AgreementPhase::Precommit,
             },
+            AgreementInput::Evidence { qc: late.clone() },
+            AgreementInput::AdvanceView {
+                from: AgreementView(1),
+            },
+            AgreementInput::Evidence { qc: late },
             AgreementInput::Evidence { qc: commit },
         ];
         for event in events {
@@ -1315,6 +1362,143 @@ mod tests {
             assert_eq!(output.decision.as_ref(), direct.decision());
             assert_eq!(snapshot(&prepared), snapshot(&direct));
         }
+    }
+
+    #[test]
+    fn late_valid_prepare_drop_and_apply_preserve_nil_votes_without_locking() {
+        let (mut k, keys, d) = fixture();
+        k.timeout(AgreementPhase::Prevote).unwrap();
+        k.timeout(AgreementPhase::Precommit).unwrap();
+        let late = qc(
+            &k,
+            &keys,
+            0,
+            AgreementPhase::Prevote,
+            AgreementValue::Decision(d),
+        );
+        let input = AgreementInput::Evidence { qc: late.clone() };
+        let before = snapshot(&k);
+        drop(k.prepare(input.clone(), |_| Ok(())).unwrap());
+        assert_eq!(snapshot(&k), before);
+        assert!(
+            k.prepare(input.clone(), |_| Err(invalid("rejected")))
+                .is_err()
+        );
+        assert_eq!(snapshot(&k), before);
+        let output = k.prepare(input, |_| Ok(())).unwrap().apply();
+        assert_eq!(output.vote, None);
+        assert_eq!(k.valid(), Some(&late));
+        assert_eq!(k.lock(), None);
+        assert_eq!(k.prevote, Some(AgreementValue::Nil));
+        assert_eq!(k.precommit, Some(AgreementValue::Nil));
+        let retained = snapshot(&k);
+        assert_eq!(k.evidence(&late, |_| Ok(())).unwrap(), None);
+        assert_eq!(snapshot(&k), retained);
+        k.advance_view().unwrap();
+        assert_eq!(k.valid(), Some(&late));
+        assert_eq!(k.lock(), None);
+    }
+
+    #[test]
+    fn old_valid_evidence_is_monotonic_and_never_unlocks_or_votes() {
+        let (mut k, keys, d) = fixture();
+        assert_eq!(k.valid(), None);
+        let initial = qc(
+            &k,
+            &keys,
+            0,
+            AgreementPhase::Prevote,
+            AgreementValue::Decision(d.clone()),
+        );
+        assert!(k.evidence(&initial, |_| Ok(())).unwrap().is_some());
+        assert_eq!(k.valid(), Some(&initial));
+        assert_eq!(k.lock(), Some(&(AgreementView(0), d.clone())));
+        k.advance_view().unwrap();
+        k.advance_view().unwrap();
+        let old = qc(
+            &k,
+            &keys,
+            1,
+            AgreementPhase::Prevote,
+            AgreementValue::Decision(other(&d)),
+        );
+        let before = snapshot(&k);
+        assert!(
+            k.evidence(&old, |_| Err(invalid("semantic rejection")))
+                .is_err()
+        );
+        assert_eq!(snapshot(&k), before);
+        let mut forged = old.clone();
+        forged.signatures[0].signature[0] ^= 1;
+        assert!(k.evidence(&forged, |_| Ok(())).is_err());
+        assert_eq!(snapshot(&k), before);
+        let future = qc(
+            &k,
+            &keys,
+            3,
+            AgreementPhase::Prevote,
+            AgreementValue::Decision(d.clone()),
+        );
+        assert!(k.evidence(&future, |_| Ok(())).is_err());
+        assert_eq!(snapshot(&k), before);
+        assert_eq!(k.evidence(&old, |_| Ok(())).unwrap(), None);
+        assert_eq!(k.valid(), Some(&old));
+        assert_eq!(k.lock(), Some(&(AgreementView(0), d.clone())));
+        assert_eq!(k.prevote, None);
+        assert_eq!(k.precommit, None);
+        let retained = snapshot(&k);
+        for evidence in [&initial, &old] {
+            assert_eq!(k.evidence(evidence, |_| Ok(())).unwrap(), None);
+            assert_eq!(snapshot(&k), retained);
+        }
+        // Cached POL is evidence, not implicit permission to override the lock.
+        assert!(k.propose(k.view(), other(&d), None, |_| Ok(())).is_err());
+        assert_eq!(snapshot(&k), retained);
+        let conflict = qc(
+            &k,
+            &keys,
+            1,
+            AgreementPhase::Prevote,
+            AgreementValue::Decision(d.clone()),
+        );
+        assert!(k.evidence(&conflict, |_| Ok(())).is_err());
+        assert_eq!(snapshot(&k), retained);
+        let mut different_signers = old.clone();
+        let payload = old.vote.signing_payload(&k.set).unwrap();
+        different_signers.signatures.remove(0);
+        different_signers.signatures.push(ValidatorSignature {
+            validator_id: vec![3],
+            key_id: vec![3],
+            signature: Ed25519Scheme.sign(&keys[3], &payload).unwrap(),
+        });
+        different_signers.verify(&k.context, &k.set).unwrap();
+        let mut calls = 0;
+        assert_eq!(
+            k.evidence(&different_signers, |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap(),
+            None
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(k.valid(), Some(&old));
+        assert_eq!(snapshot(&k), retained);
+        assert!(
+            k.evidence(&different_signers, |_| Err(invalid("semantic rejection")))
+                .is_err()
+        );
+        assert_eq!(snapshot(&k), retained);
+        different_signers.signatures[0].signature[0] ^= 1;
+        assert!(k.evidence(&different_signers, |_| Ok(())).is_err());
+        assert_eq!(snapshot(&k), retained);
+        k.timeout(AgreementPhase::Prevote).unwrap();
+        k.timeout(AgreementPhase::Precommit).unwrap();
+        let nil = qc(&k, &keys, 1, AgreementPhase::Prevote, AgreementValue::Nil);
+        assert_eq!(k.evidence(&nil, |_| Ok(())).unwrap(), None);
+        k.advance_view().unwrap();
+        assert_eq!(k.valid(), Some(&old));
+        assert_eq!(k.lock(), Some(&(AgreementView(0), d)));
     }
 
     #[test]
@@ -1375,7 +1559,9 @@ mod tests {
             AgreementPhase::Prevote,
             AgreementValue::Decision(other(&d)),
         );
-        assert!(k.evidence(&late, |_| Ok(())).is_err());
+        assert_eq!(k.evidence(&late, |_| Ok(())).unwrap(), None);
+        assert_eq!(k.valid(), Some(&late));
+        assert_eq!(k.precommit, Some(AgreementValue::Nil));
         assert_eq!(k.lock(), Some(&(AgreementView(0), d.clone())));
         k.advance_view().unwrap();
         k.timeout(AgreementPhase::Precommit).unwrap();

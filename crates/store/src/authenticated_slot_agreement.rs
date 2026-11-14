@@ -5,8 +5,8 @@ use validator::slot_agreement::{
     SlotAgreement,
 };
 use validator::{
-    Dag, SlotAgreementBinding, SlotAgreementProof, SlotAgreementViewLineage,
-    SlotAgreementVotePayload, SlotAgreementVoteWitness, Vertex, VertexId,
+    CertifiedDag, Dag, SlotAgreementBinding, SlotAgreementProof, SlotAgreementViewLineage,
+    SlotAgreementVotePayload, SlotAgreementVoteWitness, SlotDecisionBinding, Vertex, VertexId,
 };
 
 pub(super) const FILE: &str = "authenticated-slot-agreement";
@@ -37,6 +37,8 @@ pub struct AuthenticatedSlotAgreementBootstrap {
 #[derive(Debug, Clone, PartialEq, Eq)]
 
 pub enum AuthenticatedSlotAgreementRequest {
+    /// Apply the first durable deciding proof and derive the next same-set slot.
+    AdvanceSlot,
     /// Authenticate the exact lineage before emitting a prevote.
     Propose {
         /// Complete historical authorization, including exact carriers.
@@ -193,6 +195,7 @@ impl AuthenticatedSlotAgreementRequest {
         let mut e = Encoder::new();
         e.put_u16(1);
         match self {
+            Self::AdvanceSlot => e.put_u8(6),
             Self::Propose { lineage, vertices } | Self::ObservePrevote { lineage, vertices } => {
                 e.put_u8(if matches!(self, Self::Propose { .. }) {
                     0
@@ -245,6 +248,7 @@ impl AuthenticatedSlotAgreementRequest {
         }
         let tag = d.read_u8()?;
         let value = match tag {
+            6 => Self::AdvanceSlot,
             0 | 1 => {
                 let lineage = SlotAgreementViewLineage::decode(d.read_bytes()?, set)?;
                 let vertices = get_vertices(&mut d)?;
@@ -460,6 +464,40 @@ fn add(
     }
     Ok(())
 }
+fn ingest(
+    dag: &mut CertifiedDag,
+    vertices: &mut BTreeMap<(u64, Vec<u8>), Vertex>,
+    incoming: &[Vertex],
+) -> Result<(), StoreError> {
+    let mut additions = BTreeMap::new();
+    for vertex in incoming {
+        let key = (vertex.round, vertex.author.clone());
+        if !vertices.contains_key(&key) {
+            additions.insert(key, vertex.clone());
+        }
+    }
+    add(vertices, incoming)?;
+    if vertices.values().map(|v| v.references.len()).sum::<usize>() > MAX_DEPENDENCIES {
+        return Err(invalid("retained dependency edge bound exceeded"));
+    }
+    for vertex in additions.into_values() {
+        for reference in &vertex.references {
+            if reference.round >= vertex.round
+                || vertices
+                    .get(&(reference.round, reference.author.clone()))
+                    .map(Vertex::id)
+                    .transpose()?
+                    .as_ref()
+                    != Some(reference)
+            {
+                return Err(invalid("missing or conflicting authenticated dependency"));
+            }
+        }
+        dag.insert(vertex)?;
+    }
+    Ok(())
+}
+
 /// Frozen quorum evidence, not an authenticated POL or finalization carrier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgreementQuorumCandidate {
@@ -496,6 +534,33 @@ impl AgreementQuorumCandidate {
     }
 }
 
+/// Authenticated lineage ending at the reducer-selected highest valid POL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgreementReproposalCandidate {
+    lineage: SlotAgreementViewLineage,
+}
+
+impl AgreementReproposalCandidate {
+    /// Returns the selected POL view.
+    pub fn view(&self) -> validator::slot_agreement::AgreementView {
+        self.lineage
+            .entries
+            .last()
+            .expect("selected POL has a lineage")
+            .pol
+            .as_ref()
+            .expect("selected lineage ends in a POL")
+            .certificate
+            .vote
+            .view
+    }
+
+    /// Returns the exact authenticated lineage retained for the selected POL.
+    pub fn lineage(&self) -> &SlotAgreementViewLineage {
+        &self.lineage
+    }
+}
+
 #[derive(Default)]
 struct VoteBucket {
     lineage: Option<SlotAgreementViewLineage>,
@@ -503,27 +568,59 @@ struct VoteBucket {
     candidate: Option<AgreementQuorumCandidate>,
 }
 
+type ReplayState = (
+    Option<AgreementTransitionResult>,
+    Vec<AgreementQuorumCandidate>,
+    SlotAgreementBootstrap,
+    SlotAgreementBinding,
+    Option<AgreementReproposalCandidate>,
+);
+
 fn replay(
     b: &AuthenticatedSlotAgreementBootstrap,
     events: &[AuthenticatedSlotAgreementRequest],
-) -> Result<
-    (
-        Option<AgreementTransitionResult>,
-        Vec<AgreementQuorumCandidate>,
-    ),
-    StoreError,
-> {
-    let binding =
+) -> Result<ReplayState, StoreError> {
+    let mut binding =
         SlotAgreementBinding::from_checkpoint(b.agreement.context.clone(), b.predecessor.clone())?;
     let mut vertices = BTreeMap::new();
     add(&mut vertices, &b.vertices)?;
-    build_dag(b, &vertices)?;
+    let mut dag = CertifiedDag::from_checkpoint(
+        build_dag(b, &vertices)?,
+        SlotDecisionBinding::from_checkpoint(b.agreement.context.clone(), b.predecessor.clone())?,
+    )?;
+    let mut active = b.agreement.clone();
+    let mut finalization = None;
     let mut reducer = SlotAgreement::new(b.agreement.context.clone(), b.agreement.set.clone())?;
     let mut result = None;
+    let mut reproposal = None;
     let mut buckets: BTreeMap<Vec<u8>, VoteBucket> = BTreeMap::new();
     let mut witness_count = 0usize;
     let mut evidence_bytes = 0usize;
     for event in events {
+        if matches!(event, AuthenticatedSlotAgreementRequest::AdvanceSlot) {
+            if reducer.decision().is_none() {
+                return Err(invalid("cannot advance an undecided slot"));
+            }
+            let (proof, carrier) = finalization
+                .take()
+                .ok_or_else(|| invalid("missing durable deciding proof"))?;
+            dag.prepare_agreement(&proof, &carrier)?.apply();
+            binding = SlotAgreementBinding::from_checkpoint(
+                dag.binding().tip().clone(),
+                dag.binding().carrier().cloned(),
+            )?;
+            active.context = binding.tip().clone();
+            reducer = SlotAgreement::new(active.context.clone(), active.set.clone())?;
+            buckets.clear();
+            reproposal = None;
+            result = Some(AgreementTransitionResult {
+                vote: None,
+                view: reducer.view(),
+                decision: None,
+            });
+            continue;
+        }
+
         if let AuthenticatedSlotAgreementRequest::ObserveVote {
             lineage,
             witness,
@@ -535,8 +632,9 @@ fn replay(
                     "individual evidence is not for the active current view",
                 ));
             }
-            add(&mut vertices, incoming)?;
-            build_dag(b, &vertices)?.inspect_slot_agreement_vote(lineage, witness, &binding)?;
+            ingest(&mut dag, &mut vertices, incoming)?;
+            dag.dag()
+                .inspect_slot_agreement_vote(lineage, witness, &binding)?;
             // Authenticate the supplied POL before removing it: a prevote authorizes
             // the selected view, not that view's subsequently assembled POL.
             let mut retained_lineage = lineage.clone();
@@ -584,7 +682,7 @@ fn replay(
                             .collect(),
                     };
                     if certificate
-                        .verify(&b.agreement.context, &b.agreement.set)
+                        .verify(&active.context, &b.agreement.set)
                         .is_ok()
                     {
                         let candidate = AgreementQuorumCandidate {
@@ -610,6 +708,7 @@ fn replay(
             continue;
         }
         let (input, decision) = match event {
+            AuthenticatedSlotAgreementRequest::AdvanceSlot => unreachable!("advance handled above"),
             AuthenticatedSlotAgreementRequest::ObserveVote { .. } => {
                 unreachable!("observations handled without reducer input")
             }
@@ -621,9 +720,10 @@ fn replay(
                 lineage,
                 vertices: incoming,
             } => {
-                add(&mut vertices, incoming)?;
-                let dag = build_dag(b, &vertices)?;
-                let proposal = dag.inspect_slot_agreement_view_lineage(lineage, &binding)?;
+                ingest(&mut dag, &mut vertices, incoming)?;
+                let proposal = dag
+                    .dag()
+                    .inspect_slot_agreement_view_lineage(lineage, &binding)?;
                 let AgreementInput::Propose { decision, .. } = &proposal else {
                     return Err(invalid("inspector returned nonproposal"));
                 };
@@ -653,9 +753,12 @@ fn replay(
                 carrier,
                 vertices: incoming,
             } => {
-                add(&mut vertices, incoming)?;
-                let dag = build_dag(b, &vertices)?;
-                dag.inspect_slot_agreement_proof(proof, carrier, &binding)?;
+                ingest(&mut dag, &mut vertices, incoming)?;
+                dag.dag()
+                    .inspect_slot_agreement_proof(proof, carrier, &binding)?;
+                if reducer.decision().is_none() {
+                    finalization = Some((proof.clone(), carrier.clone()));
+                }
                 (
                     AgreementInput::Evidence {
                         qc: proof.certificate.clone(),
@@ -696,10 +799,32 @@ fn replay(
                 })?
                 .apply(),
         );
+        if let AuthenticatedSlotAgreementRequest::ObservePrevote { lineage, .. } = event {
+            let pol = &lineage
+                .entries
+                .last()
+                .expect("inspected lineage is nonempty")
+                .pol
+                .as_ref()
+                .expect("observed prevote has a POL")
+                .certificate;
+            if reducer.valid() == Some(pol)
+                && reproposal
+                    .as_ref()
+                    .is_none_or(|old: &AgreementReproposalCandidate| old.view() < pol.vote.view)
+            {
+                reproposal = Some(AgreementReproposalCandidate {
+                    lineage: lineage.clone(),
+                });
+            }
+        }
     }
     Ok((
         result,
         buckets.into_values().filter_map(|b| b.candidate).collect(),
+        active,
+        binding,
+        reproposal,
     ))
 }
 pub(super) fn validate(root: &Path) -> Result<(), StoreError> {
@@ -777,6 +902,13 @@ impl Store {
         })
     }
 }
+type DriverSnapshot = (
+    SlotAgreementBootstrap,
+    Option<AgreementTransitionResult>,
+    Vec<AgreementQuorumCandidate>,
+    Option<AgreementReproposalCandidate>,
+);
+
 impl AuthenticatedSlotAgreement {
     /// Reauthenticates durable evidence and returns frozen candidates without mutable state access.
     ///
@@ -786,16 +918,12 @@ impl AuthenticatedSlotAgreement {
         Ok(self.driver_snapshot()?.2)
     }
 
-    pub(super) fn driver_snapshot(
-        &self,
-    ) -> Result<
-        (
-            SlotAgreementBootstrap,
-            Option<AgreementTransitionResult>,
-            Vec<AgreementQuorumCandidate>,
-        ),
-        StoreError,
-    > {
+    /// Reauthenticates the highest valid POL material, including older views.
+    pub fn reproposal_candidate(&self) -> Result<Option<AgreementReproposalCandidate>, StoreError> {
+        Ok(self.driver_snapshot()?.3)
+    }
+
+    pub(super) fn driver_snapshot(&self) -> Result<DriverSnapshot, StoreError> {
         if self.uncertain {
             return Err(invalid("uncertain authenticated write requires recovery"));
         }
@@ -812,8 +940,41 @@ impl AuthenticatedSlotAgreement {
         {
             return Err(invalid("stale authenticated owner"));
         }
-        let (transition, candidates) = replay(&journal.bootstrap, &journal.events)?;
-        Ok((journal.bootstrap.agreement, transition, candidates))
+        let (transition, candidates, active, _, reproposal) =
+            replay(&journal.bootstrap, &journal.events)?;
+        Ok((active, transition, candidates, reproposal))
+    }
+
+    /// Derives the next slot from the durable deciding proof without application effects.
+    ///
+    /// # Errors
+    /// Rejects undecided sessions, stale owners, inexact retries and uncertain I/O.
+    pub fn advance_slot(&mut self, sequence: u64) -> Result<AgreementTransitionResult, StoreError> {
+        self.apply(sequence, AuthenticatedSlotAgreementRequest::AdvanceSlot)
+    }
+
+    /// Returns an owned active binding snapshot without exposing mutable replay state.
+    ///
+    /// # Errors
+    /// Rejects uncertain or stale owners and invalid durable evidence.
+    pub fn binding(&self) -> Result<SlotAgreementBinding, StoreError> {
+        if self.uncertain {
+            return Err(invalid("uncertain authenticated write requires recovery"));
+        }
+        let root = self
+            .store
+            .slot_decisions
+            .lock()
+            .expect("slot decision lock poisoned");
+        exclusions(&root)?;
+        let journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
+        if journal.header != self.header
+            || journal.events.len() as u64 != self.sequence
+            || journal.tip != self.tip
+        {
+            return Err(invalid("stale authenticated owner"));
+        }
+        Ok(replay(&journal.bootstrap, &journal.events)?.3)
     }
 
     /// Number of durably installed requests.

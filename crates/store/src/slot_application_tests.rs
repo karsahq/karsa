@@ -211,7 +211,9 @@ impl Fixture {
         }
     }
 
-    fn extend_second_commit(&mut self) -> (SlotCertificatePayload, VertexId, Vec<VertexId>) {
+    pub(super) fn extend_second_commit(
+        &mut self,
+    ) -> (SlotCertificatePayload, VertexId, Vec<VertexId>) {
         let mut state = self.state(self.vertices.clone());
         state.prepare(&self.payload, &self.carrier).unwrap().apply();
         let Decision::Commit(history) = state.dag().inspect_commit(2).unwrap() else {
@@ -807,7 +809,7 @@ pub(super) fn unified_fixture(commit: bool) -> (Fixture, validator::SlotAgreemen
     (f, proof, carrier)
 }
 
-fn append_unified_proof(
+pub(super) fn append_unified_proof(
     f: &mut Fixture,
     proposal: SlotProposal,
     proposal_carrier: VertexId,

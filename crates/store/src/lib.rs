@@ -37,6 +37,10 @@ use std::sync::{Arc, Mutex, RwLock};
 mod authenticated_checkpoint_tests;
 #[cfg(test)]
 mod authenticated_finalization_tests;
+#[cfg(test)]
+mod authenticated_multislot_tests;
+#[cfg(test)]
+mod authenticated_reproposal_tests;
 mod authenticated_slot_agreement;
 #[cfg(test)]
 mod authenticated_slot_agreement_tests;
@@ -52,8 +56,8 @@ pub use slot_agreement_driver::{
 };
 mod slot_agreement_journal;
 pub use authenticated_slot_agreement::{
-    AgreementQuorumCandidate, AuthenticatedSlotAgreement, AuthenticatedSlotAgreementBootstrap,
-    AuthenticatedSlotAgreementRequest,
+    AgreementQuorumCandidate, AgreementReproposalCandidate, AuthenticatedSlotAgreement,
+    AuthenticatedSlotAgreementBootstrap, AuthenticatedSlotAgreementRequest,
 };
 #[cfg(test)]
 mod slot_agreement_signing_tests;
