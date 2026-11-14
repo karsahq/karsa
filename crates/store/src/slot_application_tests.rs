@@ -12,10 +12,10 @@ use validator::{
     ValidatorKey, ValidatorRecord, ValidatorSet, ValidatorSignature, Vertex, VertexId,
 };
 
-struct TempDir(PathBuf);
+pub(super) struct TempDir(pub(super) PathBuf);
 
 impl TempDir {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         loop {
             let path = std::env::temp_dir().join(format!(
@@ -38,18 +38,18 @@ impl Drop for TempDir {
     }
 }
 
-struct Fixture {
-    set: ValidatorSet,
-    keys: Vec<Vec<u8>>,
-    vertices: Vec<Vertex>,
-    payload: SlotCertificatePayload,
-    carrier: VertexId,
-    binding: SlotDecisionBinding,
+pub(super) struct Fixture {
+    pub(super) set: ValidatorSet,
+    pub(super) keys: Vec<Vec<u8>>,
+    pub(super) vertices: Vec<Vertex>,
+    pub(super) payload: SlotCertificatePayload,
+    pub(super) carrier: VertexId,
+    pub(super) binding: SlotDecisionBinding,
     expected_order: Vec<VertexId>,
     leader: VertexId,
 }
 
-fn signed_vertex(
+pub(super) fn signed_vertex(
     keys: &[Vec<u8>],
     author: usize,
     round: u64,
@@ -72,7 +72,7 @@ fn signed_vertex(
 }
 
 impl Fixture {
-    fn new(committing: bool) -> Self {
+    pub(super) fn new(committing: bool) -> Self {
         let mut keys = Vec::new();
         let validators = (0..4)
             .map(|index| {
@@ -293,7 +293,7 @@ impl Fixture {
         (payload, carrier, expected_order)
     }
 
-    fn state(&self, vertices: impl IntoIterator<Item = Vertex>) -> CertifiedDag {
+    pub(super) fn state(&self, vertices: impl IntoIterator<Item = Vertex>) -> CertifiedDag {
         let mut dag = Dag::new(self.set.clone());
         dag.set_chain_id(b"slot-store-tests".to_vec());
         let mut state = CertifiedDag::from_checkpoint(dag, self.binding.clone()).unwrap();
@@ -303,13 +303,13 @@ impl Fixture {
         state
     }
 
-    fn persist(&self, store: &Store) {
+    pub(super) fn persist(&self, store: &Store) {
         for vertex in &self.vertices {
             store.append_vertex(vertex).unwrap();
         }
     }
 
-    fn assert_applied(&self, state: &CertifiedDag) {
+    pub(super) fn assert_applied(&self, state: &CertifiedDag) {
         assert_eq!(state.dag().order(), self.expected_order);
         assert_eq!(
             state.dag().commit_root(),
@@ -799,6 +799,21 @@ fn staged_drop_and_activation_route_clones_without_changing_signing_lock() {
 }
 
 fn unified_fixture(commit: bool) -> (Fixture, validator::SlotAgreementProof, VertexId) {
+    let mut f = Fixture::new(commit);
+    let proposal = f.payload.proposal.clone();
+    let proposal_carrier = f.payload.proposal_carrier.clone();
+    let context = f.binding.tip().clone();
+    let (proof, carrier) = append_unified_proof(&mut f, proposal, proposal_carrier, context, 4);
+    (f, proof, carrier)
+}
+
+fn append_unified_proof(
+    f: &mut Fixture,
+    proposal: SlotProposal,
+    proposal_carrier: VertexId,
+    context: SlotDecisionTip,
+    first_round: u64,
+) -> (validator::SlotAgreementProof, VertexId) {
     use validator::slot_agreement::{
         AgreementPhase, AgreementQc, AgreementValue, AgreementView, AgreementVote,
     };
@@ -806,14 +821,13 @@ fn unified_fixture(commit: bool) -> (Fixture, validator::SlotAgreementProof, Ver
         SlotAgreementProof, SlotAgreementProofEntry, SlotAgreementProofPol,
         SlotAgreementVotePayload, SlotAgreementVoteWitness,
     };
-    let mut f = Fixture::new(commit);
-    f.vertices.retain(|v| v.round < 4);
+    f.vertices.retain(|v| v.round < first_round);
     let qc = |phase| {
         let vote = AgreementVote {
-            context: f.binding.tip().clone(),
+            context: context.clone(),
             view: AgreementView(0),
             phase,
-            value: AgreementValue::Decision(f.payload.proposal.decision.clone()),
+            value: AgreementValue::Decision(proposal.decision.clone()),
         };
         let bytes = vote.signing_payload(&f.set).unwrap();
         let signatures = (0..3)
@@ -828,8 +842,8 @@ fn unified_fixture(commit: bool) -> (Fixture, validator::SlotAgreementProof, Ver
     let prevote = qc(AgreementPhase::Prevote);
     let mut proof = SlotAgreementProof {
         entries: vec![SlotAgreementProofEntry {
-            proposal: f.payload.proposal.clone(),
-            proposal_carrier: f.payload.proposal_carrier.clone(),
+            proposal: proposal.clone(),
+            proposal_carrier,
             view: AgreementView(0),
             view_carrier: f.carrier.clone(),
             previous_pol: None,
@@ -841,23 +855,26 @@ fn unified_fixture(commit: bool) -> (Fixture, validator::SlotAgreementProof, Ver
     let mut refs: Vec<_> = f
         .vertices
         .iter()
-        .filter(|v| v.round == 3)
+        .filter(|v| v.round == first_round - 1)
         .map(|v| v.id().unwrap())
         .collect();
-    let proposer = validator::slot_agreement_view_proposer(&f.set, 1, AgreementView(0)).unwrap();
+    let proposer =
+        validator::slot_agreement_view_proposer(&f.set, proposal.decision.round, AgreementView(0))
+            .unwrap();
     let author = f
         .set
         .validators
         .iter()
         .position(|v| v.validator_id == proposer)
         .unwrap();
-    for round in 4..=8 {
+    for offset in 0..=4 {
+        let round = first_round + offset;
         let mut hashes = [[9; 32]; 4];
-        if round == 4 {
+        if offset == 0 {
             hashes[author] = proof.view_digest(0).unwrap();
         }
-        if round == 5 || round == 7 {
-            let certificate = if round == 5 {
+        if offset == 1 || offset == 3 {
+            let certificate = if offset == 1 {
                 &prevote
             } else {
                 &proof.certificate
@@ -866,7 +883,7 @@ fn unified_fixture(commit: bool) -> (Fixture, validator::SlotAgreementProof, Ver
                 let payload = SlotAgreementVotePayload {
                     vote: certificate.vote.clone(),
                     signature: signature.clone(),
-                    prerequisite: if round == 5 {
+                    prerequisite: if offset == 1 {
                         proof.entries[0].view_carrier.clone()
                     } else {
                         proof.entries[0].pol.as_ref().unwrap().carrier.clone()
@@ -878,7 +895,7 @@ fn unified_fixture(commit: bool) -> (Fixture, validator::SlotAgreementProof, Ver
                     payload,
                     carrier: vertex.id().unwrap(),
                 };
-                if round == 5 {
+                if offset == 1 {
                     proof.entries[0]
                         .pol
                         .get_or_insert(SlotAgreementProofPol {
@@ -893,10 +910,10 @@ fn unified_fixture(commit: bool) -> (Fixture, validator::SlotAgreementProof, Ver
                 }
             }
         }
-        if round == 6 {
+        if offset == 2 {
             hashes[0] = proof.pol_digest(0, &f.set).unwrap();
         }
-        if round == 8 {
+        if offset == 4 {
             hashes[0] = proof.digest(&f.set).unwrap();
         }
         let mut next = vec![];
@@ -905,15 +922,254 @@ fn unified_fixture(commit: bool) -> (Fixture, validator::SlotAgreementProof, Ver
             next.push(v.id().unwrap());
             f.vertices.push(v);
         }
-        if round == 4 {
+        if offset == 0 {
             proof.entries[0].view_carrier = next[author].clone();
         }
-        if round == 6 {
+        if offset == 2 {
             proof.entries[0].pol.as_mut().unwrap().carrier = next[0].clone();
         }
         refs = next;
     }
-    (f, proof, refs[0].clone())
+    (proof, refs[0].clone())
+}
+
+fn sync_application_test_barrier(
+    file: &fs::File,
+    root: &std::path::Path,
+) -> Result<(), crate::StoreError> {
+    file.sync_all()?;
+    for directory in fs::canonicalize(root)?.ancestors() {
+        fs::File::open(directory)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn mixed_signed_suffix_replays_from_baseline_and_interior_checkpoint() {
+    for agreement_first in [false, true] {
+        for commit in [false, true] {
+            let mut f = Fixture::new(commit);
+            let (mut second, mut second_carrier, expected_order) = f.extend_second_commit();
+            let (proof, agreement_carrier) = if agreement_first {
+                let proposal = f.payload.proposal.clone();
+                let proposal_carrier = f.payload.proposal_carrier.clone();
+                let context = f.binding.tip().clone();
+                let result = append_unified_proof(&mut f, proposal, proposal_carrier, context, 4);
+                let refs = f
+                    .vertices
+                    .iter()
+                    .filter(|v| v.round == 8)
+                    .map(|v| v.id().unwrap())
+                    .collect::<Vec<_>>();
+                let mut next = Vec::new();
+                for author in 0..4 {
+                    let hash = if author == 0 {
+                        second.proposal.digest().unwrap()
+                    } else {
+                        [9; 32]
+                    };
+                    let vertex = signed_vertex(&f.keys, author, 9, refs.clone(), hash);
+                    next.push(vertex.id().unwrap());
+                    f.vertices.push(vertex);
+                }
+                second.proposal_carrier = next[0].clone();
+                let vertex = signed_vertex(&f.keys, 1, 10, next, second.digest().unwrap());
+                second_carrier = vertex.id().unwrap();
+                f.vertices.push(vertex);
+                result
+            } else {
+                let mut prefix = f.state(f.vertices.clone());
+                prefix.prepare(&f.payload, &f.carrier).unwrap().apply();
+                append_unified_proof(
+                    &mut f,
+                    second.proposal.clone(),
+                    second.proposal_carrier.clone(),
+                    prefix.binding().tip().clone(),
+                    6,
+                )
+            };
+            let dir = TempDir::new();
+            let store = Store::open(&dir.0).unwrap();
+            f.persist(&store);
+            let mut state = f.state(store.vertices().unwrap());
+            let first_result = if agreement_first {
+                store
+                    .apply_slot_agreement(&mut state, &proof, &agreement_carrier)
+                    .unwrap()
+            } else {
+                store
+                    .apply_slot_certificate(&mut state, &f.payload, &f.carrier)
+                    .unwrap()
+            };
+            let prefix_binding = state.binding().clone();
+            let prefix_order = state.dag().order().to_vec();
+            let second_result = if agreement_first {
+                store
+                    .apply_slot_certificate(&mut state, &second, &second_carrier)
+                    .unwrap()
+            } else {
+                store
+                    .apply_slot_agreement(&mut state, &proof, &agreement_carrier)
+                    .unwrap()
+            };
+            assert_eq!(state.dag().order(), expected_order);
+            let final_binding = state.binding().clone();
+            let final_skipped = state.dag().skipped().to_vec();
+            let records = store.slot_application_requests().unwrap();
+            assert_eq!(records.len(), 2);
+            let wal = fs::read(dir.0.join("slot-applications")).unwrap();
+            drop(store);
+            let store = Store::open(&dir.0).unwrap();
+            assert_eq!(store.slot_application_requests().unwrap(), records);
+            let mut recovered = f.state(store.vertices().unwrap());
+            assert_eq!(
+                store.replay_slot_applications(&mut recovered).unwrap(),
+                vec![first_result, second_result.clone()]
+            );
+            assert_eq!(recovered.binding(), &final_binding);
+            assert_eq!(recovered.dag().order(), expected_order);
+            assert_eq!(recovered.dag().skipped(), final_skipped);
+
+            // Reconstruct a trusted checkpoint rather than retaining prepared application state.
+            for mismatch in 0..3 {
+                let mut previous = *prefix_binding.tip().previous_id();
+                let mut carrier = prefix_binding.carrier().unwrap().clone();
+                if mismatch == 1 {
+                    previous[0] ^= 1;
+                }
+                if mismatch == 2 {
+                    carrier.digest[0] ^= 1;
+                }
+                let tip = prefix_binding.tip();
+                let binding = SlotDecisionBinding::from_checkpoint(
+                    SlotDecisionTip::from_checkpoint(
+                        tip.chain_id().to_vec(),
+                        &f.set,
+                        tip.next_round(),
+                        previous,
+                        tip.order_len(),
+                        *tip.order_root(),
+                    )
+                    .unwrap(),
+                    Some(carrier),
+                )
+                .unwrap();
+                let mut dag = Dag::new(f.set.clone());
+                dag.set_chain_id(tip.chain_id().to_vec());
+                for vertex in store.vertices().unwrap() {
+                    dag.insert(vertex).unwrap();
+                }
+                dag.seed_order(prefix_order.clone());
+                let mut checkpoint = CertifiedDag::from_checkpoint(dag, binding.clone()).unwrap();
+                let skipped = checkpoint.dag().skipped().to_vec();
+                let mut barriers = 0;
+                let result =
+                    store.replay_slot_applications_with_barrier(&mut checkpoint, |file, root| {
+                        barriers += 1;
+                        sync_application_test_barrier(file, root)
+                    });
+                if mismatch == 0 {
+                    assert_eq!(result.unwrap(), vec![second_result.clone()]);
+                    assert_eq!(barriers, 2, "checkpoint and suffix must both sync");
+                    assert_eq!(checkpoint.binding(), &final_binding);
+                    assert_eq!(checkpoint.dag().order(), expected_order);
+                    assert_eq!(
+                        checkpoint.dag().commit_root(),
+                        *final_binding.tip().order_root()
+                    );
+                    // Checkpoints restore order, not historical skip markers.
+                    assert_eq!(checkpoint.dag().skipped(), skipped);
+                    assert!(
+                        store
+                            .replay_slot_applications(&mut checkpoint)
+                            .unwrap()
+                            .is_empty()
+                    );
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "agreement_first={agreement_first}, mismatch={mismatch}"
+                    );
+                    assert_eq!(barriers, 0);
+                    assert_eq!(checkpoint.binding(), &binding);
+                    assert_eq!(checkpoint.dag().order(), prefix_order);
+                    assert_eq!(checkpoint.dag().commit_root(), *tip.order_root());
+                    assert_eq!(checkpoint.dag().skipped(), skipped);
+                }
+            }
+            assert_eq!(fs::read(dir.0.join("slot-applications")).unwrap(), wal);
+        }
+    }
+}
+
+#[test]
+fn matching_unified_tip_requires_sync_after_uncertain_write() {
+    for commit in [false, true] {
+        let (f, proof, carrier) = unified_fixture(commit);
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        f.persist(&store);
+        let mut state = f.state(store.vertices().unwrap());
+        assert!(
+            store
+                .apply_slot_agreement_with_barrier(&mut state, &proof, &carrier, |_, _| Err(
+                    std::io::Error::other("uncertain unified write").into()
+                ))
+                .is_err()
+        );
+        f.assert_baseline(&state);
+        assert_eq!(store.slot_application_requests().unwrap().len(), 1);
+        // A matching trusted tip does not prove that the readable WAL was synced.
+        state.prepare_agreement(&proof, &carrier).unwrap().apply();
+        let binding = state.binding().clone();
+        let order = state.dag().order().to_vec();
+        let root = state.dag().commit_root();
+        let skipped = state.dag().skipped().to_vec();
+        let wal = fs::read(dir.0.join("slot-applications")).unwrap();
+        let mut barriers = 0;
+        assert!(
+            store
+                .replay_slot_applications_with_barrier(&mut state, |_, _| {
+                    barriers += 1;
+                    Err(std::io::Error::other("matching tip still uncertain").into())
+                })
+                .is_err()
+        );
+        assert_eq!(barriers, 1);
+        assert_eq!(state.binding(), &binding);
+        assert_eq!(state.dag().order(), order);
+        assert_eq!(state.dag().commit_root(), root);
+        assert_eq!(state.dag().skipped(), skipped);
+        let mut barriers = 0;
+        assert!(
+            store
+                .replay_slot_applications_with_barrier(&mut state, |file, root| {
+                    barriers += 1;
+                    sync_application_test_barrier(file, root)
+                })
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(barriers, 1);
+        assert_eq!(state.binding(), &binding);
+        assert_eq!(state.dag().order(), order);
+        assert_eq!(state.dag().commit_root(), root);
+        assert_eq!(state.dag().skipped(), skipped);
+        assert_eq!(fs::read(dir.0.join("slot-applications")).unwrap(), wal);
+        drop(store);
+        let store = Store::open(&dir.0).unwrap();
+        let mut recovered = f.state(store.vertices().unwrap());
+        assert_eq!(
+            store
+                .replay_slot_applications(&mut recovered)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(recovered.binding(), &binding);
+        assert_eq!(recovered.dag().order(), order);
+        assert_eq!(recovered.dag().skipped(), skipped);
+    }
 }
 
 #[test]

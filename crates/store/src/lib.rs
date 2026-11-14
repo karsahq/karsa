@@ -33,6 +33,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+#[cfg(test)]
+mod signed_dag_agreement_tests;
 mod slot_agreement_journal;
 #[cfg(test)]
 mod slot_agreement_signing_tests;
