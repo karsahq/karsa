@@ -36,6 +36,8 @@ use std::sync::{Arc, Mutex, RwLock};
 #[cfg(test)]
 mod authenticated_checkpoint_tests;
 #[cfg(test)]
+mod authenticated_conservative_skip_tests;
+#[cfg(test)]
 mod authenticated_finalization_tests;
 #[cfg(test)]
 mod authenticated_indirect_tests;
@@ -48,6 +50,8 @@ mod authenticated_slot_agreement;
 mod authenticated_slot_agreement_tests;
 #[cfg(test)]
 mod authenticated_vote_tests;
+#[cfg(test)]
+mod competing_slot_proposal_tests;
 #[cfg(test)]
 mod signed_dag_agreement_tests;
 mod slot_agreement_driver;
