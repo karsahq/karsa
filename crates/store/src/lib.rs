@@ -33,11 +33,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+mod slot_agreement_journal;
+#[cfg(test)]
+mod slot_agreement_tests;
 mod slot_application_journal;
 #[cfg(test)]
 mod slot_application_tests;
 mod slot_decision_journal;
 
+pub use slot_agreement_journal::{DurableSlotAgreement, SlotAgreementBootstrap};
 pub use slot_application_journal::StoredSlotApplication;
 
 use crypto::CryptoError;
@@ -393,6 +397,9 @@ impl Drop for StagedStore<'_> {
 impl Store {
     /// Opens (and creates) a store directory.
     ///
+    /// The root is canonicalized before locking and routing so later cwd changes
+    /// cannot redirect this owner or its clones to a different directory.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Io`] when the directory cannot be created, or when `CURRENT`
@@ -401,8 +408,8 @@ impl Store {
     /// Returns an actionable [`StoreError::Io`] if another handle holds the
     /// exclusive directory lock. The `.lock` entry must be a regular file.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root)?;
+        fs::create_dir_all(root.as_ref())?;
+        let root = fs::canonicalize(root.as_ref())?;
         let lock_path = root.join(".lock");
         match fs::symlink_metadata(&lock_path) {
             Ok(metadata) if metadata.file_type().is_file() => {}
@@ -439,6 +446,7 @@ impl Store {
             root.clone()
         };
         slot_decision_journal::read(&root)?;
+        slot_agreement_journal::validate(&root)?;
         slot_application_journal::read(&active)?;
         cleanup_generations(&root, generation.as_deref());
         Ok(Self {
@@ -450,7 +458,7 @@ impl Store {
         })
     }
 
-    /// The stable logical root, independent of the active generation.
+    /// The canonical absolute logical root, independent of the active generation.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.root

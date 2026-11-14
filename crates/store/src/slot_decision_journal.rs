@@ -103,6 +103,7 @@ impl Store {
             .slot_decisions
             .lock()
             .expect("slot decision lock poisoned");
+        slot_agreement_journal::exclude_legacy(&root, decision)?;
         let body = decision.encode()?;
         SlotDecision::decode(&body)?;
         let locks = read(&root)?;
