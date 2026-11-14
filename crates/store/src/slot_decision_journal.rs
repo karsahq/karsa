@@ -138,6 +138,7 @@ impl Store {
             .slot_decisions
             .lock()
             .expect("slot decision lock poisoned");
+        authenticated_slot_agreement::exclude_legacy(&root)?;
         read(&root)
     }
 }

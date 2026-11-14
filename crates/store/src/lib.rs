@@ -33,9 +33,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+mod authenticated_slot_agreement;
+#[cfg(test)]
+mod authenticated_slot_agreement_tests;
 #[cfg(test)]
 mod signed_dag_agreement_tests;
 mod slot_agreement_journal;
+pub use authenticated_slot_agreement::{
+    AuthenticatedSlotAgreement, AuthenticatedSlotAgreementBootstrap,
+    AuthenticatedSlotAgreementRequest,
+};
 #[cfg(test)]
 mod slot_agreement_signing_tests;
 #[cfg(test)]
@@ -366,6 +373,11 @@ impl StagedStore<'_> {
     /// Returns filesystem errors before publication. Cleanup after publication
     /// is best-effort and cannot turn successful publication into an error.
     pub fn activate(mut self) -> Result<(), StoreError> {
+        let signing_root = Arc::clone(&self.owner.slot_decisions);
+        let root = signing_root.lock().expect("slot decision lock poisoned");
+        slot_decision_journal::read(&root)?;
+        slot_agreement_journal::validate(&root)?;
+        // Hold the signing mutex through CURRENT publication and active routing.
         validate_generation(&self.view.root)?;
         validate_pointer_file(&self.owner.root.join("CURRENT"))?;
         let temporary = self.owner.root.join("CURRENT.tmp");
@@ -484,6 +496,11 @@ impl Store {
     /// Returns filesystem errors for invalid layouts or failed copies, and decode
     /// errors for complete corrupt log records. The active files are unchanged.
     pub fn stage(&mut self) -> Result<StagedStore<'_>, StoreError> {
+        // Own the Arc independently of the mutable owner borrow held by the stage.
+        let signing_root = Arc::clone(&self.slot_decisions);
+        let root = signing_root.lock().expect("slot decision lock poisoned");
+        slot_decision_journal::read(&root)?;
+        slot_agreement_journal::validate(&root)?;
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let source = self
             .active
@@ -523,6 +540,8 @@ impl Store {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name == slot_decision_journal::FILE
+                || name == slot_agreement_journal::FILE
+                || name == authenticated_slot_agreement::FILE
                 || name == ".lock"
                 || name == "CURRENT"
                 || name == "CURRENT.tmp"

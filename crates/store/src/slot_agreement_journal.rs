@@ -39,7 +39,7 @@ pub struct SlotAgreementBootstrap {
 }
 
 impl SlotAgreementBootstrap {
-    fn encode(&self) -> Result<Vec<u8>, StoreError> {
+    pub(super) fn encode(&self) -> Result<Vec<u8>, StoreError> {
         if self.local_validator.len() > 1024 || self.set.validator(&self.local_validator).is_none()
         {
             return Err(malformed("invalid local agreement identity"));
@@ -62,7 +62,7 @@ impl SlotAgreementBootstrap {
         Ok(body)
     }
 
-    fn decode(body: &[u8]) -> Result<Self, StoreError> {
+    pub(super) fn decode(body: &[u8]) -> Result<Self, StoreError> {
         let mut d = Decoder::new(body);
         if d.read_u16()? != 1 {
             return Err(malformed("unknown agreement WAL version"));
@@ -112,6 +112,7 @@ fn frame(previous: &[u8; 32], sequence: u64, body: &[u8]) -> Vec<u8> {
 }
 
 fn read(root: &Path) -> Result<Option<Journal>, StoreError> {
+    authenticated_slot_agreement::exclude_legacy(root)?;
     let path = root.join(FILE);
     validate_pointer_file(&path)?;
     let file = match File::open(&path) {
@@ -189,6 +190,9 @@ fn overlap(root: &Path, bootstrap: &SlotAgreementBootstrap) -> Result<(), StoreE
 }
 
 pub(super) fn validate(root: &Path) -> Result<(), StoreError> {
+    if root.join(authenticated_slot_agreement::FILE).try_exists()? {
+        return authenticated_slot_agreement::validate(root);
+    }
     if let Some(journal) = read(root)? {
         overlap(root, &journal.bootstrap)?;
     }
