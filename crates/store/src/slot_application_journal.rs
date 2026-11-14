@@ -6,11 +6,14 @@
 
 use super::*;
 use std::collections::HashSet;
-use validator::{CertifiedDag, SlotApplicationResult, SlotCertificatePayload};
+use validator::{
+    CertifiedDag, SlotAgreementProof, SlotApplicationResult, SlotCertificatePayload, SlotDecision,
+    ValidatorSet,
+};
 
 const FILE: &str = "slot-applications";
 const VERSION: u16 = 1;
-const MAX_RECORD: usize = crypto::encoding::MAX_FIELD_LEN + 1100;
+const MAX_RECORD: usize = 2 * crypto::encoding::MAX_FIELD_LEN + 1200;
 
 /// A replayable inactive application request, not proof that application completed.
 ///
@@ -75,16 +78,119 @@ impl StoredSlotApplication {
     }
 }
 
+/// A versioned request in the shared application WAL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredSlotApplicationRequest {
+    /// Original direct-certificate request.
+    Legacy(StoredSlotApplication),
+    /// Complete unified proof and its decoding context (not a trust anchor).
+    Agreement {
+        /// Exact bounded lineage and quorum witnesses.
+        proof: SlotAgreementProof,
+        /// Signed final proof carrier.
+        carrier: VertexId,
+        /// Persisted codec context, authenticated independently during replay.
+        set: ValidatorSet,
+    },
+}
+
+impl StoredSlotApplicationRequest {
+    fn decision(&self) -> Result<&SlotDecision, StoreError> {
+        match self {
+            Self::Legacy(record) => Ok(&record.payload.certificate.decision),
+            Self::Agreement { proof, .. } => proof
+                .entries
+                .last()
+                .map(|entry| &entry.proposal.decision)
+                .ok_or_else(|| malformed("empty agreement proof")),
+        }
+    }
+    fn carrier(&self) -> &VertexId {
+        match self {
+            Self::Legacy(r) => &r.carrier,
+            Self::Agreement { carrier, .. } => carrier,
+        }
+    }
+    fn proposal_round(&self) -> u64 {
+        match self {
+            Self::Legacy(r) => r.payload.proposal_carrier.round,
+            Self::Agreement { proof, .. } => proof.entries[0].proposal_carrier.round,
+        }
+    }
+    fn encode(&self) -> Result<Vec<u8>, StoreError> {
+        match self {
+            Self::Legacy(r) => r.encode(),
+            Self::Agreement {
+                proof,
+                carrier,
+                set,
+            } => {
+                let mut e = Encoder::new();
+                e.put_u16(2);
+                e.put_bytes(&set.encode()?)?;
+                e.put_bytes(&proof.encode(set)?)?;
+                e.put_u64(carrier.round);
+                if carrier.author.len() > 1024 {
+                    return Err(malformed("carrier author too long"));
+                }
+                e.put_bytes(&carrier.author)?;
+                e.put_bytes(&carrier.digest)?;
+                Ok(e.finish())
+            }
+        }
+    }
+    fn decode(bytes: &[u8]) -> Result<Self, StoreError> {
+        let mut d = Decoder::new(bytes);
+        match d.read_u16()? {
+            1 => Ok(Self::Legacy(StoredSlotApplication::decode(bytes)?)),
+            2 => {
+                let set = ValidatorSet::decode(d.read_bytes()?)?;
+                set.validate()?;
+                let proof = SlotAgreementProof::decode(d.read_bytes()?, &set)?;
+                let round = d.read_u64()?;
+                let author = d.read_bytes()?.to_vec();
+                if author.len() > 1024 {
+                    return Err(malformed("carrier author too long"));
+                }
+                let digest = d
+                    .read_bytes()?
+                    .try_into()
+                    .map_err(|_| malformed("invalid carrier digest"))?;
+                d.finish()?;
+                let record = Self::Agreement {
+                    proof,
+                    carrier: VertexId {
+                        round,
+                        author,
+                        digest,
+                    },
+                    set,
+                };
+                if record.decision()?.validator_set_id
+                    != match &record {
+                        Self::Agreement { set, .. } => set.id()?,
+                        _ => unreachable!(),
+                    }
+                {
+                    return Err(malformed("agreement decoding set mismatch"));
+                }
+                Ok(record)
+            }
+            _ => Err(malformed("unsupported slot application record version")),
+        }
+    }
+}
+
 fn checksum(body: &[u8]) -> [u8; 32] {
     crypto::merkle::leaf(b"KARSA/STORE/SLOT_APPLICATION/v1", &[body])
 }
 
 fn follows(
-    previous: &StoredSlotApplication,
-    next: &StoredSlotApplication,
+    previous: &StoredSlotApplicationRequest,
+    next: &StoredSlotApplicationRequest,
 ) -> Result<(), StoreError> {
-    let before = &previous.payload.certificate.decision;
-    let after = &next.payload.certificate.decision;
+    let before = previous.decision()?;
+    let after = next.decision()?;
     if before.round.checked_add(1) != Some(after.round)
         || before.chain_id != after.chain_id
         || before.validator_set_id != after.validator_set_id
@@ -92,14 +198,14 @@ fn follows(
         || before.id()? != after.previous
         || before.after_len != after.before_len
         || before.after_root != after.before_root
-        || previous.carrier.round >= next.payload.proposal_carrier.round
+        || previous.carrier().round >= next.proposal_round()
     {
         return Err(malformed("slot application journal continuity mismatch"));
     }
     Ok(())
 }
 
-pub(super) fn read(root: &Path) -> Result<Vec<StoredSlotApplication>, StoreError> {
+pub(super) fn read(root: &Path) -> Result<Vec<StoredSlotApplicationRequest>, StoreError> {
     let path = root.join(FILE);
     validate_pointer_file(&path)?;
     let bytes = match fs::read(path) {
@@ -133,7 +239,7 @@ pub(super) fn read(root: &Path) -> Result<Vec<StoredSlotApplication>, StoreError
         if checksum(body).as_slice() != stored_checksum {
             return Err(malformed("corrupt slot application journal checksum"));
         }
-        let record = StoredSlotApplication::decode(body)?;
+        let record = StoredSlotApplicationRequest::decode(body)?;
         if let Some(previous) = records.last() {
             follows(previous, &record)?;
         }
@@ -150,7 +256,7 @@ pub(super) fn read(root: &Path) -> Result<Vec<StoredSlotApplication>, StoreError
 fn require_stored_history(
     store: &Store,
     state: &CertifiedDag,
-    payload: &SlotCertificatePayload,
+    decision: &SlotDecision,
     carrier: &VertexId,
 ) -> Result<(), StoreError> {
     let mut stored = BTreeMap::new();
@@ -163,7 +269,7 @@ fn require_stored_history(
     // A direct skip still needs its elected leader on replay, even though
     // nonvoters need not carry that leader in the QC carrier's causal cone.
     let leader = dag
-        .leader(payload.proposal.decision.round)
+        .leader(decision.round)
         .ok_or_else(|| malformed("slot application elected leader missing"))?;
     if stored.get(&(leader.round, leader.author.clone())) != Some(leader) {
         return Err(malformed(
@@ -171,7 +277,7 @@ fn require_stored_history(
         ));
     }
     let mut seen = HashSet::new();
-    let mut stack = vec![carrier.clone()];
+    let mut stack = vec![carrier.clone(), leader.id()?];
     while let Some(current) = stack.pop() {
         if !seen.insert(current.clone()) || dag.floor().is_some_and(|floor| current.round <= floor)
         {
@@ -198,12 +304,12 @@ fn sync_request(file: &File, root: &Path) -> Result<(), StoreError> {
 
 fn append_synced(
     root: &Path,
-    record: &StoredSlotApplication,
+    record: &StoredSlotApplicationRequest,
     barrier: &mut impl FnMut(&File, &Path) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
     let records = read(root)?;
     let existing = records.iter().find(|old| {
-        old.payload.certificate.decision.round == record.payload.certificate.decision.round
+        old.decision().map(|d| d.round).ok() == record.decision().map(|d| d.round).ok()
     });
     if let Some(existing) = existing {
         if existing != record {
@@ -226,6 +332,61 @@ fn append_synced(
 }
 
 impl Store {
+    /// Reads all request versions from the shared, structurally checked WAL.
+    pub fn slot_application_requests(
+        &self,
+    ) -> Result<Vec<StoredSlotApplicationRequest>, StoreError> {
+        let _guard = self
+            .slot_applications
+            .lock()
+            .expect("slot application lock poisoned");
+        read(self.path_of(FILE).parent().expect("journal has a parent"))
+    }
+
+    /// Durably records a complete unified proof before applying its volatile effect.
+    /// Exact retries repeat supporting-log and request durability barriers.
+    pub fn apply_slot_agreement(
+        &self,
+        state: &mut CertifiedDag,
+        proof: &SlotAgreementProof,
+        carrier: &VertexId,
+    ) -> Result<SlotApplicationResult, StoreError> {
+        self.apply_slot_agreement_with_barrier(state, proof, carrier, sync_request)
+    }
+
+    pub(super) fn apply_slot_agreement_with_barrier(
+        &self,
+        state: &mut CertifiedDag,
+        proof: &SlotAgreementProof,
+        carrier: &VertexId,
+        mut barrier: impl FnMut(&File, &Path) -> Result<(), StoreError>,
+    ) -> Result<SlotApplicationResult, StoreError> {
+        let _guard = self
+            .slot_applications
+            .lock()
+            .expect("slot application lock poisoned");
+        let decision = &proof
+            .entries
+            .last()
+            .ok_or_else(|| malformed("empty agreement proof"))?
+            .proposal
+            .decision;
+        require_stored_history(self, state, decision, carrier)?;
+        let record = StoredSlotApplicationRequest::Agreement {
+            proof: proof.clone(),
+            carrier: carrier.clone(),
+            set: state.dag().set_for_epoch(decision.epoch).clone(),
+        };
+        let prepared = state.prepare_agreement(proof, carrier)?;
+        self.sync()?;
+        append_synced(
+            self.path_of(FILE).parent().expect("journal has a parent"),
+            &record,
+            &mut barrier,
+        )?;
+        Ok(prepared.apply())
+    }
+
     /// Persists an inactive certified-DAG request before installing its volatile effect.
     ///
     /// Requires exact supporting vertices already in this store, then syncs vertex
@@ -265,13 +426,13 @@ impl Store {
             .slot_applications
             .lock()
             .expect("slot application lock poisoned");
-        require_stored_history(self, state, payload, carrier)?;
+        require_stored_history(self, state, &payload.proposal.decision, carrier)?;
         let prepared = state.prepare(payload, carrier)?;
         self.sync()?;
-        let record = StoredSlotApplication {
+        let record = StoredSlotApplicationRequest::Legacy(StoredSlotApplication {
             payload: payload.clone(),
             carrier: carrier.clone(),
-        };
+        });
         append_synced(
             self.path_of(FILE).parent().expect("journal has a parent"),
             &record,
@@ -290,7 +451,13 @@ impl Store {
             .slot_applications
             .lock()
             .expect("slot application lock poisoned");
-        read(self.path_of(FILE).parent().expect("journal has a parent"))
+        read(self.path_of(FILE).parent().expect("journal has a parent"))?
+            .into_iter()
+            .map(|r| match r {
+                StoredSlotApplicationRequest::Legacy(r) => Ok(r),
+                _ => Err(malformed("unified WAL requires slot_application_requests")),
+            })
+            .collect()
     }
 
     /// Replays a contiguous inactive WAL suffix into a trusted, history-loaded DAG.
@@ -324,11 +491,11 @@ impl Store {
             .expect("slot application lock poisoned");
         let records = read(self.path_of(FILE).parent().expect("journal has a parent"))?;
         let next = state.binding().tip().next_round();
-        let boundary =
-            records.partition_point(|record| record.payload.certificate.decision.round < next);
+        let boundary = records
+            .partition_point(|record| record.decision().expect("decoded decision").round < next);
         if boundary > 0 {
             let record = &records[boundary - 1];
-            let decision = &record.payload.certificate.decision;
+            let decision = record.decision()?;
             let tip = state.binding().tip();
             if decision.round.checked_add(1) != Some(next)
                 || decision.id()? != *tip.previous_id()
@@ -337,15 +504,27 @@ impl Store {
                 || decision.epoch != tip.epoch()
                 || decision.after_len != tip.order_len()
                 || decision.after_root != *tip.order_root()
-                || state.binding().carrier() != Some(&record.carrier)
+                || state.binding().carrier() != Some(record.carrier())
             {
                 return Err(malformed("slot application WAL checkpoint mismatch"));
             }
         }
+        if boundary > 0 {
+            // A matching checkpoint does not establish durability after an uncertain sync.
+            self.sync()?;
+            let root = self.path_of(FILE);
+            let file = OpenOptions::new().append(true).open(&root)?;
+            barrier(&file, root.parent().expect("journal has a parent"))?;
+        }
         let mut applied = Vec::new();
         for record in &records[boundary..] {
-            require_stored_history(self, state, &record.payload, &record.carrier)?;
-            let prepared = state.prepare(&record.payload, &record.carrier)?;
+            require_stored_history(self, state, record.decision()?, record.carrier())?;
+            let prepared = match record {
+                StoredSlotApplicationRequest::Legacy(r) => state.prepare(&r.payload, &r.carrier)?,
+                StoredSlotApplicationRequest::Agreement { proof, carrier, .. } => {
+                    state.prepare_agreement(proof, carrier)?
+                }
+            };
             self.sync()?;
             append_synced(
                 self.path_of(FILE).parent().expect("journal has a parent"),

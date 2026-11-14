@@ -2,7 +2,13 @@ use super::*;
 use crate::{SlotAgreementProof, SlotAgreementProofEntry, SlotAgreementProofPol};
 
 fn fixture() -> (Fixture, SlotAgreementProof, VertexId, SlotAgreementBinding) {
-    let (mut f, proposal, plain, tip) = direct_slot_proposal(true);
+    fixture_with_decision(true)
+}
+
+fn fixture_with_decision(
+    commit: bool,
+) -> (Fixture, SlotAgreementProof, VertexId, SlotAgreementBinding) {
+    let (mut f, proposal, plain, tip) = direct_slot_proposal(commit);
     let refs = f.ids(LEADER_ROUND + 1);
     for a in 1..f.count() {
         let v = vertex(&f, a, LEADER_ROUND + 2, refs.clone());
@@ -74,6 +80,97 @@ fn fixture() -> (Fixture, SlotAgreementProof, VertexId, SlotAgreementBinding) {
     let b = SlotAgreementBinding::from_checkpoint(tip, Some(f.ids(0)[0].clone())).unwrap();
     (f, p, c, b)
 }
+#[test]
+fn unified_owned_skip_application() {
+    let (f, p, c, b) = fixture_with_decision(false);
+    let selected = &p.entries.last().unwrap().proposal.decision;
+    let binding =
+        crate::SlotDecisionBinding::from_checkpoint(b.tip().clone(), b.carrier().cloned()).unwrap();
+    let mut dag = crate::CertifiedDag::from_checkpoint(f.dag, binding).unwrap();
+    let before_root = dag.dag().commit_root();
+    let before_skips = dag.dag.skipped.len();
+    drop(dag.prepare_agreement(&p, &c).unwrap());
+    assert_eq!(dag.dag.skipped.len(), before_skips);
+    assert_eq!(
+        dag.prepare_agreement(&p, &c).unwrap().apply(),
+        crate::SlotApplicationResult::Applied {
+            round: selected.round,
+            decision: Decision::Skip
+        }
+    );
+    assert_eq!(dag.dag.skipped.len(), before_skips + 1);
+    assert_eq!(dag.dag.skipped.last().unwrap().round, selected.round);
+    assert_eq!(dag.dag().commit_root(), before_root);
+    assert_eq!(dag.binding().tip().previous_id(), &selected.id().unwrap());
+    assert_eq!(
+        dag.prepare_agreement(&p, &c).unwrap().apply(),
+        crate::SlotApplicationResult::AlreadyApplied {
+            round: selected.round
+        }
+    );
+    assert_eq!(dag.dag.skipped.len(), before_skips + 1);
+}
+
+#[test]
+fn unified_owned_apply_drop_retry_and_errors() {
+    let (mut f, mut p, _, b) = fixture();
+    let c = extend(&mut f, &mut p, &b, LEADER_ROUND + 8, 3, false);
+    let expected = f.dag.inspect_slot_agreement_proof(&p, &c, &b).unwrap();
+    let selected = p.entries.last().unwrap().proposal.decision.clone();
+    let binding =
+        crate::SlotDecisionBinding::from_checkpoint(b.tip().clone(), b.carrier().cloned()).unwrap();
+    let mut dag = crate::CertifiedDag::from_checkpoint(f.dag, binding.clone()).unwrap();
+    let before_order = dag.dag().order_len();
+    let before_root = dag.dag().commit_root();
+    drop(dag.prepare_agreement(&p, &c).unwrap());
+    assert_eq!(dag.binding(), &binding);
+    assert_eq!(dag.dag().order_len(), before_order);
+    assert_eq!(dag.dag().commit_root(), before_root);
+
+    let mut bad = p.clone();
+    bad.entries.clear();
+    assert!(dag.prepare_agreement(&bad, &c).is_err());
+    let mut bad = p.clone();
+    bad.entries[0].view_carrier = c.clone();
+    assert!(dag.prepare_agreement(&bad, &c).is_err());
+    let mut wrong_carrier = c.clone();
+    wrong_carrier.digest[0] ^= 1;
+    assert!(dag.prepare_agreement(&p, &wrong_carrier).is_err());
+    assert_eq!(dag.binding(), &binding);
+    assert_eq!(dag.dag().commit_root(), before_root);
+
+    assert_eq!(
+        dag.prepare_agreement(&p, &c).unwrap().apply(),
+        crate::SlotApplicationResult::Applied {
+            round: selected.round,
+            decision: expected
+        }
+    );
+    assert_eq!(dag.binding().tip().next_round(), selected.round + 1);
+    assert_eq!(dag.binding().tip().previous_id(), &selected.id().unwrap());
+    assert_eq!(dag.binding().tip().order_len(), selected.after_len);
+    assert_eq!(dag.binding().tip().order_root(), &selected.after_root);
+    assert_eq!(dag.dag().order_len() as u64, selected.after_len);
+    assert_eq!(dag.dag().commit_root(), selected.after_root);
+    assert_eq!(dag.binding().carrier(), Some(&c));
+    let applied = dag.binding().clone();
+    assert_eq!(
+        dag.prepare_agreement(&p, &c).unwrap().apply(),
+        crate::SlotApplicationResult::AlreadyApplied {
+            round: selected.round
+        }
+    );
+    assert!(dag.prepare_agreement(&p, &wrong_carrier).is_err());
+    assert!(dag.prepare_agreement(&bad, &c).is_err());
+    assert_eq!(dag.binding(), &applied);
+    assert_eq!(
+        dag.prepare_agreement(&p, &c).unwrap().apply(),
+        crate::SlotApplicationResult::AlreadyApplied {
+            round: selected.round
+        }
+    );
+}
+
 #[test]
 fn unified_signed_view_zero_and_codec() {
     let (f, p, c, b) = fixture();

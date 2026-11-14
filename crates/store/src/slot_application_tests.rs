@@ -797,3 +797,216 @@ fn staged_drop_and_activation_route_clones_without_changing_signing_lock() {
         vec![fixture.payload.certificate.decision]
     );
 }
+
+fn unified_fixture(commit: bool) -> (Fixture, validator::SlotAgreementProof, VertexId) {
+    use validator::slot_agreement::{
+        AgreementPhase, AgreementQc, AgreementValue, AgreementView, AgreementVote,
+    };
+    use validator::{
+        SlotAgreementProof, SlotAgreementProofEntry, SlotAgreementProofPol,
+        SlotAgreementVotePayload, SlotAgreementVoteWitness,
+    };
+    let mut f = Fixture::new(commit);
+    f.vertices.retain(|v| v.round < 4);
+    let qc = |phase| {
+        let vote = AgreementVote {
+            context: f.binding.tip().clone(),
+            view: AgreementView(0),
+            phase,
+            value: AgreementValue::Decision(f.payload.proposal.decision.clone()),
+        };
+        let bytes = vote.signing_payload(&f.set).unwrap();
+        let signatures = (0..3)
+            .map(|i| ValidatorSignature {
+                validator_id: f.set.validators[i].validator_id.clone(),
+                key_id: f.set.validators[i].keys[0].key_id.clone(),
+                signature: Ed25519Scheme.sign(&f.keys[i], &bytes).unwrap(),
+            })
+            .collect();
+        AgreementQc { vote, signatures }
+    };
+    let prevote = qc(AgreementPhase::Prevote);
+    let mut proof = SlotAgreementProof {
+        entries: vec![SlotAgreementProofEntry {
+            proposal: f.payload.proposal.clone(),
+            proposal_carrier: f.payload.proposal_carrier.clone(),
+            view: AgreementView(0),
+            view_carrier: f.carrier.clone(),
+            previous_pol: None,
+            pol: None,
+        }],
+        certificate: qc(AgreementPhase::Precommit),
+        votes: vec![],
+    };
+    let mut refs: Vec<_> = f
+        .vertices
+        .iter()
+        .filter(|v| v.round == 3)
+        .map(|v| v.id().unwrap())
+        .collect();
+    let proposer = validator::slot_agreement_view_proposer(&f.set, 1, AgreementView(0)).unwrap();
+    let author = f
+        .set
+        .validators
+        .iter()
+        .position(|v| v.validator_id == proposer)
+        .unwrap();
+    for round in 4..=8 {
+        let mut hashes = [[9; 32]; 4];
+        if round == 4 {
+            hashes[author] = proof.view_digest(0).unwrap();
+        }
+        if round == 5 || round == 7 {
+            let certificate = if round == 5 {
+                &prevote
+            } else {
+                &proof.certificate
+            };
+            for (i, signature) in certificate.signatures.iter().enumerate() {
+                let payload = SlotAgreementVotePayload {
+                    vote: certificate.vote.clone(),
+                    signature: signature.clone(),
+                    prerequisite: if round == 5 {
+                        proof.entries[0].view_carrier.clone()
+                    } else {
+                        proof.entries[0].pol.as_ref().unwrap().carrier.clone()
+                    },
+                };
+                hashes[i] = payload.digest(&f.set).unwrap();
+                let vertex = signed_vertex(&f.keys, i, round, refs.clone(), hashes[i]);
+                let witness = SlotAgreementVoteWitness {
+                    payload,
+                    carrier: vertex.id().unwrap(),
+                };
+                if round == 5 {
+                    proof.entries[0]
+                        .pol
+                        .get_or_insert(SlotAgreementProofPol {
+                            certificate: prevote.clone(),
+                            votes: vec![],
+                            carrier: f.carrier.clone(),
+                        })
+                        .votes
+                        .push(witness);
+                } else {
+                    proof.votes.push(witness);
+                }
+            }
+        }
+        if round == 6 {
+            hashes[0] = proof.pol_digest(0, &f.set).unwrap();
+        }
+        if round == 8 {
+            hashes[0] = proof.digest(&f.set).unwrap();
+        }
+        let mut next = vec![];
+        for (i, hash) in hashes.into_iter().enumerate() {
+            let v = signed_vertex(&f.keys, i, round, refs.clone(), hash);
+            next.push(v.id().unwrap());
+            f.vertices.push(v);
+        }
+        if round == 4 {
+            proof.entries[0].view_carrier = next[author].clone();
+        }
+        if round == 6 {
+            proof.entries[0].pol.as_mut().unwrap().carrier = next[0].clone();
+        }
+        refs = next;
+    }
+    (f, proof, refs[0].clone())
+}
+
+#[test]
+fn unified_signed_apply_reopen_retry_and_uncertain_sync() {
+    for commit in [true, false] {
+        let (mut f, proof, carrier) = unified_fixture(commit);
+        let refs = f
+            .vertices
+            .iter()
+            .filter(|v| v.round == 8)
+            .map(|v| v.id().unwrap())
+            .collect();
+        let legacy = signed_vertex(&f.keys, 0, 9, refs, f.payload.digest().unwrap());
+        f.carrier = legacy.id().unwrap();
+        f.vertices.push(legacy);
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        f.persist(&store);
+        let mut state = f.state(f.vertices.clone());
+        let baseline = state.binding().clone();
+        assert!(
+            store
+                .apply_slot_agreement_with_barrier(&mut state, &proof, &carrier, |_, _| Err(
+                    std::io::Error::other("uncertain sync").into()
+                ))
+                .is_err()
+        );
+        assert_eq!(state.binding(), &baseline);
+        assert_eq!(store.slot_application_requests().unwrap().len(), 1);
+        assert!(
+            store
+                .replay_slot_applications_with_barrier(&mut state, |_, _| Err(
+                    std::io::Error::other("still uncertain").into()
+                ))
+                .is_err()
+        );
+        assert_eq!(state.binding(), &baseline);
+        store
+            .apply_slot_agreement(&mut state, &proof, &carrier)
+            .unwrap();
+        assert_eq!(
+            store
+                .apply_slot_agreement(&mut state, &proof, &carrier)
+                .unwrap(),
+            SlotApplicationResult::AlreadyApplied { round: 1 }
+        );
+        let mut wrong = carrier.clone();
+        wrong.digest[0] ^= 1;
+        assert!(
+            store
+                .apply_slot_agreement(&mut state, &proof, &wrong)
+                .is_err()
+        );
+        let mut wrong_proof = proof.clone();
+        wrong_proof.certificate.vote.context = SlotDecisionTip::from_checkpoint(
+            b"wrong-chain".to_vec(),
+            &f.set,
+            1,
+            [7; 32],
+            0,
+            baseline.tip().order_root().to_owned(),
+        )
+        .unwrap();
+        assert!(
+            store
+                .apply_slot_agreement(&mut state, &wrong_proof, &carrier)
+                .is_err()
+        );
+        // The legacy format cannot introduce another request at this slot.
+        let mut legacy_state = f.state(f.vertices.clone());
+        assert!(
+            store
+                .apply_slot_certificate(&mut legacy_state, &f.payload, &f.carrier)
+                .is_err()
+        );
+        let expected = state.binding().clone();
+        drop(store);
+        let store = Store::open(&dir.0).unwrap();
+        let mut recovered = f.state(store.vertices().unwrap());
+        assert_eq!(
+            store
+                .replay_slot_applications(&mut recovered)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(recovered.binding(), &expected);
+        assert_eq!(recovered.dag().commit_root(), state.dag().commit_root());
+        assert!(
+            store
+                .replay_slot_applications(&mut recovered)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}

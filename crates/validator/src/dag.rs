@@ -281,6 +281,63 @@ impl CertifiedDag {
             .inspect_slot_certificate(payload, carrier, &self.binding)?;
         let mut tip = self.binding.tip().clone();
         tip.advance_authorized(&payload.certificate, self.dag.set_for_round(round))?;
+        self.prepare_inspected(round, decision, tip, digest, carrier)
+    }
+
+    /// Validates a unified agreement proof without changing the owned DAG.
+    ///
+    /// As with [`Self::prepare`], the caller must durably persist the complete proof,
+    /// exact carrier, and supporting history before applying the returned plan.
+    /// Only the exact most recently applied proof digest and carrier are retriable.
+    ///
+    /// # Errors
+    /// Rejects invalid lineage, authorization, causal history, continuity, or skip metadata.
+    /// Every failure leaves the DAG, binding, and retry cache unchanged.
+    pub fn prepare_agreement<'a>(
+        &'a mut self,
+        proof: &crate::SlotAgreementProof,
+        carrier: &VertexId,
+    ) -> Result<PreparedSlotApplication<'a>, CryptoError> {
+        let selected = &proof
+            .entries
+            .last()
+            .ok_or_else(|| {
+                CryptoError::new(CryptoErrorKind::MalformedCertificate, "empty lineage")
+            })?
+            .proposal
+            .decision;
+        let round = selected.round;
+        let digest = proof.digest(self.dag.set_for_round(round))?;
+        if self
+            .last_event
+            .as_ref()
+            .is_some_and(|(last, previous)| *last == digest && previous == carrier)
+        {
+            return Ok(PreparedSlotApplication {
+                owner: self,
+                plan: SlotApplicationPlan::AlreadyApplied { round },
+            });
+        }
+        let binding = crate::SlotAgreementBinding::from_checkpoint(
+            self.binding.tip().clone(),
+            self.binding.carrier().cloned(),
+        )?;
+        let decision = self
+            .dag
+            .inspect_slot_agreement_proof(proof, carrier, &binding)?;
+        let mut tip = self.binding.tip().clone();
+        tip.advance_inspected(selected)?;
+        self.prepare_inspected(round, decision, tip, digest, carrier)
+    }
+
+    fn prepare_inspected<'a>(
+        &'a mut self,
+        round: u64,
+        decision: Decision,
+        tip: crate::SlotDecisionTip,
+        digest: [u8; 32],
+        carrier: &VertexId,
+    ) -> Result<PreparedSlotApplication<'a>, CryptoError> {
         if self.dag.skipped.iter().any(|entry| entry.round == round) {
             return Err(CryptoError::new(
                 CryptoErrorKind::MalformedCertificate,

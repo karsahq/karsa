@@ -396,7 +396,11 @@ impl SlotDecisionTip {
         set: &ValidatorSet,
     ) -> Result<(), CryptoError> {
         cert.verify(&self.chain_id, set)?;
-        let d = &cert.decision;
+        self.advance_inspected(&cert.decision)
+    }
+
+    // The caller must fully inspect authorization, causal binding, and effects first.
+    pub(crate) fn advance_inspected(&mut self, d: &SlotDecision) -> Result<(), CryptoError> {
         if d.validator_set_id != self.set_id || d.epoch != self.epoch {
             return Err(malformed("slot tip pinned set or epoch mismatch"));
         }

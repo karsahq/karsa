@@ -44,7 +44,7 @@ mod slot_application_tests;
 mod slot_decision_journal;
 
 pub use slot_agreement_journal::{DurableSlotAgreement, SlotAgreementBootstrap};
-pub use slot_application_journal::StoredSlotApplication;
+pub use slot_application_journal::{StoredSlotApplication, StoredSlotApplicationRequest};
 
 use crypto::CryptoError;
 use crypto::encoding::{Decoder, Encoder};
