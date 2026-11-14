@@ -113,6 +113,198 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.root);
     }
 }
+#[test]
+fn agreement_event_validation_rejection_retry_and_decision_checks() {
+    let f = Fixture::new();
+    let store = Store::open(&f.root).unwrap();
+    let mut owner = store.begin_slot_agreement(f.bootstrap.clone()).unwrap();
+    let path = f.root.join(slot_agreement_journal::FILE);
+    let before = fs::read(&path).unwrap();
+    let mut seen = Vec::new();
+    assert!(
+        owner
+            .apply_validated(
+                1,
+                f.proposal(),
+                |input| {
+                    seen.push(input.clone());
+                    reject(&f.decision)
+                },
+                |_| Ok(())
+            )
+            .is_err()
+    );
+    assert_eq!(seen, vec![f.proposal()]);
+    assert_eq!(owner.sequence(), 0);
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(
+        owner
+            .apply_validated(1, f.proposal(), |_| Ok(()), reject)
+            .is_err()
+    );
+    assert_eq!(owner.sequence(), 0);
+    assert_eq!(fs::read(&path).unwrap(), before);
+    let result = owner
+        .apply_validated(1, f.proposal(), |_| Ok(()), |_| Ok(()))
+        .unwrap();
+    let persisted = fs::read(&path).unwrap();
+    let mut calls = 0;
+    assert!(
+        owner
+            .apply_validated(
+                1,
+                f.proposal(),
+                |input| {
+                    calls += 1;
+                    assert_eq!(input, &f.proposal());
+                    reject(&f.decision)
+                },
+                |_| Ok(())
+            )
+            .is_err()
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(owner.sequence(), 1);
+    assert_eq!(fs::read(&path).unwrap(), persisted);
+    assert_eq!(
+        owner
+            .apply_validated(1, f.proposal(), |_| Ok(()), |_| Ok(()))
+            .unwrap(),
+        result
+    );
+}
+
+#[test]
+fn agreement_event_recovery_checks_history_and_exact_qc() {
+    let f = Fixture::new();
+    let store = Store::open(&f.root).unwrap();
+    let mut owner = store.begin_slot_agreement(f.bootstrap.clone()).unwrap();
+    let inputs = vec![
+        f.proposal(),
+        f.qc(AgreementPhase::Prevote),
+        f.qc(AgreementPhase::Precommit),
+    ];
+    for (index, input) in inputs.iter().enumerate() {
+        owner
+            .apply_validated(
+                index as u64 + 1,
+                input.clone(),
+                |actual| {
+                    assert_eq!(actual, input);
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+    }
+    let before = fs::read(f.root.join(slot_agreement_journal::FILE)).unwrap();
+    let mut seen = Vec::new();
+    assert!(
+        store
+            .recover_slot_agreement_validated(
+                f.bootstrap.clone(),
+                |input| {
+                    seen.push(input.clone());
+                    if input == &inputs[1] {
+                        reject(&f.decision)
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| Ok(())
+            )
+            .is_err()
+    );
+    assert_eq!(seen, inputs[..2]);
+    assert_eq!(owner.sequence(), 3);
+    assert_eq!(
+        fs::read(f.root.join(slot_agreement_journal::FILE)).unwrap(),
+        before
+    );
+    let mut seen = Vec::new();
+    let recovered = store
+        .recover_slot_agreement_validated(
+            f.bootstrap.clone(),
+            |input| {
+                seen.push(input.clone());
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(seen, inputs);
+    assert_eq!(recovered.sequence(), 3);
+    assert!(
+        store
+            .recover_slot_agreement_validated(f.bootstrap.clone(), |_| Ok(()), reject)
+            .is_err()
+    );
+}
+
+#[test]
+fn agreement_event_validation_includes_timeout_view_and_pol() {
+    let f = Fixture::new();
+    let store = Store::open(&f.root).unwrap();
+    let mut owner = store.begin_slot_agreement(f.bootstrap.clone()).unwrap();
+    let event = timeout();
+    assert!(
+        owner
+            .apply_validated(
+                1,
+                event.clone(),
+                |actual| {
+                    assert_eq!(actual, &event);
+                    reject(&f.decision)
+                },
+                |_| panic!("timeout has no decision")
+            )
+            .is_err()
+    );
+    assert_eq!(owner.sequence(), 0);
+    owner
+        .apply_validated(
+            1,
+            event.clone(),
+            |_| Ok(()),
+            |_| panic!("timeout has no decision"),
+        )
+        .unwrap();
+    let AgreementInput::Evidence { qc } = f.qc(AgreementPhase::Prevote) else {
+        unreachable!()
+    };
+    let proposal = AgreementInput::Propose {
+        view: AgreementView(1),
+        decision: f.decision.clone(),
+        pol: Some(qc),
+    };
+    assert!(
+        owner
+            .apply_validated(
+                2,
+                proposal.clone(),
+                |actual| {
+                    assert_eq!(actual, &proposal);
+                    reject(&f.decision)
+                },
+                |_| Ok(())
+            )
+            .is_err()
+    );
+    assert_eq!(owner.sequence(), 1);
+    let mut seen = Vec::new();
+    store
+        .recover_slot_agreement_validated(
+            f.bootstrap.clone(),
+            |actual| {
+                seen.push(actual.clone());
+                Ok(())
+            },
+            |_| panic!("timeout has no decision"),
+        )
+        .unwrap();
+    assert_eq!(seen, vec![event]);
+}
+
 fn timeout() -> AgreementInput {
     AgreementInput::Timeout {
         view: AgreementView(0),

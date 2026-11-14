@@ -1,13 +1,9 @@
 //! Concrete signed DAG integration, not a live network driver.
 //!
-//! The semantic callback receives only a decision and captures the latest
-//! authenticated lineage supplied to each harness phase. During recovery it
-//! rechecks that lineage and decision, but cannot bind each historical WAL event
-//! to its exact view/POL. These tests do not establish event-level lineage
-//! authentication during recovery.
 use crate::slot_application_tests::{Fixture, TempDir, signed_vertex};
 use crate::{SlotAgreementBootstrap, Store};
 use crypto::scheme::Ed25519Scheme;
+use std::collections::BTreeMap;
 use validator::slot_agreement::{
     AgreementInput, AgreementPhase, AgreementQc, AgreementValue, AgreementView,
 };
@@ -16,11 +12,49 @@ use validator::{
     SlotAgreementVotePayload, SlotAgreementVoteWitness, SlotApplicationResult, ValidatorSignature,
 };
 
-// Each signature comes only from a successful durable apply. The callback checks
-// the captured lineage and exact decision, subject to the module-level limitation.
+// Lineages are supplied externally, not persisted as authenticated DAG bytes in the WAL.
+fn validate_event(
+    dag: &validator::Dag,
+    binding: &validator::SlotAgreementBinding,
+    history: &BTreeMap<AgreementView, SlotAgreementViewLineage>,
+    event: &AgreementInput,
+) -> Result<(), crypto::CryptoError> {
+    let invalid = || {
+        crypto::CryptoError::new(
+            crypto::CryptoErrorKind::MalformedCertificate,
+            "event does not match authenticated historical lineage",
+        )
+    };
+    let view = match event {
+        AgreementInput::Propose { view, .. } => *view,
+        AgreementInput::Evidence { qc } => qc.vote.view,
+        // The reducer checks exact view and phase progression.
+        AgreementInput::Timeout { .. } | AgreementInput::AdvanceView { .. } => return Ok(()),
+    };
+    let lineage = history.get(&view).ok_or_else(invalid)?;
+    let authenticated = dag.inspect_slot_agreement_view_lineage(lineage, binding)?;
+    match event {
+        AgreementInput::Propose { .. } if event == &authenticated => Ok(()),
+        AgreementInput::Evidence { qc } => {
+            let pol = lineage
+                .entries
+                .last()
+                .and_then(|entry| entry.pol.as_ref())
+                .ok_or_else(invalid)?;
+            if qc.vote.phase != AgreementPhase::Prevote || qc != &pol.certificate {
+                return Err(invalid());
+            }
+            Ok(())
+        }
+        _ => Err(invalid()),
+    }
+}
+
+// Each signature comes only from a successful durable apply.
 fn emitted_qc(
     f: &Fixture,
     lineage: &SlotAgreementViewLineage,
+    history: &BTreeMap<AgreementView, SlotAgreementViewLineage>,
     prevote: Option<&AgreementQc>,
     dirs: &[TempDir],
     view: AgreementView,
@@ -42,11 +76,9 @@ fn emitted_qc(
             decision, &proposal.decision,
             "only the exact proposal is accepted"
         );
-        state
-            .dag()
-            .inspect_slot_agreement_view_lineage(lineage, &binding)
-            .map(|_| ())
+        Ok(())
     };
+    let validate = |event: &AgreementInput| validate_event(state.dag(), &binding, history, event);
     let mut votes = Vec::new();
     let mut signatures = Vec::new();
     let members = if view.0 == 0 { 0..3 } else { 1..4 };
@@ -58,78 +90,56 @@ fn emitted_qc(
             set: f.set.clone(),
             local_validator: f.set.validators[id].validator_id.clone(),
         };
-        if prevote.is_some() || (view.0 > 0 && id < 3) {
-            let mut unauthenticated = lineage.clone();
-            let carrier = &lineage.entries.last().unwrap().view_carrier;
-            let original = f
-                .vertices
-                .iter()
-                .find(|v| v.id().unwrap() == *carrier)
+        if view.0 > 0 && id < 3 {
+            // Latest lineage is authentic, but cannot authorize the earlier WAL proposal.
+            state
+                .dag()
+                .inspect_slot_agreement_view_lineage(lineage, &binding)
                 .unwrap();
-            let author = f
-                .set
-                .validators
-                .iter()
-                .position(|v| v.validator_id == carrier.author)
-                .unwrap();
-            let mut wrong_digest = lineage.view_digest(lineage.entries.len() - 1).unwrap();
-            wrong_digest[0] ^= 1;
-            // Keep the elected author, causal references and exact round ordering;
-            // only the signed payload commitment is wrong.
-            let replacement = signed_vertex(
-                &f.keys,
-                author,
-                carrier.round,
-                original.references.clone(),
-                wrong_digest,
+            let mut wrong_history = history.clone();
+            wrong_history.insert(AgreementView(0), lineage.clone());
+            assert!(
+                store
+                    .recover_slot_agreement_validated(
+                        bootstrap.clone(),
+                        |event| validate_event(state.dag(), &binding, &wrong_history, event),
+                        inspect,
+                    )
+                    .is_err()
             );
-            unauthenticated.entries.last_mut().unwrap().view_carrier = replacement.id().unwrap();
-            let mut vertices = f.vertices.clone();
-            vertices.retain(|v| v.round != carrier.round || v.author != carrier.author);
-            vertices.push(replacement);
-            let wrong_state = f.state(vertices);
-            let recovery = store.recover_slot_agreement(bootstrap.clone(), |decision| {
-                assert_eq!(decision, &proposal.decision);
-                wrong_state
-                    .dag()
-                    .inspect_slot_agreement_view_lineage(&unauthenticated, &binding)
-                    .map(|_| ())
-            });
-            let error = match recovery {
-                Ok(_) => panic!("recovery must reject the wrong captured lineage commitment"),
-                Err(error) => error,
-            };
-            let crate::StoreError::Decode(error) = error else {
-                panic!("expected lineage validation failure, got {error}");
-            };
-            assert_eq!(error.detail(), "slot payload is not bound to its carrier");
         }
         let mut session = store
-            .recover_slot_agreement(bootstrap.clone(), inspect)
+            .recover_slot_agreement_validated(bootstrap.clone(), validate, inspect)
             .unwrap();
         let result = if let Some(qc) = prevote {
             let sequence = session.sequence();
             // A real current-view prevote QC is not an earlier POL. Reject
             // it before the repeated-prevote guard, without consuming sequence.
             let error = session
-                .apply(
+                .apply_validated(
                     sequence + 1,
                     AgreementInput::Propose {
                         view,
                         decision: proposal.decision.clone(),
                         pol: Some(qc.clone()),
                     },
+                    validate,
                     inspect,
                 )
                 .unwrap_err();
             let crate::StoreError::Decode(error) = error else {
                 panic!("expected POL validation failure, got {error}");
             };
-            assert_eq!(error.detail(), "POL must match proposal in an earlier view");
+            assert_eq!(
+                error.detail(),
+                "event does not match authenticated historical lineage"
+            );
             assert_eq!(session.sequence(), sequence);
             let input = AgreementInput::Evidence { qc: qc.clone() };
             let sequence = session.sequence() + 1;
-            let persisted = session.apply(sequence, input.clone(), inspect).unwrap();
+            let persisted = session
+                .apply_validated(sequence, input.clone(), validate, inspect)
+                .unwrap();
             assert_eq!(
                 persisted.vote.as_ref().unwrap().phase,
                 AgreementPhase::Precommit
@@ -138,9 +148,13 @@ fn emitted_qc(
             drop(session);
             drop(store);
             let reopened = Store::open(&dir.0).unwrap();
-            let mut recovered = reopened.recover_slot_agreement(bootstrap, inspect).unwrap();
+            let mut recovered = reopened
+                .recover_slot_agreement_validated(bootstrap, validate, inspect)
+                .unwrap();
             assert_eq!(recovered.sequence(), sequence);
-            let retried = recovered.apply(sequence, input, inspect).unwrap();
+            let retried = recovered
+                .apply_validated(sequence, input, validate, inspect)
+                .unwrap();
             assert_eq!(retried.vote, persisted.vote);
             assert_eq!(
                 recovered.sequence(),
@@ -155,11 +169,12 @@ fn emitted_qc(
                 for from in 0..view.0 {
                     let sequence = session.sequence() + 1;
                     session
-                        .apply(
+                        .apply_validated(
                             sequence,
                             AgreementInput::AdvanceView {
                                 from: AgreementView(from),
                             },
+                            validate,
                             inspect,
                         )
                         .unwrap();
@@ -170,7 +185,11 @@ fn emitted_qc(
                     decision: proposal.decision.clone(),
                     pol: None,
                 };
-                assert!(session.apply(sequence, stale, inspect).is_err());
+                assert!(
+                    session
+                        .apply_validated(sequence, stale, validate, inspect)
+                        .is_err()
+                );
                 // This is cryptographically valid durable evidence, but its
                 // precommit phase cannot authorize a reproposal as a POL.
                 let wrong_pol = wrong_pol
@@ -180,13 +199,14 @@ fn emitted_qc(
                 assert_eq!(wrong_pol.vote.phase, AgreementPhase::Precommit);
                 assert!(
                     session
-                        .apply(
+                        .apply_validated(
                             sequence,
                             AgreementInput::Propose {
                                 view,
                                 decision: proposal.decision.clone(),
                                 pol: Some(wrong_pol),
                             },
+                            validate,
                             inspect
                         )
                         .is_err()
@@ -196,7 +216,7 @@ fn emitted_qc(
                 drop(store);
                 let reopened = Store::open(&dir.0).unwrap();
                 session = reopened
-                    .recover_slot_agreement(bootstrap.clone(), inspect)
+                    .recover_slot_agreement_validated(bootstrap.clone(), validate, inspect)
                     .unwrap();
                 assert_eq!(
                     session.sequence(),
@@ -205,7 +225,7 @@ fn emitted_qc(
                 );
             }
             session
-                .apply(session.sequence() + 1, input.clone(), inspect)
+                .apply_validated(session.sequence() + 1, input.clone(), validate, inspect)
                 .unwrap()
         };
         let vote = result
@@ -282,6 +302,8 @@ fn reject_unauthorized_view(f: &Fixture, lineage: &SlotAgreementViewLineage) {
             .inspect_slot_agreement_view_lineage(&unauthorized, &binding)
             .map(|_| ())
     };
+    let history = BTreeMap::from([(AgreementView(0), unauthorized.clone())]);
+    let validate = |event: &AgreementInput| validate_event(state.dag(), &binding, &history, event);
     let dir = TempDir::new();
     let store = Store::open(&dir.0).unwrap();
     let bootstrap = SlotAgreementBootstrap {
@@ -293,13 +315,14 @@ fn reject_unauthorized_view(f: &Fixture, lineage: &SlotAgreementViewLineage) {
     // Even a caller bypassing the owned-input inspection cannot release a vote.
     assert!(
         session
-            .apply(
+            .apply_validated(
                 1,
                 AgreementInput::Propose {
                     view: AgreementView(0),
                     decision: f.payload.proposal.decision.clone(),
                     pol: None,
                 },
+                validate,
                 inspect,
             )
             .is_err()
@@ -308,7 +331,9 @@ fn reject_unauthorized_view(f: &Fixture, lineage: &SlotAgreementViewLineage) {
     drop(session);
     drop(store);
     let reopened = Store::open(&dir.0).unwrap();
-    let recovered = reopened.recover_slot_agreement(bootstrap, inspect).unwrap();
+    let recovered = reopened
+        .recover_slot_agreement_validated(bootstrap, validate, inspect)
+        .unwrap();
     assert_eq!(
         recovered.sequence(),
         0,
@@ -367,7 +392,8 @@ fn run(commit: bool, later_view: Option<AgreementView>) {
             })
             .unwrap();
     }
-    let prevote = emitted_qc(&f, &lineage, None, &dirs, AgreementView(0), None);
+    let mut history = BTreeMap::from([(AgreementView(0), lineage.clone())]);
+    let prevote = emitted_qc(&f, &lineage, &history, None, &dirs, AgreementView(0), None);
     assert_eq!(prevote.vote.phase, AgreementPhase::Prevote);
     let mut proof = SlotAgreementProof {
         entries: lineage.entries.clone(),
@@ -407,17 +433,38 @@ fn run(commit: bool, later_view: Option<AgreementView>) {
                 next.iter().find(|v| v.author == author).unwrap().clone();
             refs = next;
             proof.entries = lineage.entries.clone();
+            history.insert(view, lineage.clone());
         }
         let prevote = if entry == 0 {
             prevote.clone()
         } else {
-            emitted_qc(&f, &lineage, None, &dirs, view, Some(&proof.certificate))
+            emitted_qc(
+                &f,
+                &lineage,
+                &history,
+                None,
+                &dirs,
+                view,
+                Some(&proof.certificate),
+            )
         };
         for offset in 1..=4 {
             let round = base_round + offset;
             let mut hashes = [[9; 32]; 4];
             if offset == 3 {
-                proof.certificate = emitted_qc(&f, &lineage, Some(&prevote), &dirs, view, None);
+                let authenticated_pol = SlotAgreementViewLineage {
+                    entries: proof.entries.clone(),
+                };
+                history.insert(view, authenticated_pol.clone());
+                proof.certificate = emitted_qc(
+                    &f,
+                    &authenticated_pol,
+                    &history,
+                    Some(&prevote),
+                    &dirs,
+                    view,
+                    None,
+                );
                 assert_eq!(proof.certificate.vote.phase, AgreementPhase::Precommit);
             }
             if offset == 1 || offset == 3 {

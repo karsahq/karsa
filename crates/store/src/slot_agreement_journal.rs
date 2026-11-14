@@ -310,6 +310,40 @@ impl Store {
     pub(super) fn recover_slot_agreement_with_barrier(
         &self,
         bootstrap: SlotAgreementBootstrap,
+        validate: impl FnMut(&SlotDecision) -> Result<(), CryptoError>,
+        barrier: impl FnMut(&File, &Path) -> Result<(), StoreError>,
+    ) -> Result<DurableSlotAgreement, StoreError> {
+        self.recover_slot_agreement_validated_with_barrier(bootstrap, |_| Ok(()), validate, barrier)
+    }
+
+    /// Replays each exact canonical event through an external semantic validator.
+    ///
+    /// The input callback sees the persisted view, phase/QC and exact POL, not a
+    /// reconstructed latest lineage. Decision validation remains mandatory through
+    /// reducer preparation. Both callbacks run under the root signing mutex and
+    /// MUST NOT reenter either journal, even through a store clone. External callback
+    /// side effects cannot be rolled back; failure returns no owner.
+    ///
+    /// # Errors
+    /// Returns input/decision validation, replay, bootstrap, WAL or durability errors.
+    pub fn recover_slot_agreement_validated(
+        &self,
+        bootstrap: SlotAgreementBootstrap,
+        validate_input: impl FnMut(&AgreementInput) -> Result<(), CryptoError>,
+        validate_decision: impl FnMut(&SlotDecision) -> Result<(), CryptoError>,
+    ) -> Result<DurableSlotAgreement, StoreError> {
+        self.recover_slot_agreement_validated_with_barrier(
+            bootstrap,
+            validate_input,
+            validate_decision,
+            sync,
+        )
+    }
+
+    fn recover_slot_agreement_validated_with_barrier(
+        &self,
+        bootstrap: SlotAgreementBootstrap,
+        mut validate_input: impl FnMut(&AgreementInput) -> Result<(), CryptoError>,
         mut validate: impl FnMut(&SlotDecision) -> Result<(), CryptoError>,
         mut barrier: impl FnMut(&File, &Path) -> Result<(), StoreError>,
     ) -> Result<DurableSlotAgreement, StoreError> {
@@ -328,6 +362,7 @@ impl Store {
         barrier(&file, &root)?;
         let mut last = None;
         for input in &journal.inputs {
+            validate_input(input)?;
             let prepared = reducer.prepare(input.clone(), &mut validate)?;
             barrier(&file, &root)?;
             last = Some((input.clone(), prepared.apply()));
@@ -392,6 +427,46 @@ impl DurableSlotAgreement {
         &mut self,
         sequence: u64,
         input: AgreementInput,
+        validate: impl FnMut(&SlotDecision) -> Result<(), CryptoError>,
+        write: impl FnMut(&mut File, &[u8]) -> Result<(), StoreError>,
+        barrier: impl FnMut(&File, &Path) -> Result<(), StoreError>,
+    ) -> Result<AgreementTransitionResult, StoreError> {
+        self.apply_validated_with_io(sequence, input, |_| Ok(()), validate, write, barrier)
+    }
+
+    /// Validates the exact event before persistence or output, including exact retries.
+    ///
+    /// The callback receives the actual view, phase/QC and POL, including timeouts.
+    /// Both callbacks run outside the root mutex and may reenter via another owner;
+    /// the WAL tip is rechecked afterward. Callback side effects cannot be rolled
+    /// back. Decision validation still runs through reducer preparation for new
+    /// events; retries retain the already prepared original result.
+    ///
+    /// # Errors
+    /// Returns the same errors as `apply`, plus input validation failures. Validation
+    /// failure does not change this owner or append a record.
+    pub fn apply_validated(
+        &mut self,
+        sequence: u64,
+        input: AgreementInput,
+        validate_input: impl FnMut(&AgreementInput) -> Result<(), CryptoError>,
+        validate_decision: impl FnMut(&SlotDecision) -> Result<(), CryptoError>,
+    ) -> Result<AgreementTransitionResult, StoreError> {
+        self.apply_validated_with_io(
+            sequence,
+            input,
+            validate_input,
+            validate_decision,
+            |file, bytes| Ok(file.write_all(bytes)?),
+            sync,
+        )
+    }
+
+    fn apply_validated_with_io(
+        &mut self,
+        sequence: u64,
+        input: AgreementInput,
+        mut validate_input: impl FnMut(&AgreementInput) -> Result<(), CryptoError>,
         mut validate: impl FnMut(&SlotDecision) -> Result<(), CryptoError>,
         mut write: impl FnMut(&mut File, &[u8]) -> Result<(), StoreError>,
         mut barrier: impl FnMut(&File, &Path) -> Result<(), StoreError>,
@@ -405,6 +480,7 @@ impl DurableSlotAgreement {
             return Err(malformed("incorrect agreement sequence or retry"));
         }
         let body = input.encode(&self.bootstrap.set)?;
+        validate_input(&input)?;
         let prepared = if retry {
             None
         } else {
