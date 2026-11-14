@@ -35,6 +35,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 mod slot_agreement_journal;
 #[cfg(test)]
+mod slot_agreement_signing_tests;
+#[cfg(test)]
 mod slot_agreement_tests;
 mod slot_application_journal;
 #[cfg(test)]

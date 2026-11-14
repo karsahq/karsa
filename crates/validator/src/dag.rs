@@ -1515,6 +1515,55 @@ impl Dag {
         Ok(decision)
     }
 
+    /// Inspects an inactive final agreement QC and its complete retained causal cone.
+    ///
+    /// Checks direct proposal evidence, trusted predecessor ancestry, exact payload
+    /// binding and final QC signatures against the trusted binding context. Pruned
+    /// predecessor contents remain trusted, as with the proposal inspector.
+    /// This is read-only: no signing, application, WAL or checkpoint advancement.
+    /// Intermediate prevote/POL causal carriers are NOT proven; this API is not
+    /// sufficient for live activation. Work scales with both complete retained
+    /// cones and committed history; callers must budget it independently of wire bounds.
+    ///
+    /// # Errors
+    /// Rejects nonfinal QCs, context/effect/signature mismatches, invalid retained
+    /// history and unbound or noncausal proposal/predecessor/QC carriers.
+    pub fn inspect_slot_agreement_certificate(
+        &self,
+        payload: &crate::SlotAgreementCertificatePayload,
+        carrier: &VertexId,
+        binding: &crate::SlotAgreementBinding,
+    ) -> Result<Decision, CryptoError> {
+        let invalid =
+            |message: &str| CryptoError::new(CryptoErrorKind::MalformedCertificate, message);
+        let set = self.set_for_round(payload.proposal.decision.round);
+        let digest = payload.digest(set)?;
+        if carrier.round <= payload.proposal_carrier.round {
+            return Err(invalid("agreement QC carrier must follow its proposal"));
+        }
+        let (decision, proposal_causal) = self.inspect_slot_proposal_with_causal(
+            &payload.proposal,
+            &payload.proposal_carrier,
+            binding.tip(),
+        )?;
+        if let Some(previous) = binding.carrier()
+            && (previous.round >= payload.proposal_carrier.round
+                || !proposal_causal.contains(previous))
+        {
+            return Err(invalid(
+                "agreement proposal does not extend predecessor carrier",
+            ));
+        }
+        payload.certificate.verify(binding.tip(), set)?;
+        let causal = self.slot_causal_history(carrier, digest, &payload.proposal.decision)?;
+        if !causal.contains(&payload.proposal_carrier) {
+            return Err(invalid(
+                "agreement QC does not causally extend proposal carrier",
+            ));
+        }
+        Ok(decision)
+    }
+
     /// Number of held vertices in `round + 1` that vote for the leader of
     /// `round`.
     ///
@@ -2839,6 +2888,10 @@ mod tests {
             fixture.dag.try_commit(LEADER_ROUND).unwrap(),
             Decision::Undecided
         );
+    }
+
+    mod slot_agreement_certificate_tests {
+        include!("slot_agreement_certificate_tests.rs");
     }
 
     fn bind_slot_certificate(
