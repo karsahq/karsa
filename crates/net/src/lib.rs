@@ -525,6 +525,41 @@ impl Node {
         })
     }
 
+    /// Prepares a bounded plain proposal using the current exact reference selection.
+    ///
+    /// Holds exclusive access through authoring; preparation neither signs nor mutates the node.
+    /// # Errors
+    /// Rejects occupied rounds, invalid proposals, and invalid prospective causal cones.
+    pub fn prepare_slot_proposal(
+        &mut self,
+        proposal: &validator::SlotProposalEnvelope,
+        binding: &validator::SlotAgreementBinding,
+    ) -> Result<PreparedSlotCarrier<'_>, CryptoError> {
+        let vertex = self.unoccupied_prospective_vertex(proposal.digest()?)?;
+        self.dag
+            .inspect_slot_proposal_authoring_cone(&vertex, proposal, binding)?;
+        let mut prerequisites = match &proposal.evidence {
+            validator::SlotProposalEvidence::Direct { voters }
+            | validator::SlotProposalEvidence::ConservativeSkip { voters, .. } => voters.clone(),
+            validator::SlotProposalEvidence::IndirectCommit { anchor, support } => {
+                let mut ids = support.clone();
+                ids.push(anchor.clone());
+                ids
+            }
+        };
+        if let Some(previous) = binding.carrier() {
+            prerequisites.push(previous.clone());
+        }
+        prerequisites
+            .sort_by(|a, b| (a.round, &a.author, a.digest).cmp(&(b.round, &b.author, b.digest)));
+        prerequisites.dedup();
+        Ok(PreparedSlotCarrier {
+            node: self,
+            vertex,
+            prerequisites,
+        })
+    }
+
     /// Prepares a bounded POL carrier using the current exact reference selection.
     /// # Errors
     /// Propagates unified prospective evidence and cone inspection failures.
@@ -1224,6 +1259,159 @@ mod tests {
             assert!(prepared.author().unwrap().is_none());
             assert_eq!((node.round(), node.authored()), (existing.round, 0));
             assert_eq!(node.dag().get(existing.round, node.id()), Some(&existing));
+        }
+    }
+
+    fn plain_proposal_fixture() -> (
+        Vec<Node>,
+        validator::SlotProposalEnvelope,
+        validator::SlotAgreementBinding,
+    ) {
+        let mut nodes = test_nodes(4);
+        for _ in 0..3 {
+            let vertices: Vec<_> = nodes
+                .iter_mut()
+                .map(|node| node.author().unwrap().unwrap())
+                .collect();
+            for node in &mut nodes {
+                for vertex in &vertices {
+                    node.receive(vertex.clone()).unwrap();
+                }
+            }
+        }
+        let dag = nodes[0].dag();
+        let validator::Decision::Commit(history) = dag.inspect_commit(1).unwrap() else {
+            panic!("fixture must commit round one");
+        };
+        let tip = validator::SlotDecisionTip::from_checkpoint(
+            CHAIN_ID.to_vec(),
+            dag.set(),
+            1,
+            [7; 32],
+            0,
+            dag.commit_root(),
+        )
+        .unwrap();
+        let proposal = validator::SlotProposalEnvelope {
+            decision: validator::SlotDecision {
+                chain_id: CHAIN_ID.to_vec(),
+                validator_set_id: dag.set().id().unwrap(),
+                epoch: EPOCH,
+                round: 1,
+                previous: [7; 32],
+                before_len: 0,
+                before_root: dag.commit_root(),
+                after_len: history.len() as u64,
+                after_root: validator::commit_root(&history),
+                outcome: validator::SlotOutcome::Commit {
+                    leader: dag.leader(1).unwrap().id().unwrap(),
+                },
+            },
+            evidence: validator::SlotProposalEvidence::Direct {
+                voters: nodes[0].ids(2)[..3].to_vec(),
+            },
+        };
+        let binding =
+            validator::SlotAgreementBinding::from_checkpoint(tip, Some(nodes[0].ids(1)[0].clone()))
+                .unwrap();
+        (nodes, proposal, binding)
+    }
+
+    #[test]
+    fn prepared_plain_proposal_matches_actual_received_inspection() {
+        let (mut nodes, proposal, binding) = plain_proposal_fixture();
+        let node = &mut nodes[0];
+        let unsigned = node.prospective_vertex(proposal.digest().unwrap());
+        let expected = node
+            .dag()
+            .inspect_slot_proposal_authoring_cone(&unsigned, &proposal, &binding)
+            .unwrap();
+        let before = (node.round(), node.authored(), node.dag().order().to_vec());
+        let prepared = node.prepare_slot_proposal(&proposal, &binding).unwrap();
+        assert_eq!(prepared.unsigned(), &unsigned);
+        assert!(prepared.unsigned().signature.is_empty());
+        assert!(prepared.prerequisites.contains(binding.carrier().unwrap()));
+        assert_eq!(prepared.dag().order(), before.2);
+        let signed = prepared.author().unwrap().unwrap();
+        assert_eq!(signed.references, unsigned.references);
+        assert_eq!(signed.payload_hash, unsigned.payload_hash);
+        assert!(!signed.signature.is_empty());
+        assert_eq!(
+            (node.round(), node.authored()),
+            (before.0 + 1, before.1 + 1)
+        );
+        nodes[1].receive(signed.clone()).unwrap();
+        assert_eq!(
+            nodes[1]
+                .dag()
+                .inspect_slot_proposal_envelope(&proposal, &signed.id().unwrap(), binding.tip(),)
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn prepared_plain_proposal_rejections_do_not_mutate_or_sign() {
+        for case in 0..7 {
+            let (mut nodes, mut proposal, mut binding) = plain_proposal_fixture();
+            let node = &mut nodes[0];
+            match case {
+                0 => proposal.decision.chain_id.clear(),
+                1 => proposal.decision.after_root[0] ^= 1,
+                2 => {
+                    let validator::SlotProposalEvidence::Direct { voters } = &mut proposal.evidence
+                    else {
+                        unreachable!();
+                    };
+                    voters[0].digest[0] ^= 1;
+                }
+                3 => proposal.decision.previous[0] ^= 1,
+                4 => {
+                    let mut previous = binding.carrier().unwrap().clone();
+                    previous.digest[0] ^= 1;
+                    binding = validator::SlotAgreementBinding::from_checkpoint(
+                        binding.tip().clone(),
+                        Some(previous),
+                    )
+                    .unwrap();
+                }
+                5 => {
+                    node.set_floor(0);
+                }
+                6 => {
+                    node.author_with(proposal.digest().unwrap())
+                        .unwrap()
+                        .unwrap();
+                    node.set_round(3);
+                }
+                _ => unreachable!(),
+            }
+            let before = (
+                node.round(),
+                node.authored(),
+                node.dag().highest_round(),
+                node.dag().order().to_vec(),
+                node.dag().commit_root(),
+                node.ids(3),
+            );
+            // Preparation must reject the input, not merely fail in the outer signer.
+            node.private_key.clear();
+            assert!(
+                node.prepare_slot_proposal(&proposal, &binding).is_err(),
+                "case {case}"
+            );
+            assert_eq!(
+                (
+                    node.round(),
+                    node.authored(),
+                    node.dag().highest_round(),
+                    node.dag().order().to_vec(),
+                    node.dag().commit_root(),
+                    node.ids(3),
+                ),
+                before,
+                "case {case}"
+            );
         }
     }
 

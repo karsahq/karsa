@@ -1403,6 +1403,64 @@ impl Dag {
             .map(|(decision, _)| decision)
     }
 
+    /// Inspects an unsigned plain proposal carrier before signing, without changing the DAG.
+    ///
+    /// Reauthenticates the full actual retained reference cone under one phase budget.
+    /// Exact pruned boundary IDs and the supplied binding remain trusted, as in other
+    /// prospective inspectors. The root must be unsigned and its author must have an
+    /// active key in the round's validator set; signing remains the author's responsibility.
+    ///
+    /// # Errors
+    /// Rejects invalid payloads, evidence, context, frontier effects, missing history,
+    /// absent or noncausal predecessors, and exhausted work budgets.
+    pub fn inspect_slot_proposal_authoring_cone(
+        &self,
+        prospective: &Vertex,
+        proposal: &crate::SlotProposalEnvelope,
+        binding: &crate::SlotAgreementBinding,
+    ) -> Result<Decision, CryptoError> {
+        if !prospective.signature.is_empty() {
+            return Err(crate::slot_agreement_phase::invalid(
+                "prospective proposal carrier must be unsigned",
+            ));
+        }
+        let epoch = self.epoch_of(prospective.round);
+        if prospective.epoch != epoch {
+            return Err(CryptoError::new(
+                CryptoErrorKind::KeyOutOfWindow,
+                format!(
+                    "vertex claims epoch {} but round maps to {epoch}",
+                    prospective.epoch
+                ),
+            ));
+        }
+        let record = self
+            .set_for_round(prospective.round)
+            .validator(&prospective.author)
+            .ok_or_else(|| {
+                CryptoError::new(
+                    CryptoErrorKind::UnknownValidator,
+                    "vertex from an unregistered validator",
+                )
+            })?;
+        record.active_key(epoch)?;
+        let mut budget = crate::SLOT_AGREEMENT_PHASE_WORK_BUDGET;
+        let (decision, cone) = self.inspect_slot_proposal_carrier_with_budget(
+            proposal,
+            AgreementCarrier::Prospective(prospective),
+            binding.tip(),
+            &mut budget,
+        )?;
+        if let Some(previous) = binding.carrier()
+            && (previous.round >= prospective.round || !cone.contains(previous))
+        {
+            return Err(crate::slot_agreement_phase::invalid(
+                "plain proposal lacks predecessor",
+            ));
+        }
+        Ok(decision)
+    }
+
     fn inspect_slot_proposal_with_budget(
         &self,
         proposal: &crate::SlotProposalEnvelope,
@@ -1410,7 +1468,27 @@ impl Dag {
         tip: &crate::SlotDecisionTip,
         budget: &mut usize,
     ) -> Result<(Decision, HashSet<VertexId>), CryptoError> {
+        self.inspect_slot_proposal_carrier_with_budget(
+            proposal,
+            AgreementCarrier::Received(carrier),
+            tip,
+            budget,
+        )
+    }
+
+    fn inspect_slot_proposal_carrier_with_budget(
+        &self,
+        proposal: &crate::SlotProposalEnvelope,
+        carrier: AgreementCarrier<'_>,
+        tip: &crate::SlotDecisionTip,
+        budget: &mut usize,
+    ) -> Result<(Decision, HashSet<VertexId>), CryptoError> {
         use crate::SlotOutcome;
+
+        let carrier_round = match carrier {
+            AgreementCarrier::Received(id) => id.round,
+            AgreementCarrier::Prospective(vertex) => vertex.round,
+        };
 
         let invalid =
             |message: &str| CryptoError::new(CryptoErrorKind::MalformedCertificate, message);
@@ -1418,7 +1496,7 @@ impl Dag {
         *budget = budget
             .checked_sub(self.order.len().saturating_add(self.prefix.peaks().len()))
             .ok_or_else(|| invalid("agreement frontier work budget exhausted"))?;
-        self.preflight_slot_proposal_envelope(proposal, carrier)?;
+        self.preflight_slot_proposal_envelope(proposal, carrier_round)?;
         let digest = proposal.digest()?;
         let set = self.set_for_round(d.round);
         d.validate(set)?;
@@ -1449,7 +1527,7 @@ impl Dag {
         if self.set_for_round(voting_round).id()? != d.validator_set_id
             || self.epoch_of(d.round) != d.epoch
             || self.epoch_of(voting_round) != d.epoch
-            || carrier.round <= voting_round
+            || carrier_round <= voting_round
             || (!matches!(
                 proposal.evidence,
                 crate::SlotProposalEvidence::ConservativeSkip { .. }
@@ -1460,7 +1538,17 @@ impl Dag {
             ));
         }
 
-        let causal = self.slot_causal_history_with_budget(carrier, digest, d, budget)?;
+        let causal = match carrier {
+            AgreementCarrier::Received(id) => {
+                self.slot_causal_history_with_budget(id, digest, d, budget)?
+            }
+            AgreementCarrier::Prospective(vertex) => {
+                if vertex.payload_hash != digest {
+                    return Err(invalid("slot payload is not bound to its carrier"));
+                }
+                self.slot_prospective_history_with_budget(vertex, d, budget)?
+            }
+        };
         let leader = self
             .leader(d.round)
             .ok_or_else(|| invalid("slot proposal requires the retained elected leader"))?;
@@ -2371,7 +2459,7 @@ impl Dag {
     fn preflight_slot_proposal_envelope(
         &self,
         proposal: &crate::SlotProposalEnvelope,
-        carrier: &VertexId,
+        carrier_round: u64,
     ) -> Result<(), CryptoError> {
         use crate::slot_agreement_phase::invalid;
         let set = self.set_for_round(proposal.decision.round);
@@ -2388,7 +2476,7 @@ impl Dag {
                 .ok_or_else(|| invalid("invalid skip round"))?;
             let mut authors = HashSet::new();
             if !matches!(d.outcome, crate::SlotOutcome::Skip { .. })
-                || carrier.round <= voting_round
+                || carrier_round <= voting_round
                 || voters.len().saturating_add(missing.len()) != set.validators.len()
                 || fences.len() > set.validators.len().saturating_sub(1) / 3
                 || self.set_for_round(voting_round).id()? != d.validator_set_id
@@ -2432,7 +2520,7 @@ impl Dag {
                 || anchor.round < proposal.decision.round.saturating_add(2)
                 || anchor.round == u64::MAX
                 || self.is_pruned(anchor.round)
-                || carrier.round <= anchor.round + 1
+                || carrier_round <= anchor.round + 1
                 || support.len() != set.quorum_size()
                 || support.iter().any(|v| v.round != anchor.round + 1)
                 || support
@@ -2462,7 +2550,7 @@ impl Dag {
         // Preflight the entire lineage before authenticating even its first entry.
         // This bounds structural work, not total cryptographic CPU time.
         for p in entries {
-            self.preflight_slot_proposal_envelope(&p.proposal, &p.proposal_carrier)?;
+            self.preflight_slot_proposal_envelope(&p.proposal, p.proposal_carrier.round)?;
             if p.view_carrier.author != crate::slot_agreement_view_proposer(set, round, p.view)?
                 || p.proposal_carrier.round >= p.view_carrier.round
             {
@@ -4402,6 +4490,228 @@ mod tests {
         };
         let carrier = bind_slot_proposal(&mut fixture, &proposal);
         (fixture, proposal, carrier, tip)
+    }
+
+    #[test]
+    fn slot_proposal_authoring_cone_matches_received_direct_and_skip() {
+        for committing in [false, true] {
+            let (mut f, direct, carrier, tip) = direct_slot_proposal(committing);
+            let mut proposals = vec![crate::SlotProposalEnvelope::from(direct.clone())];
+            if !committing {
+                proposals.push(crate::SlotProposalEnvelope {
+                    decision: direct.decision,
+                    evidence: crate::SlotProposalEvidence::ConservativeSkip {
+                        voters: f.ids(LEADER_ROUND + 1),
+                        missing: Vec::new(),
+                        fences: Vec::new(),
+                    },
+                });
+            }
+            for proposal in proposals {
+                let mut prospective = f.dag.get(carrier.round, &carrier.author).unwrap().clone();
+                prospective.payload_hash = proposal.digest().unwrap();
+                prospective.signature.clear();
+                f.dag
+                    .vertices
+                    .remove(&(carrier.round, carrier.author.clone()));
+                let binding =
+                    crate::SlotAgreementBinding::from_checkpoint(tip.clone(), None).unwrap();
+                let expected = inspect_without_effects(&f.dag, |dag| {
+                    dag.inspect_slot_proposal_authoring_cone(&prospective, &proposal, &binding)
+                });
+                let payload = prospective.signing_payload().unwrap();
+                prospective.signature = Ed25519Scheme.sign(&f.keys[0], &payload).unwrap();
+                let received = f.dag.insert(prospective).unwrap();
+                assert_eq!(
+                    f.dag
+                        .inspect_slot_proposal_envelope(&proposal, &received, &tip)
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slot_proposal_authoring_cone_requires_unsigned_registered_active_author() {
+        let (mut f, direct, carrier, tip) = direct_slot_proposal(true);
+        let proposal = crate::SlotProposalEnvelope::from(direct);
+        let mut prospective = f
+            .dag
+            .vertices
+            .remove(&(carrier.round, carrier.author))
+            .unwrap();
+        let binding = crate::SlotAgreementBinding::from_checkpoint(tip, None).unwrap();
+        assert!(!prospective.signature.is_empty());
+        assert_eq!(
+            f.dag
+                .inspect_slot_proposal_authoring_cone(&prospective, &proposal, &binding)
+                .unwrap_err()
+                .kind(),
+            CryptoErrorKind::MalformedCertificate,
+        );
+        prospective.signature.clear();
+        assert!(
+            f.dag
+                .inspect_slot_proposal_authoring_cone(&prospective, &proposal, &binding)
+                .is_ok()
+        );
+        let mut unknown = prospective.clone();
+        unknown.author = b"unregistered".to_vec();
+        assert_eq!(
+            f.dag
+                .inspect_slot_proposal_authoring_cone(&unknown, &proposal, &binding)
+                .unwrap_err()
+                .kind(),
+            CryptoErrorKind::UnknownValidator,
+        );
+        // Resolve the root key before proposal/context checks or ancestor authentication.
+        let mut set = f.dag.set().clone();
+        set.validators
+            .iter_mut()
+            .find(|v| v.validator_id == prospective.author)
+            .unwrap()
+            .keys[0]
+            .retirement_epoch = EPOCH;
+        f.dag.sets = SetSchedule::single(set);
+        assert_eq!(
+            f.dag
+                .inspect_slot_proposal_authoring_cone(&prospective, &proposal, &binding)
+                .unwrap_err()
+                .kind(),
+            CryptoErrorKind::KeyNotActive,
+        );
+    }
+
+    #[test]
+    fn slot_proposal_authoring_cone_matches_received_indirect() {
+        let (mut f, direct, carrier, tip) = direct_slot_proposal(true);
+        let mut prospective = f
+            .dag
+            .vertices
+            .remove(&(carrier.round, carrier.author))
+            .unwrap();
+        f.full_round(LEADER_ROUND + 2, &f.ids(LEADER_ROUND + 1))
+            .unwrap();
+        f.full_round(LEADER_ROUND + 3, &f.ids(LEADER_ROUND + 2))
+            .unwrap();
+        let anchor = f.dag.leader(LEADER_ROUND + 2).unwrap().id().unwrap();
+        let proposal = crate::SlotProposalEnvelope {
+            decision: direct.decision,
+            evidence: crate::SlotProposalEvidence::IndirectCommit {
+                anchor,
+                support: f.ids(LEADER_ROUND + 3)[..3].to_vec(),
+            },
+        };
+        prospective.round = LEADER_ROUND + 4;
+        prospective.references = f.ids(LEADER_ROUND + 3);
+        prospective.payload_hash = proposal.digest().unwrap();
+        prospective.signature.clear();
+        let binding = crate::SlotAgreementBinding::from_checkpoint(tip.clone(), None).unwrap();
+        let expected = inspect_without_effects(&f.dag, |dag| {
+            dag.inspect_slot_proposal_authoring_cone(&prospective, &proposal, &binding)
+        });
+        prospective.signature = Ed25519Scheme
+            .sign(&f.keys[0], &prospective.signing_payload().unwrap())
+            .unwrap();
+        let received = f.dag.insert(prospective).unwrap();
+        assert_eq!(
+            f.dag
+                .inspect_slot_proposal_envelope(&proposal, &received, &tip)
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn slot_proposal_authoring_cone_rejects_payload_context_history_and_predecessor() {
+        let (mut f, direct, carrier, tip) = direct_slot_proposal(true);
+        let proposal = crate::SlotProposalEnvelope::from(direct);
+        let mut prospective = f
+            .dag
+            .vertices
+            .remove(&(carrier.round, carrier.author.clone()))
+            .unwrap();
+        prospective.signature.clear();
+        let binding = crate::SlotAgreementBinding::from_checkpoint(tip.clone(), None).unwrap();
+        assert!(
+            f.dag
+                .inspect_slot_proposal_authoring_cone(&prospective, &proposal, &binding)
+                .is_ok()
+        );
+        let mut bad = prospective.clone();
+        bad.payload_hash[0] ^= 1;
+        assert!(
+            f.dag
+                .inspect_slot_proposal_authoring_cone(&bad, &proposal, &binding)
+                .is_err()
+        );
+        bad = prospective.clone();
+        bad.chain_id.push(0);
+        assert!(
+            f.dag
+                .inspect_slot_proposal_authoring_cone(&bad, &proposal, &binding)
+                .is_err()
+        );
+        let previous = prospective.references[0].clone();
+        let bound =
+            crate::SlotAgreementBinding::from_checkpoint(tip.clone(), Some(previous.clone()))
+                .unwrap();
+        assert!(
+            f.dag
+                .inspect_slot_proposal_authoring_cone(&prospective, &proposal, &bound)
+                .is_ok()
+        );
+        let mut wrong = previous.clone();
+        wrong.round = prospective.round;
+        let bound = crate::SlotAgreementBinding::from_checkpoint(tip.clone(), Some(wrong)).unwrap();
+        assert!(
+            f.dag
+                .inspect_slot_proposal_authoring_cone(&prospective, &proposal, &bound)
+                .is_err()
+        );
+        let mut wrong = previous.clone();
+        wrong.digest[0] ^= 1;
+        let bound = crate::SlotAgreementBinding::from_checkpoint(tip, Some(wrong)).unwrap();
+        assert!(
+            f.dag
+                .inspect_slot_proposal_authoring_cone(&prospective, &proposal, &bound)
+                .is_err()
+        );
+        // The fourth voter is outside selected evidence but inside the actual cone.
+        let sibling = prospective.references.last().unwrap().clone();
+        let key = (sibling.round, sibling.author.clone());
+        let original = f.dag.vertices.remove(&key).unwrap();
+        assert!(
+            f.dag
+                .inspect_slot_proposal_authoring_cone(&prospective, &proposal, &binding)
+                .is_err()
+        );
+        let mut foreign = original.clone();
+        foreign.chain_id.push(0);
+        foreign.signature = Ed25519Scheme
+            .sign(&f.keys[3], &foreign.signing_payload().unwrap())
+            .unwrap();
+        bad = prospective.clone();
+        *bad.references.last_mut().unwrap() = foreign.id().unwrap();
+        f.dag.vertices.insert(key.clone(), foreign);
+        assert!(
+            f.dag
+                .inspect_slot_proposal_authoring_cone(&bad, &proposal, &binding)
+                .is_err()
+        );
+        f.dag.vertices.insert(key, original);
+        let mut budget = 1;
+        assert!(
+            f.dag
+                .inspect_slot_proposal_carrier_with_budget(
+                    &proposal,
+                    AgreementCarrier::Prospective(&prospective),
+                    binding.tip(),
+                    &mut budget
+                )
+                .is_err()
+        );
     }
 
     fn bind_conservative(f: &mut Fixture, p: &crate::SlotProposalEnvelope) -> VertexId {
