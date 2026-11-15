@@ -121,6 +121,7 @@ pub struct Adapter {
     pending: Vec<PendingIntent>,
     history: Vec<AgreementSigningIntent>,
     readiness: Readiness,
+    pacemaker: Option<pacemaker::Pacemaker>,
 }
 
 #[derive(Clone, Copy)]
@@ -142,6 +143,79 @@ pub struct AuthoredCarrier {
 pub type AuthoredVote = AuthoredCarrier;
 
 impl Adapter {
+    /// Opts into explicit local ticks, resetting volatile timers. Recovery starts disabled.
+    pub fn configure_pacemaker(&mut self, policy: pacemaker::Policy) {
+        self.pacemaker = Some(pacemaker::Pacemaker::new(policy));
+    }
+
+    /// Rechecks durable state and applies at most one timed action; never signs or sends.
+    /// Nil obligations must subsequently use `author_nil_vote`. No delayed action is accepted.
+    /// Observing any durable precommit starts a fresh, bounded publication grace. Its deadline
+    /// is not remote evidence: no publication, acknowledgement, or pending control work gates
+    /// local advancement. The driver still enforces durable votes and preserves locks.
+    /// # Errors
+    /// Snapshot failures require recovery; backwards time and arithmetic exhaustion are rejected.
+    pub fn tick(&mut self, now: std::time::Instant) -> Result<Option<pacemaker::Action>, String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before timed actions".into());
+        }
+        if self.pacemaker.is_none() {
+            return Ok(None);
+        }
+        let snapshot = self.timer_snapshot().inspect_err(|_| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+        })?;
+        let action = self
+            .pacemaker
+            .as_mut()
+            .expect("configured pacemaker")
+            .plan(&snapshot, now)?;
+        if let Some(action) = action {
+            self.apply(match action {
+                pacemaker::Action::Timeout { view, phase } => {
+                    AuthenticatedSlotAgreementRequest::Timeout { view, phase }
+                }
+                pacemaker::Action::AdvanceView { from } => {
+                    AuthenticatedSlotAgreementRequest::AdvanceView { from }
+                }
+            })?;
+        }
+        Ok(action)
+    }
+
+    fn timer_snapshot(&self) -> Result<pacemaker::Snapshot, String> {
+        use validator::slot_agreement::{AgreementPhase, AgreementView};
+        let output = self.driver.output().map_err(|e| e.to_string())?;
+        let history = self.driver.signing_outbox().map_err(|e| e.to_string())?;
+
+        let slot = output.binding.tip().clone();
+        let view = output
+            .transition
+            .as_ref()
+            .map_or(AgreementView(0), |t| t.view);
+        let mut state = pacemaker::Snapshot {
+            slot,
+            view,
+            prevote: false,
+            precommit: false,
+            decided: output
+                .transition
+                .as_ref()
+                .is_some_and(|t| t.decision.is_some()),
+        };
+        for intent in history
+            .iter()
+            .filter(|i| i.vote.context == state.slot && i.vote.view == view)
+        {
+            match intent.vote.phase {
+                AgreementPhase::Prevote => state.prevote = true,
+                AgreementPhase::Precommit => state.precommit = true,
+            }
+        }
+
+        Ok(state)
+    }
+
     /// Reserves, signs and completes a plain proposal without authorizing a view.
     /// # Errors
     /// Rejects stale owners, mismatched Nodes, invalid evidence and durable conflicts.
@@ -736,6 +810,7 @@ impl Adapter {
             private_key,
             pending: Vec::new(),
             history: Vec::new(),
+            pacemaker: None,
             readiness: Readiness::DisabledMissingCausalReadinessAndTransport,
         })
     }
@@ -763,6 +838,7 @@ impl Adapter {
             private_key,
             pending: Vec::new(),
             history: Vec::new(),
+            pacemaker: None,
             readiness: Readiness::RecoveryRequiredHistoricalIntentsUnavailable,
         };
         let output = adapter.driver.output();
@@ -1047,6 +1123,7 @@ pub(super) fn disabled_guard(store: &Store) -> Result<(), String> {
 }
 
 mod envelope;
+pub mod pacemaker;
 pub use envelope::{CarrierEnvelope, CarrierPayload, MAX_ENVELOPE_BYTES};
 
 #[cfg(test)]

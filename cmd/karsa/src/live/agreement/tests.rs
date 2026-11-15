@@ -1908,6 +1908,47 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         );
         *adapter = recovered;
     }
+    // A real authenticated nonnil precommit and pending POL must not gate the timer.
+    // Keep adapters 0/1 on the final-proof path; adapter 2 exercises local advancement.
+    {
+        use pacemaker::{Action, Policy};
+        use std::time::{Duration, Instant};
+        let adapter = &mut adapters[2];
+        let reproposal = adapter.driver.output().unwrap().reproposal;
+        assert!(reproposal.is_some());
+        assert!(
+            adapter
+                .pending()
+                .iter()
+                .any(|p| matches!(p, PendingIntent::Pol { .. }))
+        );
+        let retained_votes = |adapter: &Adapter| {
+            adapter
+                .signing_history()
+                .iter()
+                .map(|i| (i.id, i.vote.clone()))
+                .collect::<Vec<_>>()
+        };
+        let history = retained_votes(adapter);
+        assert_ne!(history[1].1.value, AgreementValue::Nil);
+        let wait = Duration::from_secs(1);
+        let now = Instant::now();
+        adapter.configure_pacemaker(Policy::new(wait, wait, wait).unwrap());
+        assert_eq!(adapter.tick(now).unwrap(), None);
+        assert_eq!(
+            adapter.tick(now + wait).unwrap(),
+            Some(Action::AdvanceView {
+                from: AgreementView(0)
+            })
+        );
+        assert_eq!(retained_votes(adapter), history);
+        assert_eq!(adapter.driver.output().unwrap().reproposal, reproposal);
+        recover_envelope_adapter(adapter, &stores[2], &bootstrap, &m, 2);
+        assert_eq!(adapter.timer_snapshot().unwrap().view, AgreementView(1));
+        assert_eq!(adapter.driver.output().unwrap().reproposal, reproposal);
+        assert_eq!(retained_votes(adapter), history);
+        assert_eq!(adapter.tick(now + wait * 100).unwrap(), None);
+    }
     for witness in &witnesses {
         let envelope = PendingIntent::Vote {
             payload: witness.payload.clone(),
@@ -2088,6 +2129,12 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
     );
     assert_eq!(proof.encode(&m.set).unwrap(), before);
     assert_eq!(*digest, proof.digest(&m.set).unwrap());
+    // Arm before receipt so the actual durable decision must cancel elapsed scheduling.
+    let timer_now = std::time::Instant::now();
+    let timer_wait = std::time::Duration::from_secs(1);
+    adapters[0]
+        .configure_pacemaker(pacemaker::Policy::new(timer_wait, timer_wait, timer_wait).unwrap());
+    assert_eq!(adapters[0].tick(timer_now).unwrap(), None);
     // Final receipt is durable protocol observation, not chain application.
     let receipt_state = exposed_receipt_state(&stores[0], &bootstrap);
     let history = format!("{:?}", adapters[0].signing_history());
@@ -2097,6 +2144,15 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         .receive_envelope(decoded, inspection_vertices)
         .unwrap();
     assert_eq!(exposed_receipt_state(&stores[0], &bootstrap), receipt_state);
+    assert_eq!(adapters[0].driver.sequence(), sequence + 1);
+    assert_eq!(
+        adapters[0].tick(timer_now + timer_wait * 100).unwrap(),
+        None
+    );
+    assert_eq!(
+        adapters[0].tick(timer_now + timer_wait * 101).unwrap(),
+        None
+    );
     assert_eq!(adapters[0].driver.sequence(), sequence + 1);
     assert_eq!(format!("{:?}", adapters[0].signing_history()), history);
     assert!(
@@ -2228,6 +2284,314 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
     assert_eq!(adapters[0].driver.sequence(), sequence);
     assert_eq!((pol_node.round(), pol_node.authored()), (7, 1));
     assert_eq!((final_node.round(), final_node.authored()), (9, 1));
+}
+
+#[test]
+fn timed_advance_and_recovery_preserve_lock_against_authenticated_conflict() {
+    use pacemaker::{Action, Policy};
+    use std::time::{Duration, Instant};
+    use validator::slot_agreement::AgreementPhase;
+    use validator::{SlotAgreementViewCandidate, SlotProposalEnvelope, SlotProposalEvidence};
+
+    let (m, bootstrap, request) = fixture();
+    let AuthenticatedSlotAgreementRequest::Propose {
+        lineage,
+        mut vertices,
+    } = request
+    else {
+        unreachable!()
+    };
+    let mut commit = lineage.entries[0].proposal.clone();
+    let SlotOutcome::Commit { leader } = &commit.decision.outcome else {
+        unreachable!()
+    };
+    let target = leader.clone();
+    vertices.retain(|v| v.round <= 1);
+    let ids = |vertices: &[Vertex], round| {
+        let mut ids = vertices
+            .iter()
+            .filter(|v| v.round == round)
+            .map(|v| v.id().unwrap())
+            .collect::<Vec<_>>();
+        ids.sort_by(|a, b| (a.round, &a.author, a.digest).cmp(&(b.round, &b.author, b.digest)));
+        ids
+    };
+    // Only one direct supporter: indirect commit and conservative skip are both valid.
+    let refs = ids(&vertices, 1);
+    for author in 0..4 {
+        let references = refs
+            .iter()
+            .filter(|id| author == 0 || **id != target)
+            .cloned()
+            .collect();
+        vertices.push(signed(&m, author, 2, references, [2; 32]));
+    }
+    for round in 3..=4 {
+        let refs = ids(&vertices, round - 1);
+        for author in 0..4 {
+            vertices.push(signed(&m, author, round, refs.clone(), [42; 32]));
+        }
+    }
+    let mut dag = Dag::new(m.set.clone());
+    dag.set_chain_id(b"live-adapter-tests".to_vec());
+    for vertex in &vertices {
+        dag.insert(vertex.clone()).unwrap();
+    }
+    commit.evidence = SlotProposalEvidence::IndirectCommit {
+        anchor: dag.leader(3).unwrap().id().unwrap(),
+        support: ids(&vertices, 4)[..3].to_vec(),
+    };
+    let voters = ids(&vertices, 2);
+    let fence = validator::Fence::new(b"live-adapter-tests".to_vec(), 2, voters[3].author.clone());
+    let bytes = fence.signing_payload().unwrap();
+    let fence = validator::FenceCertificate {
+        fence,
+        signer_bitmap: vec![0b111],
+        signatures: (0..3)
+            .map(|i| {
+                Ed25519Scheme
+                    .sign(&m.consensus[i].private_key, &bytes)
+                    .unwrap()
+            })
+            .collect(),
+    };
+    let mut decision = commit.decision.clone();
+    decision.outcome = SlotOutcome::Skip {
+        leader_author: target.author,
+    };
+    decision.after_len = decision.before_len;
+    decision.after_root = decision.before_root;
+    let skip = SlotProposalEnvelope {
+        decision,
+        evidence: SlotProposalEvidence::ConservativeSkip {
+            voters: voters[..3].to_vec(),
+            missing: vec![voters[3].author.clone()],
+            fences: vec![fence],
+        },
+    };
+    assert_ne!(commit.decision, skip.decision);
+    let dirs: Vec<_> = (0..4).map(|_| Dir::new()).collect();
+    let stores: Vec<_> = dirs.iter().map(|d| Store::open(&d.0).unwrap()).collect();
+    let mut adapters: Vec<_> = stores
+        .iter()
+        .enumerate()
+        .map(|(i, store)| {
+            let mut b = bootstrap.clone();
+            b.agreement.local_validator = m.consensus[i].id.clone();
+            Adapter::begin(store, b, &m, i).unwrap()
+        })
+        .collect();
+    let mut carriers = Vec::new();
+    for (i, adapter) in adapters.iter_mut().enumerate() {
+        let mut node = authoring_node_index(&m, &vertices, i);
+        node.set_round(5);
+        let vertex = if i < 2 {
+            adapter
+                .author_proposal(if i == 0 { &commit } else { &skip }, &mut node)
+                .unwrap()
+                .unwrap()
+                .vertex
+        } else {
+            signed(&m, i, 5, ids(&vertices, 4), [42; 32])
+        };
+        carriers.push(vertex.id().unwrap());
+        vertices.push(vertex);
+    }
+    let proposer_index = |view| {
+        let elected = validator::slot_agreement_view_proposer(&m.set, 1, view).unwrap();
+        m.consensus.iter().position(|id| id.id == elected).unwrap()
+    };
+    let candidate = SlotAgreementViewCandidate::new(
+        vec![],
+        commit.clone(),
+        carriers[0].clone(),
+        AgreementView(0),
+        &m.set,
+    )
+    .unwrap();
+    let elected = proposer_index(AgreementView(0));
+    let mut node = authoring_node_index(&m, &vertices, elected);
+    node.set_round(6);
+    let view = adapters[elected]
+        .author_view(&candidate, &mut node)
+        .unwrap()
+        .unwrap();
+    vertices.push(view.vertex.clone());
+    for i in 0..4 {
+        if i != elected {
+            vertices.push(signed(&m, i, 6, ids(&vertices, 5), [42; 32]));
+        }
+    }
+    for adapter in &mut adapters[..3] {
+        adapter
+            .receive_envelope(view.envelope.clone(), vertices.clone())
+            .unwrap();
+    }
+    let mut votes = Vec::new();
+    for (i, adapter) in adapters[..3].iter_mut().enumerate() {
+        let mut node = authoring_node_index(&m, &vertices, i);
+        node.set_round(7);
+        let id = adapter.signing_history()[0].id;
+        votes.push(adapter.author_vote(id, &mut node).unwrap().unwrap());
+    }
+    vertices.extend(votes.iter().map(|v| v.vertex.clone()));
+    vertices.push(signed(&m, 3, 7, ids(&vertices, 6), [42; 32]));
+    for adapter in &mut adapters[..3] {
+        for vote in &votes {
+            adapter
+                .receive_envelope(vote.envelope.clone(), vertices.clone())
+                .unwrap();
+        }
+    }
+    let pol_digest = adapters[0]
+        .pending()
+        .iter()
+        .find_map(|p| match p {
+            PendingIntent::Pol { digest, .. } => Some(*digest),
+            _ => None,
+        })
+        .unwrap();
+    let mut node = authoring_node_index(&m, &vertices, 0);
+    node.set_round(8);
+    let pol = adapters[0]
+        .author_pol(pol_digest, &mut node)
+        .unwrap()
+        .unwrap();
+    vertices.push(pol.vertex.clone());
+    for i in 1..4 {
+        vertices.push(signed(&m, i, 8, ids(&vertices, 7), [42; 32]));
+    }
+    let adapter = &mut adapters[2];
+    adapter
+        .receive_envelope(pol.envelope, vertices.clone())
+        .unwrap();
+    let history = adapter
+        .signing_history()
+        .iter()
+        .map(|i| (i.id, i.vote.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1].1.phase, AgreementPhase::Precommit);
+    assert_eq!(
+        history[1].1.value,
+        AgreementValue::Decision(commit.decision.clone())
+    );
+    let mut node = authoring_node_index(&m, &vertices, 2);
+    node.set_round(9);
+    let precommit = adapter
+        .author_vote(history[1].0, &mut node)
+        .unwrap()
+        .unwrap();
+    precommit
+        .envelope
+        .inspect(node.dag(), &adapter.driver.output().unwrap().binding)
+        .unwrap();
+    vertices.push(precommit.vertex);
+    for i in [0, 1, 3] {
+        vertices.push(signed(&m, i, 9, ids(&vertices, 8), [42; 32]));
+    }
+    let reproposal = adapter.driver.output().unwrap().reproposal.unwrap();
+    let wait = Duration::from_secs(1);
+    let now = Instant::now();
+    adapter.configure_pacemaker(Policy::new(wait, wait, wait).unwrap());
+    assert_eq!(adapter.tick(now).unwrap(), None);
+    assert_eq!(
+        adapter.tick(now + wait).unwrap(),
+        Some(Action::AdvanceView {
+            from: AgreementView(0)
+        })
+    );
+    recover_envelope_adapter(adapter, &stores[2], &bootstrap, &m, 2);
+    assert_eq!(adapter.timer_snapshot().unwrap().view, AgreementView(1));
+    assert_eq!(
+        adapter.driver.output().unwrap().reproposal,
+        Some(reproposal.clone())
+    );
+
+    let candidate = SlotAgreementViewCandidate::new(
+        vec![],
+        skip.clone(),
+        carriers[1].clone(),
+        AgreementView(1),
+        &m.set,
+    )
+    .unwrap();
+    let elected = proposer_index(AgreementView(1));
+    for i in [elected, 3] {
+        if adapters[i].timer_snapshot().unwrap().view == AgreementView(0) {
+            adapters[i]
+                .apply(AuthenticatedSlotAgreementRequest::AdvanceView {
+                    from: AgreementView(0),
+                })
+                .unwrap();
+        }
+    }
+    let mut node = authoring_node_index(&m, &vertices, elected);
+    node.set_round(10);
+    let conflict = adapters[elected]
+        .author_view(&candidate, &mut node)
+        .unwrap()
+        .unwrap();
+    assert_eq!(conflict.vertex.author, m.consensus[elected].id);
+    assert_eq!(
+        conflict.envelope.carrier().author,
+        validator::slot_agreement_view_proposer(&m.set, 1, AgreementView(1)).unwrap()
+    );
+    conflict
+        .envelope
+        .inspect(node.dag(), &adapters[2].driver.output().unwrap().binding)
+        .unwrap();
+    vertices.push(conflict.vertex);
+    // A lock-free receiver accepts the exact same authenticated conflict and votes skip.
+    adapters[3]
+        .receive_envelope(conflict.envelope.clone(), vertices.clone())
+        .unwrap();
+    assert_eq!(
+        adapters[3].signing_history().last().unwrap().vote.value,
+        AgreementValue::Decision(skip.decision.clone())
+    );
+    let adapter = &mut adapters[2];
+    let sequence = adapter.driver.sequence();
+    let error = adapter
+        .receive_envelope(conflict.envelope, vertices)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("conflicting proposal lacks newer POL"),
+        "must reach the lock guard, not fail authentication or proposer election: {error}"
+    );
+    assert_eq!(adapter.driver.sequence(), sequence);
+    assert_eq!(
+        adapter
+            .signing_history()
+            .iter()
+            .map(|i| (i.id, i.vote.clone()))
+            .collect::<Vec<_>>(),
+        history,
+        "the conflict must not create any signing obligation"
+    );
+    assert!(
+        !adapter
+            .signing_history()
+            .iter()
+            .any(|i| i.vote.value == AgreementValue::Decision(skip.decision.clone()))
+    );
+    assert_eq!(
+        adapter.driver.output().unwrap().reproposal,
+        Some(reproposal.clone())
+    );
+    recover_envelope_adapter(adapter, &stores[2], &bootstrap, &m, 2);
+    assert_eq!(
+        adapter.driver.output().unwrap().reproposal,
+        Some(reproposal)
+    );
+    assert!(
+        !adapter
+            .signing_history()
+            .iter()
+            .any(|i| i.vote.value == AgreementValue::Decision(skip.decision.clone()))
+    );
 }
 
 #[test]
@@ -2495,4 +2859,278 @@ fn proposal_and_view_durable_local_authoring_and_recovery() {
         assert_eq!(conflicting.authored(), before);
         assert_eq!(recovered.completed_carriers().unwrap().len(), 1);
     }
+}
+
+#[test]
+fn pacemaker_nil_deadlines_publication_and_recovery_reset() {
+    use pacemaker::{Action, Policy};
+    use std::time::{Duration, Instant};
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, _) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut a = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    let wait = Duration::from_secs(2);
+    let policy = Policy::new(wait, wait, wait).unwrap();
+    let now = Instant::now();
+    assert_eq!(a.tick(now).unwrap(), None);
+    a.configure_pacemaker(policy);
+    assert_eq!(a.tick(now).unwrap(), None);
+    assert_eq!(a.tick(now + wait - Duration::from_nanos(1)).unwrap(), None);
+    assert_eq!(
+        a.tick(now + wait).unwrap(),
+        Some(Action::Timeout {
+            view: AgreementView(0),
+            phase: AgreementPhase::Prevote,
+        })
+    );
+    assert!(a.completed_nil_votes().unwrap().is_empty());
+    let prevote = a.signing_history()[0].id;
+    // Unpublished votes are not indefinite gates. Each observed stage gets a fresh wait.
+    assert_eq!(a.tick(now + wait).unwrap(), None);
+    assert_eq!(
+        a.tick(now + wait * 2).unwrap(),
+        Some(Action::Timeout {
+            view: AgreementView(0),
+            phase: AgreementPhase::Precommit,
+        })
+    );
+    assert_eq!(a.tick(now + wait * 2).unwrap(), None);
+    assert_eq!(a.tick(now + wait * 2).unwrap(), None);
+    assert!(a.author_nil_vote(prevote).unwrap().is_none());
+    let precommit = a.signing_history()[1].id;
+    a.author_nil_vote(precommit).unwrap().unwrap();
+    assert_eq!(
+        a.tick(now + wait * 3).unwrap(),
+        Some(Action::AdvanceView {
+            from: AgreementView(0)
+        })
+    );
+    assert_eq!(a.tick(now + wait * 3).unwrap(), None);
+    assert!(a.tick(now).is_err());
+    drop(a);
+    let mut a = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    assert_eq!(a.tick(now + wait * 100).unwrap(), None);
+    a.configure_pacemaker(policy);
+    assert_eq!(a.tick(now + wait * 100).unwrap(), None);
+    assert_eq!(
+        a.tick(now + wait * 101).unwrap(),
+        Some(Action::Timeout {
+            view: AgreementView(1),
+            phase: AgreementPhase::Prevote,
+        })
+    );
+    assert_eq!(a.signing_history().len(), 3);
+}
+
+#[test]
+fn pacemaker_multi_adapter_nil_quorum_precommit_is_not_timed_out_again() {
+    use pacemaker::{Action, Policy};
+    use std::time::{Duration, Instant};
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, _) = fixture();
+    let dirs: Vec<_> = (0..4).map(|_| Dir::new()).collect();
+    let stores: Vec<_> = dirs.iter().map(|d| Store::open(&d.0).unwrap()).collect();
+    let mut adapters: Vec<_> = stores
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let mut b = bootstrap.clone();
+            b.agreement.local_validator = m.consensus[i].id.clone();
+            Adapter::begin(s, b, &m, i).unwrap()
+        })
+        .collect();
+    let wait = Duration::from_secs(1);
+    let now = Instant::now();
+    let mut votes = Vec::new();
+    for a in &mut adapters {
+        a.configure_pacemaker(Policy::new(wait, wait, wait).unwrap());
+        assert_eq!(a.tick(now).unwrap(), None);
+        assert_eq!(
+            a.tick(now + wait).unwrap(),
+            Some(Action::Timeout {
+                view: AgreementView(0),
+                phase: AgreementPhase::Prevote,
+            })
+        );
+        votes.push(
+            a.author_nil_vote(a.signing_history()[0].id)
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    let mut precommits = Vec::new();
+    for a in &mut adapters {
+        for vote in votes.iter().take(3) {
+            a.receive_nil_vote(vote.clone()).unwrap();
+        }
+        assert_eq!(a.signing_history().len(), 2);
+        assert_eq!(a.signing_history()[1].vote.phase, AgreementPhase::Precommit);
+        assert_eq!(a.tick(now + wait).unwrap(), None);
+        precommits.push(
+            a.author_nil_vote(a.signing_history()[1].id)
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    for a in &mut adapters {
+        for vote in &precommits {
+            a.receive_nil_vote(vote.clone()).unwrap();
+        }
+        assert_eq!(a.tick(now + wait).unwrap(), None);
+        assert_eq!(
+            a.tick(now + wait * 2).unwrap(),
+            Some(Action::AdvanceView {
+                from: AgreementView(0)
+            })
+        );
+        assert_eq!(a.tick(now + wait * 2).unwrap(), None);
+        assert_eq!(a.signing_history().len(), 2);
+        assert!(
+            a.driver
+                .output()
+                .unwrap()
+                .transition
+                .unwrap()
+                .decision
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn pacemaker_planner_resets_view_slot_and_idles_decided() {
+    use pacemaker::{Action, Pacemaker, Policy, Snapshot};
+    use std::time::{Duration, Instant};
+    use validator::slot_agreement::AgreementPhase;
+    let (_, bootstrap, _) = fixture();
+    let wait = Duration::from_secs(1);
+    assert!(Policy::new(Duration::ZERO, wait, wait).is_err());
+    assert!(Policy::new(Duration::MAX, wait, wait).is_err());
+    assert!(Policy::new(wait, wait, Duration::ZERO).is_err());
+    assert!(Policy::new(wait, wait, Duration::MAX).is_err());
+    let mut p = Pacemaker::new(Policy::new(wait, wait, wait).unwrap());
+    let mut s = Snapshot {
+        slot: bootstrap.agreement.context,
+        view: AgreementView(0),
+        prevote: false,
+        precommit: false,
+        decided: false,
+    };
+    let now = Instant::now();
+    assert_eq!(p.plan(&s, now).unwrap(), None);
+    s.view = AgreementView(1);
+    assert_eq!(p.plan(&s, now + wait * 10).unwrap(), None);
+    assert_eq!(
+        p.plan(&s, now + wait * 11).unwrap(),
+        Some(Action::Timeout {
+            view: AgreementView(1),
+            phase: AgreementPhase::Prevote,
+        })
+    );
+    // A precommit emitted by evidence is authoritative even without a local prevote.
+    s.precommit = true;
+    assert_eq!(p.plan(&s, now + wait * 11).unwrap(), None);
+    assert_eq!(
+        p.plan(&s, now + wait * 12).unwrap(),
+        Some(Action::AdvanceView {
+            from: AgreementView(1)
+        })
+    );
+    assert!(p.plan(&s, now).is_err());
+    s.decided = true;
+    assert_eq!(p.plan(&s, now + wait * 100).unwrap(), None);
+    s.decided = false;
+    assert_eq!(p.plan(&s, now + wait * 100).unwrap(), None);
+    s.view = AgreementView(u64::MAX);
+    assert_eq!(p.plan(&s, now + wait * 101).unwrap(), None);
+    assert!(p.plan(&s, now + wait * 102).is_err());
+}
+
+#[test]
+fn pacemaker_unpublished_nonnil_and_stale_owner() {
+    use pacemaker::{Action, Policy};
+    use std::time::{Duration, Instant};
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, request) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut a = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    a.apply(request).unwrap();
+    assert_ne!(a.signing_history()[0].vote.value, AgreementValue::Nil);
+    let wait = Duration::from_secs(1);
+    let now = Instant::now();
+    a.configure_pacemaker(Policy::new(wait, wait, wait).unwrap());
+    assert_eq!(a.tick(now).unwrap(), None);
+    assert_eq!(
+        a.tick(now + wait).unwrap(),
+        Some(Action::Timeout {
+            view: AgreementView(0),
+            phase: AgreementPhase::Precommit,
+        })
+    );
+    assert_eq!(a.tick(now + wait).unwrap(), None);
+    assert_eq!(
+        a.tick(now + wait * 2).unwrap(),
+        Some(Action::AdvanceView {
+            from: AgreementView(0)
+        })
+    );
+    assert!(a.completed_carriers().unwrap().is_empty());
+    let mut owner = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    owner
+        .apply(AuthenticatedSlotAgreementRequest::Timeout {
+            view: AgreementView(1),
+            phase: AgreementPhase::Prevote,
+        })
+        .unwrap();
+    let sequence = owner.driver.sequence();
+    assert!(a.tick(now + wait * 2).is_err());
+    assert_eq!(owner.driver.sequence(), sequence);
+    assert_eq!(
+        a.readiness(),
+        Readiness::RecoveryRequiredHistoricalIntentsUnavailable
+    );
+}
+
+#[test]
+fn pacemaker_future_nil_does_not_synchronize_a_slow_adapter() {
+    use pacemaker::{Action, Policy};
+    use std::time::{Duration, Instant};
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, _) = fixture();
+    let fast_dir = Dir::new();
+    let slow_dir = Dir::new();
+    let fast_store = Store::open(&fast_dir.0).unwrap();
+    let slow_store = Store::open(&slow_dir.0).unwrap();
+    let mut fast = Adapter::begin(&fast_store, bootstrap.clone(), &m, 0).unwrap();
+    let mut slow_bootstrap = bootstrap;
+    slow_bootstrap.agreement.local_validator = m.consensus[1].id.clone();
+    let mut slow = Adapter::begin(&slow_store, slow_bootstrap.clone(), &m, 1).unwrap();
+    let wait = Duration::from_secs(1);
+    let policy = Policy::new(wait, wait, wait).unwrap();
+    let now = Instant::now();
+    fast.configure_pacemaker(policy);
+    for offset in [0, 1, 1, 2, 2, 3, 3, 4] {
+        fast.tick(now + wait * offset).unwrap();
+    }
+    let future = fast.signing_history().last().unwrap();
+    assert_eq!(future.vote.view, AgreementView(1));
+    let future = fast.author_nil_vote(future.id).unwrap().unwrap();
+    let sequence = slow.driver.sequence();
+    assert!(slow.receive_nil_vote(future).is_err());
+    assert_eq!(slow.driver.sequence(), sequence);
+    assert!(slow.tick(now).is_err());
+    let mut slow = Adapter::recover(&slow_store, slow_bootstrap, &m, 1).unwrap();
+    assert_eq!(slow.timer_snapshot().unwrap().view, AgreementView(0));
+    slow.configure_pacemaker(policy);
+    assert_eq!(slow.tick(now + wait * 100).unwrap(), None);
+    assert_eq!(
+        slow.tick(now + wait * 101).unwrap(),
+        Some(Action::Timeout {
+            view: AgreementView(0),
+            phase: AgreementPhase::Prevote,
+        })
+    );
+    assert_eq!(slow.timer_snapshot().unwrap().view, AgreementView(0));
 }
