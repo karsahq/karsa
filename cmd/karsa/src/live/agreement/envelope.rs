@@ -60,6 +60,22 @@ fn bound(len: usize, max: usize) -> Result<(), CryptoError> {
 }
 
 impl CarrierEnvelope {
+    /// Preflights vote framing without inventing an unknown carrier digest.
+    pub(super) fn preflight_vote(
+        author: &[u8],
+        payload: &SlotAgreementVotePayload,
+        lineage: &SlotAgreementViewLineage,
+        set: &ValidatorSet,
+    ) -> Result<(), CryptoError> {
+        bound(author.len(), MAX_AUTHOR_BYTES)?;
+        let lineage = lineage.encode(set)?;
+        let vote = payload.encode(set)?;
+        bound(
+            91 + author.len() + lineage.len() + vote.len(),
+            MAX_ENVELOPE_BYTES,
+        )
+    }
+
     /// Converts owned evidence into a closed request, without asserting authentication.
     /// The receiving session must reauthenticate against its own pinned binding and DAG.
     pub(super) fn into_request(

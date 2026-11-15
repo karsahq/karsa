@@ -482,6 +482,220 @@ fn fixture_for_chain(
     )
 }
 
+fn authoring_node(m: &Membership, vertices: &[Vertex]) -> net::Node {
+    let mut node = net::Node::with_chain_id(
+        m.set.clone(),
+        m.consensus[0].id.clone(),
+        m.consensus[0].private_key.clone(),
+        b"live-adapter-tests".to_vec(),
+    );
+    for vertex in vertices {
+        node.receive(vertex.clone()).unwrap();
+    }
+    node.set_round(5);
+    node
+}
+
+#[test]
+fn actual_vote_authoring_rejects_foreign_chain_sibling_before_signing() {
+    let (m, bootstrap, request) = fixture();
+    let AuthenticatedSlotAgreementRequest::Propose { vertices, lineage } = &request else {
+        unreachable!()
+    };
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::begin(&store, bootstrap, &m, 0).unwrap();
+    adapter.apply(request.clone()).unwrap();
+    let id = adapter.signing_history()[0].id;
+    let binding = adapter.driver.output().unwrap().binding;
+    let mut foreign = vertices.clone();
+    let sibling = foreign
+        .iter_mut()
+        .find(|v| v.round == 4 && v.author != lineage.entries[0].view_carrier.author)
+        .unwrap();
+    let author = m
+        .consensus
+        .iter()
+        .position(|identity| identity.id == sibling.author)
+        .unwrap();
+    *sibling = signed_for_chain(
+        &m,
+        author,
+        4,
+        sibling.references.clone(),
+        sibling.payload_hash,
+        b"foreign-chain",
+    );
+    let mut node = authoring_node(&m, &foreign);
+    // Legacy receive accepts this signed sibling, and it is outside the lineage cone.
+    node.dag()
+        .inspect_slot_agreement_view_lineage(lineage, &binding)
+        .unwrap();
+    assert!(node.dag().get(5, node.id()).is_none());
+    assert!(adapter.author_vote(id, &mut node).unwrap().is_none());
+    assert_eq!((node.round(), node.authored()), (5, 0));
+    assert!(
+        node.dag().get(5, node.id()).is_none(),
+        "no rejected carrier may be inserted"
+    );
+    let mut valid = authoring_node(&m, vertices);
+    let authored = adapter.author_vote(id, &mut valid).unwrap().unwrap();
+    authored.envelope.inspect(valid.dag(), &binding).unwrap();
+    assert_eq!((valid.round(), valid.authored()), (6, 1));
+}
+
+#[test]
+fn actual_vote_authoring_preflights_node_and_dependencies() {
+    let (m, bootstrap, request) = fixture();
+    let AuthenticatedSlotAgreementRequest::Propose { vertices, .. } = &request else {
+        unreachable!()
+    };
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    adapter.apply(request.clone()).unwrap();
+    let id = adapter.signing_history()[0].id;
+    let mut missing = authoring_node(&m, &[]);
+    assert!(adapter.author_vote(id, &mut missing).unwrap().is_none());
+    assert_eq!((missing.round(), missing.authored()), (5, 0));
+    // Holding the direct prerequisite alone is not a complete cone or lineage.
+    let partial: Vec<_> = vertices.iter().filter(|v| v.round < 4).cloned().collect();
+    let mut partial = authoring_node(&m, &partial);
+    assert!(adapter.author_vote(id, &mut partial).unwrap().is_none());
+    assert_eq!((partial.round(), partial.authored()), (5, 0));
+    for (identity, chain, key, set) in [
+        (
+            m.consensus[1].id.clone(),
+            b"live-adapter-tests".to_vec(),
+            m.consensus[0].private_key.clone(),
+            m.set.clone(),
+        ),
+        (
+            m.consensus[0].id.clone(),
+            b"wrong-chain".to_vec(),
+            m.consensus[0].private_key.clone(),
+            m.set.clone(),
+        ),
+        (
+            m.consensus[0].id.clone(),
+            b"live-adapter-tests".to_vec(),
+            m.consensus[1].private_key.clone(),
+            m.set.clone(),
+        ),
+        (
+            m.consensus[0].id.clone(),
+            b"live-adapter-tests".to_vec(),
+            m.consensus[0].private_key.clone(),
+            chain::membership(3, None).unwrap().set,
+        ),
+    ] {
+        let mut wrong = net::Node::with_chain_id(set, identity, key, chain);
+        wrong.set_round(5);
+        assert!(adapter.author_vote(id, &mut wrong).is_err());
+        assert_eq!((wrong.round(), wrong.authored()), (5, 0));
+    }
+    let mut wrong_epoch = net::Node::with_chain_id_and_epoch_length(
+        m.set.clone(),
+        1,
+        m.consensus[0].id.clone(),
+        m.consensus[0].private_key.clone(),
+        b"live-adapter-tests".to_vec(),
+    );
+    wrong_epoch.set_round(5);
+    assert!(adapter.author_vote(id, &mut wrong_epoch).is_err());
+    assert_eq!((wrong_epoch.round(), wrong_epoch.authored()), (5, 0));
+    // An authenticated WAL lineage is not evidence for a different, valid signed DAG.
+    let mut incompatible = vertices.clone();
+    let selected = adapter.signing_history()[0]
+        .lineage
+        .as_ref()
+        .unwrap()
+        .entries[0]
+        .view_carrier
+        .clone();
+    let index = incompatible
+        .iter()
+        .position(|v| v.id().unwrap() == selected)
+        .unwrap();
+    let old = &incompatible[index];
+    let author = m
+        .consensus
+        .iter()
+        .position(|identity| identity.id == old.author)
+        .unwrap();
+    incompatible[index] = signed(&m, author, old.round, old.references.clone(), [99; 32]);
+    let mut incompatible = authoring_node(&m, &incompatible);
+    assert!(
+        adapter
+            .author_vote(id, &mut incompatible)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!((incompatible.round(), incompatible.authored()), (5, 0));
+    let mut node = authoring_node(&m, vertices);
+    let authored = adapter.author_vote(id, &mut node).unwrap().unwrap();
+    assert_eq!((node.round(), node.authored()), (6, 1));
+    assert_eq!(
+        authored.vertex.payload_hash,
+        authored.envelope.payload_digest()
+    );
+    assert_eq!(authored.vertex.id().unwrap(), *authored.envelope.carrier());
+    authored
+        .envelope
+        .inspect(node.dag(), &adapter.driver.output().unwrap().binding)
+        .unwrap();
+    check_envelope(&authored.envelope, &m.set);
+    // This API deliberately does not claim exactly-once authoring.
+}
+
+#[test]
+fn actual_vote_authoring_blocks_stale_phase_view_and_owner() {
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, request) = fixture();
+    let AuthenticatedSlotAgreementRequest::Propose { vertices, .. } = &request else {
+        unreachable!()
+    };
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    adapter.apply(request.clone()).unwrap();
+    let id = adapter.signing_history()[0].id;
+    let mut node = authoring_node(&m, vertices);
+    adapter
+        .apply(AuthenticatedSlotAgreementRequest::Timeout {
+            view: AgreementView(0),
+            phase: AgreementPhase::Precommit,
+        })
+        .unwrap();
+    assert!(adapter.author_vote(id, &mut node).unwrap().is_none());
+    let nil = adapter.signing_history()[1].id;
+    assert!(
+        adapter
+            .author_vote(nil, &mut node)
+            .unwrap_err()
+            .contains("nil")
+    );
+    adapter
+        .apply(AuthenticatedSlotAgreementRequest::AdvanceView {
+            from: AgreementView(0),
+        })
+        .unwrap();
+    assert!(adapter.author_vote(id, &mut node).unwrap().is_none());
+    let mut other = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    other
+        .apply(AuthenticatedSlotAgreementRequest::AdvanceView {
+            from: AgreementView(1),
+        })
+        .unwrap();
+    assert!(adapter.author_vote(id, &mut node).is_err());
+    assert_eq!(
+        adapter.readiness(),
+        Readiness::RecoveryRequiredHistoricalIntentsUnavailable
+    );
+    assert!(adapter.author_vote(id, &mut node).is_err());
+    assert_eq!((node.round(), node.authored()), (5, 0));
+}
+
 #[test]
 fn tampered_history_blocks_all_reconstruction_before_signing() {
     let (m, bootstrap, request) = fixture();
@@ -1139,6 +1353,28 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         );
         recover_envelope_adapter(adapter, &stores[i], &bootstrap, &m, i);
     }
+    let mut actual_node = authoring_node(&m, &inspection_vertices);
+    actual_node.set_round(7);
+    let stale_prevote = adapters[0].signing_history()[0].id;
+    assert!(
+        adapters[0]
+            .author_vote(stale_prevote, &mut actual_node)
+            .unwrap()
+            .is_none()
+    );
+    let precommit_id = adapters[0].signing_history()[1].id;
+    let authored = adapters[0]
+        .author_vote(precommit_id, &mut actual_node)
+        .unwrap()
+        .unwrap();
+    authored
+        .envelope
+        .inspect(
+            actual_node.dag(),
+            &adapters[0].driver.output().unwrap().binding,
+        )
+        .unwrap();
+    assert_eq!((actual_node.round(), actual_node.authored()), (8, 1));
     let refs: Vec<_> = pol_vertices.iter().map(|v| v.id().unwrap()).collect();
     let mut precommit_vertices = Vec::new();
     let witnesses: Vec<_> = adapters
@@ -1336,6 +1572,26 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
     recover_envelope_adapter(&mut adapters[0], &stores[0], &bootstrap, &m, 0);
     assert_eq!(exposed_receipt_state(&stores[0], &bootstrap), receipt_state);
     assert!(adapters[0].driver.output().unwrap().candidates.is_empty());
+    for id in [stale_prevote, precommit_id] {
+        assert!(
+            adapters[0]
+                .author_vote(id, &mut actual_node)
+                .unwrap()
+                .is_none()
+        );
+    }
+    adapters[0]
+        .apply(AuthenticatedSlotAgreementRequest::AdvanceSlot)
+        .unwrap();
+    for id in [stale_prevote, precommit_id] {
+        assert!(
+            adapters[0]
+                .author_vote(id, &mut actual_node)
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!((actual_node.round(), actual_node.authored()), (8, 1));
     assert_eq!(
         adapters[0].pending().len(),
         2,

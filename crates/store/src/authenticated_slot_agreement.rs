@@ -601,6 +601,7 @@ type ReplayState = (
     SlotAgreementBinding,
     Option<AgreementReproposalCandidate>,
     Vec<AgreementSigningIntent>,
+    Vec<[u8; 32]>,
 );
 
 fn replay(
@@ -897,6 +898,34 @@ fn replay(
             }
         }
     }
+    // Only current, undecided obligations may acquire a new outer carrier.
+    let authorable = outbox
+        .iter()
+        .filter(|intent| {
+            if reducer.decision().is_some()
+                || intent.agreement.context != active.context
+                || intent.vote.view != reducer.view()
+            {
+                return false;
+            }
+            match intent.vote.phase {
+                AgreementPhase::Prevote => !outbox.iter().any(|other| {
+                    other.agreement.context == active.context
+                        && other.vote.view == reducer.view()
+                        && other.vote.phase == AgreementPhase::Precommit
+                }),
+                AgreementPhase::Precommit => match &intent.vote.value {
+                    AgreementValue::Decision(decision) => {
+                        reducer.lock().is_some_and(|(view, locked)| {
+                            *view == reducer.view() && locked == decision
+                        })
+                    }
+                    AgreementValue::Nil => true,
+                },
+            }
+        })
+        .map(|intent| intent.id)
+        .collect();
     Ok((
         result,
         buckets.into_values().filter_map(|b| b.candidate).collect(),
@@ -904,6 +933,7 @@ fn replay(
         binding,
         reproposal,
         outbox,
+        authorable,
     ))
 }
 pub(super) fn validate(root: &Path) -> Result<(), StoreError> {
@@ -986,6 +1016,8 @@ type DriverSnapshot = (
     Option<AgreementTransitionResult>,
     Vec<AgreementQuorumCandidate>,
     Option<AgreementReproposalCandidate>,
+    SlotAgreementBinding,
+    Vec<[u8; 32]>,
 );
 
 impl AuthenticatedSlotAgreement {
@@ -1048,9 +1080,11 @@ impl AuthenticatedSlotAgreement {
         {
             return Err(invalid("stale authenticated owner"));
         }
-        let (transition, candidates, active, _, reproposal, _) =
+        let (transition, candidates, active, binding, reproposal, _, authorable) =
             replay(&journal.bootstrap, &journal.events)?;
-        Ok((active, transition, candidates, reproposal))
+        Ok((
+            active, transition, candidates, reproposal, binding, authorable,
+        ))
     }
 
     /// Derives the next slot from the durable deciding proof without application effects.

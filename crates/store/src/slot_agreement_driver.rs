@@ -28,6 +28,11 @@ pub struct SlotAgreementDriverOutput {
     pub candidates: Vec<SlotAgreementCarrierCandidate>,
     /// Highest valid authenticated POL material, retained across view advances.
     pub reproposal: Option<crate::AgreementReproposalCandidate>,
+    /// Active replay-derived predecessor binding for read-only DAG inspection.
+    pub binding: validator::SlotAgreementBinding,
+    /// Current undecided vote obligations appropriate to the reducer phase and lock.
+    /// These IDs are not transport or signing authority without local DAG checks.
+    pub authorable_vote_ids: Vec<[u8; 32]>,
 }
 
 impl SlotAgreementDriver {
@@ -72,7 +77,8 @@ impl SlotAgreementDriver {
     /// # Errors
     /// Rejects stale or uncertain owners, corrupt evidence, and invalid candidates.
     pub fn output(&self) -> Result<SlotAgreementDriverOutput, StoreError> {
-        let (bootstrap, transition, frozen, reproposal) = self.session.driver_snapshot()?;
+        let (bootstrap, transition, frozen, reproposal, binding, authorable_vote_ids) =
+            self.session.driver_snapshot()?;
         let mut candidates = Vec::new();
         if !transition.as_ref().is_some_and(|t| t.decision.is_some()) {
             for candidate in frozen {
@@ -104,6 +110,8 @@ impl SlotAgreementDriver {
             transition,
             candidates,
             reproposal,
+            binding,
+            authorable_vote_ids,
         })
     }
 }

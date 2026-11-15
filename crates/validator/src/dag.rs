@@ -1590,9 +1590,120 @@ impl Dag {
         if self.is_pruned(carrier.round) {
             return Err(invalid("slot carrier is pruned"));
         }
+        let causal = self.slot_reference_history_with_budget(
+            std::slice::from_ref(carrier),
+            decision,
+            budget,
+        )?;
+        let vertex = self
+            .get(carrier.round, &carrier.author)
+            .ok_or_else(|| missing(carrier))?;
+        if vertex.payload_hash != digest {
+            return Err(invalid("slot payload is not bound to its carrier"));
+        }
+        Ok(causal)
+    }
+
+    /// Checks an unsigned prospective carrier and its full actual reference cone before signing.
+    ///
+    /// Retained ancestors use the same checks as agreement carrier inspection, including
+    /// signature revalidation. Exact pruned boundary IDs are trusted, not reauthenticated.
+    /// Shares one phase budget across lineage and the prospective cone, as vote inspection does.
+    /// Only the prospective carrier's own signature remains the author's responsibility.
+    /// # Errors
+    /// Rejects pruned carriers, context/set/epoch mismatches, invalid reference rules,
+    /// missing or invalid retained ancestors, noncausal references and exhausted work.
+    pub fn inspect_slot_authoring_cone(
+        &self,
+        prospective: &Vertex,
+        lineage: &crate::SlotAgreementViewLineage,
+        payload: &crate::SlotAgreementVotePayload,
+        binding: &crate::SlotAgreementBinding,
+    ) -> Result<(), CryptoError> {
+        use crate::slot_agreement::{AgreementPhase, AgreementValue};
+        use crate::slot_agreement_phase::invalid;
+        let selected = lineage
+            .entries
+            .last()
+            .ok_or_else(|| invalid("empty lineage"))?;
+        let decision = &selected.proposal.decision;
+        let set = self.set_for_round(decision.round);
+        lineage.encode(set)?;
+        self.preflight_agreement_lineage(&lineage.entries, set, decision.round)?;
+        let prerequisite = match payload.vote.phase {
+            AgreementPhase::Prevote => &selected.view_carrier,
+            AgreementPhase::Precommit => {
+                &selected
+                    .pol
+                    .as_ref()
+                    .ok_or_else(|| invalid("precommit requires selected POL"))?
+                    .carrier
+            }
+        };
+        if payload.vote.view != selected.view
+            || payload.vote.value != AgreementValue::Decision(decision.clone())
+            || payload.vote.context != *binding.tip()
+            || prospective.author != payload.signature.validator_id
+            || payload.prerequisite != *prerequisite
+            || prerequisite.round >= prospective.round
+        {
+            return Err(invalid("individual vote does not match selected lineage"));
+        }
+        let mut budget = crate::SLOT_AGREEMENT_PHASE_WORK_BUDGET;
+        self.inspect_agreement_lineage(&lineage.entries, binding, &mut budget)?;
+        payload.verify(binding.tip(), set)?;
+        if prospective.payload_hash != payload.digest(set)? {
+            return Err(invalid("slot payload is not bound to its carrier"));
+        }
+        if self.is_pruned(prospective.round) {
+            return Err(invalid("slot carrier is pruned"));
+        }
+        if prospective.chain_id != decision.chain_id
+            || prospective.epoch != decision.epoch
+            || self.set_for_round(prospective.round).id()? != decision.validator_set_id
+            || self.epoch_of(prospective.round) != decision.epoch
+        {
+            return Err(invalid("prospective slot carrier context mismatch"));
+        }
+        self.check_round_references(prospective)?;
+        if prospective
+            .references
+            .iter()
+            .any(|reference| reference.round >= prospective.round)
+        {
+            return Err(invalid(
+                "slot causal history contains a noncausal reference",
+            ));
+        }
+        // Reserve the actual carrier's traversal visit, without inventing its ID.
+        budget = budget
+            .checked_sub(1)
+            .ok_or_else(|| invalid("agreement phase traversal work budget exhausted"))?;
+        let cone = self.slot_reference_history_with_budget(
+            &prospective.references,
+            decision,
+            &mut budget,
+        )?;
+        if !cone.contains(prerequisite) {
+            return Err(invalid("individual vote lacks selected prerequisite"));
+        }
+        Ok(())
+    }
+
+    fn slot_reference_history_with_budget(
+        &self,
+        references: &[VertexId],
+        decision: &crate::SlotDecision,
+        budget: &mut usize,
+    ) -> Result<HashSet<VertexId>, CryptoError> {
+        let invalid =
+            |message: &str| CryptoError::new(CryptoErrorKind::MalformedCertificate, message);
+        if references.len() > *budget {
+            return Err(invalid("agreement phase traversal work budget exhausted"));
+        }
         let set = self.set_for_round(decision.round);
         let mut causal = HashSet::new();
-        let mut stack = vec![carrier.clone()];
+        let mut stack = references.to_vec();
         while let Some(current) = stack.pop() {
             *budget = budget
                 .checked_sub(1)
@@ -1625,9 +1736,7 @@ impl Dag {
                     "slot causal history contains a noncausal reference",
                 ));
             }
-            if current == *carrier && vertex.payload_hash != digest {
-                return Err(invalid("slot payload is not bound to its carrier"));
-            }
+
             stack.extend(vertex.references.iter().cloned());
         }
         Ok(causal)

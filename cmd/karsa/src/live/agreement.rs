@@ -1,4 +1,4 @@
-//! Inactive durable signing boundary. No carrier authoring or transport is authorized here.
+//! Inactive durable signing boundary with explicit local carrier authoring, never live transport.
 
 use crypto::registry::{self, ALG_ED25519};
 use crypto::scheme::{Ed25519Scheme, verify_signature};
@@ -101,16 +101,16 @@ impl PendingIntent {
     }
 }
 
-/// No live activation exists until pre-sign causal readiness and transport are implemented.
+/// Live activation remains disabled; explicit local authoring is not transport authorization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Readiness {
-    /// Signing boundary available, but live carrier authoring remains disabled.
+    /// Historical compatibility label: explicit local authoring exists, but live wiring is disabled.
     DisabledMissingCausalReadinessAndTransport,
     /// A driver or reconstruction failure requires a fresh durable recovery.
     RecoveryRequiredHistoricalIntentsUnavailable,
 }
 
-/// Exclusive driver owner reconstructing historical obligations, never ready-to-send output.
+/// Exclusive driver owner retaining obligations and explicitly authoring locally checked votes.
 pub struct Adapter {
     driver: SlotAgreementDriver,
     set: ValidatorSet,
@@ -123,7 +123,121 @@ pub struct Adapter {
     readiness: Readiness,
 }
 
+/// Owned local authoring result; no publication, persistence or delivery guarantee.
+#[derive(Debug)]
+pub struct AuthoredVote {
+    /// Actual signed vertex, already inserted by Node's existing authoring path.
+    pub vertex: validator::Vertex,
+    /// Self-contained evidence bound to that actual vertex.
+    pub envelope: CarrierEnvelope,
+}
+
 impl Adapter {
+    /// Authors one stable durable vote intent, never arbitrary payloads or all history.
+    ///
+    /// Returns `None` for inactive/stale intents or unavailable local evidence. Nil
+    /// remains explicitly unsupported. This does not activate any live wiring.
+    /// # Errors
+    /// Rejects recovery-required/stale owners, unknown IDs, Node context/key mismatch,
+    /// codec failures and existing Node signing/insertion failures.
+    pub fn author_vote(
+        &mut self,
+        intent_id: [u8; 32],
+        node: &mut net::Node,
+    ) -> Result<Option<AuthoredVote>, String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before carrier signing".into());
+        }
+        // Revalidate ownership and exact durable obligation rather than trusting caches.
+        let output = match self.driver.output() {
+            Ok(output) => output,
+            Err(error) => {
+                self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+                return Err(error.to_string());
+            }
+        };
+        let history = match self.driver.signing_outbox() {
+            Ok(history) => history,
+            Err(error) => {
+                self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+                return Err(error.to_string());
+            }
+        };
+        let intent = history
+            .iter()
+            .find(|intent| intent.id == intent_id)
+            .ok_or("unknown durable vote intent ID")?;
+        if matches!(
+            intent.prerequisite,
+            AgreementSigningPrerequisite::UnsupportedNil
+        ) {
+            return Err("nil carrier is unsupported".into());
+        }
+        if !output.authorable_vote_ids.contains(&intent_id) {
+            return Ok(None);
+        }
+        if !node.matches_authoring_context(
+            &intent.agreement.context,
+            &self.set,
+            &self.validator_id,
+            &self.private_key,
+        ) {
+            return Err(
+                "Node differs from pinned agreement identity, chain, epoch, set or key".into(),
+            );
+        }
+        validate_intent_lineage(intent)?;
+        let pending = self
+            .pending
+            .iter()
+            .find_map(|pending| match pending {
+                PendingIntent::Vote {
+                    payload,
+                    digest,
+                    lineage,
+                } if payload.vote == intent.vote => Some((payload, digest, lineage)),
+                _ => None,
+            })
+            .ok_or("durable vote intent unavailable in reconstructed history")?;
+        let (payload, digest, lineage) = pending;
+        let AgreementSigningPrerequisite::Carrier(prerequisite) = &intent.prerequisite else {
+            return Err("nil carrier is unsupported".into());
+        };
+        if payload.prerequisite != *prerequisite || intent.lineage.as_ref() != Some(lineage) {
+            return Err("reconstructed vote differs from durable intent".into());
+        }
+        payload
+            .verify(&intent.agreement.context, &self.set)
+            .map_err(|e| e.to_string())?;
+        if payload.digest(&self.set).map_err(|e| e.to_string())? != *digest {
+            return Err("reconstructed vote digest mismatch".into());
+        }
+        CarrierEnvelope::preflight_vote(node.id(), payload, lineage, &self.set)
+            .map_err(|e| e.to_string())?;
+        // WAL authentication does not authenticate this Node's actual selected cone.
+        // Include siblings outside the lineage and share the full vote-inspection budget.
+        if node
+            .inspect_slot_authoring_cone(*digest, lineage, payload, &output.binding)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let Some(vertex) = node
+            .author_with_prerequisites(*digest, std::slice::from_ref(prerequisite))
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        let envelope = PendingIntent::Vote {
+            payload: payload.clone(),
+            digest: *digest,
+            lineage: lineage.clone(),
+        }
+        .into_envelope(vertex.id().map_err(|e| e.to_string())?, &self.set)
+        .map_err(|e| e.to_string())?;
+        Ok(Some(AuthoredVote { vertex, envelope }))
+    }
+
     /// Validates the pinned active key before creating a WAL. Never called by live startup.
     pub fn begin(
         store: &Store,

@@ -184,6 +184,25 @@ impl Node {
         &self.id
     }
 
+    /// Checks the exact pinned identity, chain, scheduled set/epoch and private-key association.
+    ///
+    /// Read-only: this neither signs nor changes authoring readiness. The expected key
+    /// must already have been validated against the pinned set by the caller.
+    #[must_use]
+    pub fn matches_authoring_context(
+        &self,
+        context: &validator::SlotDecisionTip,
+        set: &ValidatorSet,
+        id: &[u8],
+        private_key: &[u8],
+    ) -> bool {
+        self.id == id
+            && self.chain_id == context.chain_id()
+            && self.dag.epoch_of(self.round) == context.epoch()
+            && self.dag.set_for_round(self.round) == set
+            && self.private_key == private_key
+    }
+
     /// The round this node will author in next.
     #[must_use]
     pub fn round(&self) -> u64 {
@@ -395,6 +414,43 @@ impl Node {
         self.author_with_internal(payload_hash, prerequisites)
     }
 
+    /// Inspects the actual prospective carrier's complete agreement-context cone before signing.
+    ///
+    /// This is read-only and shares reference selection with actual authoring. It
+    /// authenticates lineage and retained ancestors, but not durable signing authority.
+    /// # Errors
+    /// Propagates the validator's prospective carrier and retained-cone checks.
+    pub fn inspect_slot_authoring_cone(
+        &self,
+        payload_hash: [u8; 32],
+        lineage: &validator::SlotAgreementViewLineage,
+        payload: &validator::SlotAgreementVotePayload,
+        binding: &validator::SlotAgreementBinding,
+    ) -> Result<(), CryptoError> {
+        self.dag.inspect_slot_authoring_cone(
+            &self.prospective_vertex(payload_hash),
+            lineage,
+            payload,
+            binding,
+        )
+    }
+
+    fn prospective_vertex(&self, payload_hash: [u8; 32]) -> Vertex {
+        Vertex {
+            chain_id: self.chain_id.clone(),
+            epoch: self.dag.epoch_of(self.round),
+            round: self.round,
+            author: self.id.clone(),
+            payload_hash,
+            references: if self.round == 0 {
+                Vec::new()
+            } else {
+                self.ids(self.round - 1)
+            },
+            signature: Vec::new(),
+        }
+    }
+
     fn references_cover_prerequisites(
         &self,
         references: &[VertexId],
@@ -468,11 +524,8 @@ impl Node {
             }
             return Ok(None);
         }
-        let references = if round == 0 {
-            Vec::new()
-        } else {
-            self.ids(round - 1)
-        };
+        let mut vertex = self.prospective_vertex(payload_hash);
+        let references = &vertex.references;
 
         if round > 0 {
             let authors: HashSet<&[u8]> = references
@@ -492,7 +545,7 @@ impl Node {
 
         if !prerequisites.is_empty()
             && !self.references_cover_prerequisites(
-                &references,
+                references,
                 prerequisites,
                 validator::SLOT_AGREEMENT_PHASE_WORK_BUDGET,
             )
@@ -500,16 +553,6 @@ impl Node {
             return Ok(None);
         }
 
-        let mut vertex = Vertex {
-            chain_id: self.chain_id.clone(),
-            epoch: self.dag.epoch_of(round),
-            round,
-            author: self.id.clone(),
-            // Ordering only unless the caller names a batch.
-            payload_hash,
-            references,
-            signature: Vec::new(),
-        };
         let payload = vertex.signing_payload()?;
         vertex.signature = Ed25519Scheme.sign(&self.private_key, &payload)?;
 
