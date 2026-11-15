@@ -62,8 +62,9 @@ pub use slot_agreement_driver::{
 };
 mod slot_agreement_journal;
 pub use authenticated_slot_agreement::{
-    AgreementQuorumCandidate, AgreementReproposalCandidate, AgreementSigningIntent,
-    AgreementSigningPrerequisite, AuthenticatedSlotAgreement, AuthenticatedSlotAgreementBootstrap,
+    AgreementCarrierEvidence, AgreementQuorumCandidate, AgreementReproposalCandidate,
+    AgreementReservedCarrier, AgreementSigningIntent, AgreementSigningPrerequisite,
+    AuthenticatedSlotAgreement, AuthenticatedSlotAgreementBootstrap,
     AuthenticatedSlotAgreementRequest,
 };
 #[cfg(test)]

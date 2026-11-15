@@ -142,7 +142,7 @@ pub struct AuthoredCarrier {
 pub type AuthoredVote = AuthoredCarrier;
 
 impl Adapter {
-    /// Authors a current driver POL candidate, never a historical pending candidate.
+    /// Durably reserves and authors a current POL candidate, never historical evidence.
     /// Returns `None` for stale digests or unavailable local evidence; never publishes.
     /// # Errors
     /// Rejects stale/uncertain owners, pinned Node mismatches, codec and authoring failures.
@@ -154,7 +154,7 @@ impl Adapter {
         self.author_aggregate(digest, node, AggregateKind::Pol)
     }
 
-    /// Authors a current driver final candidate without applying or transporting a decision.
+    /// Durably reserves and authors a current final candidate without publishing it.
     /// Returns `None` for stale digests or unavailable local evidence.
     /// # Errors
     /// Rejects stale/uncertain owners, pinned Node mismatches, codec and authoring failures.
@@ -227,10 +227,22 @@ impl Adapter {
         let Ok(prepared) = prepared else {
             return Ok(None);
         };
+        let unsigned = prepared.unsigned().clone();
+        let evidence = match &intent {
+            PendingIntent::Pol { candidate, .. } => store::AgreementCarrierEvidence::Pol {
+                lineage: candidate
+                    .clone()
+                    .bind_carrier(unsigned.id().map_err(|e| e.to_string())?),
+            },
+            PendingIntent::FinalProof { proof, .. } => store::AgreementCarrierEvidence::Final {
+                proof: proof.clone(),
+            },
+            _ => unreachable!("selected only aggregate candidates"),
+        };
+        self.reserve_carrier(&unsigned, evidence, prepared.dag())?;
         let Some(vertex) = prepared.author().map_err(|e| e.to_string())? else {
             return Ok(None);
         };
-        // All size and evidence checks ran before signing; only bind the actual ID here.
         let envelope = intent
             .into_envelope(vertex.id().map_err(|e| e.to_string())?, &self.set)
             .map_err(|e| e.to_string())?;
@@ -241,6 +253,8 @@ impl Adapter {
     ///
     /// Returns `None` for inactive/stale intents or unavailable local evidence. Nil
     /// remains explicitly unsupported. This does not activate any live wiring.
+    /// Exact current prospective statements reuse durable reservations after recovery.
+    /// Changed reference selection is rejected; historical-context resume is unsupported.
     /// # Errors
     /// Rejects recovery-required/stale owners, unknown IDs, Node context/key mismatch,
     /// codec failures and existing Node signing/insertion failures.
@@ -320,26 +334,105 @@ impl Adapter {
             .map_err(|e| e.to_string())?;
         // WAL authentication does not authenticate this Node's actual selected cone.
         // Include siblings outside the lineage and share the full vote-inspection budget.
-        if node
-            .inspect_slot_authoring_cone(*digest, lineage, payload, &output.binding)
-            .is_err()
-        {
-            return Ok(None);
-        }
-        let Some(vertex) = node
-            .author_with_prerequisites(*digest, std::slice::from_ref(prerequisite))
-            .map_err(|e| e.to_string())?
-        else {
+        let unsigned = match node.prospective_slot_vote(lineage, payload, &output.binding) {
+            Ok(unsigned) => unsigned,
+            Err(_) => return Ok(None),
+        };
+        let payload = payload.clone();
+        let lineage = lineage.clone();
+        let digest = *digest;
+        self.reserve_carrier(
+            &unsigned,
+            store::AgreementCarrierEvidence::Vote {
+                lineage: lineage.clone(),
+                payload: payload.clone(),
+            },
+            node.dag(),
+        )?;
+        let prepared = node
+            .prepare_reserved_slot_vote(&unsigned, &lineage, &payload, &output.binding)
+            .map_err(|e| e.to_string())?;
+        let Some(vertex) = prepared.author().map_err(|e| e.to_string())? else {
             return Ok(None);
         };
         let envelope = PendingIntent::Vote {
             payload: payload.clone(),
-            digest: *digest,
+            digest,
             lineage: lineage.clone(),
         }
         .into_envelope(vertex.id().map_err(|e| e.to_string())?, &self.set)
         .map_err(|e| e.to_string())?;
         Ok(Some(AuthoredVote { vertex, envelope }))
+    }
+
+    fn reserve_carrier(
+        &mut self,
+        unsigned: &validator::Vertex,
+        evidence: store::AgreementCarrierEvidence,
+        dag: &validator::Dag,
+    ) -> Result<(), String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before carrier signing".into());
+        }
+        let reservations = self.driver.reserved_carriers().map_err(|error| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            error.to_string()
+        })?;
+        if let Some(reserved) = reservations.iter().find(|reserved| {
+            reserved.unsigned.round == unsigned.round && reserved.unsigned.author == unsigned.author
+        }) {
+            if reserved.unsigned != *unsigned
+                || std::mem::discriminant(&reserved.evidence) != std::mem::discriminant(&evidence)
+            {
+                return Err("reserved carrier differs from current prospective statement".into());
+            }
+            // The durable getter revalidates ownership; initial append or recovery
+            // already synchronized the reservation. Do not allocate another sequence.
+        } else {
+            let mut todo = unsigned.references.clone();
+            let mut vertices = Vec::new();
+            let mut seen = std::collections::BTreeSet::new();
+            let mut edges = 0usize;
+            while let Some(id) = todo.pop() {
+                if !seen.insert((id.round, id.author.clone(), id.digest)) {
+                    continue;
+                }
+                if seen.len() > 4096 {
+                    return Err("carrier dependency count exceeds reservation bound".into());
+                }
+                let vertex = dag
+                    .get(id.round, &id.author)
+                    .ok_or("missing carrier reservation dependency")?;
+                if vertex.id().map_err(|e| e.to_string())? != id {
+                    return Err("carrier reservation dependency ID mismatch".into());
+                }
+                edges = edges.saturating_add(vertex.references.len());
+                if edges > 65536 {
+                    return Err("carrier dependency edges exceed reservation bound".into());
+                }
+                todo.extend(vertex.references.iter().cloned());
+                vertices.push(vertex.clone());
+            }
+            let sequence = self
+                .driver
+                .sequence()
+                .checked_add(1)
+                .ok_or("agreement sequence exhausted")?;
+            // Do not consume reducer output: reservation preserves the transition
+            // and must not rebuild or shift the pending candidate selection.
+            if let Err(error) = self.driver.apply(
+                sequence,
+                AuthenticatedSlotAgreementRequest::ReserveCarrier {
+                    evidence,
+                    unsigned: unsigned.clone(),
+                    vertices,
+                },
+            ) {
+                self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+                return Err(error.to_string());
+            }
+        }
+        Ok(())
     }
 
     /// Validates the pinned active key before creating a WAL. Never called by live startup.

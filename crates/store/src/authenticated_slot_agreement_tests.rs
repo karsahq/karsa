@@ -763,3 +763,628 @@ fn authenticated_multiview_skip_zero_to_three_root_wal_recovery() {
         authenticated_emitted_qc,
     );
 }
+
+#[test]
+fn durable_presign_vote_reservation_retries_and_rejections() {
+    use crypto::scheme::Ed25519Scheme;
+    use validator::{SlotAgreementVotePayload, ValidatorSignature};
+    let (f, lineage, bootstrap) = fixture(true);
+    let dir = TempDir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = store
+        .begin_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    let vote = owner
+        .apply(
+            1,
+            AuthenticatedSlotAgreementRequest::Propose {
+                lineage: lineage.clone(),
+                vertices: f.vertices.clone(),
+            },
+        )
+        .unwrap()
+        .vote
+        .unwrap();
+    let payload = SlotAgreementVotePayload {
+        signature: ValidatorSignature {
+            validator_id: f.set.validators[0].validator_id.clone(),
+            key_id: f.set.validators[0].keys[0].key_id.clone(),
+            signature: Ed25519Scheme
+                .sign(&f.keys[0], &vote.signing_payload(&f.set).unwrap())
+                .unwrap(),
+        },
+        vote,
+        prerequisite: lineage.entries[0].view_carrier.clone(),
+    };
+    let mut unsigned = signed_vertex(
+        &f.keys,
+        0,
+        5,
+        f.vertices
+            .iter()
+            .filter(|v| v.round == 4)
+            .map(|v| v.id().unwrap())
+            .collect(),
+        payload.digest(&f.set).unwrap(),
+    );
+    unsigned.signature.clear();
+    let request = AuthenticatedSlotAgreementRequest::ReserveCarrier {
+        evidence: AgreementCarrierEvidence::Vote {
+            lineage: lineage.clone(),
+            payload: payload.clone(),
+        },
+        unsigned: unsigned.clone(),
+        vertices: vec![],
+    };
+    let path = dir.0.join(authenticated_slot_agreement::FILE);
+    let before = fs::read(&path).unwrap();
+    let mut bads = Vec::new();
+    for kind in 0..6 {
+        let mut bad = request.clone();
+        let AuthenticatedSlotAgreementRequest::ReserveCarrier {
+            evidence, unsigned, ..
+        } = &mut bad
+        else {
+            unreachable!()
+        };
+        match kind {
+            0 => unsigned.signature = vec![1],
+            1 => unsigned.author = f.set.validators[1].validator_id.clone(),
+            2 => unsigned.chain_id.push(1),
+            3 => unsigned.references[0].digest[0] ^= 1,
+            4 => {
+                let AgreementCarrierEvidence::Vote { payload, .. } = evidence else {
+                    unreachable!()
+                };
+                payload.signature.signature[0] ^= 1;
+            }
+            _ => {
+                let AgreementCarrierEvidence::Vote { lineage, .. } = evidence else {
+                    unreachable!()
+                };
+                lineage.entries[0].view_carrier.digest[0] ^= 1;
+            }
+        }
+        bads.push(bad);
+    }
+    for bad in bads {
+        assert!(owner.apply(2, bad).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+    let before_driver = SlotAgreementDriver::new(
+        store
+            .recover_authenticated_slot_agreement(bootstrap.clone())
+            .unwrap(),
+    );
+    let transition = before_driver.output().unwrap().transition.unwrap();
+    let intents = before_driver.signing_outbox().unwrap();
+    drop(before_driver);
+    assert_eq!(owner.apply(2, request.clone()).unwrap(), transition);
+    assert_eq!(
+        owner.driver_snapshot().unwrap().1.as_ref(),
+        Some(&transition)
+    );
+    let after_driver = SlotAgreementDriver::new(owner);
+    assert_eq!(
+        after_driver.output().unwrap().transition.as_ref(),
+        Some(&transition)
+    );
+    assert_eq!(after_driver.signing_outbox().unwrap().len(), intents.len());
+    drop(after_driver);
+    let mut owner = store
+        .recover_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    assert_eq!(owner.signing_outbox().unwrap().len(), intents.len());
+    let reserved = owner.reserved_carriers().unwrap();
+    assert_eq!(reserved.len(), 1);
+    assert_eq!(reserved[0].id, unsigned.id().unwrap());
+    assert_eq!(reserved[0].unsigned, unsigned);
+    assert_eq!(reserved[0].sequence, 2);
+    let durable = fs::read(&path).unwrap();
+    assert!(owner.apply(3, request.clone()).is_err());
+    assert_eq!(owner.sequence(), 2);
+    assert_eq!(fs::read(&path).unwrap(), durable);
+    let stale = store
+        .recover_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    let driver = SlotAgreementDriver::new(stale);
+    assert_eq!(
+        driver.output().unwrap().transition.as_ref(),
+        Some(&transition)
+    );
+    assert_eq!(driver.signing_outbox().unwrap().len(), intents.len());
+    assert_eq!(driver.reserved_carriers().unwrap().len(), 1);
+    assert_eq!(owner.apply(2, request.clone()).unwrap(), transition);
+    assert_eq!(fs::read(&path).unwrap(), durable);
+    let mut conflict = request.clone();
+    let AuthenticatedSlotAgreementRequest::ReserveCarrier { unsigned, .. } = &mut conflict else {
+        unreachable!()
+    };
+    unsigned.references.pop();
+    assert!(owner.apply(3, conflict).is_err());
+    assert_eq!(fs::read(&path).unwrap(), durable);
+    owner
+        .apply(
+            3,
+            AuthenticatedSlotAgreementRequest::AdvanceView {
+                from: AgreementView(0),
+            },
+        )
+        .unwrap();
+    let advanced = fs::read(&path).unwrap();
+    assert!(driver.reserved_carriers().is_err());
+    assert_eq!(owner.apply(2, request.clone()).unwrap(), transition);
+    assert_eq!(owner.sequence(), 3);
+    assert_eq!(fs::read(&path).unwrap(), advanced);
+    assert!(owner.apply(4, request.clone()).is_err());
+    drop(owner);
+    let mut owner = store
+        .recover_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    assert!(
+        owner
+            .apply_with_io(
+                2,
+                request.clone(),
+                |file, bytes| Ok(file.write_all(bytes)?),
+                |_, _| Err(std::io::Error::other("reservation barrier failure").into()),
+            )
+            .is_err()
+    );
+    assert!(owner.reserved_carriers().is_err());
+    assert!(owner.apply(2, request.clone()).is_err());
+    drop(owner);
+    let mut owner = store
+        .recover_authenticated_slot_agreement(bootstrap)
+        .unwrap();
+    owner.apply(2, request).unwrap();
+    assert_eq!(
+        owner.reserved_carriers().unwrap()[0].unsigned.signature,
+        Vec::<u8>::new()
+    );
+    assert_eq!(fs::read(&path).unwrap(), advanced);
+}
+
+#[test]
+fn presign_reservation_survives_slot_advance_without_reauthorizing() {
+    use crate::slot_application_tests::unified_fixture;
+    use crypto::scheme::Ed25519Scheme;
+    use validator::{SlotAgreementVotePayload, ValidatorSignature};
+    let (f, proof, carrier) = unified_fixture(true);
+    let bootstrap = AuthenticatedSlotAgreementBootstrap {
+        agreement: SlotAgreementBootstrap {
+            context: f.binding.tip().clone(),
+            set: f.set.clone(),
+            local_validator: f.set.validators[0].validator_id.clone(),
+        },
+        predecessor: None,
+        order: vec![],
+        vertices: vec![],
+    };
+    let dir = TempDir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = store
+        .begin_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    let lineage = SlotAgreementViewLineage {
+        entries: proof.entries.clone(),
+    };
+    let vote = owner
+        .apply(
+            1,
+            AuthenticatedSlotAgreementRequest::ObservePrevote {
+                lineage: lineage.clone(),
+                vertices: f.vertices.clone(),
+            },
+        )
+        .unwrap()
+        .vote
+        .unwrap();
+    let payload = SlotAgreementVotePayload {
+        signature: ValidatorSignature {
+            validator_id: f.set.validators[0].validator_id.clone(),
+            key_id: f.set.validators[0].keys[0].key_id.clone(),
+            signature: Ed25519Scheme
+                .sign(&f.keys[0], &vote.signing_payload(&f.set).unwrap())
+                .unwrap(),
+        },
+        vote,
+        prerequisite: lineage
+            .entries
+            .last()
+            .unwrap()
+            .pol
+            .as_ref()
+            .unwrap()
+            .carrier
+            .clone(),
+    };
+    let round = f.vertices.iter().map(|v| v.round).max().unwrap() + 1;
+    let mut unsigned = signed_vertex(
+        &f.keys,
+        0,
+        round,
+        f.vertices
+            .iter()
+            .filter(|v| v.round == round - 1)
+            .map(|v| v.id().unwrap())
+            .collect(),
+        payload.digest(&f.set).unwrap(),
+    );
+    unsigned.signature.clear();
+    let request = AuthenticatedSlotAgreementRequest::ReserveCarrier {
+        evidence: AgreementCarrierEvidence::Vote { lineage, payload },
+        unsigned,
+        vertices: vec![],
+    };
+    owner.apply(2, request.clone()).unwrap();
+    owner
+        .apply(
+            3,
+            AuthenticatedSlotAgreementRequest::ObservePrecommit {
+                proof,
+                carrier,
+                vertices: vec![],
+            },
+        )
+        .unwrap();
+    owner.advance_slot(4).unwrap();
+    let path = dir.0.join(authenticated_slot_agreement::FILE);
+    let bytes = fs::read(&path).unwrap();
+    owner.apply(2, request.clone()).unwrap();
+    assert!(owner.apply(5, request.clone()).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    let original = owner.reserved_carriers().unwrap().remove(0);
+    assert_ne!(original.binding.tip(), owner.binding().unwrap().tip());
+    drop(owner);
+    let mut owner = store
+        .recover_authenticated_slot_agreement(bootstrap)
+        .unwrap();
+    owner.apply(2, request).unwrap();
+    assert_eq!(owner.reserved_carriers().unwrap()[0].id, original.id);
+    assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+#[test]
+fn presign_aggregate_frozen_candidates_recovery_and_rejections() {
+    use crate::slot_application_tests::unified_fixture;
+    use validator::SlotAgreementVotePayload;
+    for final_carrier in [false, true] {
+        let (f, proof, carrier) = unified_fixture(true);
+        let bootstrap = AuthenticatedSlotAgreementBootstrap {
+            agreement: SlotAgreementBootstrap {
+                context: f.binding.tip().clone(),
+                set: f.set.clone(),
+                local_validator: f.set.validators[0].validator_id.clone(),
+            },
+            predecessor: None,
+            order: vec![],
+            vertices: vec![],
+        };
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let mut owner = store
+            .begin_authenticated_slot_agreement(bootstrap.clone())
+            .unwrap();
+        let full = SlotAgreementViewLineage {
+            entries: proof.entries.clone(),
+        };
+        let mut base = full.clone();
+        let pol = base.entries.last_mut().unwrap().pol.take().unwrap();
+        let initial = if final_carrier {
+            AuthenticatedSlotAgreementRequest::ObservePrevote {
+                lineage: full.clone(),
+                vertices: f.vertices.clone(),
+            }
+        } else {
+            AuthenticatedSlotAgreementRequest::Propose {
+                lineage: base.clone(),
+                vertices: f.vertices.clone(),
+            }
+        };
+        owner.apply(1, initial).unwrap();
+        let round = f.vertices.iter().map(|v| v.round).max().unwrap() + 1;
+        let refs: Vec<_> = f
+            .vertices
+            .iter()
+            .filter(|v| v.round == round - 1)
+            .map(|v| v.id().unwrap())
+            .collect();
+        let mut unsigned = signed_vertex(
+            &f.keys,
+            0,
+            round,
+            refs.clone(),
+            if final_carrier {
+                proof.digest(&f.set).unwrap()
+            } else {
+                full.pol_digest(0, &f.set).unwrap()
+            },
+        );
+        unsigned.signature.clear();
+        let evidence = if final_carrier {
+            AgreementCarrierEvidence::Final {
+                proof: proof.clone(),
+            }
+        } else {
+            let mut bound = full.clone();
+            bound
+                .entries
+                .last_mut()
+                .unwrap()
+                .pol
+                .as_mut()
+                .unwrap()
+                .carrier = unsigned.id().unwrap();
+            AgreementCarrierEvidence::Pol { lineage: bound }
+        };
+        let request = AuthenticatedSlotAgreementRequest::ReserveCarrier {
+            evidence,
+            unsigned: unsigned.clone(),
+            vertices: vec![],
+        };
+        let path = dir.0.join(authenticated_slot_agreement::FILE);
+        let before = fs::read(&path).unwrap();
+        assert!(
+            owner
+                .apply(2, request.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("fresh exact frozen candidate")
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let witnesses = if final_carrier {
+            &proof.votes
+        } else {
+            &pol.votes
+        };
+        for witness in witnesses {
+            owner
+                .apply(
+                    owner.sequence() + 1,
+                    AuthenticatedSlotAgreementRequest::ObserveVote {
+                        lineage: if final_carrier {
+                            full.clone()
+                        } else {
+                            base.clone()
+                        },
+                        witness: witness.clone(),
+                        vertices: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        let candidates = owner.quorum_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        let frozen = &candidates[0];
+        let evidence = if final_carrier {
+            AgreementCarrierEvidence::Final {
+                proof: frozen
+                    .lineage
+                    .clone()
+                    .into_proof(frozen.certificate.clone(), frozen.witnesses.clone(), &f.set)
+                    .unwrap(),
+            }
+        } else {
+            AgreementCarrierEvidence::Pol {
+                lineage: frozen
+                    .lineage
+                    .pol_candidate_digest(
+                        frozen.certificate.clone(),
+                        frozen.witnesses.clone(),
+                        &f.set,
+                    )
+                    .unwrap()
+                    .bind_carrier(unsigned.id().unwrap()),
+            }
+        };
+        let request = AuthenticatedSlotAgreementRequest::ReserveCarrier {
+            evidence,
+            unsigned: unsigned.clone(),
+            vertices: vec![],
+        };
+        let before = fs::read(&path).unwrap();
+        for mutation in 0..7 {
+            let mut bad = request.clone();
+            let AuthenticatedSlotAgreementRequest::ReserveCarrier {
+                evidence, unsigned, ..
+            } = &mut bad
+            else {
+                unreachable!()
+            };
+            match mutation {
+                0 => unsigned.signature = vec![1],
+                1 => unsigned.references[0].digest[0] ^= 1,
+                2 => unsigned.chain_id.push(1),
+                5 => unsigned.epoch += 1,
+                6 => unsigned.author = f.set.validators[1].validator_id.clone(),
+                3 => match evidence {
+                    AgreementCarrierEvidence::Pol { lineage } => {
+                        lineage
+                            .entries
+                            .last_mut()
+                            .unwrap()
+                            .pol
+                            .as_mut()
+                            .unwrap()
+                            .carrier
+                            .digest[0] ^= 1
+                    }
+                    AgreementCarrierEvidence::Final { proof } => {
+                        proof.votes[0].carrier.digest[0] ^= 1
+                    }
+                    _ => unreachable!(),
+                },
+                _ => match evidence {
+                    AgreementCarrierEvidence::Pol { lineage } => {
+                        lineage
+                            .entries
+                            .last_mut()
+                            .unwrap()
+                            .pol
+                            .as_mut()
+                            .unwrap()
+                            .certificate
+                            .signatures[0]
+                            .signature[0] ^= 1
+                    }
+                    AgreementCarrierEvidence::Final { proof } => {
+                        proof.certificate.signatures[0].signature[0] ^= 1
+                    }
+                    _ => unreachable!(),
+                },
+            }
+            assert!(owner.apply(owner.sequence() + 1, bad).is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+        let sequence = owner.sequence() + 1;
+        let transition = owner.driver_snapshot().unwrap().1;
+        let intents = owner.signing_outbox().unwrap().len();
+        owner.apply(sequence, request.clone()).unwrap();
+        assert_eq!(owner.driver_snapshot().unwrap().1, transition);
+        assert_eq!(owner.signing_outbox().unwrap().len(), intents);
+        let durable = fs::read(&path).unwrap();
+        assert!(owner.apply(sequence + 1, request.clone()).is_err());
+        assert_eq!(owner.sequence(), sequence);
+        assert_eq!(fs::read(&path).unwrap(), durable);
+        let conflicting_dependency = signed_vertex(&f.keys, 0, round, refs, [4; 32]);
+        assert!(
+            owner
+                .apply(
+                    sequence + 1,
+                    AuthenticatedSlotAgreementRequest::ObserveVote {
+                        lineage: if final_carrier {
+                            full.clone()
+                        } else {
+                            base.clone()
+                        },
+                        witness: witnesses[0].clone(),
+                        vertices: vec![conflicting_dependency],
+                    }
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("signed dependency conflicts")
+        );
+        assert_eq!(fs::read(&path).unwrap(), durable);
+        let reserved = owner.reserved_carriers().unwrap().remove(0);
+        assert_eq!(reserved.id, unsigned.id().unwrap());
+        assert_eq!(reserved.sequence, sequence);
+        if !final_carrier {
+            let payload: SlotAgreementVotePayload = pol
+                .votes
+                .iter()
+                .find(|w| w.payload.signature.validator_id == bootstrap.agreement.local_validator)
+                .unwrap()
+                .payload
+                .clone();
+            let mut vote_unsigned = unsigned.clone();
+            vote_unsigned.payload_hash = payload.digest(&f.set).unwrap();
+            let conflict = AuthenticatedSlotAgreementRequest::ReserveCarrier {
+                evidence: AgreementCarrierEvidence::Vote {
+                    lineage: base.clone(),
+                    payload,
+                },
+                unsigned: vote_unsigned,
+                vertices: vec![],
+            };
+            assert!(
+                owner
+                    .apply(sequence + 1, conflict)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("conflicting local round")
+            );
+            assert_eq!(fs::read(&path).unwrap(), durable);
+        }
+        drop(owner);
+        let mut owner = store
+            .recover_authenticated_slot_agreement(bootstrap.clone())
+            .unwrap();
+        assert_eq!(
+            owner.reserved_carriers().unwrap()[0].evidence,
+            reserved.evidence
+        );
+        owner.apply(sequence, request.clone()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), durable);
+        owner
+            .apply(
+                sequence + 1,
+                AuthenticatedSlotAgreementRequest::AdvanceView {
+                    from: AgreementView(0),
+                },
+            )
+            .unwrap();
+        let mut stale = request.clone();
+        let AuthenticatedSlotAgreementRequest::ReserveCarrier {
+            unsigned, evidence, ..
+        } = &mut stale
+        else {
+            unreachable!()
+        };
+        unsigned.round += 1;
+        if let AgreementCarrierEvidence::Pol { lineage } = evidence {
+            lineage
+                .entries
+                .last_mut()
+                .unwrap()
+                .pol
+                .as_mut()
+                .unwrap()
+                .carrier = unsigned.id().unwrap();
+        }
+        assert!(
+            owner
+                .apply(sequence + 2, stale)
+                .unwrap_err()
+                .to_string()
+                .contains("fresh exact frozen candidate")
+        );
+        owner.apply(sequence, request.clone()).unwrap();
+        owner
+            .apply(
+                sequence + 2,
+                AuthenticatedSlotAgreementRequest::ObservePrecommit {
+                    proof,
+                    carrier,
+                    vertices: vec![],
+                },
+            )
+            .unwrap();
+        let mut decided = request.clone();
+        let AuthenticatedSlotAgreementRequest::ReserveCarrier {
+            unsigned, evidence, ..
+        } = &mut decided
+        else {
+            unreachable!()
+        };
+        unsigned.round += 1;
+        if let AgreementCarrierEvidence::Pol { lineage } = evidence {
+            lineage
+                .entries
+                .last_mut()
+                .unwrap()
+                .pol
+                .as_mut()
+                .unwrap()
+                .carrier = unsigned.id().unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        assert!(
+            owner
+                .apply(sequence + 3, decided)
+                .unwrap_err()
+                .to_string()
+                .contains("fresh exact frozen candidate")
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        owner.advance_slot(sequence + 3).unwrap();
+        owner.apply(sequence, request.clone()).unwrap();
+        drop(owner);
+        let mut owner = store
+            .recover_authenticated_slot_agreement(bootstrap)
+            .unwrap();
+        owner.apply(sequence, request).unwrap();
+        assert_eq!(owner.reserved_carriers().unwrap()[0].id, reserved.id);
+    }
+}

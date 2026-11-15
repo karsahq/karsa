@@ -652,7 +652,75 @@ fn actual_vote_authoring_preflights_node_and_dependencies() {
     );
     assert_eq!((incompatible.round(), incompatible.authored()), (5, 0));
     let mut node = authoring_node(&m, vertices);
+    let PendingIntent::Vote {
+        payload, lineage, ..
+    } = adapter
+        .pending()
+        .iter()
+        .find(|intent| matches!(intent, PendingIntent::Vote { .. }))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let payload = payload.clone();
+    let lineage = lineage.clone();
+    let binding = adapter.driver.output().unwrap().binding;
+    let unsigned = node
+        .prospective_slot_vote(&lineage, &payload, &binding)
+        .unwrap();
+    adapter
+        .reserve_carrier(
+            &unsigned,
+            store::AgreementCarrierEvidence::Vote {
+                lineage: lineage.clone(),
+                payload: payload.clone(),
+            },
+            node.dag(),
+        )
+        .unwrap();
+    assert_eq!((node.round(), node.authored()), (5, 0));
+    assert_eq!(
+        adapter.driver.reserved_carriers().unwrap()[0].unsigned,
+        unsigned
+    );
+    let sequence = adapter.driver.sequence();
+    assert!(
+        adapter
+            .reserve_carrier(
+                &unsigned,
+                store::AgreementCarrierEvidence::Pol {
+                    lineage: lineage.clone(),
+                },
+                node.dag()
+            )
+            .is_err()
+    );
+    assert_eq!((node.round(), node.authored()), (5, 0));
+    assert_eq!(adapter.driver.sequence(), sequence);
+    // Crash boundary: the reservation exists, but no outer signer has run.
+    drop(adapter);
+    let mut adapter = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    let mut changed_vertices = vertices.clone();
+    let sibling = signed(
+        &m,
+        3,
+        4,
+        vertices
+            .iter()
+            .filter(|v| v.round == 3)
+            .map(|v| v.id().unwrap())
+            .collect(),
+        [231; 32],
+    );
+    changed_vertices.retain(|v| !(v.round == 4 && v.author == sibling.author));
+    changed_vertices.push(sibling);
+    let mut changed = authoring_node(&m, &changed_vertices);
+    assert!(adapter.author_vote(id, &mut changed).is_err());
+    assert_eq!((changed.round(), changed.authored()), (5, 0));
+    assert_eq!(adapter.driver.sequence(), sequence);
     let authored = adapter.author_vote(id, &mut node).unwrap().unwrap();
+    assert_eq!(authored.vertex.id().unwrap(), unsigned.id().unwrap());
+    assert_eq!(adapter.driver.sequence(), sequence);
     assert_eq!((node.round(), node.authored()), (6, 1));
     assert_eq!(
         authored.vertex.payload_hash,
@@ -1469,17 +1537,56 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         pol_digest,
         true,
     );
+    let binding = adapters[0].driver.output().unwrap().binding;
+    let prepared = pol_node.prepare_slot_pol(&candidate, &binding).unwrap();
+    let unsigned = prepared.unsigned().clone();
+    adapters[0]
+        .reserve_carrier(
+            &unsigned,
+            store::AgreementCarrierEvidence::Pol {
+                lineage: candidate.clone().bind_carrier(unsigned.id().unwrap()),
+            },
+            prepared.dag(),
+        )
+        .unwrap();
+    drop(prepared);
+    assert_eq!((pol_node.round(), pol_node.authored()), (6, 0));
+    assert!(
+        adapters[0]
+            .driver
+            .reserved_carriers()
+            .unwrap()
+            .iter()
+            .any(|r| r.unsigned == unsigned)
+    );
+    let sequence = adapters[0].driver.sequence();
+    // Replace the owner with a recovered session before invoking the outer signer.
+    let recovered = Adapter::recover(&stores[0], bootstrap.clone(), &m, 0).unwrap();
+    adapters[0] = recovered;
+    let mut fresh_pol_node = authoring_node_index(&m, &pol_node_vertices, 1);
+    fresh_pol_node.set_round(6);
+    let fresh_pol = adapters[1]
+        .author_pol(pol_digest, &mut fresh_pol_node)
+        .unwrap()
+        .unwrap();
+    assert!(
+        adapters[1]
+            .driver
+            .reserved_carriers()
+            .unwrap()
+            .iter()
+            .any(|r| r.id == fresh_pol.vertex.id().unwrap())
+    );
     let authored_pol = adapters[0]
         .author_pol(pol_digest, &mut pol_node)
         .unwrap()
         .unwrap();
+    assert_eq!(adapters[0].driver.sequence(), sequence);
+    assert_eq!(authored_pol.vertex.id().unwrap(), unsigned.id().unwrap());
     assert_eq!(authored_pol.vertex, pol_vertices[0]);
     authored_pol
         .envelope
-        .inspect(
-            pol_node.dag(),
-            &adapters[0].driver.output().unwrap().binding,
-        )
+        .inspect(pol_node.dag(), &binding)
         .unwrap();
     assert_eq!((pol_node.round(), pol_node.authored()), (7, 1));
     let pol_carrier = pol_vertices[0].id().unwrap();
@@ -1640,6 +1747,9 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         .into_envelope(witness.carrier.clone(), &m.set)
         .unwrap();
         let decoded = CarrierEnvelope::decode(&envelope.encode(&m.set).unwrap(), &m.set).unwrap();
+        adapters[1]
+            .receive_envelope(decoded.clone(), precommit_vertices.clone())
+            .unwrap();
         adapters[0]
             .receive_envelope(decoded, precommit_vertices.clone())
             .unwrap();
@@ -1689,16 +1799,54 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             .is_err()
     );
     assert_eq!((final_node.round(), final_node.authored()), (8, 0));
+    let binding = adapters[0].driver.output().unwrap().binding;
+    let prepared = final_node.prepare_slot_final(proof, &binding).unwrap();
+    let unsigned = prepared.unsigned().clone();
+    adapters[0]
+        .reserve_carrier(
+            &unsigned,
+            store::AgreementCarrierEvidence::Final {
+                proof: proof.clone(),
+            },
+            prepared.dag(),
+        )
+        .unwrap();
+    drop(prepared);
+    assert_eq!((final_node.round(), final_node.authored()), (8, 0));
+    assert!(
+        adapters[0]
+            .driver
+            .reserved_carriers()
+            .unwrap()
+            .iter()
+            .any(|r| r.unsigned == unsigned)
+    );
+    let sequence = adapters[0].driver.sequence();
+    let recovered = Adapter::recover(&stores[0], bootstrap.clone(), &m, 0).unwrap();
+    adapters[0] = recovered;
+    let mut fresh_final_node = authoring_node_index(&m, &final_node_vertices, 1);
+    fresh_final_node.set_round(8);
+    let fresh_final = adapters[1]
+        .author_final_proof(*digest, &mut fresh_final_node)
+        .unwrap()
+        .unwrap();
+    assert!(
+        adapters[1]
+            .driver
+            .reserved_carriers()
+            .unwrap()
+            .iter()
+            .any(|r| r.id == fresh_final.vertex.id().unwrap())
+    );
     let authored_final = adapters[0]
         .author_final_proof(*digest, &mut final_node)
         .unwrap()
         .unwrap();
+    assert_eq!(adapters[0].driver.sequence(), sequence);
+    assert_eq!(authored_final.vertex.id().unwrap(), unsigned.id().unwrap());
     authored_final
         .envelope
-        .inspect(
-            final_node.dag(),
-            &adapters[0].driver.output().unwrap().binding,
-        )
+        .inspect(final_node.dag(), &binding)
         .unwrap();
     assert_eq!((final_node.round(), final_node.authored()), (9, 1));
     let before = proof.encode(&m.set).unwrap();

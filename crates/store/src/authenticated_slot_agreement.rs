@@ -39,6 +39,15 @@ pub struct AuthenticatedSlotAgreementBootstrap {
 pub enum AuthenticatedSlotAgreementRequest {
     /// Apply the first durable deciding proof and derive the next same-set slot.
     AdvanceSlot,
+    /// Reserve an exact unsigned outer statement before invoking its signer.
+    ReserveCarrier {
+        /// Typed authenticated evidence bound to the exact prospective statement.
+        evidence: AgreementCarrierEvidence,
+        /// Actual prospective statement, with an empty outer signature.
+        unsigned: Vertex,
+        /// Complete additional signed dependencies.
+        vertices: Vec<Vertex>,
+    },
     /// Authenticate the exact lineage before emitting a prevote.
     Propose {
         /// Complete historical authorization, including exact carriers.
@@ -84,6 +93,45 @@ pub enum AuthenticatedSlotAgreementRequest {
         from: AgreementView,
     },
 }
+/// Typed evidence for a pre-sign reservation of a VOTE, POL or FINAL carrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgreementCarrierEvidence {
+    /// A signed inner vote matching a durable local signing obligation.
+    Vote {
+        /// Full authenticated authorization.
+        lineage: SlotAgreementViewLineage,
+        /// Signed inner payload; the outer vertex remains unsigned.
+        payload: SlotAgreementVotePayload,
+    },
+    /// Selected frozen prevotes bound to the actual prospective POL carrier ID.
+    Pol {
+        /// Full lineage, including the selected POL bound to `unsigned.id()`.
+        lineage: SlotAgreementViewLineage,
+    },
+    /// Exact frozen precommit evidence awaiting an outer FINAL carrier.
+    Final {
+        /// Complete direct final proof.
+        proof: SlotAgreementProof,
+    },
+}
+
+/// Durable, replay-derived outer signing permission; never acknowledged or removed.
+#[derive(Debug, Clone)]
+pub struct AgreementReservedCarrier {
+    /// Stable hash of the exact vertex signing statement (independent of request sequence).
+    pub id: VertexId,
+    /// Original one-based WAL event sequence.
+    pub sequence: u64,
+    /// Original local identity, set and slot context.
+    pub agreement: SlotAgreementBootstrap,
+    /// Original predecessor binding.
+    pub binding: SlotAgreementBinding,
+    /// Full authenticated evidence.
+    pub evidence: AgreementCarrierEvidence,
+    /// Exact statement to sign, with no outer signature.
+    pub unsigned: Vertex,
+}
+
 fn put_id(e: &mut Encoder, id: &VertexId) -> Result<(), StoreError> {
     if id.author.len() > 1024 {
         return Err(invalid("carrier author exceeds bound"));
@@ -196,6 +244,31 @@ impl AuthenticatedSlotAgreementRequest {
         e.put_u16(1);
         match self {
             Self::AdvanceSlot => e.put_u8(6),
+            Self::ReserveCarrier {
+                evidence,
+                unsigned,
+                vertices,
+            } => {
+                e.put_u8(7);
+                // Persisted inner tags: 0 VOTE, 1 POL, 2 FINAL. Existing VOTE bytes stay unchanged.
+                match evidence {
+                    AgreementCarrierEvidence::Vote { lineage, payload } => {
+                        e.put_u8(0);
+                        e.put_bytes(&lineage.encode(set)?)?;
+                        e.put_bytes(&payload.encode(set)?)?;
+                    }
+                    AgreementCarrierEvidence::Pol { lineage } => {
+                        e.put_u8(1);
+                        e.put_bytes(&lineage.encode(set)?)?;
+                    }
+                    AgreementCarrierEvidence::Final { proof } => {
+                        e.put_u8(2);
+                        e.put_bytes(&proof.encode(set)?)?;
+                    }
+                }
+                e.put_bytes(&unsigned.encode()?)?;
+                put_vertices(&mut e, vertices)?;
+            }
             Self::Propose { lineage, vertices } | Self::ObservePrevote { lineage, vertices } => {
                 e.put_u8(if matches!(self, Self::Propose { .. }) {
                     0
@@ -249,6 +322,26 @@ impl AuthenticatedSlotAgreementRequest {
         let tag = d.read_u8()?;
         let value = match tag {
             6 => Self::AdvanceSlot,
+            7 => {
+                let evidence = match d.read_u8()? {
+                    0 => AgreementCarrierEvidence::Vote {
+                        lineage: SlotAgreementViewLineage::decode(d.read_bytes()?, set)?,
+                        payload: SlotAgreementVotePayload::decode(d.read_bytes()?, set)?,
+                    },
+                    1 => AgreementCarrierEvidence::Pol {
+                        lineage: SlotAgreementViewLineage::decode(d.read_bytes()?, set)?,
+                    },
+                    2 => AgreementCarrierEvidence::Final {
+                        proof: SlotAgreementProof::decode(d.read_bytes()?, set)?,
+                    },
+                    _ => return Err(invalid("unsupported reservation evidence")),
+                };
+                Self::ReserveCarrier {
+                    evidence,
+                    unsigned: Vertex::decode(d.read_bytes()?)?,
+                    vertices: get_vertices(&mut d)?,
+                }
+            }
             0 | 1 => {
                 let lineage = SlotAgreementViewLineage::decode(d.read_bytes()?, set)?;
                 let vertices = get_vertices(&mut d)?;
@@ -510,6 +603,10 @@ pub struct AgreementQuorumCandidate {
 }
 
 impl AgreementQuorumCandidate {
+    pub(super) fn is_fresh(&self, view: AgreementView, decided: bool) -> bool {
+        !decided && self.certificate.vote.view == view
+    }
+
     pub(super) fn validate_envelope(
         &self,
         set: &validator::ValidatorSet,
@@ -602,7 +699,60 @@ type ReplayState = (
     Option<AgreementReproposalCandidate>,
     Vec<AgreementSigningIntent>,
     Vec<[u8; 32]>,
+    Vec<AgreementReservedCarrier>,
 );
+
+fn reservation_bounds(
+    vertices: &BTreeMap<(u64, Vec<u8>), Vertex>,
+    reservations: &[AgreementReservedCarrier],
+    prospective: Option<&Vertex>,
+) -> Result<(), StoreError> {
+    let count = vertices.len() + reservations.len() + usize::from(prospective.is_some());
+    let edges = vertices.values().map(|v| v.references.len()).sum::<usize>()
+        + reservations
+            .iter()
+            .map(|r| r.unsigned.references.len())
+            .sum::<usize>()
+        + prospective.map_or(0, |v| v.references.len());
+    if count > MAX_VERTICES || edges > MAX_DEPENDENCIES {
+        return Err(invalid("combined reservation dependency bound exceeded"));
+    }
+    Ok(())
+}
+
+fn authorable_votes(
+    outbox: &[AgreementSigningIntent],
+    reducer: &SlotAgreement,
+    active: &SlotAgreementBootstrap,
+) -> Vec<[u8; 32]> {
+    outbox
+        .iter()
+        .filter(|intent| {
+            if reducer.decision().is_some()
+                || intent.agreement.context != active.context
+                || intent.vote.view != reducer.view()
+            {
+                return false;
+            }
+            match intent.vote.phase {
+                AgreementPhase::Prevote => !outbox.iter().any(|other| {
+                    other.agreement.context == active.context
+                        && other.vote.view == reducer.view()
+                        && other.vote.phase == AgreementPhase::Precommit
+                }),
+                AgreementPhase::Precommit => match &intent.vote.value {
+                    AgreementValue::Decision(decision) => {
+                        reducer.lock().is_some_and(|(view, locked)| {
+                            *view == reducer.view() && locked == decision
+                        })
+                    }
+                    AgreementValue::Nil => true,
+                },
+            }
+        })
+        .map(|intent| intent.id)
+        .collect()
+}
 
 fn replay(
     b: &AuthenticatedSlotAgreementBootstrap,
@@ -624,8 +774,156 @@ fn replay(
     let mut buckets: BTreeMap<Vec<u8>, VoteBucket> = BTreeMap::new();
     let mut witness_count = 0usize;
     let mut evidence_bytes = 0usize;
-    let mut outbox = Vec::new();
+    let mut outbox: Vec<AgreementSigningIntent> = Vec::new();
+    let mut reserved: Vec<AgreementReservedCarrier> = Vec::new();
     for (index, event) in events.iter().enumerate() {
+        let incoming = match event {
+            AuthenticatedSlotAgreementRequest::ReserveCarrier { vertices, .. }
+            | AuthenticatedSlotAgreementRequest::Propose { vertices, .. }
+            | AuthenticatedSlotAgreementRequest::ObservePrevote { vertices, .. }
+            | AuthenticatedSlotAgreementRequest::ObservePrecommit { vertices, .. }
+            | AuthenticatedSlotAgreementRequest::ObserveVote { vertices, .. } => {
+                vertices.as_slice()
+            }
+            _ => &[],
+        };
+        for vertex in incoming {
+            for reservation in &reserved {
+                if vertex.author == reservation.unsigned.author
+                    && vertex.round == reservation.unsigned.round
+                    && vertex.id()? != reservation.id
+                {
+                    return Err(invalid(
+                        "signed dependency conflicts with reserved local round",
+                    ));
+                }
+            }
+        }
+        if let AuthenticatedSlotAgreementRequest::ReserveCarrier {
+            evidence,
+            unsigned,
+            vertices: incoming,
+        } = event
+        {
+            if !unsigned.signature.is_empty() || unsigned.author != active.local_validator {
+                return Err(invalid("reservation requires an unsigned local carrier"));
+            }
+            if reserved.iter().any(|old| old.unsigned == *unsigned) {
+                return Err(invalid("carrier already reserved; retry original sequence"));
+            }
+            ingest(&mut dag, &mut vertices, incoming)?;
+            reservation_bounds(&vertices, &reserved, None)?;
+            let fresh = || {
+                buckets
+                    .values()
+                    .filter_map(|bucket| bucket.candidate.as_ref())
+                    .filter(|candidate| {
+                        candidate.is_fresh(reducer.view(), reducer.decision().is_some())
+                    })
+            };
+            match evidence {
+                AgreementCarrierEvidence::Vote { lineage, payload } => {
+                    let eligible = authorable_votes(&outbox, &reducer, &active);
+                    if !outbox.iter().any(|intent| {
+                        eligible.contains(&intent.id)
+                            && intent.vote == payload.vote
+                            && intent.lineage.as_ref() == Some(lineage)
+                            && intent.prerequisite
+                                == AgreementSigningPrerequisite::Carrier(
+                                    payload.prerequisite.clone(),
+                                )
+                    }) {
+                        return Err(invalid("reservation lacks current durable vote obligation"));
+                    }
+                    dag.dag()
+                        .inspect_slot_authoring_cone(unsigned, lineage, payload, &binding)?;
+                }
+                AgreementCarrierEvidence::Pol { lineage } => {
+                    let mut unbound = lineage.clone();
+                    let pol = unbound
+                        .entries
+                        .last_mut()
+                        .and_then(|entry| entry.pol.take())
+                        .ok_or_else(|| invalid("POL reservation lacks selected evidence"))?;
+                    if pol.carrier != unsigned.id()? {
+                        return Err(invalid(
+                            "POL reservation does not bind actual prospective ID",
+                        ));
+                    }
+                    let candidate =
+                        unbound.pol_candidate_digest(pol.certificate, pol.votes, &active.set)?;
+                    let mut matched = false;
+                    for frozen in
+                        fresh().filter(|c| c.certificate.vote.phase == AgreementPhase::Prevote)
+                    {
+                        let expected = frozen.lineage.pol_candidate_digest(
+                            frozen.certificate.clone(),
+                            frozen.witnesses.clone(),
+                            &active.set,
+                        )?;
+                        if candidate == expected {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if !matched {
+                        return Err(invalid(
+                            "POL reservation lacks fresh exact frozen candidate",
+                        ));
+                    }
+                    dag.dag()
+                        .inspect_slot_pol_authoring_cone(unsigned, &candidate, &binding)?;
+                }
+                AgreementCarrierEvidence::Final { proof } => {
+                    let mut matched = false;
+                    for frozen in
+                        fresh().filter(|c| c.certificate.vote.phase == AgreementPhase::Precommit)
+                    {
+                        let expected = frozen.lineage.clone().into_proof(
+                            frozen.certificate.clone(),
+                            frozen.witnesses.clone(),
+                            &active.set,
+                        )?;
+                        if *proof == expected {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if !matched {
+                        return Err(invalid(
+                            "FINAL reservation lacks fresh exact frozen candidate",
+                        ));
+                    }
+                    dag.dag()
+                        .inspect_slot_final_authoring_cone(unsigned, proof, &binding)?;
+                }
+            }
+            reservation_bounds(&vertices, &reserved, Some(unsigned))?;
+            let id = unsigned.id()?;
+            if reserved.iter().any(|old| {
+                old.unsigned.round == unsigned.round
+                    && old.unsigned.author == unsigned.author
+                    && old.unsigned != *unsigned
+            }) || vertices
+                .get(&(unsigned.round, unsigned.author.clone()))
+                .is_some_and(|old| old.id().ok().as_ref() != Some(&id))
+            {
+                return Err(invalid("conflicting local round signing reservation"));
+            }
+            if reserved.len() >= MAX_EVENTS {
+                return Err(invalid("reservation count exceeds bound"));
+            }
+            reserved.push(AgreementReservedCarrier {
+                id,
+                sequence: index as u64 + 1,
+                agreement: active.clone(),
+                binding: binding.clone(),
+                evidence: evidence.clone(),
+                unsigned: unsigned.clone(),
+            });
+            // No reducer input: retain its last transition and skip vote emission.
+            continue;
+        }
         if matches!(event, AuthenticatedSlotAgreementRequest::AdvanceSlot) {
             if reducer.decision().is_none() {
                 return Err(invalid("cannot advance an undecided slot"));
@@ -662,6 +960,7 @@ fn replay(
                 ));
             }
             ingest(&mut dag, &mut vertices, incoming)?;
+            reservation_bounds(&vertices, &reserved, None)?;
             dag.dag()
                 .inspect_slot_agreement_vote(lineage, witness, &binding)?;
             // Authenticate the supplied POL before removing it: a prevote authorizes
@@ -737,6 +1036,9 @@ fn replay(
             continue;
         }
         let (input, decision) = match event {
+            AuthenticatedSlotAgreementRequest::ReserveCarrier { .. } => {
+                unreachable!("reservation handled above")
+            }
             AuthenticatedSlotAgreementRequest::AdvanceSlot => unreachable!("advance handled above"),
             AuthenticatedSlotAgreementRequest::ObserveVote { .. } => {
                 unreachable!("observations handled without reducer input")
@@ -750,6 +1052,7 @@ fn replay(
                 vertices: incoming,
             } => {
                 ingest(&mut dag, &mut vertices, incoming)?;
+                reservation_bounds(&vertices, &reserved, None)?;
                 let proposal = dag
                     .dag()
                     .inspect_slot_agreement_view_lineage(lineage, &binding)?;
@@ -783,6 +1086,7 @@ fn replay(
                 vertices: incoming,
             } => {
                 ingest(&mut dag, &mut vertices, incoming)?;
+                reservation_bounds(&vertices, &reserved, None)?;
                 dag.dag()
                     .inspect_slot_agreement_proof(proof, carrier, &binding)?;
                 if reducer.decision().is_none() {
@@ -899,33 +1203,7 @@ fn replay(
         }
     }
     // Only current, undecided obligations may acquire a new outer carrier.
-    let authorable = outbox
-        .iter()
-        .filter(|intent| {
-            if reducer.decision().is_some()
-                || intent.agreement.context != active.context
-                || intent.vote.view != reducer.view()
-            {
-                return false;
-            }
-            match intent.vote.phase {
-                AgreementPhase::Prevote => !outbox.iter().any(|other| {
-                    other.agreement.context == active.context
-                        && other.vote.view == reducer.view()
-                        && other.vote.phase == AgreementPhase::Precommit
-                }),
-                AgreementPhase::Precommit => match &intent.vote.value {
-                    AgreementValue::Decision(decision) => {
-                        reducer.lock().is_some_and(|(view, locked)| {
-                            *view == reducer.view() && locked == decision
-                        })
-                    }
-                    AgreementValue::Nil => true,
-                },
-            }
-        })
-        .map(|intent| intent.id)
-        .collect();
+    let authorable = authorable_votes(&outbox, &reducer, &active);
     Ok((
         result,
         buckets.into_values().filter_map(|b| b.candidate).collect(),
@@ -934,6 +1212,7 @@ fn replay(
         reproposal,
         outbox,
         authorable,
+        reserved,
     ))
 }
 pub(super) fn validate(root: &Path) -> Result<(), StoreError> {
@@ -1050,6 +1329,30 @@ impl AuthenticatedSlotAgreement {
         Ok(replay(&journal.bootstrap, &journal.events)?.5)
     }
 
+    /// Returns all durable pre-sign reservations in original WAL order.
+    ///
+    /// # Errors
+    /// Rejects uncertain or stale owners and invalid durable evidence.
+    pub fn reserved_carriers(&self) -> Result<Vec<AgreementReservedCarrier>, StoreError> {
+        if self.uncertain {
+            return Err(invalid("uncertain authenticated write requires recovery"));
+        }
+        let root = self
+            .store
+            .slot_decisions
+            .lock()
+            .expect("slot decision lock poisoned");
+        exclusions(&root)?;
+        let journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
+        if journal.header != self.header
+            || journal.events.len() as u64 != self.sequence
+            || journal.tip != self.tip
+        {
+            return Err(invalid("stale authenticated owner"));
+        }
+        Ok(replay(&journal.bootstrap, &journal.events)?.7)
+    }
+
     /// Reauthenticates durable evidence and returns frozen candidates without mutable state access.
     ///
     /// # Errors
@@ -1080,7 +1383,7 @@ impl AuthenticatedSlotAgreement {
         {
             return Err(invalid("stale authenticated owner"));
         }
-        let (transition, candidates, active, binding, reproposal, _, authorable) =
+        let (transition, candidates, active, binding, reproposal, _, authorable, _) =
             replay(&journal.bootstrap, &journal.events)?;
         Ok((
             active, transition, candidates, reproposal, binding, authorable,
@@ -1158,7 +1461,13 @@ impl AuthenticatedSlotAgreement {
             return Err(invalid("stale authenticated owner"));
         }
         let body = request.encode(&journal.bootstrap.agreement.set)?;
-        let retry = sequence == self.sequence && journal.events.last() == Some(&request);
+        let reservation_retry = matches!(
+            request,
+            AuthenticatedSlotAgreementRequest::ReserveCarrier { .. }
+        ) && sequence > 0
+            && journal.events.get((sequence - 1) as usize) == Some(&request);
+        let retry = reservation_retry
+            || (sequence == self.sequence && journal.events.last() == Some(&request));
         if !retry && sequence != self.sequence + 1 {
             return Err(invalid("incorrect authenticated sequence or retry"));
         }
@@ -1170,7 +1479,12 @@ impl AuthenticatedSlotAgreement {
             }
             journal.events.push(request);
         }
-        let result = replay(&journal.bootstrap, &journal.events)?
+        let replay_events = if reservation_retry {
+            &journal.events[..sequence as usize]
+        } else {
+            &journal.events
+        };
+        let result = replay(&journal.bootstrap, replay_events)?
             .0
             .ok_or_else(|| invalid("no authenticated transition"))?;
         self.uncertain = true;
@@ -1288,6 +1602,39 @@ mod envelope_tests {
                 witnesses,
             },
         )
+    }
+
+    #[test]
+    fn reservations_share_vertex_and_dependency_capacity() {
+        let (f, proof, _) = unified_fixture(true);
+        let mut unsigned = f.vertices[0].clone();
+        unsigned.signature.clear();
+        unsigned.references.clear();
+        let reservation = AgreementReservedCarrier {
+            id: unsigned.id().unwrap(),
+            sequence: 1,
+            agreement: SlotAgreementBootstrap {
+                context: f.binding.tip().clone(),
+                set: f.set.clone(),
+                local_validator: unsigned.author.clone(),
+            },
+            binding: SlotAgreementBinding::from_checkpoint(f.binding.tip().clone(), None).unwrap(),
+            evidence: AgreementCarrierEvidence::Final { proof },
+            unsigned: unsigned.clone(),
+        };
+        let mut vertices = BTreeMap::new();
+        for round in 0..MAX_VERTICES - 1 {
+            vertices.insert((round as u64, unsigned.author.clone()), unsigned.clone());
+        }
+        let reservations = [reservation];
+        reservation_bounds(&vertices, &reservations, None).unwrap();
+        assert!(reservation_bounds(&vertices, &reservations, Some(&unsigned)).is_err());
+        vertices.clear();
+        let mut reservations = reservations;
+        reservations[0].unsigned.references = vec![unsigned.id().unwrap(); MAX_DEPENDENCIES];
+        reservation_bounds(&vertices, &reservations, Some(&unsigned)).unwrap();
+        unsigned.references.push(unsigned.id().unwrap());
+        assert!(reservation_bounds(&vertices, &reservations, Some(&unsigned)).is_err());
     }
 
     #[test]

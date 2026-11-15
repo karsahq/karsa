@@ -50,10 +50,33 @@ pub struct PreparedSlotCarrier<'a> {
 }
 
 impl PreparedSlotCarrier<'_> {
+    /// Returns the exact inspected unsigned statement held by this exclusive borrow.
+    pub fn unsigned(&self) -> &Vertex {
+        &self.vertex
+    }
+
+    /// Returns the unchanged DAG for bounded durable dependency reconstruction.
+    pub fn dag(&self) -> &Dag {
+        self.node.dag()
+    }
+
     /// Signs and inserts the exact reference selection inspected during preparation.
     /// # Errors
     /// Propagates existing Node signing and insertion failures.
     pub fn author(self) -> Result<Option<Vertex>, CryptoError> {
+        if self.node.authoring_slot_occupied() {
+            return Ok(None);
+        }
+        if self
+            .node
+            .unoccupied_prospective_vertex(self.vertex.payload_hash)?
+            != self.vertex
+        {
+            return Err(CryptoError::new(
+                CryptoErrorKind::InvalidVertex,
+                "prepared carrier differs from current prospective statement",
+            ));
+        }
         self.node
             .author_with_prerequisites(self.vertex.payload_hash, &self.prerequisites)
     }
@@ -455,6 +478,51 @@ impl Node {
             payload,
             binding,
         )
+    }
+
+    /// Returns the inspected unsigned VOTE carrier for durable pre-sign reservation.
+    ///
+    /// This neither signs nor reserves anything. The caller must durably reserve this
+    /// exact statement before invoking any outer signer; later node changes can make
+    /// the statement differ from current reference selection.
+    ///
+    /// # Errors
+    /// Rejects occupied local rounds and invalid evidence or prospective causal cones.
+    pub fn prospective_slot_vote(
+        &self,
+        lineage: &validator::SlotAgreementViewLineage,
+        payload: &validator::SlotAgreementVotePayload,
+        binding: &validator::SlotAgreementBinding,
+    ) -> Result<Vertex, CryptoError> {
+        let set = self.dag.set_for_round(binding.tip().next_round());
+        let vertex = self.unoccupied_prospective_vertex(payload.digest(set)?)?;
+        self.dag
+            .inspect_slot_authoring_cone(&vertex, lineage, payload, binding)?;
+        Ok(vertex)
+    }
+
+    /// Holds exclusive access to the exact inspected vote until outer signing.
+    /// The caller must durably reserve `unsigned` before calling `author`.
+    /// # Errors
+    /// Rejects any change from the current inspected prospective statement.
+    pub fn prepare_reserved_slot_vote(
+        &mut self,
+        unsigned: &Vertex,
+        lineage: &validator::SlotAgreementViewLineage,
+        payload: &validator::SlotAgreementVotePayload,
+        binding: &validator::SlotAgreementBinding,
+    ) -> Result<PreparedSlotCarrier<'_>, CryptoError> {
+        if self.prospective_slot_vote(lineage, payload, binding)? != *unsigned {
+            return Err(CryptoError::new(
+                CryptoErrorKind::InvalidVertex,
+                "reserved vote differs from current prospective statement",
+            ));
+        }
+        Ok(PreparedSlotCarrier {
+            node: self,
+            vertex: unsigned.clone(),
+            prerequisites: vec![payload.prerequisite.clone()],
+        })
     }
 
     /// Prepares a bounded POL carrier using the current exact reference selection.
