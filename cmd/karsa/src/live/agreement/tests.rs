@@ -483,10 +483,14 @@ fn fixture_for_chain(
 }
 
 fn authoring_node(m: &Membership, vertices: &[Vertex]) -> net::Node {
+    authoring_node_index(m, vertices, 0)
+}
+
+fn authoring_node_index(m: &Membership, vertices: &[Vertex], index: usize) -> net::Node {
     let mut node = net::Node::with_chain_id(
         m.set.clone(),
-        m.consensus[0].id.clone(),
-        m.consensus[0].private_key.clone(),
+        m.consensus[index].id.clone(),
+        m.consensus[index].private_key.clone(),
         b"live-adapter-tests".to_vec(),
     );
     for vertex in vertices {
@@ -555,6 +559,21 @@ fn actual_vote_authoring_preflights_node_and_dependencies() {
     let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
     adapter.apply(request.clone()).unwrap();
     let id = adapter.signing_history()[0].id;
+    let mut occupied = authoring_node(&m, vertices);
+    let refs = vertices
+        .iter()
+        .filter(|v| v.round == 4)
+        .map(|v| v.id().unwrap())
+        .collect();
+    let existing = signed(&m, 0, 5, refs, [42; 32]);
+    occupied.receive(existing.clone()).unwrap();
+    occupied.set_round(5);
+    assert!(
+        adapter.author_vote(id, &mut occupied).unwrap().is_none(),
+        "occupied vote slot must not sign a conflicting carrier"
+    );
+    assert_eq!((occupied.round(), occupied.authored()), (5, 0));
+    assert_eq!(occupied.dag().get(5, occupied.id()), Some(&existing));
     let mut missing = authoring_node(&m, &[]);
     assert!(adapter.author_vote(id, &mut missing).unwrap().is_none());
     assert_eq!((missing.round(), missing.authored()), (5, 0));
@@ -1099,6 +1118,124 @@ fn failed_durability_result_never_signs_and_requires_recovery() {
     );
     assert!(adapter.apply(request).is_err());
     assert_eq!(adapter.driver.sequence(), 0);
+    let mut node = authoring_node(&m, &[]);
+    assert!(adapter.author_pol([0; 32], &mut node).is_err());
+    assert!(adapter.author_final_proof([0; 32], &mut node).is_err());
+    assert_eq!((node.round(), node.authored()), (5, 0));
+}
+
+// Exercise both aggregate paths against the same complete quorum fixture.
+fn check_aggregate_pre_sign_failures(
+    adapter: &mut Adapter,
+    m: &Membership,
+    vertices: &[Vertex],
+    round: u64,
+    digest: [u8; 32],
+    pol: bool,
+) {
+    let author = |adapter: &mut Adapter, node: &mut net::Node, digest| {
+        if pol {
+            adapter.author_pol(digest, node)
+        } else {
+            adapter.author_final_proof(digest, node)
+        }
+    };
+    let history = format!("{:?}", adapter.pending());
+    let sequence = adapter.driver.sequence();
+    let mut occupied = authoring_node(m, vertices);
+    let refs = vertices
+        .iter()
+        .filter(|v| v.round == round - 1)
+        .map(|v| v.id().unwrap())
+        .collect();
+    let existing = signed(m, 0, round, refs, [42; 32]);
+    occupied.receive(existing.clone()).unwrap();
+    occupied.set_round(round);
+    assert!(
+        author(adapter, &mut occupied, digest).unwrap().is_none(),
+        "occupied aggregate slot must not sign a conflicting carrier"
+    );
+    assert_eq!((occupied.round(), occupied.authored()), (round, 0));
+    assert_eq!(occupied.dag().get(round, occupied.id()), Some(&existing));
+    // Public preparation must reject occupancy too, not merely the Adapter wrapper.
+    let output = adapter.driver.output().unwrap();
+    for candidate in &output.candidates {
+        match candidate {
+            SlotAgreementCarrierCandidate::PendingPol(candidate)
+                if pol && candidate.digest() == digest =>
+            {
+                assert!(
+                    occupied
+                        .prepare_slot_pol(candidate, &output.binding)
+                        .is_err()
+                )
+            }
+            SlotAgreementCarrierCandidate::PendingFinalProof(proof)
+                if !pol && proof.digest(&m.set).unwrap() == digest =>
+            {
+                assert!(occupied.prepare_slot_final(proof, &output.binding).is_err())
+            }
+            _ => {}
+        }
+    }
+    let mut missing = authoring_node(m, &[]);
+    missing.set_round(round);
+    assert!(author(adapter, &mut missing, digest).unwrap().is_none());
+    assert_eq!((missing.round(), missing.authored()), (round, 0));
+    // A foreign-chain sibling is accepted by legacy receive, but is not part of
+    // the selected aggregate's witnesses. The prospective full cone must catch it.
+    let refs = vertices
+        .iter()
+        .filter(|v| v.round == round - 2)
+        .map(|v| v.id().unwrap())
+        .collect();
+    let sibling = signed_for_chain(m, 3, round - 1, refs, [42; 32], b"foreign-chain");
+    let mut foreign = vertices.to_vec();
+    foreign.retain(|v| !(v.round == round - 1 && v.author == m.consensus[3].id));
+    foreign.push(sibling);
+    let mut node = authoring_node(m, &foreign);
+    node.set_round(round);
+    assert!(author(adapter, &mut node, digest).unwrap().is_none());
+    assert_eq!((node.round(), node.authored()), (round, 0));
+    assert!(node.dag().get(round, node.id()).is_none());
+    let mut wrong = authoring_node_index(m, vertices, 1);
+    wrong.set_round(round);
+    assert!(author(adapter, &mut wrong, digest).is_err());
+    assert_eq!((wrong.round(), wrong.authored()), (round, 0));
+    let mut pruned = authoring_node(m, vertices);
+    pruned.set_round(round);
+    pruned.set_floor(0);
+    assert!(author(adapter, &mut pruned, digest).unwrap().is_none());
+    assert_eq!((pruned.round(), pruned.authored()), (round, 0));
+    for (chain, key) in [
+        (b"wrong-chain".to_vec(), m.consensus[0].private_key.clone()),
+        (
+            b"live-adapter-tests".to_vec(),
+            m.consensus[1].private_key.clone(),
+        ),
+    ] {
+        let mut wrong =
+            net::Node::with_chain_id(m.set.clone(), m.consensus[0].id.clone(), key, chain);
+        wrong.set_round(round);
+        assert!(author(adapter, &mut wrong, digest).is_err());
+        assert_eq!((wrong.round(), wrong.authored()), (round, 0));
+    }
+    let mut wrong_epoch = net::Node::with_chain_id_and_epoch_length(
+        m.set.clone(),
+        1,
+        m.consensus[0].id.clone(),
+        m.consensus[0].private_key.clone(),
+        b"live-adapter-tests".to_vec(),
+    );
+    wrong_epoch.set_round(round);
+    assert!(author(adapter, &mut wrong_epoch, digest).is_err());
+    assert_eq!((wrong_epoch.round(), wrong_epoch.authored()), (round, 0));
+    let mut valid = authoring_node(m, vertices);
+    valid.set_round(round);
+    assert!(author(adapter, &mut valid, [255; 32]).unwrap().is_none());
+    assert_eq!((valid.round(), valid.authored()), (round, 0));
+    assert_eq!(adapter.driver.sequence(), sequence);
+    assert_eq!(format!("{:?}", adapter.pending()), history);
 }
 
 #[test]
@@ -1120,22 +1257,18 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
     let AuthenticatedSlotAgreementRequest::Propose { lineage, vertices } = request else {
         panic!("proposal")
     };
-    let refs: Vec<_> = vertices
-        .iter()
-        .filter(|v| v.round == 4)
-        .map(|v| v.id().unwrap())
-        .collect();
     let mut vote_vertices = Vec::new();
     let witnesses: Vec<_> = adapters
-        .iter()
+        .iter_mut()
         .enumerate()
         .map(|(i, a)| {
-            let PendingIntent::Vote {
-                payload, digest, ..
-            } = &a.pending()[0]
-            else {
-                panic!("prevote")
+            let (payload, digest) = match &a.pending()[0] {
+                PendingIntent::Vote {
+                    payload, digest, ..
+                } => (payload.clone(), *digest),
+                _ => panic!("prevote"),
             };
+            let (payload, digest) = (&payload, &digest);
             let before = payload.encode(&m.set).unwrap();
             assert_eq!(
                 a.pending()[0].prerequisite_carriers().unwrap(),
@@ -1154,7 +1287,14 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
                 .prerequisite_carriers(),
                 Err(PrerequisiteExtractionError::UnsupportedNil)
             );
-            let v = signed(&m, i, 5, refs.clone(), *digest);
+            let mut node = authoring_node_index(&m, &vertices, i);
+            let id = a.signing_history()[0].id;
+            let authored = a.author_vote(id, &mut node).unwrap().unwrap();
+            authored
+                .envelope
+                .inspect(node.dag(), &a.driver.output().unwrap().binding)
+                .unwrap();
+            let v = authored.vertex;
             let carrier = v.id().unwrap();
             let envelope = PendingIntent::Vote {
                 payload: payload.clone(),
@@ -1317,6 +1457,31 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
     let pol_vertices: Vec<_> = (0..4)
         .map(|i| signed(&m, i, 6, refs.clone(), pol_digest))
         .collect();
+    let mut pol_node_vertices = vertices.clone();
+    pol_node_vertices.extend(vote_vertices.clone());
+    let mut pol_node = authoring_node(&m, &pol_node_vertices);
+    pol_node.set_round(6);
+    check_aggregate_pre_sign_failures(
+        &mut adapters[0],
+        &m,
+        &pol_node_vertices,
+        6,
+        pol_digest,
+        true,
+    );
+    let authored_pol = adapters[0]
+        .author_pol(pol_digest, &mut pol_node)
+        .unwrap()
+        .unwrap();
+    assert_eq!(authored_pol.vertex, pol_vertices[0]);
+    authored_pol
+        .envelope
+        .inspect(
+            pol_node.dag(),
+            &adapters[0].driver.output().unwrap().binding,
+        )
+        .unwrap();
+    assert_eq!((pol_node.round(), pol_node.authored()), (7, 1));
     let pol_carrier = pol_vertices[0].id().unwrap();
     let envelope = PendingIntent::Pol {
         candidate: candidate.clone(),
@@ -1337,6 +1502,12 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
     let lineage = candidate.bind_carrier(pol_carrier.clone());
     assert_eq!(envelope.payload(), &CarrierPayload::Pol(lineage.clone()));
     assert_eq!(lineage.pol_digest(0, &m.set).unwrap(), pol_digest);
+    assert_eq!(
+        before
+            .bound_lineage_len(&pol_carrier.author, &m.set)
+            .unwrap(),
+        lineage.encode(&m.set).unwrap().len()
+    );
     let mut inspection_vertices = vertices.clone();
     inspection_vertices.extend(vote_vertices.clone());
     inspection_vertices.extend(pol_vertices.clone());
@@ -1378,7 +1549,7 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
     let refs: Vec<_> = pol_vertices.iter().map(|v| v.id().unwrap()).collect();
     let mut precommit_vertices = Vec::new();
     let witnesses: Vec<_> = adapters
-        .iter()
+        .iter_mut()
         .enumerate()
         .map(|(i, a)| {
             let (payload, digest) = a
@@ -1390,11 +1561,12 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
                     } if payload.vote.phase
                         == validator::slot_agreement::AgreementPhase::Precommit =>
                     {
-                        Some((payload, digest))
+                        Some((payload.clone(), *digest))
                     }
                     _ => None,
                 })
                 .expect("durable precommit");
+            let (payload, digest) = (&payload, &digest);
             assert_eq!(payload.prerequisite, pol_carrier);
             assert_eq!(
                 PendingIntent::Vote {
@@ -1415,7 +1587,16 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
                     )
                     .unwrap()
             );
-            let v = signed(&m, i, 7, refs.clone(), *digest);
+            let mut node = authoring_node_index(&m, &inspection_vertices, i);
+            node.set_round(7);
+            let id = a.signing_history()[1].id;
+            let authored = a.author_vote(id, &mut node).unwrap().unwrap();
+            authored
+                .envelope
+                .inspect(node.dag(), &a.driver.output().unwrap().binding)
+                .unwrap();
+            let v = authored.vertex;
+            assert_eq!(v, signed(&m, i, 7, refs.clone(), *digest));
             let witness = validator::SlotAgreementVoteWitness {
                 payload: payload.clone(),
                 carrier: v.id().unwrap(),
@@ -1480,6 +1661,46 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             _ => None,
         })
         .expect("final proof intent");
+    let (proof, digest) = (proof.clone(), *digest);
+    let (proof, digest) = (&proof, &digest);
+    let mut final_node_vertices = inspection_vertices.clone();
+    final_node_vertices.extend(precommit_vertices.clone());
+    check_aggregate_pre_sign_failures(
+        &mut adapters[0],
+        &m,
+        &final_node_vertices,
+        8,
+        *digest,
+        false,
+    );
+    let mut final_node = authoring_node(&m, &final_node_vertices);
+    final_node.set_round(8);
+    let mut invalid_proof = proof.clone();
+    invalid_proof.certificate.signatures[0].signature[0] ^= 1;
+    invalid_proof.votes[0].payload.signature.signature[0] ^= 1;
+    // Matching malformed signatures pass structural encoding, not authentication.
+    invalid_proof.encode(&m.set).unwrap();
+    assert!(
+        final_node
+            .prepare_slot_final(
+                &invalid_proof,
+                &adapters[0].driver.output().unwrap().binding
+            )
+            .is_err()
+    );
+    assert_eq!((final_node.round(), final_node.authored()), (8, 0));
+    let authored_final = adapters[0]
+        .author_final_proof(*digest, &mut final_node)
+        .unwrap()
+        .unwrap();
+    authored_final
+        .envelope
+        .inspect(
+            final_node.dag(),
+            &adapters[0].driver.output().unwrap().binding,
+        )
+        .unwrap();
+    assert_eq!((final_node.round(), final_node.authored()), (9, 1));
     let before = proof.encode(&m.set).unwrap();
     let mut expected = vec![pol_carrier];
     expected.extend(witnesses.iter().map(|w| w.carrier.clone()));
@@ -1497,6 +1718,7 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
     assert_eq!(intent.prerequisite_carriers().unwrap(), expected);
     let refs = precommit_vertices.iter().map(|v| v.id().unwrap()).collect();
     let final_vertex = signed(&m, 0, 8, refs, *digest);
+    assert_eq!(authored_final.vertex, final_vertex);
     let final_carrier = final_vertex.id().unwrap();
     let envelope = intent.into_envelope(final_carrier.clone(), &m.set).unwrap();
     assert_eq!(envelope.payload(), &CarrierPayload::Final(proof.clone()));
@@ -1569,9 +1791,37 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             .decision
             .is_some()
     );
+    // The cache still contains historical aggregate material, but fresh driver
+    // output has no candidates after final receipt.
+    assert!(
+        adapters[0]
+            .pending()
+            .iter()
+            .any(|p| matches!(p, PendingIntent::FinalProof { .. }))
+    );
+    assert!(
+        adapters[0]
+            .author_final_proof(*digest, &mut final_node)
+            .unwrap()
+            .is_none()
+    );
     recover_envelope_adapter(&mut adapters[0], &stores[0], &bootstrap, &m, 0);
     assert_eq!(exposed_receipt_state(&stores[0], &bootstrap), receipt_state);
     assert!(adapters[0].driver.output().unwrap().candidates.is_empty());
+    assert!(
+        adapters[0]
+            .author_pol(pol_digest, &mut pol_node)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        adapters[0]
+            .author_final_proof(*digest, &mut final_node)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!((pol_node.round(), pol_node.authored()), (7, 1));
+    assert_eq!((final_node.round(), final_node.authored()), (9, 1));
     for id in [stale_prevote, precommit_id] {
         assert!(
             adapters[0]
@@ -1601,6 +1851,43 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         adapters[0].readiness(),
         Readiness::DisabledMissingCausalReadinessAndTransport
     );
+    // A view advance must not make historical POL cache entries authorable.
+    adapters[1]
+        .apply(AuthenticatedSlotAgreementRequest::AdvanceView {
+            from: AgreementView(0),
+        })
+        .unwrap();
+    assert!(
+        adapters[1]
+            .pending()
+            .iter()
+            .any(|p| matches!(p, PendingIntent::Pol { .. }))
+    );
+    let mut old_pol_node = authoring_node_index(&m, &pol_node_vertices, 1);
+    old_pol_node.set_round(6);
+    assert!(
+        adapters[1]
+            .author_pol(pol_digest, &mut old_pol_node)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!((old_pol_node.round(), old_pol_node.authored()), (6, 0));
+    let sequence = adapters[0].driver.sequence();
+    let mut new_owner = Adapter::recover(&stores[0], bootstrap.clone(), &m, 0).unwrap();
+    new_owner
+        .apply(AuthenticatedSlotAgreementRequest::AdvanceView {
+            from: AgreementView(0),
+        })
+        .unwrap();
+    assert!(adapters[0].author_pol(pol_digest, &mut pol_node).is_err());
+    assert!(
+        adapters[0]
+            .author_final_proof(*digest, &mut final_node)
+            .is_err()
+    );
+    assert_eq!(adapters[0].driver.sequence(), sequence);
+    assert_eq!((pol_node.round(), pol_node.authored()), (7, 1));
+    assert_eq!((final_node.round(), final_node.authored()), (9, 1));
 }
 
 #[test]

@@ -59,6 +59,19 @@ fn bound(len: usize, max: usize) -> Result<(), CryptoError> {
     Ok(())
 }
 
+// version + kind + round + author/body length prefixes + two fixed digests.
+const ENVELOPE_FRAMING_BYTES: usize = 83;
+
+fn preflight_body_len(author_len: usize, body_len: usize) -> Result<(), CryptoError> {
+    bound(author_len, MAX_AUTHOR_BYTES)?;
+    bound(
+        ENVELOPE_FRAMING_BYTES
+            .saturating_add(author_len)
+            .saturating_add(body_len),
+        MAX_ENVELOPE_BYTES,
+    )
+}
+
 impl CarrierEnvelope {
     /// Preflights vote framing without inventing an unknown carrier digest.
     pub(super) fn preflight_vote(
@@ -74,6 +87,21 @@ impl CarrierEnvelope {
             91 + author.len() + lineage.len() + vote.len(),
             MAX_ENVELOPE_BYTES,
         )
+    }
+
+    /// Preflights exact aggregate framing without a dummy carrier or binding.
+    pub(super) fn preflight_aggregate(
+        author: &[u8],
+        intent: &PendingIntent,
+        set: &ValidatorSet,
+    ) -> Result<(), CryptoError> {
+        bound(author.len(), MAX_AUTHOR_BYTES)?;
+        let len = match intent {
+            PendingIntent::Pol { candidate, .. } => candidate.bound_lineage_len(author, set)?,
+            PendingIntent::FinalProof { proof, .. } => proof.encode(set)?.len(),
+            _ => return Err(invalid("expected aggregate candidate")),
+        };
+        preflight_body_len(author.len(), len)
     }
 
     /// Converts owned evidence into a closed request, without asserting authentication.
@@ -227,10 +255,7 @@ impl CarrierEnvelope {
             CarrierPayload::Final(p) => (2, p.encode(set)?),
         };
         // Fixed framing: version + kind + round + two length prefixes + two digests.
-        bound(
-            83 + self.carrier.author.len() + body.len(),
-            MAX_ENVELOPE_BYTES,
-        )?;
+        preflight_body_len(self.carrier.author.len(), body.len())?;
         let mut e = Encoder::new();
         e.put_u16(VERSION);
         e.put_u8(tag);
@@ -296,6 +321,34 @@ impl CarrierEnvelope {
             payload_digest,
             set,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_framing_accepts_exact_limit_and_rejects_one_byte_over() {
+        for author_len in [0, 1, MAX_AUTHOR_BYTES] {
+            let author = vec![0; author_len];
+            let body_len = MAX_ENVELOPE_BYTES - ENVELOPE_FRAMING_BYTES - author_len;
+            let body = vec![0; body_len];
+            let mut encoded = Encoder::new();
+            encoded.put_u16(VERSION);
+            encoded.put_u8(1);
+            encoded.put_u64(6);
+            encoded.put_bytes(&author).unwrap();
+            encoded.put_raw(&[0; 32]);
+            encoded.put_raw(&[0; 32]);
+            encoded.put_bytes(&body).unwrap();
+            assert_eq!(encoded.len(), MAX_ENVELOPE_BYTES);
+            assert!(preflight_body_len(author_len, body_len - 1).is_ok());
+            assert!(preflight_body_len(author_len, body_len).is_ok());
+            assert!(preflight_body_len(author_len, body_len + 1).is_err());
+        }
+        assert!(preflight_body_len(MAX_AUTHOR_BYTES + 1, 0).is_err());
+        assert!(preflight_body_len(1, usize::MAX).is_err());
     }
 }
 

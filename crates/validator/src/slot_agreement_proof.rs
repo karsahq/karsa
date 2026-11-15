@@ -170,6 +170,36 @@ impl SlotAgreementPolCandidate {
         ids
     }
 
+    /// Returns the carrier-free selected lineage for prospective inspection.
+    pub fn lineage(&self) -> &SlotAgreementViewLineage {
+        &self.lineage
+    }
+
+    /// Returns the selected quorum and its exact witnesses.
+    pub fn evidence(&self) -> (&AgreementQc, &[SlotAgreementVoteWitness]) {
+        (&self.certificate, &self.witnesses)
+    }
+
+    /// Computes the exact bound lineage codec length without inventing a carrier ID.
+    /// # Errors
+    /// Rejects nested codec errors and aggregate bounds.
+    pub fn bound_lineage_len(
+        &self,
+        author: &[u8],
+        set: &ValidatorSet,
+    ) -> Result<usize, CryptoError> {
+        let mut evidence = Encoder::new();
+        evidence.put_bytes(&self.certificate.encode(set)?)?;
+        put_witnesses(&mut evidence, &self.witnesses, set)?;
+        // The absent/present tag has equal width. ID includes round and two
+        // length-prefixed fields (author and digest), as in phase::put_id.
+        let len = self.lineage.encode(set)?.len() + evidence.len() + 48 + author.len();
+        if len > SLOT_AGREEMENT_PROOF_MAX_BYTES {
+            return Err(invalid("POL lineage exceeds one MiB"));
+        }
+        Ok(len)
+    }
+
     /// Attaches the supplied ID; only DAG inspection authenticates the carrier.
     pub fn bind_carrier(mut self, carrier: VertexId) -> SlotAgreementViewLineage {
         let index = self.lineage.entries.len() - 1;

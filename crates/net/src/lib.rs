@@ -42,6 +42,23 @@ use validator::{
 const CHAIN_ID: &[u8] = b"karsa-net-1";
 const EPOCH: u64 = 1;
 
+/// A fully inspected unsigned carrier holding exclusive access to its unchanged Node.
+pub struct PreparedSlotCarrier<'a> {
+    node: &'a mut Node,
+    vertex: Vertex,
+    prerequisites: Vec<VertexId>,
+}
+
+impl PreparedSlotCarrier<'_> {
+    /// Signs and inserts the exact reference selection inspected during preparation.
+    /// # Errors
+    /// Propagates existing Node signing and insertion failures.
+    pub fn author(self) -> Result<Option<Vertex>, CryptoError> {
+        self.node
+            .author_with_prerequisites(self.vertex.payload_hash, &self.prerequisites)
+    }
+}
+
 /// How the simulated network is configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SimConfig {
@@ -398,7 +415,9 @@ impl Node {
     /// strictly round-decreasing walk with exact vertex IDs. Missing or pruned
     /// ancestors, unreachable prerequisites, and work exhaustion return `Ok(None)`
     /// before signing or insertion, without consuming an active, unfenced member's
-    /// round. Empty prerequisites preserve legacy authoring behavior.
+    /// round. An occupied local `(round, author)` slot always returns `Ok(None)`
+    /// before signing, including for empty prerequisites and identical retries.
+    /// [`Self::author_with`] retains its legacy behavior.
     ///
     /// This is local causal readiness only, not agreement authentication: it does
     /// not authenticate agreement payloads, votes, certificates, or lineage.
@@ -411,6 +430,9 @@ impl Node {
         payload_hash: [u8; 32],
         prerequisites: &[VertexId],
     ) -> Result<Option<Vertex>, CryptoError> {
+        if self.authoring_slot_occupied() {
+            return Ok(None);
+        }
         self.author_with_internal(payload_hash, prerequisites)
     }
 
@@ -428,11 +450,82 @@ impl Node {
         binding: &validator::SlotAgreementBinding,
     ) -> Result<(), CryptoError> {
         self.dag.inspect_slot_authoring_cone(
-            &self.prospective_vertex(payload_hash),
+            &self.unoccupied_prospective_vertex(payload_hash)?,
             lineage,
             payload,
             binding,
         )
+    }
+
+    /// Prepares a bounded POL carrier using the current exact reference selection.
+    /// # Errors
+    /// Propagates unified prospective evidence and cone inspection failures.
+    pub fn prepare_slot_pol(
+        &mut self,
+        candidate: &validator::SlotAgreementPolCandidate,
+        binding: &validator::SlotAgreementBinding,
+    ) -> Result<PreparedSlotCarrier<'_>, CryptoError> {
+        let vertex = self.unoccupied_prospective_vertex(candidate.digest())?;
+        self.dag
+            .inspect_slot_pol_authoring_cone(&vertex, candidate, binding)?;
+        Ok(PreparedSlotCarrier {
+            node: self,
+            vertex,
+            prerequisites: candidate.prerequisite_carriers(),
+        })
+    }
+
+    /// Prepares a bounded final carrier using the current exact reference selection.
+    /// # Errors
+    /// Propagates unified prospective evidence and cone inspection failures.
+    pub fn prepare_slot_final(
+        &mut self,
+        proof: &validator::SlotAgreementProof,
+        binding: &validator::SlotAgreementBinding,
+    ) -> Result<PreparedSlotCarrier<'_>, CryptoError> {
+        let set = self.dag.set_for_round(binding.tip().next_round());
+        let vertex = self.unoccupied_prospective_vertex(proof.digest(set)?)?;
+        self.dag
+            .inspect_slot_final_authoring_cone(&vertex, proof, binding)?;
+        let mut prerequisites = vec![
+            proof
+                .entries
+                .last()
+                .and_then(|p| p.pol.as_ref())
+                .ok_or_else(|| {
+                    CryptoError::new(
+                        crypto::CryptoErrorKind::MalformedCertificate,
+                        "missing final POL",
+                    )
+                })?
+                .carrier
+                .clone(),
+        ];
+        prerequisites.extend(proof.votes.iter().map(|w| w.carrier.clone()));
+        prerequisites
+            .sort_by(|a, b| (a.round, &a.author, a.digest).cmp(&(b.round, &b.author, b.digest)));
+        prerequisites.dedup();
+        Ok(PreparedSlotCarrier {
+            node: self,
+            vertex,
+            prerequisites,
+        })
+    }
+
+    fn authoring_slot_occupied(&self) -> bool {
+        self.dag.get(self.round, &self.id).is_some()
+    }
+
+    fn unoccupied_prospective_vertex(&self, payload_hash: [u8; 32]) -> Result<Vertex, CryptoError> {
+        // DAG insertion is first-wins, not an equivocation-prevention signing gate.
+        // A restored local vertex forbids even an identical retry here.
+        if self.authoring_slot_occupied() {
+            return Err(CryptoError::new(
+                CryptoErrorKind::InvalidVertex,
+                "local authoring slot is already occupied",
+            ));
+        }
+        Ok(self.prospective_vertex(payload_hash))
     }
 
     fn prospective_vertex(&self, payload_hash: [u8; 32]) -> Vertex {
@@ -1034,6 +1127,36 @@ mod tests {
             summary.committed[0], 0,
             "one node cannot form a quorum alone"
         );
+    }
+
+    #[test]
+    fn occupied_causal_and_prepared_authoring_never_reaches_signing() {
+        let mut original = test_nodes(2);
+        let existing = original[0].author_with([1; 32]).unwrap().unwrap();
+        let mut restored = test_nodes(2);
+        let node = &mut restored[0];
+        node.receive(existing.clone()).unwrap();
+        node.set_round(existing.round);
+        // A broken key makes accidental entry into the signer observable as an error.
+        node.private_key.clear();
+        for payload in [[1; 32], [2; 32]] {
+            assert!(
+                node.author_with_prerequisites(payload, &[])
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(node.unoccupied_prospective_vertex(payload).is_err());
+            // Even internal token construction cannot bypass the final pre-sign gate.
+            let vertex = node.prospective_vertex(payload);
+            let prepared = PreparedSlotCarrier {
+                node,
+                vertex,
+                prerequisites: vec![],
+            };
+            assert!(prepared.author().unwrap().is_none());
+            assert_eq!((node.round(), node.authored()), (existing.round, 0));
+            assert_eq!(node.dag().get(existing.round, node.id()), Some(&existing));
+        }
     }
 
     #[test]

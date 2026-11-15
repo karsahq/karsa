@@ -31,6 +31,11 @@ use crate::schedule::{EpochSchedule, ValidatorSet};
 use crate::set_change::{SetChangeError, SetSchedule, Transition, TransitionCertificate};
 use crate::vertex::{Vertex, VertexId, tally_votes};
 
+enum AgreementCarrier<'a> {
+    Received(&'a VertexId),
+    Prospective(&'a Vertex),
+}
+
 /// The outcome of asking a round to decide.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -1655,6 +1660,20 @@ impl Dag {
         if prospective.payload_hash != payload.digest(set)? {
             return Err(invalid("slot payload is not bound to its carrier"));
         }
+        let cone = self.slot_prospective_history_with_budget(prospective, decision, &mut budget)?;
+        if !cone.contains(prerequisite) {
+            return Err(invalid("individual vote lacks selected prerequisite"));
+        }
+        Ok(())
+    }
+
+    fn slot_prospective_history_with_budget(
+        &self,
+        prospective: &Vertex,
+        decision: &crate::SlotDecision,
+        budget: &mut usize,
+    ) -> Result<HashSet<VertexId>, CryptoError> {
+        use crate::slot_agreement_phase::invalid;
         if self.is_pruned(prospective.round) {
             return Err(invalid("slot carrier is pruned"));
         }
@@ -1676,18 +1695,10 @@ impl Dag {
             ));
         }
         // Reserve the actual carrier's traversal visit, without inventing its ID.
-        budget = budget
+        *budget = budget
             .checked_sub(1)
             .ok_or_else(|| invalid("agreement phase traversal work budget exhausted"))?;
-        let cone = self.slot_reference_history_with_budget(
-            &prospective.references,
-            decision,
-            &mut budget,
-        )?;
-        if !cone.contains(prerequisite) {
-            return Err(invalid("individual vote lacks selected prerequisite"));
-        }
-        Ok(())
+        self.slot_reference_history_with_budget(&prospective.references, decision, budget)
     }
 
     fn slot_reference_history_with_budget(
@@ -2162,7 +2173,45 @@ impl Dag {
         binding: &crate::SlotAgreementBinding,
         mut budget: usize,
     ) -> Result<Decision, CryptoError> {
+        self.inspect_slot_agreement_final_root(
+            proof,
+            AgreementCarrier::Received(carrier),
+            binding,
+            &mut budget,
+        )
+    }
+
+    /// Authenticates complete final evidence and an unsigned root before local signing.
+    /// # Errors
+    /// Rejects the same evidence, ancestry and shared-budget failures as received inspection.
+    pub fn inspect_slot_final_authoring_cone(
+        &self,
+        prospective: &Vertex,
+        proof: &crate::SlotAgreementProof,
+        binding: &crate::SlotAgreementBinding,
+    ) -> Result<(), CryptoError> {
+        let mut budget = crate::SLOT_AGREEMENT_PHASE_WORK_BUDGET;
+        self.inspect_slot_agreement_final_root(
+            proof,
+            AgreementCarrier::Prospective(prospective),
+            binding,
+            &mut budget,
+        )
+        .map(|_| ())
+    }
+
+    fn inspect_slot_agreement_final_root(
+        &self,
+        proof: &crate::SlotAgreementProof,
+        root: AgreementCarrier<'_>,
+        binding: &crate::SlotAgreementBinding,
+        budget: &mut usize,
+    ) -> Result<Decision, CryptoError> {
         use crate::slot_agreement_phase::invalid;
+        let round = match root {
+            AgreementCarrier::Received(id) => id.round,
+            AgreementCarrier::Prospective(vertex) => vertex.round,
+        };
         let last = proof
             .entries
             .last()
@@ -2176,15 +2225,25 @@ impl Dag {
             .pol
             .as_ref()
             .ok_or_else(|| invalid("missing final POL"))?;
-        if selected_pol.carrier.round >= carrier.round {
+        if selected_pol.carrier.round >= round {
             return Err(invalid("selected POL must precede final carrier"));
         }
-        if proof.votes.iter().any(|w| w.carrier.round >= carrier.round) {
+        if proof.votes.iter().any(|w| w.carrier.round >= round) {
             return Err(invalid("precommit witness must precede final carrier"));
         }
-        let result = self.inspect_agreement_lineage(&proof.entries, binding, &mut budget)?;
+        let result = self.inspect_agreement_lineage(&proof.entries, binding, budget)?;
         proof.certificate.verify(binding.tip(), set)?;
-        let cone = self.slot_causal_history_with_budget(carrier, digest, d, &mut budget)?;
+        let cone = match root {
+            AgreementCarrier::Received(carrier) => {
+                self.slot_causal_history_with_budget(carrier, digest, d, budget)?
+            }
+            AgreementCarrier::Prospective(vertex) => {
+                if vertex.payload_hash != digest {
+                    return Err(invalid("slot payload is not bound to its carrier"));
+                }
+                self.slot_prospective_history_with_budget(vertex, d, budget)?
+            }
+        };
         let pol = last
             .pol
             .as_ref()
@@ -2201,7 +2260,7 @@ impl Dag {
                 &w.carrier,
                 w.payload.digest(set)?,
                 d,
-                &mut budget,
+                budget,
             )?;
             if !c.contains(&pol.carrier) {
                 return Err(invalid("precommit lacks selected POL"));
@@ -2485,27 +2544,77 @@ impl Dag {
                     d,
                     budget,
                 )?;
-                if !cone.contains(&p.view_carrier) {
-                    return Err(invalid("POL lacks view proposal"));
-                }
-                for w in &pol.votes {
-                    if !cone.contains(&w.carrier) {
-                        return Err(invalid("POL lacks vote witness"));
-                    }
-                    w.payload.verify(binding.tip(), set)?;
-                    let c = self.slot_causal_history_with_budget(
-                        &w.carrier,
-                        w.payload.digest(set)?,
-                        d,
-                        budget,
-                    )?;
-                    if !c.contains(&p.view_carrier) {
-                        return Err(invalid("prevote lacks view authorization"));
-                    }
-                }
+                self.inspect_agreement_pol_witnesses(p, &pol.votes, &cone, binding, budget)?;
             }
         }
         result.ok_or_else(|| invalid("empty lineage"))
+    }
+
+    fn inspect_agreement_pol_witnesses(
+        &self,
+        p: &crate::SlotAgreementProofEntry,
+        votes: &[crate::SlotAgreementVoteWitness],
+        cone: &HashSet<VertexId>,
+        binding: &crate::SlotAgreementBinding,
+        budget: &mut usize,
+    ) -> Result<(), CryptoError> {
+        use crate::slot_agreement_phase::invalid;
+        let d = &p.proposal.decision;
+        let set = self.set_for_round(d.round);
+        if !cone.contains(&p.view_carrier) {
+            return Err(invalid("POL lacks view proposal"));
+        }
+        for w in votes {
+            if !cone.contains(&w.carrier) {
+                return Err(invalid("POL lacks vote witness"));
+            }
+            w.payload.verify(binding.tip(), set)?;
+            let c = self.slot_causal_history_with_budget(
+                &w.carrier,
+                w.payload.digest(set)?,
+                d,
+                budget,
+            )?;
+            if !c.contains(&p.view_carrier) {
+                return Err(invalid("prevote lacks view authorization"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Authenticates carrier-free POL evidence and the complete unsigned root cone.
+    /// # Errors
+    /// Rejects malformed evidence, signatures, proposal/lineage, ancestry and work exhaustion.
+    pub fn inspect_slot_pol_authoring_cone(
+        &self,
+        prospective: &Vertex,
+        candidate: &crate::SlotAgreementPolCandidate,
+        binding: &crate::SlotAgreementBinding,
+    ) -> Result<(), CryptoError> {
+        use crate::slot_agreement_phase::invalid;
+        let lineage = candidate.lineage();
+        let p = lineage
+            .entries
+            .last()
+            .ok_or_else(|| invalid("empty lineage"))?;
+        let d = &p.proposal.decision;
+        let set = self.set_for_round(d.round);
+        candidate.bound_lineage_len(&prospective.author, set)?;
+        self.preflight_agreement_lineage(&lineage.entries, set, d.round)?;
+        let (certificate, votes) = candidate.evidence();
+        if p.view_carrier.round >= prospective.round
+            || votes.iter().any(|w| w.carrier.round >= prospective.round)
+            || prospective.payload_hash != candidate.digest()
+        {
+            return Err(invalid(
+                "prospective POL carrier ordering or digest mismatch",
+            ));
+        }
+        let mut budget = crate::SLOT_AGREEMENT_PHASE_WORK_BUDGET;
+        self.inspect_agreement_lineage(&lineage.entries, binding, &mut budget)?;
+        certificate.verify(binding.tip(), set)?;
+        let cone = self.slot_prospective_history_with_budget(prospective, d, &mut budget)?;
+        self.inspect_agreement_pol_witnesses(p, votes, &cone, binding, &mut budget)
     }
 
     /// Number of held vertices in `round + 1` that vote for the leader of

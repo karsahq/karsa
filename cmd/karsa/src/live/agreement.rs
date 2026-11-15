@@ -123,16 +123,120 @@ pub struct Adapter {
     readiness: Readiness,
 }
 
+#[derive(Clone, Copy)]
+enum AggregateKind {
+    Pol,
+    Final,
+}
+
 /// Owned local authoring result; no publication, persistence or delivery guarantee.
 #[derive(Debug)]
-pub struct AuthoredVote {
+pub struct AuthoredCarrier {
     /// Actual signed vertex, already inserted by Node's existing authoring path.
     pub vertex: validator::Vertex,
     /// Self-contained evidence bound to that actual vertex.
     pub envelope: CarrierEnvelope,
 }
 
+/// Backward-compatible name for the local vote authoring result.
+pub type AuthoredVote = AuthoredCarrier;
+
 impl Adapter {
+    /// Authors a current driver POL candidate, never a historical pending candidate.
+    /// Returns `None` for stale digests or unavailable local evidence; never publishes.
+    /// # Errors
+    /// Rejects stale/uncertain owners, pinned Node mismatches, codec and authoring failures.
+    pub fn author_pol(
+        &mut self,
+        digest: [u8; 32],
+        node: &mut net::Node,
+    ) -> Result<Option<AuthoredCarrier>, String> {
+        self.author_aggregate(digest, node, AggregateKind::Pol)
+    }
+
+    /// Authors a current driver final candidate without applying or transporting a decision.
+    /// Returns `None` for stale digests or unavailable local evidence.
+    /// # Errors
+    /// Rejects stale/uncertain owners, pinned Node mismatches, codec and authoring failures.
+    pub fn author_final_proof(
+        &mut self,
+        digest: [u8; 32],
+        node: &mut net::Node,
+    ) -> Result<Option<AuthoredCarrier>, String> {
+        self.author_aggregate(digest, node, AggregateKind::Final)
+    }
+
+    fn author_aggregate(
+        &mut self,
+        digest: [u8; 32],
+        node: &mut net::Node,
+        kind: AggregateKind,
+    ) -> Result<Option<AuthoredCarrier>, String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before carrier signing".into());
+        }
+        let output = match self.driver.output() {
+            Ok(output) => output,
+            Err(error) => {
+                self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+                return Err(error.to_string());
+            }
+        };
+        if !node.matches_authoring_context(
+            output.binding.tip(),
+            &self.set,
+            &self.validator_id,
+            &self.private_key,
+        ) {
+            return Err(
+                "Node differs from pinned agreement identity, chain, epoch, set or key".into(),
+            );
+        }
+        let mut selected = None;
+        for candidate in output.candidates {
+            match (kind, candidate) {
+                (AggregateKind::Pol, SlotAgreementCarrierCandidate::PendingPol(candidate))
+                    if candidate.digest() == digest =>
+                {
+                    selected = Some(PendingIntent::Pol { candidate, digest });
+                    break;
+                }
+                (AggregateKind::Final, SlotAgreementCarrierCandidate::PendingFinalProof(proof))
+                    if proof.digest(&self.set).map_err(|e| e.to_string())? == digest =>
+                {
+                    selected = Some(PendingIntent::FinalProof { proof, digest });
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(intent) = selected else {
+            return Ok(None);
+        };
+        CarrierEnvelope::preflight_aggregate(node.id(), &intent, &self.set)
+            .map_err(|e| e.to_string())?;
+        let prepared = match &intent {
+            PendingIntent::Pol { candidate, .. } => {
+                node.prepare_slot_pol(candidate, &output.binding)
+            }
+            PendingIntent::FinalProof { proof, .. } => {
+                node.prepare_slot_final(proof, &output.binding)
+            }
+            _ => unreachable!("selected only aggregate candidates"),
+        };
+        let Ok(prepared) = prepared else {
+            return Ok(None);
+        };
+        let Some(vertex) = prepared.author().map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        // All size and evidence checks ran before signing; only bind the actual ID here.
+        let envelope = intent
+            .into_envelope(vertex.id().map_err(|e| e.to_string())?, &self.set)
+            .map_err(|e| e.to_string())?;
+        Ok(Some(AuthoredCarrier { vertex, envelope }))
+    }
+
     /// Authors one stable durable vote intent, never arbitrary payloads or all history.
     ///
     /// Returns `None` for inactive/stale intents or unavailable local evidence. Nil
