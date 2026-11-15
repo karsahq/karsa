@@ -37,6 +37,17 @@ fn durable_signing_history_survives_observation_and_bootstrap_only_recovery() {
     assert_eq!(original.len(), 1);
     assert_eq!(original[0].vote, vote);
     assert_eq!(original[0].sequence, 1);
+    assert_eq!(
+        original[0]
+            .lineage
+            .as_ref()
+            .unwrap()
+            .encode(&f.set)
+            .unwrap(),
+        lineage.encode(&f.set).unwrap()
+    );
+    assert_eq!(vote.phase, AgreementPhase::Prevote);
+    assert_eq!(vote.context, bootstrap.agreement.context);
     assert_eq!(original[0].agreement.set, bootstrap.agreement.set);
     assert_eq!(
         original[0].prerequisite,
@@ -46,7 +57,7 @@ fn durable_signing_history_survives_observation_and_bootstrap_only_recovery() {
         .apply(
             2,
             AuthenticatedSlotAgreementRequest::ObserveVote {
-                lineage,
+                lineage: lineage.clone(),
                 witness: pol.votes[0].clone(),
                 vertices: vec![],
             },
@@ -71,11 +82,32 @@ fn durable_signing_history_survives_observation_and_bootstrap_only_recovery() {
     assert_eq!(history.len(), 2);
     assert_eq!(history[1].sequence, 3);
     assert_eq!(history[1].vote, precommit);
+    assert_eq!(precommit.phase, AgreementPhase::Precommit);
+    assert_eq!(precommit.context, bootstrap.agreement.context);
+    let precommit_lineage = SlotAgreementViewLineage {
+        entries: proof.entries.clone(),
+    };
+    assert_eq!(
+        history[1].lineage.as_ref().unwrap().encode(&f.set).unwrap(),
+        precommit_lineage.encode(&f.set).unwrap()
+    );
+    assert_eq!(
+        history[0].lineage.as_ref().unwrap().encode(&f.set).unwrap(),
+        lineage.encode(&f.set).unwrap()
+    );
     assert_eq!(
         history[1].prerequisite,
         AgreementSigningPrerequisite::Carrier(pol.carrier)
     );
     assert_ne!(history[0].id, history[1].id);
+    owner
+        .apply(
+            4,
+            AuthenticatedSlotAgreementRequest::AdvanceView {
+                from: AgreementView(0),
+            },
+        )
+        .unwrap();
     drop(owner);
     drop(store);
     let store = Store::open(&dir.0).unwrap();
@@ -89,6 +121,13 @@ fn durable_signing_history_survives_observation_and_bootstrap_only_recovery() {
     assert_eq!(recovered[1].vote, precommit);
     assert_eq!(recovered[0].id, original[0].id);
     assert_eq!(recovered[0].vote, vote);
+    for (actual, expected) in recovered.iter().zip(&history) {
+        assert_eq!(actual.sequence, expected.sequence);
+        assert_eq!(
+            actual.lineage.as_ref().unwrap().encode(&f.set).unwrap(),
+            expected.lineage.as_ref().unwrap().encode(&f.set).unwrap()
+        );
+    }
 }
 
 #[test]
@@ -131,6 +170,7 @@ fn durable_signing_history_retains_explicit_unsupported_timeout_nil() {
     let history = owner.signing_outbox().unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].vote, vote);
+    assert!(history[0].lineage.is_none());
     assert_eq!(
         history[0].prerequisite,
         AgreementSigningPrerequisite::UnsupportedNil
@@ -138,7 +178,9 @@ fn durable_signing_history_retains_explicit_unsupported_timeout_nil() {
     let recovered = store
         .recover_authenticated_slot_agreement(bootstrap)
         .unwrap();
-    assert_eq!(recovered.signing_outbox().unwrap()[0].id, history[0].id);
+    let recovered = recovered.signing_outbox().unwrap();
+    assert_eq!(recovered[0].id, history[0].id);
+    assert!(recovered[0].lineage.is_none());
 }
 
 #[test]

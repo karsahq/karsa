@@ -27,6 +27,8 @@ pub enum PendingIntent {
         payload: SlotAgreementVotePayload,
         /// Existing vote-carrier payload digest.
         digest: [u8; 32],
+        /// Exact full authenticated lineage from the original durable emission.
+        lineage: validator::SlotAgreementViewLineage,
     },
     /// Authenticated prevote quorum awaiting a real carrier.
     Pol {
@@ -195,6 +197,20 @@ impl Adapter {
         &self.pending
     }
 
+    /// Receives untrusted owned evidence through the existing authenticated WAL path.
+    /// Envelope construction, caller-set decoding and external inspection grant no authority:
+    /// the session reauthenticates with its pinned binding and supplied/retained signed DAG.
+    /// This does not activate transport, carrier authoring or decision application.
+    /// # Errors
+    /// Returns existing apply errors and requires recovery after any driver/output failure.
+    pub fn receive_envelope(
+        &mut self,
+        envelope: CarrierEnvelope,
+        vertices: Vec<validator::Vertex>,
+    ) -> Result<(), String> {
+        self.apply(envelope.into_request(vertices))
+    }
+
     /// Accepts only authenticated requests and reconstructs the durable signing outbox.
     /// Any driver/output failure requires recovery, even when persistence may have succeeded.
     pub fn apply(&mut self, request: AuthenticatedSlotAgreementRequest) -> Result<(), String> {
@@ -225,6 +241,15 @@ impl Adapter {
         // A post-durability encoding/signing failure must also block continued operation.
         self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
         let history = self.driver.signing_outbox().map_err(|e| e.to_string())?;
+        self.reconstruct_history(output, history)
+    }
+
+    fn reconstruct_history(
+        &mut self,
+        output: SlotAgreementDriverOutput,
+        history: Vec<AgreementSigningIntent>,
+    ) -> Result<(), String> {
+        self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
         // Validate every historical identity before producing any signature. Nil is an
         // unsupported obligation, not a reason to discard valid nonnil history.
         for intent in &history {
@@ -244,6 +269,7 @@ impl Adapter {
             if key != (self.key_id.clone(), self.public_key.clone()) {
                 return Err("historical active key mismatch".into());
             }
+            validate_intent_lineage(intent)?;
             match (&intent.prerequisite, &intent.vote.value) {
                 (AgreementSigningPrerequisite::UnsupportedNil, AgreementValue::Nil) => {}
                 (AgreementSigningPrerequisite::Carrier(_), AgreementValue::Nil)
@@ -290,7 +316,14 @@ impl Adapter {
                         .verify(&intent.agreement.context, set)
                         .map_err(|e| e.to_string())?;
                     let digest = payload.digest(set).map_err(|e| e.to_string())?;
-                    PendingIntent::Vote { payload, digest }
+                    PendingIntent::Vote {
+                        payload,
+                        digest,
+                        lineage: intent
+                            .lineage
+                            .clone()
+                            .ok_or("historical vote lacks lineage")?,
+                    }
                 }
             };
             self.pending.push(pending);
@@ -322,6 +355,56 @@ impl Adapter {
         self.readiness = Readiness::DisabledMissingCausalReadinessAndTransport;
         Ok(())
     }
+}
+
+fn validate_intent_lineage(intent: &AgreementSigningIntent) -> Result<(), String> {
+    use validator::slot_agreement::AgreementPhase;
+
+    let AgreementValue::Decision(decision) = &intent.vote.value else {
+        if intent.lineage.is_some() {
+            return Err("historical nil vote has lineage".into());
+        }
+        return Ok(());
+    };
+    let lineage = intent
+        .lineage
+        .as_ref()
+        .ok_or("historical vote lacks lineage")?;
+    let selected = lineage
+        .entries
+        .last()
+        .ok_or("historical lineage is empty")?;
+    if selected.view != intent.vote.view || selected.proposal.decision != *decision {
+        return Err("historical selected view or decision mismatch".into());
+    }
+    for entry in &lineage.entries {
+        if entry
+            .pol
+            .as_ref()
+            .is_some_and(|pol| pol.certificate.vote.context != intent.vote.context)
+        {
+            return Err("historical POL context mismatch".into());
+        }
+    }
+    let prerequisite = match intent.vote.phase {
+        AgreementPhase::Prevote => &selected.view_carrier,
+        AgreementPhase::Precommit => {
+            &selected
+                .pol
+                .as_ref()
+                .ok_or("historical precommit lacks selected POL")?
+                .carrier
+        }
+    };
+    if !matches!(&intent.prerequisite, AgreementSigningPrerequisite::Carrier(carrier) if carrier == prerequisite)
+    {
+        return Err("historical lineage prerequisite mismatch".into());
+    }
+    // Structural/codec validation only: the durable session authenticated this exact evidence.
+    lineage
+        .encode(&intent.agreement.set)
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn membership_key(

@@ -581,6 +581,8 @@ pub struct AgreementSigningIntent {
     pub vote: AgreementVote,
     /// Authenticated carrier to bind, or explicit unsupported nil intent.
     pub prerequisite: AgreementSigningPrerequisite,
+    /// Full authenticated lineage from the original emission request; absent for nil votes.
+    pub lineage: Option<SlotAgreementViewLineage>,
 }
 
 /// Signing support derived exclusively from authenticated request lineage.
@@ -829,8 +831,8 @@ fn replay(
             .as_ref()
             .and_then(|transition| transition.vote.as_ref())
         {
-            let prerequisite = if matches!(vote.value, AgreementValue::Nil) {
-                AgreementSigningPrerequisite::UnsupportedNil
+            let (prerequisite, lineage) = if matches!(vote.value, AgreementValue::Nil) {
+                (AgreementSigningPrerequisite::UnsupportedNil, None)
             } else {
                 let lineage = match event {
                     AuthenticatedSlotAgreementRequest::Propose { lineage, .. }
@@ -850,7 +852,10 @@ fn replay(
                         .carrier
                         .clone(),
                 };
-                AgreementSigningPrerequisite::Carrier(carrier)
+                (
+                    AgreementSigningPrerequisite::Carrier(carrier),
+                    Some(lineage.clone()),
+                )
             };
             let mut statement = Encoder::new();
             statement.put_bytes(b"KARSA/STORE/AGREEMENT_SIGNING_INTENT/v1")?;
@@ -869,6 +874,7 @@ fn replay(
                 agreement: active.clone(),
                 vote: vote.clone(),
                 prerequisite,
+                lineage,
             });
         }
         if let AuthenticatedSlotAgreementRequest::ObservePrevote { lineage, .. } = event {

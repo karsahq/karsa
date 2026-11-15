@@ -1,7 +1,7 @@
 //! Inactive carrier representation; construction and decoding are not authentication.
 //!
-//! Vote envelopes are not self-contained lineage: inspection requires the caller's full
-//! retained view lineage. POL and final envelopes retain their full inner lineage.
+//! Version 2 retains full vote lineage; version 1 is deliberately rejected.
+//! No migration, network activation, or storage integration is provided.
 
 use super::PendingIntent;
 use crypto::encoding::{Decoder, Encoder, MAX_FIELD_LEN};
@@ -14,13 +14,18 @@ use validator::{
 /// One MiB including framing, consistent with the existing evidence codec bound.
 pub const MAX_ENVELOPE_BYTES: usize = MAX_FIELD_LEN;
 const MAX_AUTHOR_BYTES: usize = 1024;
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 
-/// Owned payload evidence, immutable through an envelope; votes require external lineage.
+/// Owned, self-contained payload evidence, immutable through an envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CarrierPayload {
     /// Individual nonnil prevote or precommit, including its prerequisite.
-    Vote(SlotAgreementVotePayload),
+    Vote {
+        /// Existing protocol vote, still the sole payload-digest authority.
+        payload: SlotAgreementVotePayload,
+        /// Complete retained lineage used by unified DAG inspection.
+        lineage: SlotAgreementViewLineage,
+    },
     /// Complete lineage whose last entry contains the selected, actual POL carrier.
     Pol(SlotAgreementViewLineage),
     /// Complete final evidence, not decision-application authority.
@@ -55,6 +60,35 @@ fn bound(len: usize, max: usize) -> Result<(), CryptoError> {
 }
 
 impl CarrierEnvelope {
+    /// Converts owned evidence into a closed request, without asserting authentication.
+    /// The receiving session must reauthenticate against its own pinned binding and DAG.
+    pub(super) fn into_request(
+        self,
+        vertices: Vec<validator::Vertex>,
+    ) -> store::AuthenticatedSlotAgreementRequest {
+        use store::AuthenticatedSlotAgreementRequest;
+        match self.payload {
+            CarrierPayload::Vote { payload, lineage } => {
+                AuthenticatedSlotAgreementRequest::ObserveVote {
+                    lineage,
+                    witness: SlotAgreementVoteWitness {
+                        payload,
+                        carrier: self.carrier,
+                    },
+                    vertices,
+                }
+            }
+            CarrierPayload::Pol(lineage) => {
+                AuthenticatedSlotAgreementRequest::ObservePrevote { lineage, vertices }
+            }
+            CarrierPayload::Final(proof) => AuthenticatedSlotAgreementRequest::ObservePrecommit {
+                proof,
+                carrier: self.carrier,
+                vertices,
+            },
+        }
+    }
+
     fn checked(
         carrier: VertexId,
         payload: CarrierPayload,
@@ -63,7 +97,18 @@ impl CarrierEnvelope {
     ) -> Result<Self, CryptoError> {
         bound(carrier.author.len(), MAX_AUTHOR_BYTES)?;
         let actual = match &payload {
-            CarrierPayload::Vote(vote) => {
+            CarrierPayload::Vote {
+                payload: vote,
+                lineage,
+            } => {
+                if vote.vote.phase == validator::slot_agreement::AgreementPhase::Precommit
+                    && lineage
+                        .entries
+                        .last()
+                        .is_none_or(|entry| entry.pol.is_none())
+                {
+                    return Err(invalid("precommit requires selected POL"));
+                }
                 if carrier.author != vote.signature.validator_id {
                     return Err(invalid("vote carrier author differs from signer"));
                 }
@@ -104,7 +149,7 @@ impl CarrierEnvelope {
         &self.carrier
     }
 
-    /// Returns immutable payload evidence; vote payloads do not contain full view lineage.
+    /// Returns immutable payload evidence, including full retained vote lineage.
     pub fn payload(&self) -> &CarrierPayload {
         &self.payload
     }
@@ -116,46 +161,27 @@ impl CarrierEnvelope {
 
     /// Authenticates evidence against the current DAG and a caller-trusted binding.
     ///
-    /// Votes require the full retained `vote_lineage`; POL and final payloads carry
-    /// their own lineage and reject an external one. Success is only an inspection
-    /// result for this DAG borrow, not a reusable authentication token or permission
-    /// to persist, sign, publish, or apply a decision. This boundary is inactive.
-    ///
+    /// Uses only retained lineage. Success is an inspection result for this DAG borrow,
+    /// not authority to persist, sign, publish, or apply a decision. This is inactive.
     /// # Errors
-    /// Rejects missing/irrelevant vote lineage and all unified DAG inspection errors,
-    /// including incorrect carriers, payload hashes, ancestry, signatures or binding.
-    pub fn inspect(
-        &self,
-        dag: &Dag,
-        binding: &SlotAgreementBinding,
-        vote_lineage: Option<&SlotAgreementViewLineage>,
-    ) -> Result<(), CryptoError> {
+    /// Rejects all unified DAG inspection errors, including incorrect lineage,
+    /// carriers, payload hashes, ancestry, signatures or binding.
+    pub fn inspect(&self, dag: &Dag, binding: &SlotAgreementBinding) -> Result<(), CryptoError> {
         match &self.payload {
-            CarrierPayload::Vote(payload) => {
-                let lineage = vote_lineage.ok_or_else(|| invalid("vote requires full lineage"))?;
-                dag.inspect_slot_agreement_vote(
-                    lineage,
-                    &SlotAgreementVoteWitness {
-                        payload: payload.clone(),
-                        carrier: self.carrier.clone(),
-                    },
-                    binding,
-                )
-            }
-            CarrierPayload::Pol(lineage) => {
-                if vote_lineage.is_some() {
-                    return Err(invalid("external vote lineage supplied for POL"));
-                }
-                dag.inspect_slot_agreement_view_lineage(lineage, binding)
-                    .map(|_| ())
-            }
-            CarrierPayload::Final(proof) => {
-                if vote_lineage.is_some() {
-                    return Err(invalid("external vote lineage supplied for final proof"));
-                }
-                dag.inspect_slot_agreement_proof(proof, &self.carrier, binding)
-                    .map(|_| ())
-            }
+            CarrierPayload::Vote { payload, lineage } => dag.inspect_slot_agreement_vote(
+                lineage,
+                &SlotAgreementVoteWitness {
+                    payload: payload.clone(),
+                    carrier: self.carrier.clone(),
+                },
+                binding,
+            ),
+            CarrierPayload::Pol(lineage) => dag
+                .inspect_slot_agreement_view_lineage(lineage, binding)
+                .map(|_| ()),
+            CarrierPayload::Final(proof) => dag
+                .inspect_slot_agreement_proof(proof, &self.carrier, binding)
+                .map(|_| ()),
         }
     }
 
@@ -169,7 +195,18 @@ impl CarrierEnvelope {
     pub fn encode(&self, set: &ValidatorSet) -> Result<Vec<u8>, CryptoError> {
         bound(self.carrier.author.len(), MAX_AUTHOR_BYTES)?;
         let (tag, body) = match &self.payload {
-            CarrierPayload::Vote(p) => (0, p.encode(set)?),
+            CarrierPayload::Vote { payload, lineage } => {
+                let lineage = lineage.encode(set)?;
+                let vote = payload.encode(set)?;
+                bound(
+                    91 + self.carrier.author.len() + lineage.len() + vote.len(),
+                    MAX_ENVELOPE_BYTES,
+                )?;
+                let mut body = Encoder::new();
+                body.put_bytes(&lineage)?;
+                body.put_bytes(&vote)?;
+                (0, body.finish())
+            }
             CarrierPayload::Pol(p) => (1, p.encode(set)?),
             CarrierPayload::Final(p) => (2, p.encode(set)?),
         };
@@ -190,7 +227,7 @@ impl CarrierEnvelope {
     }
 
     /// Decodes payload evidence against a caller-pinned set, without authenticating it.
-    /// Vote envelopes still require external full lineage for inspection.
+    /// Vote bodies contain length-prefixed full lineage followed by the vote codec.
     /// # Errors
     /// Rejects all outer lengths/trailing bytes before nested decode, unknown tags or
     /// versions, malformed bodies, digest mismatch and selected-carrier mismatch.
@@ -218,7 +255,17 @@ impl CarrierEnvelope {
         let body = d.read_bytes()?;
         d.finish()?;
         let payload = match tag {
-            0 => CarrierPayload::Vote(SlotAgreementVotePayload::decode(body, set)?),
+            0 => {
+                // Preflight both nested lengths and trailing bytes before nested decoding.
+                let mut body = Decoder::new(body);
+                let lineage = body.read_bytes()?;
+                let vote = body.read_bytes()?;
+                body.finish()?;
+                CarrierPayload::Vote {
+                    lineage: SlotAgreementViewLineage::decode(lineage, set)?,
+                    payload: SlotAgreementVotePayload::decode(vote, set)?,
+                }
+            }
             1 => CarrierPayload::Pol(SlotAgreementViewLineage::decode(body, set)?),
             2 => CarrierPayload::Final(SlotAgreementProof::decode(body, set)?),
             _ => unreachable!("kind preflighted"),
@@ -238,11 +285,12 @@ impl CarrierEnvelope {
 
 impl PendingIntent {
     /// Binds owned payload evidence to a supplied actual carrier ID.
-    /// Vote intents do not contain the full lineage required for inspection.
+    /// Votes carry their exact original lineage; no external reconstruction is accepted.
     /// This checks construction consistency only, not authentication, readiness,
     /// carrier payload_hash, signing, publication or application authority.
     /// # Errors
-    /// Rejects nil, stale/untrusted intent digests, vote-author mismatch and codec bounds.
+    /// Rejects nil, stale/untrusted
+    /// intent digests, vote-author mismatch, incomplete precommit lineage and codec bounds.
     pub fn into_envelope(
         self,
         carrier: VertexId,
@@ -250,7 +298,11 @@ impl PendingIntent {
     ) -> Result<CarrierEnvelope, CryptoError> {
         let (payload, digest) = match self {
             Self::UnsupportedNil { .. } => return Err(invalid("nil carrier is unsupported")),
-            Self::Vote { payload, digest } => (CarrierPayload::Vote(payload), digest),
+            Self::Vote {
+                payload,
+                digest,
+                lineage,
+            } => (CarrierPayload::Vote { payload, lineage }, digest),
             Self::Pol { candidate, digest } => {
                 if candidate.digest() != digest {
                     return Err(invalid("POL intent digest mismatch"));

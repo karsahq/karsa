@@ -19,28 +19,44 @@ fn inspect_envelope(
             .unwrap();
     let mut dag = Dag::new(m.set.clone());
     dag.set_chain_id(b"live-adapter-tests".to_vec());
-    let is_vote = matches!(envelope.payload(), CarrierPayload::Vote(_));
-    let external = is_vote.then_some(lineage);
+    let is_vote = matches!(envelope.payload(), CarrierPayload::Vote { .. });
     // No retained ancestry, even though the wrapper itself is codec-consistent.
-    assert!(envelope.inspect(&dag, &binding, external).is_err());
+    assert!(envelope.inspect(&dag, &binding).is_err());
     for vertex in vertices {
         dag.insert(vertex.clone()).unwrap();
     }
     let decoded = CarrierEnvelope::decode(&envelope.encode(&m.set).unwrap(), &m.set).unwrap();
-    decoded.inspect(&dag, &binding, external).unwrap();
+    decoded.inspect(&dag, &binding).unwrap();
     let wrong_binding = validator::SlotAgreementBinding::from_checkpoint(
         bootstrap.agreement.context.clone(),
         Some(envelope.carrier().clone()),
     )
     .unwrap();
-    assert!(decoded.inspect(&dag, &wrong_binding, external).is_err());
+    assert!(decoded.inspect(&dag, &wrong_binding).is_err());
     if is_vote {
-        assert!(decoded.inspect(&dag, &binding, None).is_err());
+        let CarrierPayload::Vote { payload, .. } = envelope.payload() else {
+            unreachable!()
+        };
         let mut wrong = lineage.clone();
         wrong.entries[0].view_carrier.digest[0] ^= 1;
-        assert!(decoded.inspect(&dag, &binding, Some(&wrong)).is_err());
-    } else {
-        assert!(decoded.inspect(&dag, &binding, Some(lineage)).is_err());
+        let intent = PendingIntent::Vote {
+            payload: payload.clone(),
+            digest: envelope.payload_digest(),
+            lineage: wrong,
+        };
+        if let Ok(wrong) = intent.into_envelope(envelope.carrier().clone(), &m.set) {
+            assert!(wrong.inspect(&dag, &binding).is_err());
+        }
+        let mut wrong_payload = payload.clone();
+        wrong_payload.prerequisite.digest[0] ^= 1;
+        let wrong = PendingIntent::Vote {
+            digest: wrong_payload.digest(&m.set).unwrap(),
+            payload: wrong_payload,
+            lineage: lineage.clone(),
+        }
+        .into_envelope(envelope.carrier().clone(), &m.set)
+        .unwrap();
+        assert!(wrong.inspect(&dag, &binding).is_err());
     }
 
     // A real signed carrier with an unrelated payload_hash is not authenticated
@@ -68,7 +84,10 @@ fn inspect_envelope(
     }
     let wrong_id = wrong_dag.insert(wrong).unwrap();
     let payload = match envelope.payload() {
-        CarrierPayload::Vote(p) => CarrierPayload::Vote(p.clone()),
+        CarrierPayload::Vote { payload, lineage } => CarrierPayload::Vote {
+            payload: payload.clone(),
+            lineage: lineage.clone(),
+        },
         CarrierPayload::Pol(p) => {
             let mut p = p.clone();
             p.entries.last_mut().unwrap().pol.as_mut().unwrap().carrier = wrong_id.clone();
@@ -77,14 +96,19 @@ fn inspect_envelope(
         CarrierPayload::Final(p) => CarrierPayload::Final(p.clone()),
     };
     let body = match &payload {
-        CarrierPayload::Vote(p) => p.encode(&m.set).unwrap(),
+        CarrierPayload::Vote { payload, lineage } => {
+            let mut body = crypto::encoding::Encoder::new();
+            body.put_bytes(&lineage.encode(&m.set).unwrap()).unwrap();
+            body.put_bytes(&payload.encode(&m.set).unwrap()).unwrap();
+            body.finish()
+        }
         CarrierPayload::Pol(p) => p.encode(&m.set).unwrap(),
         CarrierPayload::Final(p) => p.encode(&m.set).unwrap(),
     };
     let mut e = crypto::encoding::Encoder::new();
-    e.put_u16(1);
+    e.put_u16(2);
     e.put_u8(match payload {
-        CarrierPayload::Vote(_) => 0,
+        CarrierPayload::Vote { .. } => 0,
         CarrierPayload::Pol(_) => 1,
         CarrierPayload::Final(_) => 2,
     });
@@ -94,7 +118,7 @@ fn inspect_envelope(
     e.put_raw(&envelope.payload_digest());
     e.put_bytes(&body).unwrap();
     let wrong = CarrierEnvelope::decode(&e.finish(), &m.set).unwrap();
-    assert!(wrong.inspect(&wrong_dag, &binding, external).is_err());
+    assert!(wrong.inspect(&wrong_dag, &binding).is_err());
 }
 
 fn check_envelope(envelope: &CarrierEnvelope, set: &ValidatorSet) {
@@ -109,6 +133,9 @@ fn check_envelope(envelope: &CarrierEnvelope, set: &ValidatorSet) {
             "prefix {end}"
         );
     }
+    let mut v1 = bytes.clone();
+    v1[..2].copy_from_slice(&1u16.to_le_bytes());
+    assert!(CarrierEnvelope::decode(&v1, set).is_err());
     let mut trailing = bytes.clone();
     trailing.push(0);
     assert!(CarrierEnvelope::decode(&trailing, set).is_err());
@@ -131,6 +158,52 @@ fn check_envelope(envelope: &CarrierEnvelope, set: &ValidatorSet) {
     let mut body_len = bytes.clone();
     body_len[body_len_offset..body_len_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(CarrierEnvelope::decode(&body_len, set).is_err());
+    let mut nested_trailing = bytes.clone();
+    let body_len = bytes.len() - body_len_offset - 4;
+    nested_trailing[body_len_offset..body_len_offset + 4]
+        .copy_from_slice(&u32::try_from(body_len + 1).unwrap().to_le_bytes());
+    nested_trailing.push(0);
+    assert!(CarrierEnvelope::decode(&nested_trailing, set).is_err());
+    if let CarrierPayload::Vote { payload, lineage } = envelope.payload() {
+        let lineage_bytes = lineage.encode(set).unwrap();
+        let vote_bytes = payload.encode(set).unwrap();
+        for corrupt_lineage in [true, false] {
+            let mut inner_lineage = lineage_bytes.clone();
+            let mut inner_vote = vote_bytes.clone();
+            if corrupt_lineage {
+                inner_lineage.push(0);
+            } else {
+                inner_vote.push(0);
+            }
+            let mut body = crypto::encoding::Encoder::new();
+            body.put_bytes(&inner_lineage).unwrap();
+            body.put_bytes(&inner_vote).unwrap();
+            let body = body.finish();
+            let mut bad = bytes[..body_len_offset].to_vec();
+            bad.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
+            bad.extend_from_slice(&body);
+            assert!(CarrierEnvelope::decode(&bad, set).is_err());
+        }
+        let start = body_len_offset + 4;
+        for offset in [start, start + 4 + lineage.encode(set).unwrap().len()] {
+            let mut bad = bytes.clone();
+            bad[offset..offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(CarrierEnvelope::decode(&bad, set).is_err());
+        }
+        if payload.vote.phase == validator::slot_agreement::AgreementPhase::Precommit {
+            let mut incomplete = lineage.clone();
+            incomplete.entries.last_mut().unwrap().pol = None;
+            assert!(
+                PendingIntent::Vote {
+                    payload: payload.clone(),
+                    digest: envelope.payload_digest(),
+                    lineage: incomplete,
+                }
+                .into_envelope(envelope.carrier().clone(), set)
+                .is_err()
+            );
+        }
+    }
     let mut malformed_body = bytes.clone();
     malformed_body[body_len_offset + 4] = 255;
     assert!(CarrierEnvelope::decode(&malformed_body, set).is_err());
@@ -140,6 +213,85 @@ fn check_envelope(envelope: &CarrierEnvelope, set: &ValidatorSet) {
         wrong_carrier[3] ^= 1;
         assert!(CarrierEnvelope::decode(&wrong_carrier, set).is_err());
     }
+}
+
+fn historical_vote_envelopes(adapter: &Adapter) -> Vec<Vec<u8>> {
+    adapter
+        .pending()
+        .iter()
+        .filter_map(|intent| {
+            let PendingIntent::Vote {
+                payload,
+                digest,
+                lineage,
+            } = intent
+            else {
+                return None;
+            };
+            let carrier = VertexId {
+                round: payload.prerequisite.round + 1,
+                author: payload.signature.validator_id.clone(),
+                digest: [42; 32],
+            };
+            Some(
+                PendingIntent::Vote {
+                    payload: payload.clone(),
+                    digest: *digest,
+                    lineage: lineage.clone(),
+                }
+                .into_envelope(carrier, &adapter.set)
+                .unwrap()
+                .encode(&adapter.set)
+                .unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn recover_envelope_adapter(
+    adapter: &mut Adapter,
+    store: &Store,
+    bootstrap: &AuthenticatedSlotAgreementBootstrap,
+    m: &chain::Membership,
+    index: usize,
+) {
+    let envelopes = historical_vote_envelopes(adapter);
+    let sequence = adapter.driver.sequence();
+    let history = format!("{:?}", adapter.signing_history());
+    let output = format!("{:?}", adapter.driver.output().unwrap());
+    let votes: Vec<_> = adapter
+        .pending()
+        .iter()
+        .filter_map(|p| match p {
+            PendingIntent::Vote {
+                payload, digest, ..
+            } => Some((payload.clone(), *digest)),
+            _ => None,
+        })
+        .collect();
+    let mut bootstrap = bootstrap.clone();
+    bootstrap.agreement.local_validator = m.consensus[index].id.clone();
+    let recovered = Adapter::recover(store, bootstrap, m, index).unwrap();
+    assert_eq!(recovered.driver.sequence(), sequence);
+    assert_eq!(format!("{:?}", recovered.signing_history()), history);
+    assert_eq!(format!("{:?}", recovered.driver.output().unwrap()), output);
+    let recovered_votes: Vec<_> = recovered
+        .pending()
+        .iter()
+        .filter_map(|p| match p {
+            PendingIntent::Vote {
+                payload, digest, ..
+            } => Some((payload.clone(), *digest)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(recovered_votes, votes);
+    assert_eq!(historical_vote_envelopes(&recovered), envelopes);
+    assert_eq!(
+        recovered.readiness(),
+        Readiness::DisabledMissingCausalReadinessAndTransport
+    );
+    *adapter = recovered;
 }
 
 struct Dir(std::path::PathBuf);
@@ -168,9 +320,27 @@ fn signed(
     references: Vec<VertexId>,
     payload_hash: [u8; 32],
 ) -> Vertex {
+    signed_for_chain(
+        m,
+        author,
+        round,
+        references,
+        payload_hash,
+        b"live-adapter-tests",
+    )
+}
+
+fn signed_for_chain(
+    m: &chain::Membership,
+    author: usize,
+    round: u64,
+    references: Vec<VertexId>,
+    payload_hash: [u8; 32],
+    chain_id: &[u8],
+) -> Vertex {
     let identity = &m.consensus[author];
     let mut v = Vertex {
-        chain_id: b"live-adapter-tests".to_vec(),
+        chain_id: chain_id.to_vec(),
         epoch: m.set.epoch,
         round,
         author: identity.id.clone(),
@@ -189,15 +359,25 @@ fn fixture() -> (
     AuthenticatedSlotAgreementBootstrap,
     AuthenticatedSlotAgreementRequest,
 ) {
+    fixture_for_chain(b"live-adapter-tests")
+}
+
+fn fixture_for_chain(
+    chain_id: &[u8],
+) -> (
+    chain::Membership,
+    AuthenticatedSlotAgreementBootstrap,
+    AuthenticatedSlotAgreementRequest,
+) {
     let m = chain::membership(4, None).unwrap();
     let mut dag = Dag::new(m.set.clone());
-    dag.set_chain_id(b"live-adapter-tests".to_vec());
+    dag.set_chain_id(chain_id.to_vec());
     let mut vertices = vec![];
     let mut refs = vec![];
     for round in 0..=2 {
         let mut ids = vec![];
         for author in 0..4 {
-            let v = signed(&m, author, round, refs.clone(), [1; 32]);
+            let v = signed_for_chain(&m, author, round, refs.clone(), [1; 32], chain_id);
             ids.push(dag.insert(v.clone()).unwrap());
             vertices.push(v);
         }
@@ -240,7 +420,7 @@ fn fixture() -> (
     };
     let mut carriers = vec![];
     for author in 0..4 {
-        let v = signed(
+        let v = signed_for_chain(
             &m,
             author,
             3,
@@ -250,6 +430,7 @@ fn fixture() -> (
             } else {
                 [3; 32]
             },
+            chain_id,
         );
         carriers.push(v.id().unwrap());
         vertices.push(v);
@@ -267,7 +448,7 @@ fn fixture() -> (
     let proposer = validator::slot_agreement_view_proposer(&m.set, 1, AgreementView(0)).unwrap();
     for author in 0..4 {
         let elected = m.consensus[author].id == proposer;
-        let v = signed(
+        let v = signed_for_chain(
             &m,
             author,
             4,
@@ -277,6 +458,7 @@ fn fixture() -> (
             } else {
                 [4; 32]
             },
+            chain_id,
         );
         if elected {
             lineage.entries[0].view_carrier = v.id().unwrap();
@@ -301,6 +483,73 @@ fn fixture() -> (
 }
 
 #[test]
+fn tampered_history_blocks_all_reconstruction_before_signing() {
+    let (m, bootstrap, request) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::begin(&store, bootstrap, &m, 0).unwrap();
+    adapter.apply(request.clone()).unwrap();
+    let original = adapter.signing_history()[0].clone();
+    let mut variants = Vec::new();
+    let mut missing = original.clone();
+    missing.lineage = None;
+    variants.push(missing);
+    let mut empty = original.clone();
+    empty.lineage.as_mut().unwrap().entries.clear();
+    variants.push(empty);
+    let mut wrong_view = original.clone();
+    wrong_view
+        .lineage
+        .as_mut()
+        .unwrap()
+        .entries
+        .last_mut()
+        .unwrap()
+        .view
+        .0 += 1;
+    variants.push(wrong_view);
+    let mut wrong_carrier = original.clone();
+    wrong_carrier
+        .lineage
+        .as_mut()
+        .unwrap()
+        .entries
+        .last_mut()
+        .unwrap()
+        .view_carrier
+        .digest[0] ^= 1;
+    variants.push(wrong_carrier);
+    let mut wrong_decision = original.clone();
+    wrong_decision.vote.value = AgreementValue::Nil;
+    wrong_decision.prerequisite = AgreementSigningPrerequisite::UnsupportedNil;
+    variants.push(wrong_decision);
+    let mut missing_pol = original.clone();
+    missing_pol.vote.phase = validator::slot_agreement::AgreementPhase::Precommit;
+    variants.push(missing_pol);
+    let mut wrong_context = original.clone();
+    wrong_context.vote.context = fixture_for_chain(b"other-history").1.agreement.context;
+    variants.push(wrong_context);
+    for tampered in variants {
+        adapter.pending.clear();
+        adapter.history.clear();
+        // A valid first entry must not be signed before a malformed later one is checked.
+        let output = adapter.driver.output().unwrap();
+        assert!(
+            adapter
+                .reconstruct_history(output, vec![original.clone(), tampered])
+                .is_err()
+        );
+        assert!(adapter.pending().is_empty());
+        assert!(adapter.signing_history().is_empty());
+        assert_eq!(
+            adapter.readiness(),
+            Readiness::RecoveryRequiredHistoricalIntentsUnavailable
+        );
+        assert!(adapter.apply(request.clone()).is_err());
+    }
+}
+
+#[test]
 fn exact_durable_signature_retention_and_recovery_boundary() {
     let (m, bootstrap, request) = fixture();
     let dir = Dir::new();
@@ -316,7 +565,10 @@ fn exact_durable_signature_retention_and_recovery_boundary() {
     drop(stage);
     adapter.apply(request.clone()).unwrap();
     assert_eq!(adapter.driver.sequence(), 1);
-    let PendingIntent::Vote { payload, digest } = &adapter.pending()[0] else {
+    let PendingIntent::Vote {
+        payload, digest, ..
+    } = &adapter.pending()[0]
+    else {
         panic!("expected vote")
     };
     let expected = Ed25519Scheme
@@ -328,6 +580,7 @@ fn exact_durable_signature_retention_and_recovery_boundary() {
     assert_eq!(payload.signature.signature, expected);
     assert_eq!(*digest, payload.digest(&m.set).unwrap());
     let original = payload.clone();
+    let original_envelopes = historical_vote_envelopes(&adapter);
     let AuthenticatedSlotAgreementRequest::Propose { lineage, vertices } = request else {
         panic!("proposal fixture")
     };
@@ -374,6 +627,7 @@ fn exact_durable_signature_retention_and_recovery_boundary() {
         panic!("recovered historical vote")
     };
     assert_eq!(*payload, original);
+    assert_eq!(historical_vote_envelopes(&recovered), original_envelopes);
     let output = recovered.driver.output();
     recovered.consume_durable_result(output, None).unwrap();
     assert_eq!(
@@ -381,6 +635,202 @@ fn exact_durable_signature_retention_and_recovery_boundary() {
         1,
         "outbox reads deduplicate by ID"
     );
+}
+
+#[test]
+fn received_envelope_valid_for_other_chain_is_rejected_without_durable_change() {
+    let (m, bootstrap, request) = fixture();
+    let (other_m, other_bootstrap, other_request) = fixture_for_chain(b"other-envelope-chain");
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let other_dir = Dir::new();
+    let other_store = Store::open(&other_dir.0).unwrap();
+    let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    adapter.apply(request.clone()).unwrap();
+    let mut other = Adapter::begin(&other_store, other_bootstrap.clone(), &other_m, 0).unwrap();
+    other.apply(other_request.clone()).unwrap();
+    let AuthenticatedSlotAgreementRequest::Propose {
+        lineage,
+        mut vertices,
+    } = other_request
+    else {
+        panic!("other proposal")
+    };
+    let PendingIntent::Vote {
+        payload, digest, ..
+    } = &other.pending()[0]
+    else {
+        panic!("other prevote")
+    };
+    let refs = vertices
+        .iter()
+        .filter(|v| v.round == 4)
+        .map(|v| v.id().unwrap())
+        .collect();
+    let carrier = signed_for_chain(&other_m, 0, 5, refs, *digest, b"other-envelope-chain");
+    let envelope = PendingIntent::Vote {
+        payload: payload.clone(),
+        digest: *digest,
+        lineage: lineage.clone(),
+    }
+    .into_envelope(carrier.id().unwrap(), &other_m.set)
+    .unwrap();
+    vertices.push(carrier);
+    let decoded =
+        CarrierEnvelope::decode(&envelope.encode(&other_m.set).unwrap(), &other_m.set).unwrap();
+    // Prove the complete signed envelope is independently valid, not a corrupt fixture.
+    other.receive_envelope(decoded, vertices.clone()).unwrap();
+    recover_envelope_adapter(&mut other, &other_store, &other_bootstrap, &other_m, 0);
+
+    let sequence = adapter.driver.sequence();
+    let history = format!("{:?}", adapter.signing_history());
+    let pending = format!("{:?}", adapter.pending());
+    let state = exposed_receipt_state(&store, &bootstrap);
+    let decoded =
+        CarrierEnvelope::decode(&envelope.encode(&other_m.set).unwrap(), &other_m.set).unwrap();
+    assert!(adapter.receive_envelope(decoded, vertices).is_err());
+    assert_eq!(adapter.driver.sequence(), sequence);
+    assert_eq!(format!("{:?}", adapter.signing_history()), history);
+    assert_eq!(format!("{:?}", adapter.pending()), pending);
+    assert_eq!(
+        adapter.readiness(),
+        Readiness::RecoveryRequiredHistoricalIntentsUnavailable
+    );
+    recover_envelope_adapter(&mut adapter, &store, &bootstrap, &m, 0);
+    assert_eq!(exposed_receipt_state(&store, &bootstrap), state);
+    assert_eq!(adapter.driver.sequence(), sequence);
+    assert_eq!(format!("{:?}", adapter.signing_history()), history);
+    assert_eq!(format!("{:?}", adapter.pending()), pending);
+
+    let AuthenticatedSlotAgreementRequest::Propose { lineage, vertices } = request else {
+        panic!("original proposal")
+    };
+    let PendingIntent::Vote {
+        payload, digest, ..
+    } = &adapter.pending()[0]
+    else {
+        panic!("original prevote")
+    };
+    let refs = vertices
+        .iter()
+        .filter(|v| v.round == 4)
+        .map(|v| v.id().unwrap())
+        .collect();
+    let carrier = signed(&m, 0, 5, refs, *digest);
+    let envelope = PendingIntent::Vote {
+        payload: payload.clone(),
+        digest: *digest,
+        lineage: lineage.clone(),
+    }
+    .into_envelope(carrier.id().unwrap(), &m.set)
+    .unwrap();
+    let decoded = CarrierEnvelope::decode(&envelope.encode(&m.set).unwrap(), &m.set).unwrap();
+    adapter.receive_envelope(decoded, vec![carrier]).unwrap();
+    assert_eq!(adapter.driver.sequence(), sequence + 1);
+    assert_eq!(format!("{:?}", adapter.signing_history()), history);
+    recover_envelope_adapter(&mut adapter, &store, &bootstrap, &m, 0);
+    assert_eq!(exposed_receipt_state(&store, &bootstrap), state);
+}
+
+// The driver's session/DAG are private to store. Reopen through existing read/replay
+// APIs: the binding includes the active tip's order length/root and predecessor carrier.
+fn exposed_receipt_state(store: &Store, bootstrap: &AuthenticatedSlotAgreementBootstrap) -> String {
+    let session = store
+        .recover_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    format!(
+        "{:?}",
+        (
+            session.binding().unwrap(),
+            store.slot_application_requests().unwrap(),
+            store.slot_applications().unwrap(),
+            store.live_snapshot().unwrap(),
+        )
+    )
+}
+
+#[test]
+fn received_envelope_reauthenticates_carrier_before_wal_and_requires_recovery() {
+    let (m, bootstrap, request) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    adapter.apply(request.clone()).unwrap();
+    let AuthenticatedSlotAgreementRequest::Propose { lineage, vertices } = request else {
+        panic!("proposal")
+    };
+    let PendingIntent::Vote {
+        payload, digest, ..
+    } = &adapter.pending()[0]
+    else {
+        panic!("prevote")
+    };
+    let refs = vertices
+        .iter()
+        .filter(|v| v.round == 4)
+        .map(|v| v.id().unwrap())
+        .collect();
+    // This is a genuinely signed vertex, but it carries an unrelated payload hash.
+    // The envelope codec cannot establish that association and must not authorize it.
+    let wrong_vertex = signed(&m, 0, 5, refs, [99; 32]);
+    let envelope = PendingIntent::Vote {
+        payload: payload.clone(),
+        digest: *digest,
+        lineage: lineage.clone(),
+    }
+    .into_envelope(wrong_vertex.id().unwrap(), &m.set)
+    .unwrap();
+    let decoded = CarrierEnvelope::decode(&envelope.encode(&m.set).unwrap(), &m.set).unwrap();
+    let sequence = adapter.driver.sequence();
+    let history = format!("{:?}", adapter.signing_history());
+    let pending = format!("{:?}", adapter.pending());
+    assert!(
+        adapter
+            .receive_envelope(decoded, vec![wrong_vertex])
+            .is_err()
+    );
+    assert_eq!(adapter.driver.sequence(), sequence);
+    assert_eq!(format!("{:?}", adapter.signing_history()), history);
+    assert_eq!(format!("{:?}", adapter.pending()), pending);
+    assert_eq!(
+        adapter.readiness(),
+        Readiness::RecoveryRequiredHistoricalIntentsUnavailable
+    );
+    let decoded = CarrierEnvelope::decode(&envelope.encode(&m.set).unwrap(), &m.set).unwrap();
+    assert!(adapter.receive_envelope(decoded, vec![]).is_err());
+    assert_eq!(adapter.driver.sequence(), sequence);
+    recover_envelope_adapter(&mut adapter, &store, &bootstrap, &m, 0);
+    assert_eq!(format!("{:?}", adapter.pending()), pending);
+    assert!(adapter.driver.output().unwrap().candidates.is_empty());
+
+    let PendingIntent::Vote {
+        payload, digest, ..
+    } = &adapter.pending()[0]
+    else {
+        panic!("recovered prevote")
+    };
+    let refs = vertices
+        .iter()
+        .filter(|v| v.round == 4)
+        .map(|v| v.id().unwrap())
+        .collect();
+    let valid_vertex = signed(&m, 0, 5, refs, *digest);
+    let envelope = PendingIntent::Vote {
+        payload: payload.clone(),
+        digest: *digest,
+        lineage: lineage.clone(),
+    }
+    .into_envelope(valid_vertex.id().unwrap(), &m.set)
+    .unwrap();
+    let decoded = CarrierEnvelope::decode(&envelope.encode(&m.set).unwrap(), &m.set).unwrap();
+    // Proposal dependencies are retained by the authenticated session: only the new
+    // carrier is supplied here. Recovery must preserve that authenticated history.
+    adapter
+        .receive_envelope(decoded, vec![valid_vertex])
+        .unwrap();
+    assert_eq!(adapter.driver.sequence(), sequence + 1);
+    assert_eq!(format!("{:?}", adapter.signing_history()), history);
+    recover_envelope_adapter(&mut adapter, &store, &bootstrap, &m, 0);
 }
 
 #[test]
@@ -466,7 +916,10 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         .iter()
         .enumerate()
         .map(|(i, a)| {
-            let PendingIntent::Vote { payload, digest } = &a.pending()[0] else {
+            let PendingIntent::Vote {
+                payload, digest, ..
+            } = &a.pending()[0]
+            else {
                 panic!("prevote")
             };
             let before = payload.encode(&m.set).unwrap();
@@ -481,7 +934,8 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             assert_eq!(
                 PendingIntent::Vote {
                     payload: nil,
-                    digest: *digest
+                    digest: *digest,
+                    lineage: lineage.clone(),
                 }
                 .prerequisite_carriers(),
                 Err(PrerequisiteExtractionError::UnsupportedNil)
@@ -491,10 +945,17 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             let envelope = PendingIntent::Vote {
                 payload: payload.clone(),
                 digest: *digest,
+                lineage: lineage.clone(),
             }
             .into_envelope(carrier.clone(), &m.set)
             .unwrap();
-            assert_eq!(envelope.payload(), &CarrierPayload::Vote(payload.clone()));
+            assert_eq!(
+                envelope.payload(),
+                &CarrierPayload::Vote {
+                    payload: payload.clone(),
+                    lineage: lineage.clone()
+                }
+            );
             check_envelope(&envelope, &m.set);
             let mut inspection_vertices = vertices.clone();
             inspection_vertices.push(v.clone());
@@ -507,7 +968,8 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             assert!(
                 PendingIntent::Vote {
                     payload: oversized,
-                    digest: *digest
+                    digest: *digest,
+                    lineage: lineage.clone(),
                 }
                 .into_envelope(carrier.clone(), &m.set)
                 .is_err()
@@ -524,6 +986,7 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             let constructed = PendingIntent::Vote {
                 payload: unauthenticated,
                 digest: unauthenticated_digest,
+                lineage: lineage.clone(),
             }
             .into_envelope(carrier.clone(), &m.set)
             .unwrap();
@@ -531,7 +994,8 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             assert!(
                 PendingIntent::Vote {
                     payload: payload.clone(),
-                    digest: [0; 32]
+                    digest: [0; 32],
+                    lineage: lineage.clone(),
                 }
                 .into_envelope(carrier.clone(), &m.set)
                 .is_err()
@@ -541,7 +1005,8 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             assert!(
                 PendingIntent::Vote {
                     payload: payload.clone(),
-                    digest: *digest
+                    digest: *digest,
+                    lineage: lineage.clone(),
                 }
                 .into_envelope(wrong_author, &m.set)
                 .is_err()
@@ -551,7 +1016,8 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             assert!(
                 PendingIntent::Vote {
                     payload: nil,
-                    digest: *digest
+                    digest: *digest,
+                    lineage: lineage.clone(),
                 }
                 .into_envelope(carrier.clone(), &m.set)
                 .is_err()
@@ -564,15 +1030,42 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             witness
         })
         .collect();
-    for adapter in &mut adapters {
-        for witness in &witnesses {
+    for (i, adapter) in adapters.iter_mut().enumerate() {
+        for (n, witness) in witnesses.iter().enumerate() {
+            let envelope = PendingIntent::Vote {
+                payload: witness.payload.clone(),
+                digest: witness.payload.digest(&m.set).unwrap(),
+                lineage: lineage.clone(),
+            }
+            .into_envelope(witness.carrier.clone(), &m.set)
+            .unwrap();
+            let decoded =
+                CarrierEnvelope::decode(&envelope.encode(&m.set).unwrap(), &m.set).unwrap();
             adapter
-                .apply(AuthenticatedSlotAgreementRequest::ObserveVote {
-                    lineage: lineage.clone(),
-                    witness: witness.clone(),
-                    vertices: vote_vertices.clone(),
-                })
+                .receive_envelope(decoded, vote_vertices.clone())
                 .unwrap();
+            assert_eq!(
+                adapter.signing_history().len(),
+                1,
+                "observing votes does not create local signing intent"
+            );
+            recover_envelope_adapter(adapter, &stores[i], &bootstrap, &m, i);
+            if n < 2 {
+                assert!(
+                    !adapter
+                        .pending()
+                        .iter()
+                        .any(|p| matches!(p, PendingIntent::Pol { .. }))
+                );
+            } else {
+                assert!(
+                    adapter
+                        .pending()
+                        .iter()
+                        .any(|p| matches!(p, PendingIntent::Pol { .. })),
+                    "replayed vote bucket reaches quorum"
+                );
+            }
         }
     }
     let (candidate, pol_digest) = adapters[0]
@@ -636,13 +1129,15 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
     inspect_envelope(&envelope, &m, &bootstrap, &inspection_vertices, &lineage);
     let mut incoming = vote_vertices;
     incoming.extend(pol_vertices.clone());
-    for adapter in &mut adapters {
-        adapter
-            .apply(AuthenticatedSlotAgreementRequest::ObservePrevote {
-                lineage: lineage.clone(),
-                vertices: incoming.clone(),
-            })
-            .unwrap();
+    for (i, adapter) in adapters.iter_mut().enumerate() {
+        let decoded = CarrierEnvelope::decode(&envelope.encode(&m.set).unwrap(), &m.set).unwrap();
+        adapter.receive_envelope(decoded, incoming.clone()).unwrap();
+        assert_eq!(
+            adapter.signing_history().len(),
+            2,
+            "POL durably emits local precommit"
+        );
+        recover_envelope_adapter(adapter, &stores[i], &bootstrap, &m, i);
     }
     let refs: Vec<_> = pol_vertices.iter().map(|v| v.id().unwrap()).collect();
     let mut precommit_vertices = Vec::new();
@@ -654,9 +1149,10 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
                 .pending()
                 .iter()
                 .find_map(|intent| match intent {
-                    PendingIntent::Vote { payload, digest }
-                        if payload.vote.phase
-                            == validator::slot_agreement::AgreementPhase::Precommit =>
+                    PendingIntent::Vote {
+                        payload, digest, ..
+                    } if payload.vote.phase
+                        == validator::slot_agreement::AgreementPhase::Precommit =>
                     {
                         Some((payload, digest))
                     }
@@ -667,7 +1163,8 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             assert_eq!(
                 PendingIntent::Vote {
                     payload: payload.clone(),
-                    digest: *digest
+                    digest: *digest,
+                    lineage: lineage.clone(),
                 }
                 .prerequisite_carriers()
                 .unwrap(),
@@ -718,13 +1215,18 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         *adapter = recovered;
     }
     for witness in &witnesses {
+        let envelope = PendingIntent::Vote {
+            payload: witness.payload.clone(),
+            digest: witness.payload.digest(&m.set).unwrap(),
+            lineage: lineage.clone(),
+        }
+        .into_envelope(witness.carrier.clone(), &m.set)
+        .unwrap();
+        let decoded = CarrierEnvelope::decode(&envelope.encode(&m.set).unwrap(), &m.set).unwrap();
         adapters[0]
-            .apply(AuthenticatedSlotAgreementRequest::ObserveVote {
-                lineage: lineage.clone(),
-                witness: witness.clone(),
-                vertices: precommit_vertices.clone(),
-            })
+            .receive_envelope(decoded, precommit_vertices.clone())
             .unwrap();
+        recover_envelope_adapter(&mut adapters[0], &stores[0], &bootstrap, &m, 0);
     }
     let pending = adapters[0].pending();
     assert_eq!(
@@ -771,9 +1273,11 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         let vote = PendingIntent::Vote {
             payload: witness.payload.clone(),
             digest: witness.payload.digest(&m.set).unwrap(),
+            lineage: lineage.clone(),
         }
         .into_envelope(witness.carrier.clone(), &m.set)
         .unwrap();
+        check_envelope(&vote, &m.set);
         inspect_envelope(&vote, &m, &bootstrap, &inspection_vertices, &lineage);
     }
     assert!(
@@ -808,6 +1312,35 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
     );
     assert_eq!(proof.encode(&m.set).unwrap(), before);
     assert_eq!(*digest, proof.digest(&m.set).unwrap());
+    // Final receipt is durable protocol observation, not chain application.
+    let receipt_state = exposed_receipt_state(&stores[0], &bootstrap);
+    let history = format!("{:?}", adapters[0].signing_history());
+    let sequence = adapters[0].driver.sequence();
+    let decoded = CarrierEnvelope::decode(&envelope.encode(&m.set).unwrap(), &m.set).unwrap();
+    adapters[0]
+        .receive_envelope(decoded, inspection_vertices)
+        .unwrap();
+    assert_eq!(exposed_receipt_state(&stores[0], &bootstrap), receipt_state);
+    assert_eq!(adapters[0].driver.sequence(), sequence + 1);
+    assert_eq!(format!("{:?}", adapters[0].signing_history()), history);
+    assert!(
+        adapters[0]
+            .driver
+            .output()
+            .unwrap()
+            .transition
+            .unwrap()
+            .decision
+            .is_some()
+    );
+    recover_envelope_adapter(&mut adapters[0], &stores[0], &bootstrap, &m, 0);
+    assert_eq!(exposed_receipt_state(&stores[0], &bootstrap), receipt_state);
+    assert!(adapters[0].driver.output().unwrap().candidates.is_empty());
+    assert_eq!(
+        adapters[0].pending().len(),
+        2,
+        "recovery retains signing obligations, not stale carrier candidates"
+    );
     assert_eq!(
         adapters[0].readiness(),
         Readiness::DisabledMissingCausalReadinessAndTransport

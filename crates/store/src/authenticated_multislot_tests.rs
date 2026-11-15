@@ -74,6 +74,25 @@ fn signed_contiguous_slots_recover_and_do_not_leak_outputs() {
             )
             .unwrap();
         let first_intent = owner.signing_outbox().unwrap().remove(0);
+        let first_lineage = SlotAgreementViewLineage {
+            entries: first.entries.clone(),
+        }
+        .encode(&f.set)
+        .unwrap();
+        let next_lineage = SlotAgreementViewLineage {
+            entries: next.entries.clone(),
+        }
+        .encode(&f.set)
+        .unwrap();
+        assert_eq!(
+            first_intent
+                .lineage
+                .as_ref()
+                .unwrap()
+                .encode(&f.set)
+                .unwrap(),
+            first_lineage
+        );
         owner
             .apply(
                 2,
@@ -99,6 +118,17 @@ fn signed_contiguous_slots_recover_and_do_not_leak_outputs() {
         let mut owner = store
             .recover_authenticated_slot_agreement(bootstrap.clone())
             .unwrap();
+        let recovered_history = owner.signing_outbox().unwrap();
+        assert_eq!(recovered_history[0].id, first_intent.id);
+        assert_eq!(
+            recovered_history[0]
+                .lineage
+                .as_ref()
+                .unwrap()
+                .encode(&f.set)
+                .unwrap(),
+            first_lineage
+        );
         let proposal = AuthenticatedSlotAgreementRequest::Propose {
             lineage: SlotAgreementViewLineage {
                 entries: next.entries.clone(),
@@ -131,6 +161,14 @@ fn signed_contiguous_slots_recover_and_do_not_leak_outputs() {
         assert_eq!(history[0].id, first_intent.id);
         assert_eq!(history[0].sequence, 1);
         assert_eq!(history[1].sequence, 4);
+        assert_eq!(
+            history[0].lineage.as_ref().unwrap().encode(&f.set).unwrap(),
+            first_lineage
+        );
+        assert_eq!(
+            history[1].lineage.as_ref().unwrap().encode(&f.set).unwrap(),
+            next_lineage
+        );
         assert_eq!(history[0].agreement.context, f.binding.tip().clone());
         assert_eq!(history[1].agreement.context, context);
         assert_ne!(history[0].id, history[1].id);
