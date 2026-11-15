@@ -1042,12 +1042,94 @@ fn presign_reservation_survives_slot_advance_without_reauthorizing() {
         .unwrap();
     owner.apply(2, request).unwrap();
     assert_eq!(owner.reserved_carriers().unwrap()[0].id, original.id);
-    assert_eq!(fs::read(path).unwrap(), bytes);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+
+    let mut signed = original.unsigned.clone();
+    signed.signature = Ed25519Scheme
+        .sign(&f.keys[0], &signed.signing_payload().unwrap())
+        .unwrap();
+    let completion = AuthenticatedSlotAgreementRequest::CompleteCarrier {
+        reservation_sequence: original.sequence,
+        signed: signed.clone(),
+    };
+    for mutation in 0..3 {
+        let mut bad = completion.clone();
+        let AuthenticatedSlotAgreementRequest::CompleteCarrier {
+            reservation_sequence,
+            signed,
+        } = &mut bad
+        else {
+            unreachable!()
+        };
+        match mutation {
+            0 => *reservation_sequence = 1,
+            1 => signed.signature[0] ^= 1,
+            _ => signed.payload_hash[0] ^= 1,
+        }
+        assert!(owner.apply(5, bad).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+    let binding = owner.binding().unwrap();
+    assert!(
+        owner
+            .apply_with_io(
+                5,
+                completion.clone(),
+                |file, bytes| Ok(file.write_all(bytes)?),
+                |_, _| Err(std::io::Error::other("completion barrier failure").into()),
+            )
+            .is_err()
+    );
+    assert!(owner.completed_carriers().is_err());
+    assert!(owner.apply(5, completion.clone()).is_err());
+    owner = store
+        .recover_authenticated_slot_agreement(AuthenticatedSlotAgreementBootstrap {
+            agreement: original.agreement.clone(),
+            predecessor: None,
+            order: vec![],
+            vertices: vec![],
+        })
+        .unwrap();
+    owner.apply(5, completion.clone()).unwrap();
+    assert_eq!(owner.binding().unwrap(), binding);
+    assert!(owner.apply(6, completion.clone()).is_err());
+    owner
+        .apply(
+            6,
+            AuthenticatedSlotAgreementRequest::AdvanceView {
+                from: AgreementView(0),
+            },
+        )
+        .unwrap();
+    let durable = fs::read(&path).unwrap();
+    owner.apply(5, completion.clone()).unwrap();
+    assert_eq!(owner.sequence(), 6);
+    assert_eq!(fs::read(&path).unwrap(), durable);
+    let recovered = store
+        .recover_authenticated_slot_agreement(AuthenticatedSlotAgreementBootstrap {
+            agreement: original.agreement.clone(),
+            predecessor: None,
+            order: vec![],
+            vertices: vec![],
+        })
+        .unwrap();
+    assert!(owner.completed_carriers().is_ok());
+    let driver = SlotAgreementDriver::new(recovered);
+    let completed = driver.completed_carriers().unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].sequence, 5);
+    assert_eq!(completed[0].reservation.sequence, 2);
+    assert_eq!(
+        completed[0].signed.encode().unwrap(),
+        signed.encode().unwrap()
+    );
+    assert_eq!(fs::read(&path).unwrap(), durable);
 }
 
 #[test]
 fn presign_aggregate_frozen_candidates_recovery_and_rejections() {
     use crate::slot_application_tests::unified_fixture;
+    use crypto::scheme::Ed25519Scheme;
     use validator::SlotAgreementVotePayload;
     for final_carrier in [false, true] {
         let (f, proof, carrier) = unified_fixture(true);
@@ -1386,5 +1468,38 @@ fn presign_aggregate_frozen_candidates_recovery_and_rejections() {
             .unwrap();
         owner.apply(sequence, request).unwrap();
         assert_eq!(owner.reserved_carriers().unwrap()[0].id, reserved.id);
+        let mut signed = reserved.unsigned.clone();
+        signed.signature = Ed25519Scheme
+            .sign(&f.keys[0], &signed.signing_payload().unwrap())
+            .unwrap();
+        let completion = AuthenticatedSlotAgreementRequest::CompleteCarrier {
+            reservation_sequence: sequence,
+            signed: signed.clone(),
+        };
+        let transition = owner.driver_snapshot().unwrap().1;
+        owner.apply(sequence + 4, completion.clone()).unwrap();
+        assert_eq!(owner.driver_snapshot().unwrap().1, transition);
+        assert_eq!(
+            owner.completed_carriers().unwrap()[0].reservation.evidence,
+            reserved.evidence
+        );
+        let durable = fs::read(&path).unwrap();
+        owner.apply(sequence + 4, completion).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), durable);
+        let recovered = store
+            .recover_authenticated_slot_agreement(AuthenticatedSlotAgreementBootstrap {
+                agreement: reserved.agreement.clone(),
+                predecessor: None,
+                order: vec![],
+                vertices: vec![],
+            })
+            .unwrap();
+        assert_eq!(
+            recovered.completed_carriers().unwrap()[0]
+                .signed
+                .encode()
+                .unwrap(),
+            signed.encode().unwrap()
+        );
     }
 }

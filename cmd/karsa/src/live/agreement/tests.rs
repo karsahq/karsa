@@ -720,7 +720,7 @@ fn actual_vote_authoring_preflights_node_and_dependencies() {
     assert_eq!(adapter.driver.sequence(), sequence);
     let authored = adapter.author_vote(id, &mut node).unwrap().unwrap();
     assert_eq!(authored.vertex.id().unwrap(), unsigned.id().unwrap());
-    assert_eq!(adapter.driver.sequence(), sequence);
+    assert_eq!(adapter.driver.sequence(), sequence + 1);
     assert_eq!((node.round(), node.authored()), (6, 1));
     assert_eq!(
         authored.vertex.payload_hash,
@@ -732,7 +732,24 @@ fn actual_vote_authoring_preflights_node_and_dependencies() {
         .inspect(node.dag(), &adapter.driver.output().unwrap().binding)
         .unwrap();
     check_envelope(&authored.envelope, &m.set);
-    // This API deliberately does not claim exactly-once authoring.
+    let signed_bytes = authored.vertex.encode().unwrap();
+    let envelope_bytes = authored.envelope.encode(&m.set).unwrap();
+    let completed = adapter.driver.completed_carriers().unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].signed.encode().unwrap(), signed_bytes);
+    assert_eq!(completed[0].reservation.sequence, sequence);
+    assert_eq!(completed[0].sequence, sequence + 1);
+    let mut recovered = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    for _ in 0..2 {
+        let publications = recovered.completed_carriers().unwrap();
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].vertex.encode().unwrap(), signed_bytes);
+        assert_eq!(
+            publications[0].envelope.encode(&m.set).unwrap(),
+            envelope_bytes
+        );
+        assert_eq!(recovered.driver.sequence(), sequence + 1);
+    }
 }
 
 #[test]
@@ -1581,7 +1598,7 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         .author_pol(pol_digest, &mut pol_node)
         .unwrap()
         .unwrap();
-    assert_eq!(adapters[0].driver.sequence(), sequence);
+    assert_eq!(adapters[0].driver.sequence(), sequence + 1);
     assert_eq!(authored_pol.vertex.id().unwrap(), unsigned.id().unwrap());
     assert_eq!(authored_pol.vertex, pol_vertices[0]);
     authored_pol
@@ -1842,7 +1859,7 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         .author_final_proof(*digest, &mut final_node)
         .unwrap()
         .unwrap();
-    assert_eq!(adapters[0].driver.sequence(), sequence);
+    assert_eq!(adapters[0].driver.sequence(), sequence + 1);
     assert_eq!(authored_final.vertex.id().unwrap(), unsigned.id().unwrap());
     authored_final
         .envelope
@@ -1978,9 +1995,31 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
                 .is_none()
         );
     }
+    let publication_bytes = |adapter: &mut Adapter| {
+        adapter
+            .completed_carriers()
+            .unwrap()
+            .into_iter()
+            .map(|publication| {
+                (
+                    publication.vertex.encode().unwrap(),
+                    publication.envelope.encode(&m.set).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before_advance = publication_bytes(&mut adapters[0]);
+    assert!(
+        before_advance.len() >= 3,
+        "vote, POL and FINAL completions persisted"
+    );
     adapters[0]
         .apply(AuthenticatedSlotAgreementRequest::AdvanceSlot)
         .unwrap();
+    assert_eq!(publication_bytes(&mut adapters[0]), before_advance);
+    recover_envelope_adapter(&mut adapters[0], &stores[0], &bootstrap, &m, 0);
+    assert_eq!(publication_bytes(&mut adapters[0]), before_advance);
+
     for id in [stale_prevote, precommit_id] {
         assert!(
             adapters[0]

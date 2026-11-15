@@ -39,6 +39,13 @@ pub struct AuthenticatedSlotAgreementBootstrap {
 pub enum AuthenticatedSlotAgreementRequest {
     /// Apply the first durable deciding proof and derive the next same-set slot.
     AdvanceSlot,
+    /// Persist the exact signed publication for an existing reservation.
+    CompleteCarrier {
+        /// Original one-based reservation WAL sequence.
+        reservation_sequence: u64,
+        /// Actual signed vertex; evidence is derived from the reservation.
+        signed: Vertex,
+    },
     /// Reserve an exact unsigned outer statement before invoking its signer.
     ReserveCarrier {
         /// Typed authenticated evidence bound to the exact prospective statement.
@@ -130,6 +137,17 @@ pub struct AgreementReservedCarrier {
     pub evidence: AgreementCarrierEvidence,
     /// Exact statement to sign, with no outer signature.
     pub unsigned: Vertex,
+}
+
+/// Durable signed publication with its replay-derived original authorization.
+#[derive(Debug, Clone)]
+pub struct AgreementCompletedCarrier {
+    /// Original reservation, including pinned context and authenticated evidence.
+    pub reservation: AgreementReservedCarrier,
+    /// Original one-based completion WAL sequence.
+    pub sequence: u64,
+    /// Exact signed publication bytes, recoverable through `Vertex::encode`.
+    pub signed: Vertex,
 }
 
 fn put_id(e: &mut Encoder, id: &VertexId) -> Result<(), StoreError> {
@@ -244,6 +262,14 @@ impl AuthenticatedSlotAgreementRequest {
         e.put_u16(1);
         match self {
             Self::AdvanceSlot => e.put_u8(6),
+            Self::CompleteCarrier {
+                reservation_sequence,
+                signed,
+            } => {
+                e.put_u8(8);
+                e.put_u64(*reservation_sequence);
+                e.put_bytes(&signed.encode()?)?;
+            }
             Self::ReserveCarrier {
                 evidence,
                 unsigned,
@@ -322,6 +348,10 @@ impl AuthenticatedSlotAgreementRequest {
         let tag = d.read_u8()?;
         let value = match tag {
             6 => Self::AdvanceSlot,
+            8 => Self::CompleteCarrier {
+                reservation_sequence: d.read_u64()?,
+                signed: Vertex::decode(d.read_bytes()?)?,
+            },
             7 => {
                 let evidence = match d.read_u8()? {
                     0 => AgreementCarrierEvidence::Vote {
@@ -700,6 +730,7 @@ type ReplayState = (
     Vec<AgreementSigningIntent>,
     Vec<[u8; 32]>,
     Vec<AgreementReservedCarrier>,
+    Vec<AgreementCompletedCarrier>,
 );
 
 fn reservation_bounds(
@@ -776,6 +807,7 @@ fn replay(
     let mut evidence_bytes = 0usize;
     let mut outbox: Vec<AgreementSigningIntent> = Vec::new();
     let mut reserved: Vec<AgreementReservedCarrier> = Vec::new();
+    let mut completed: Vec<AgreementCompletedCarrier> = Vec::new();
     for (index, event) in events.iter().enumerate() {
         let incoming = match event {
             AuthenticatedSlotAgreementRequest::ReserveCarrier { vertices, .. }
@@ -798,6 +830,45 @@ fn replay(
                     ));
                 }
             }
+        }
+        if let AuthenticatedSlotAgreementRequest::CompleteCarrier {
+            reservation_sequence,
+            signed,
+        } = event
+        {
+            let reservation = reserved
+                .iter()
+                .find(|r| r.sequence == *reservation_sequence)
+                .ok_or_else(|| invalid("completion lacks original reservation"))?;
+            if completed
+                .iter()
+                .any(|c| c.reservation.sequence == *reservation_sequence)
+            {
+                return Err(invalid(
+                    "carrier already completed; retry original sequence",
+                ));
+            }
+            let mut unsigned = signed.clone();
+            unsigned.signature.clear();
+            if unsigned != reservation.unsigned || signed.id()? != reservation.id {
+                return Err(invalid(
+                    "completion differs from reserved signing statement",
+                ));
+            }
+            signed.verify(&reservation.agreement.set, reservation.unsigned.epoch)?;
+            if vertices
+                .get(&(signed.round, signed.author.clone()))
+                .is_some_and(|old| old != signed)
+            {
+                return Err(invalid("completion conflicts with retained signed vertex"));
+            }
+            completed.push(AgreementCompletedCarrier {
+                reservation: reservation.clone(),
+                sequence: index as u64 + 1,
+                signed: signed.clone(),
+            });
+            // Publication is not a reducer input or a new signing authorization.
+            continue;
         }
         if let AuthenticatedSlotAgreementRequest::ReserveCarrier {
             evidence,
@@ -1036,8 +1107,9 @@ fn replay(
             continue;
         }
         let (input, decision) = match event {
-            AuthenticatedSlotAgreementRequest::ReserveCarrier { .. } => {
-                unreachable!("reservation handled above")
+            AuthenticatedSlotAgreementRequest::ReserveCarrier { .. }
+            | AuthenticatedSlotAgreementRequest::CompleteCarrier { .. } => {
+                unreachable!("publication handled above")
             }
             AuthenticatedSlotAgreementRequest::AdvanceSlot => unreachable!("advance handled above"),
             AuthenticatedSlotAgreementRequest::ObserveVote { .. } => {
@@ -1213,6 +1285,7 @@ fn replay(
         outbox,
         authorable,
         reserved,
+        completed,
     ))
 }
 pub(super) fn validate(root: &Path) -> Result<(), StoreError> {
@@ -1353,6 +1426,30 @@ impl AuthenticatedSlotAgreement {
         Ok(replay(&journal.bootstrap, &journal.events)?.7)
     }
 
+    /// Returns all durable signed publications in completion WAL order.
+    ///
+    /// # Errors
+    /// Rejects uncertain or stale owners and invalid durable evidence.
+    pub fn completed_carriers(&self) -> Result<Vec<AgreementCompletedCarrier>, StoreError> {
+        if self.uncertain {
+            return Err(invalid("uncertain authenticated write requires recovery"));
+        }
+        let root = self
+            .store
+            .slot_decisions
+            .lock()
+            .expect("slot decision lock poisoned");
+        exclusions(&root)?;
+        let journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
+        if journal.header != self.header
+            || journal.events.len() as u64 != self.sequence
+            || journal.tip != self.tip
+        {
+            return Err(invalid("stale authenticated owner"));
+        }
+        Ok(replay(&journal.bootstrap, &journal.events)?.8)
+    }
+
     /// Reauthenticates durable evidence and returns frozen candidates without mutable state access.
     ///
     /// # Errors
@@ -1383,7 +1480,7 @@ impl AuthenticatedSlotAgreement {
         {
             return Err(invalid("stale authenticated owner"));
         }
-        let (transition, candidates, active, binding, reproposal, _, authorable, _) =
+        let (transition, candidates, active, binding, reproposal, _, authorable, _, _) =
             replay(&journal.bootstrap, &journal.events)?;
         Ok((
             active, transition, candidates, reproposal, binding, authorable,
@@ -1464,6 +1561,7 @@ impl AuthenticatedSlotAgreement {
         let reservation_retry = matches!(
             request,
             AuthenticatedSlotAgreementRequest::ReserveCarrier { .. }
+                | AuthenticatedSlotAgreementRequest::CompleteCarrier { .. }
         ) && sequence > 0
             && journal.events.get((sequence - 1) as usize) == Some(&request);
         let retry = reservation_retry

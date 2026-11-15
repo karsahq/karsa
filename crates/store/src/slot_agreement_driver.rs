@@ -59,6 +59,14 @@ impl SlotAgreementDriver {
         self.session.reserved_carriers()
     }
 
+    /// Returns every durable signed publication, including historical slots and views.
+    ///
+    /// # Errors
+    /// Rejects stale or uncertain sessions and invalid durable evidence.
+    pub fn completed_carriers(&self) -> Result<Vec<crate::AgreementCompletedCarrier>, StoreError> {
+        self.session.completed_carriers()
+    }
+
     /// Returns the number of durable requests installed by this owner.
     pub fn sequence(&self) -> u64 {
         self.session.sequence()

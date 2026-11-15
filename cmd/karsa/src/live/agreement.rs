@@ -129,7 +129,7 @@ enum AggregateKind {
     Final,
 }
 
-/// Owned local authoring result; no publication, persistence or delivery guarantee.
+/// Durable signed publication and evidence; no transport or delivery guarantee.
 #[derive(Debug)]
 pub struct AuthoredCarrier {
     /// Actual signed vertex, already inserted by Node's existing authoring path.
@@ -239,14 +239,12 @@ impl Adapter {
             },
             _ => unreachable!("selected only aggregate candidates"),
         };
-        self.reserve_carrier(&unsigned, evidence, prepared.dag())?;
+        let reservation_sequence = self.reserve_carrier(&unsigned, evidence, prepared.dag())?;
         let Some(vertex) = prepared.author().map_err(|e| e.to_string())? else {
             return Ok(None);
         };
-        let envelope = intent
-            .into_envelope(vertex.id().map_err(|e| e.to_string())?, &self.set)
-            .map_err(|e| e.to_string())?;
-        Ok(Some(AuthoredCarrier { vertex, envelope }))
+        self.complete_carrier(reservation_sequence, vertex)
+            .map(Some)
     }
 
     /// Authors one stable durable vote intent, never arbitrary payloads or all history.
@@ -340,8 +338,7 @@ impl Adapter {
         };
         let payload = payload.clone();
         let lineage = lineage.clone();
-        let digest = *digest;
-        self.reserve_carrier(
+        let reservation_sequence = self.reserve_carrier(
             &unsigned,
             store::AgreementCarrierEvidence::Vote {
                 lineage: lineage.clone(),
@@ -355,14 +352,95 @@ impl Adapter {
         let Some(vertex) = prepared.author().map_err(|e| e.to_string())? else {
             return Ok(None);
         };
-        let envelope = PendingIntent::Vote {
-            payload: payload.clone(),
-            digest,
-            lineage: lineage.clone(),
+        self.complete_carrier(reservation_sequence, vertex)
+            .map(Some)
+    }
+
+    fn complete_carrier(
+        &mut self,
+        reservation_sequence: u64,
+        signed: validator::Vertex,
+    ) -> Result<AuthoredCarrier, String> {
+        let result = (|| {
+            let id = signed.id().map_err(|e| e.to_string())?;
+            if let Some(publication) = self
+                .completed_carriers()?
+                .into_iter()
+                .find(|publication| publication.vertex == signed)
+            {
+                return Ok(publication);
+            }
+
+            let sequence = self
+                .driver
+                .sequence()
+                .checked_add(1)
+                .ok_or("agreement sequence exhausted")?;
+            self.driver
+                .apply(
+                    sequence,
+                    AuthenticatedSlotAgreementRequest::CompleteCarrier {
+                        reservation_sequence,
+                        signed,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            self.completed_carriers()?
+                .into_iter()
+                .find(|publication| publication.vertex.id().ok().as_ref() == Some(&id))
+                .ok_or_else(|| "completed carrier unavailable after durable append".to_string())
+        })();
+        if result.is_err() {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
         }
-        .into_envelope(vertex.id().map_err(|e| e.to_string())?, &self.set)
-        .map_err(|e| e.to_string())?;
-        Ok(Some(AuthoredVote { vertex, envelope }))
+        result
+    }
+
+    /// Retrieves exact durable signed publications, including historical slots.
+    /// Never signs, consults a Node, or accepts caller-supplied evidence.
+    /// # Errors
+    /// Stale owners, uncertain writes and reconstruction errors require recovery.
+    pub fn completed_carriers(&mut self) -> Result<Vec<AuthoredCarrier>, String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before publication retrieval".into());
+        }
+        let result: Result<Vec<AuthoredCarrier>, String> = (|| {
+            self.driver
+                .completed_carriers()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|completed| {
+                    let set = &completed.reservation.agreement.set;
+                    let carrier = completed.signed.id().map_err(|e| e.to_string())?;
+                    let payload = match completed.reservation.evidence {
+                        store::AgreementCarrierEvidence::Vote { lineage, payload } => {
+                            CarrierPayload::Vote { lineage, payload }
+                        }
+                        store::AgreementCarrierEvidence::Pol { lineage } => {
+                            CarrierPayload::Pol(lineage)
+                        }
+                        store::AgreementCarrierEvidence::Final { proof } => {
+                            CarrierPayload::Final(proof)
+                        }
+                    };
+                    let envelope = CarrierEnvelope::from_publication(
+                        carrier,
+                        payload,
+                        completed.signed.payload_hash,
+                        set,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok(AuthoredCarrier {
+                        vertex: completed.signed,
+                        envelope,
+                    })
+                })
+                .collect()
+        })();
+        if result.is_err() {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+        }
+        result
     }
 
     fn reserve_carrier(
@@ -370,7 +448,7 @@ impl Adapter {
         unsigned: &validator::Vertex,
         evidence: store::AgreementCarrierEvidence,
         dag: &validator::Dag,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
             return Err("agreement owner requires recovery before carrier signing".into());
         }
@@ -386,8 +464,7 @@ impl Adapter {
             {
                 return Err("reserved carrier differs from current prospective statement".into());
             }
-            // The durable getter revalidates ownership; initial append or recovery
-            // already synchronized the reservation. Do not allocate another sequence.
+            Ok(reserved.sequence)
         } else {
             let mut todo = unsigned.references.clone();
             let mut vertices = Vec::new();
@@ -431,8 +508,8 @@ impl Adapter {
                 self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
                 return Err(error.to_string());
             }
+            Ok(sequence)
         }
-        Ok(())
     }
 
     /// Validates the pinned active key before creating a WAL. Never called by live startup.

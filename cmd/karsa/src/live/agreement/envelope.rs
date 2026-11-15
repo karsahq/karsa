@@ -73,6 +73,18 @@ fn preflight_body_len(author_len: usize, body_len: usize) -> Result<(), CryptoEr
 }
 
 impl CarrierEnvelope {
+    /// Reconstructs typed publication evidence with canonical codec validation.
+    /// This does not authenticate the vertex or authorize publication.
+    pub(super) fn from_publication(
+        carrier: VertexId,
+        payload: CarrierPayload,
+        payload_digest: [u8; 32],
+        set: &ValidatorSet,
+    ) -> Result<Self, CryptoError> {
+        let envelope = Self::checked(carrier, payload, payload_digest, set)?;
+        Self::decode(&envelope.encode(set)?, set)
+    }
+
     /// Preflights vote framing without inventing an unknown carrier digest.
     pub(super) fn preflight_vote(
         author: &[u8],
