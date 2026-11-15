@@ -145,6 +145,124 @@ pub struct SlotAgreementViewLineage {
     /// Connected lineage selecting the last view; that view need not have a POL.
     pub entries: Vec<SlotAgreementProofEntry>,
 }
+/// Carrier-free view authorization with a fully carried historical prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotAgreementViewCandidate {
+    pub(crate) prefix: Vec<SlotAgreementProofEntry>,
+    pub(crate) proposal: SlotProposalEnvelope,
+    pub(crate) proposal_carrier: VertexId,
+    pub(crate) view: AgreementView,
+    digest: [u8; 32],
+}
+impl SlotAgreementViewCandidate {
+    /// Checks canonical history and constructs authorization without a selected carrier.
+    /// # Errors
+    /// Rejects disconnected history, missing prior POLs, statement mismatches and bounds.
+    pub fn new(
+        prefix: Vec<SlotAgreementProofEntry>,
+        proposal: SlotProposalEnvelope,
+        proposal_carrier: VertexId,
+        view: AgreementView,
+        set: &ValidatorSet,
+    ) -> Result<Self, CryptoError> {
+        if prefix.len() >= SLOT_AGREEMENT_PROOF_MAX_ENTRIES {
+            return Err(invalid("lineage entry bound"));
+        }
+        if !prefix.is_empty() {
+            Lineage(&prefix).check()?;
+            let prior = &prefix[prefix.len() - 1];
+            if prior.pol.is_none()
+                || prior.view >= view
+                || prior.proposal.decision != proposal.decision
+            {
+                return Err(invalid("invalid candidate prior POL or decision"));
+            }
+        }
+        let mut e = Encoder::new();
+        e.put_u64(view.0);
+        e.put_bytes(&proposal.encode()?)?;
+        put_id(&mut e, &proposal_carrier)?;
+        if let Some(prior) = prefix.last() {
+            e.put_u8(1);
+            e.put_u32((prefix.len() - 1) as u32);
+            put_id(
+                &mut e,
+                &prior
+                    .pol
+                    .as_ref()
+                    .ok_or_else(|| invalid("missing POL"))?
+                    .carrier,
+            )?;
+        } else {
+            e.put_u8(0);
+        }
+        let candidate = Self {
+            prefix,
+            proposal,
+            proposal_carrier,
+            view,
+            digest: hash(0, &e.finish())?,
+        };
+        candidate.bound_lineage_len(&[], set)?;
+        Ok(candidate)
+    }
+
+    /// Returns the canonical view authorization digest.
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    /// Returns sorted, deduplicated direct prerequisites, without a selected carrier.
+    pub fn prerequisite_carriers(&self) -> Vec<VertexId> {
+        let mut ids = vec![self.proposal_carrier.clone()];
+        if let Some(prior) = self.prefix.last().and_then(|p| p.pol.as_ref()) {
+            ids.push(prior.carrier.clone());
+        }
+        ids.sort_by(|a, b| (a.round, &a.author, a.digest).cmp(&(b.round, &b.author, b.digest)));
+        ids.dedup();
+        ids
+    }
+
+    /// Computes the exact eventual lineage size without manufacturing an ID.
+    /// # Errors
+    /// Rejects oversized carrier authors, nested encoding errors or the one MiB aggregate bound.
+    pub fn bound_lineage_len(
+        &self,
+        author: &[u8],
+        set: &ValidatorSet,
+    ) -> Result<usize, CryptoError> {
+        if author.len() > crate::slot_agreement_phase::MAX_AUTHOR {
+            return Err(invalid("agreement phase carrier author exceeds bound"));
+        }
+        let mut e = Encoder::new();
+        e.put_u16(1);
+        Lineage(&self.prefix).encode_into(&mut e, set)?;
+        e.put_bytes(&self.proposal.encode()?)?;
+        put_id(&mut e, &self.proposal_carrier)?;
+        e.put_u64(self.view.0);
+        let len = e.len() + 48 + author.len() + 1 + usize::from(!self.prefix.is_empty()) * 4 + 1;
+        if len > SLOT_AGREEMENT_PROOF_MAX_BYTES {
+            return Err(invalid("view lineage exceeds one MiB"));
+        }
+        Ok(len)
+    }
+
+    /// Attaches the actual carrier; DAG inspection authenticates its contents.
+    pub fn bind_carrier(self, actual: VertexId) -> SlotAgreementViewLineage {
+        let previous_pol = self.prefix.len().checked_sub(1);
+        let mut entries = self.prefix;
+        entries.push(SlotAgreementProofEntry {
+            proposal: self.proposal,
+            proposal_carrier: self.proposal_carrier,
+            view: self.view,
+            view_carrier: actual,
+            previous_pol,
+            pol: None,
+        });
+        SlotAgreementViewLineage { entries }
+    }
+}
+
 /// Validated selected prevote evidence awaiting its actual signed DAG carrier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotAgreementPolCandidate {

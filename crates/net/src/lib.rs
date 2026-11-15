@@ -560,6 +560,27 @@ impl Node {
         })
     }
 
+    /// Prepares a bounded view carrier using the current exact reference selection.
+    ///
+    /// Holds exclusive access through authoring; preparation neither signs nor mutates the node.
+    /// Prerequisites never add references, and readiness uses the bounded retained-cone checks.
+    /// # Errors
+    /// Rejects occupied rounds, invalid candidates, unelected authors, and invalid causal cones.
+    pub fn prepare_slot_view(
+        &mut self,
+        candidate: &validator::SlotAgreementViewCandidate,
+        binding: &validator::SlotAgreementBinding,
+    ) -> Result<PreparedSlotCarrier<'_>, CryptoError> {
+        let vertex = self.unoccupied_prospective_vertex(candidate.digest())?;
+        self.dag
+            .inspect_slot_view_authoring_cone(&vertex, candidate, binding)?;
+        Ok(PreparedSlotCarrier {
+            node: self,
+            vertex,
+            prerequisites: candidate.prerequisite_carriers(),
+        })
+    }
+
     /// Prepares a bounded POL carrier using the current exact reference selection.
     /// # Errors
     /// Propagates unified prospective evidence and cone inspection failures.
@@ -1315,6 +1336,160 @@ mod tests {
             validator::SlotAgreementBinding::from_checkpoint(tip, Some(nodes[0].ids(1)[0].clone()))
                 .unwrap();
         (nodes, proposal, binding)
+    }
+
+    fn view_candidate_fixture(
+        foreign_sibling: bool,
+    ) -> (
+        Vec<Node>,
+        validator::SlotProposalEnvelope,
+        VertexId,
+        validator::SlotAgreementBinding,
+    ) {
+        let (mut nodes, proposal, binding) = plain_proposal_fixture();
+        let vertices: Vec<_> = nodes
+            .iter_mut()
+            .enumerate()
+            .map(|(index, node)| {
+                let chain_id = node.chain_id.clone();
+                if foreign_sibling && index == 1 {
+                    node.chain_id.push(99);
+                }
+                let vertex = node
+                    .author_with(if index == 0 {
+                        proposal.digest().unwrap()
+                    } else {
+                        [0; 32]
+                    })
+                    .unwrap()
+                    .unwrap();
+                node.chain_id = chain_id;
+                vertex
+            })
+            .collect();
+        for node in &mut nodes {
+            for vertex in &vertices {
+                node.receive(vertex.clone()).unwrap();
+            }
+        }
+        (nodes, proposal, vertices[0].id().unwrap(), binding)
+    }
+
+    #[test]
+    fn prepared_view_matches_actual_received_lineage() {
+        let (mut nodes, proposal, carrier, binding) = view_candidate_fixture(false);
+        let view = validator::slot_agreement::AgreementView(0);
+        let candidate = validator::SlotAgreementViewCandidate::new(
+            vec![],
+            proposal,
+            carrier,
+            view,
+            nodes[0].dag().set(),
+        )
+        .unwrap();
+        let elected =
+            validator::slot_agreement_view_proposer(nodes[0].dag().set(), 1, view).unwrap();
+        let index = nodes.iter().position(|node| node.id() == elected).unwrap();
+        let node = &mut nodes[index];
+        let unsigned = node.prospective_vertex(candidate.digest());
+        let expected = node
+            .dag()
+            .inspect_slot_view_authoring_cone(&unsigned, &candidate, &binding)
+            .unwrap();
+        let before = (node.round(), node.authored(), node.dag().order().to_vec());
+        {
+            let prepared = node.prepare_slot_view(&candidate, &binding).unwrap();
+            assert_eq!(prepared.unsigned(), &unsigned);
+            assert_eq!(prepared.prerequisites, candidate.prerequisite_carriers());
+            assert_eq!(prepared.dag().order(), before.2);
+        }
+        assert_eq!(
+            (node.round(), node.authored(), node.dag().order().to_vec()),
+            before
+        );
+        let signed = node
+            .prepare_slot_view(&candidate, &binding)
+            .unwrap()
+            .author()
+            .unwrap()
+            .unwrap();
+        let mut actual = signed.clone();
+        actual.signature.clear();
+        assert_eq!(actual, unsigned);
+        assert!(!signed.signature.is_empty());
+        assert_eq!(
+            (node.round(), node.authored()),
+            (before.0 + 1, before.1 + 1)
+        );
+        let lineage = candidate.bind_carrier(signed.id().unwrap());
+        let receiver = &mut nodes[(index + 1) % 4];
+        receiver.receive(signed).unwrap();
+        assert_eq!(
+            receiver
+                .dag()
+                .inspect_slot_agreement_view_lineage(&lineage, &binding)
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn prepared_view_rejections_do_not_mutate_or_sign() {
+        for case in 0..6 {
+            let (mut nodes, mut proposal, mut carrier, binding) = view_candidate_fixture(case == 5);
+            let view = validator::slot_agreement::AgreementView(0);
+            let elected =
+                validator::slot_agreement_view_proposer(nodes[0].dag().set(), 1, view).unwrap();
+            let mut index = nodes.iter().position(|node| node.id() == elected).unwrap();
+            match case {
+                0 => proposal.decision.chain_id.clear(),
+                1 => carrier.digest[0] ^= 1,
+                2 => index = (index + 1) % nodes.len(),
+                3 => {
+                    nodes[index].author().unwrap().unwrap();
+                    nodes[index].set_round(4);
+                }
+                4 => {
+                    nodes[index].set_floor(0);
+                }
+                5 => {} // A foreign-chain sibling is retained in the selected cone.
+                _ => unreachable!(),
+            }
+            let candidate = validator::SlotAgreementViewCandidate::new(
+                vec![],
+                proposal,
+                carrier,
+                view,
+                nodes[0].dag().set(),
+            )
+            .unwrap();
+            let node = &mut nodes[index];
+            let before = (
+                node.round(),
+                node.authored(),
+                node.dag().highest_round(),
+                node.dag().order().to_vec(),
+                node.dag().commit_root(),
+                node.ids(4),
+            );
+            node.private_key.clear();
+            assert!(
+                node.prepare_slot_view(&candidate, &binding).is_err(),
+                "case {case}"
+            );
+            assert_eq!(
+                (
+                    node.round(),
+                    node.authored(),
+                    node.dag().highest_round(),
+                    node.dag().order().to_vec(),
+                    node.dag().commit_root(),
+                    node.ids(4)
+                ),
+                before,
+                "case {case}"
+            );
+        }
     }
 
     #[test]

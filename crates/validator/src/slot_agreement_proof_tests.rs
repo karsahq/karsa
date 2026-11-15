@@ -53,6 +53,198 @@ fn conservative_skip_and_indirect_commit_can_compete_without_direct_quorum() {
     ));
 }
 
+#[test]
+fn view_candidate_author_bound_matches_eventual_encoding() {
+    for later in [false, true] {
+        let (mut f, mut proof, _, binding) = fixture();
+        if later {
+            extend(&mut f, &mut proof, &binding, LEADER_ROUND + 8, 3, false);
+        }
+        let lineage = view_lineage(&proof);
+        let selected = lineage.entries.last().unwrap();
+        let candidate = crate::SlotAgreementViewCandidate::new(
+            lineage.entries[..lineage.entries.len() - 1].to_vec(),
+            selected.proposal.clone(),
+            selected.proposal_carrier.clone(),
+            selected.view,
+            f.dag.set(),
+        )
+        .unwrap();
+        for author_len in [1024, 1025] {
+            let mut actual = selected.view_carrier.clone();
+            actual.author = vec![42; author_len];
+            let preflight = candidate.bound_lineage_len(&actual.author, f.dag.set());
+            let encoded = candidate.clone().bind_carrier(actual).encode(f.dag.set());
+            if author_len == 1024 {
+                assert_eq!(preflight.unwrap(), encoded.unwrap().len(), "later {later}");
+            } else {
+                let preflight_error = preflight.unwrap_err();
+                let encoding_error = encoded.unwrap_err();
+                assert_eq!(preflight_error.kind(), encoding_error.kind());
+                assert_eq!(preflight_error.to_string(), encoding_error.to_string());
+            }
+        }
+    }
+}
+
+#[test]
+fn view_authoring_candidate_parity_and_unsigned_rejections() {
+    for later in [false, true] {
+        let (mut f, mut p, _, b) = fixture();
+        if later {
+            extend(&mut f, &mut p, &b, LEADER_ROUND + 8, 3, false);
+        }
+        let lineage = view_lineage(&p);
+        let selected = lineage.entries.last().unwrap();
+        let candidate = crate::SlotAgreementViewCandidate::new(
+            lineage.entries[..lineage.entries.len() - 1].to_vec(),
+            selected.proposal.clone(),
+            selected.proposal_carrier.clone(),
+            selected.view,
+            f.dag.set(),
+        )
+        .unwrap();
+        assert_eq!(
+            candidate.digest(),
+            lineage.view_digest(lineage.entries.len() - 1).unwrap()
+        );
+        assert_eq!(
+            candidate
+                .clone()
+                .bind_carrier(selected.view_carrier.clone()),
+            lineage
+        );
+        assert_eq!(
+            candidate
+                .bound_lineage_len(&selected.view_carrier.author, f.dag.set())
+                .unwrap(),
+            lineage.encode(f.dag.set()).unwrap().len()
+        );
+        let mut root = f
+            .dag
+            .vertices
+            .get(&(
+                selected.view_carrier.round,
+                selected.view_carrier.author.clone(),
+            ))
+            .unwrap()
+            .clone();
+        root.signature.clear();
+        let expected = f
+            .dag
+            .inspect_slot_agreement_view_lineage(&lineage, &b)
+            .unwrap();
+        assert_eq!(
+            f.dag
+                .inspect_slot_view_authoring_cone(&root, &candidate, &b)
+                .unwrap(),
+            expected
+        );
+        for mutation in 0..6 {
+            let mut bad = root.clone();
+            match mutation {
+                0 => bad.signature = vec![0; 64],
+                1 => bad.author = vec![99; 32],
+                2 => bad.chain_id.push(99),
+                3 => bad.payload_hash[0] ^= 1,
+                4 => bad.references.clear(),
+                _ => {
+                    bad.author = f
+                        .dag
+                        .set()
+                        .validators
+                        .iter()
+                        .find(|v| v.validator_id != root.author)
+                        .unwrap()
+                        .validator_id
+                        .clone()
+                }
+            }
+            assert!(
+                f.dag
+                    .inspect_slot_view_authoring_cone(&bad, &candidate, &b)
+                    .is_err(),
+                "mutation {mutation}, later {later}"
+            );
+        }
+        let mut oversized = root.clone();
+        oversized.author = vec![1; crate::SLOT_AGREEMENT_PROOF_MAX_BYTES];
+        assert!(
+            candidate
+                .bound_lineage_len(&oversized.author, f.dag.set())
+                .is_err()
+        );
+        assert!(
+            crate::SlotAgreementViewCandidate::new(
+                vec![selected.clone(); crate::SLOT_AGREEMENT_PROOF_MAX_ENTRIES],
+                selected.proposal.clone(),
+                selected.proposal_carrier.clone(),
+                selected.view,
+                f.dag.set(),
+            )
+            .is_err()
+        );
+        if later {
+            let mut prefix = candidate.prefix.clone();
+            prefix[0].pol = None;
+            assert!(
+                crate::SlotAgreementViewCandidate::new(
+                    prefix,
+                    selected.proposal.clone(),
+                    selected.proposal_carrier.clone(),
+                    selected.view,
+                    f.dag.set()
+                )
+                .is_err()
+            );
+        }
+        let sibling = root
+            .references
+            .iter()
+            .find(|id| !candidate.prerequisite_carriers().contains(id))
+            .unwrap()
+            .clone();
+        let key = (sibling.round, sibling.author.clone());
+        let original = f.dag.vertices.remove(&key).unwrap();
+        assert!(
+            f.dag
+                .inspect_slot_view_authoring_cone(&root, &candidate, &b)
+                .is_err()
+        );
+        let mut foreign = original.clone();
+        foreign.chain_id.push(0);
+        let signer = f
+            .dag
+            .set()
+            .validators
+            .iter()
+            .position(|v| v.validator_id == foreign.author)
+            .unwrap();
+        foreign.signature = Ed25519Scheme
+            .sign(&f.keys[signer], &foreign.signing_payload().unwrap())
+            .unwrap();
+        let mut bad = root.clone();
+        *bad.references
+            .iter_mut()
+            .find(|id| **id == sibling)
+            .unwrap() = foreign.id().unwrap();
+        f.dag.vertices.insert(key.clone(), foreign);
+        assert!(
+            f.dag
+                .inspect_slot_view_authoring_cone(&bad, &candidate, &b)
+                .is_err()
+        );
+        f.dag.vertices.insert(key, original);
+        let missing = candidate.prerequisite_carriers()[0].clone();
+        f.dag.vertices.remove(&(missing.round, missing.author));
+        assert!(
+            f.dag
+                .inspect_slot_view_authoring_cone(&root, &candidate, &b)
+                .is_err()
+        );
+    }
+}
+
 fn fixture() -> (Fixture, SlotAgreementProof, VertexId, SlotAgreementBinding) {
     fixture_with_decision(true)
 }

@@ -2389,6 +2389,99 @@ impl Dag {
         })
     }
 
+    /// Inspects carrier-free view authorization and its unsigned prospective root.
+    /// # Errors
+    /// Rejects invalid history, context, proposer, prerequisites, bounds or active keys.
+    pub fn inspect_slot_view_authoring_cone(
+        &self,
+        prospective: &Vertex,
+        candidate: &crate::SlotAgreementViewCandidate,
+        binding: &crate::SlotAgreementBinding,
+    ) -> Result<crate::slot_agreement::AgreementInput, CryptoError> {
+        use crate::slot_agreement_phase::invalid;
+        let d = &candidate.proposal.decision;
+        let set = self.set_for_round(d.round);
+        candidate.bound_lineage_len(&prospective.author, set)?;
+        if !prospective.signature.is_empty() {
+            return Err(invalid("prospective view carrier must be unsigned"));
+        }
+        let epoch = self.epoch_of(prospective.round);
+        let record = self
+            .set_for_round(prospective.round)
+            .validator(&prospective.author)
+            .ok_or_else(|| {
+                CryptoError::new(
+                    CryptoErrorKind::UnknownValidator,
+                    "vertex from an unregistered validator",
+                )
+            })?;
+        record.active_key(epoch)?;
+        if prospective.author != crate::slot_agreement_view_proposer(set, d.round, candidate.view)?
+            || prospective.payload_hash != candidate.digest()
+            || candidate
+                .prerequisite_carriers()
+                .iter()
+                .any(|id| id.round >= prospective.round)
+        {
+            return Err(invalid("wrong view proposer, digest or carrier ordering"));
+        }
+        self.preflight_slot_proposal_envelope(
+            &candidate.proposal,
+            candidate.proposal_carrier.round,
+        )?;
+        self.preflight_agreement_lineage(&candidate.prefix, set, d.round)?;
+        let mut budget = crate::SLOT_AGREEMENT_PHASE_WORK_BUDGET;
+        if !candidate.prefix.is_empty() {
+            self.inspect_agreement_lineage(&candidate.prefix, binding, &mut budget)?;
+        }
+        let cone = self.slot_prospective_history_with_budget(prospective, d, &mut budget)?;
+        self.inspect_agreement_view_proposal(
+            &candidate.proposal,
+            &candidate.proposal_carrier,
+            &cone,
+            binding,
+            &mut budget,
+        )?;
+        if candidate
+            .prerequisite_carriers()
+            .iter()
+            .any(|id| !cone.contains(id))
+        {
+            return Err(invalid("view lacks exact prerequisite"));
+        }
+        Ok(crate::slot_agreement::AgreementInput::Propose {
+            view: candidate.view,
+            decision: d.clone(),
+            pol: candidate
+                .prefix
+                .last()
+                .and_then(|p| p.pol.as_ref())
+                .map(|p| p.certificate.clone()),
+        })
+    }
+
+    fn inspect_agreement_view_proposal(
+        &self,
+        proposal: &crate::SlotProposalEnvelope,
+        carrier: &VertexId,
+        view_cone: &HashSet<VertexId>,
+        binding: &crate::SlotAgreementBinding,
+        budget: &mut usize,
+    ) -> Result<Decision, CryptoError> {
+        use crate::slot_agreement_phase::invalid;
+        let (decision, plain_cone) =
+            self.inspect_slot_proposal_with_budget(proposal, carrier, binding.tip(), budget)?;
+        if let Some(previous) = binding.carrier()
+            && (previous.round >= carrier.round || !plain_cone.contains(previous))
+        {
+            return Err(invalid("plain proposal lacks predecessor"));
+        }
+        if !view_cone.contains(carrier) {
+            return Err(invalid("view lacks plain proposal"));
+        }
+        Ok(decision)
+    }
+
     /// Authenticates one selected-view vote and its complete retained lineage without granting signing authority.
     ///
     /// # Errors
@@ -2594,27 +2687,19 @@ impl Dag {
         let lineage = crate::slot_agreement_proof::Lineage(entries);
         let mut result = None;
         for (i, p) in entries.iter().enumerate() {
-            let (decision, plain_cone) = self.inspect_slot_proposal_with_budget(
-                &p.proposal,
-                &p.proposal_carrier,
-                binding.tip(),
-                budget,
-            )?;
-            result = Some(decision);
-            if let Some(previous) = binding.carrier()
-                && (previous.round >= p.proposal_carrier.round || !plain_cone.contains(previous))
-            {
-                return Err(invalid("plain proposal lacks predecessor"));
-            }
             let view_cone = self.slot_causal_history_with_budget(
                 &p.view_carrier,
                 lineage.view_digest(i)?,
                 d,
                 budget,
             )?;
-            if !view_cone.contains(&p.proposal_carrier) {
-                return Err(invalid("view lacks plain proposal"));
-            }
+            result = Some(self.inspect_agreement_view_proposal(
+                &p.proposal,
+                &p.proposal_carrier,
+                &view_cone,
+                binding,
+                budget,
+            )?);
             if let Some(prior) = p.previous_pol {
                 let pol = entries[prior]
                     .pol
