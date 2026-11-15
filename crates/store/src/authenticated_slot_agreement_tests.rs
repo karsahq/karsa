@@ -60,6 +60,120 @@ pub(super) fn fixture(
     (f, lineage, bootstrap)
 }
 #[test]
+fn observe_plain_proposal_retains_without_voting_and_recovers() {
+    let (f, lineage, bootstrap) = fixture(true);
+    let selected = &lineage.entries[0];
+    let request = AuthenticatedSlotAgreementRequest::ObserveProposal {
+        proposal: selected.proposal.clone(),
+        carrier: selected.proposal_carrier.clone(),
+        vertices: f
+            .vertices
+            .iter()
+            .filter(|v| v.round <= selected.proposal_carrier.round)
+            .cloned()
+            .collect(),
+    };
+    let dir = TempDir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = store
+        .begin_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    let path = dir.0.join(authenticated_slot_agreement::FILE);
+    let before = fs::read(&path).unwrap();
+    for kind in 0..5 {
+        let mut bad = request.clone();
+        let AuthenticatedSlotAgreementRequest::ObserveProposal {
+            proposal,
+            carrier,
+            vertices,
+        } = &mut bad
+        else {
+            unreachable!()
+        };
+        match kind {
+            0 => carrier.digest[0] ^= 1,
+            1 => {
+                let signed = vertices
+                    .iter_mut()
+                    .find(|v| v.id().unwrap() == *carrier)
+                    .unwrap();
+                signed.signature[0] ^= 1;
+            }
+            2 => proposal.decision.round += 1,
+            3 => {
+                let signed = vertices
+                    .iter_mut()
+                    .find(|v| v.id().unwrap() == *carrier)
+                    .unwrap();
+                let author = f
+                    .set
+                    .validators
+                    .iter()
+                    .position(|v| v.validator_id == signed.author)
+                    .unwrap();
+                *signed = signed_vertex(
+                    &f.keys,
+                    author,
+                    signed.round,
+                    signed.references.clone(),
+                    [42; 32],
+                );
+                *carrier = signed.id().unwrap();
+            }
+            _ => {
+                // A pinned foreign chain cannot authenticate otherwise valid evidence.
+                proposal.decision.chain_id.push(1);
+            }
+        }
+        assert!(owner.apply(1, bad).is_err(), "invalid observation {kind}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+    let neutral = owner.apply(1, request.clone()).unwrap();
+    assert!(neutral.vote.is_none());
+    assert!(neutral.decision.is_none());
+    assert_eq!(neutral.view, AgreementView(0));
+    assert!(owner.signing_outbox().unwrap().is_empty());
+    assert!(owner.reserved_carriers().unwrap().is_empty());
+    drop(owner);
+    let mut owner = store
+        .recover_authenticated_slot_agreement(bootstrap)
+        .unwrap();
+    assert!(owner.apply(1, request).unwrap().vote.is_none());
+    assert!(owner.signing_outbox().unwrap().is_empty());
+    let accepted = owner
+        .apply(
+            2,
+            AuthenticatedSlotAgreementRequest::Propose {
+                lineage: lineage.clone(),
+                vertices: f
+                    .vertices
+                    .iter()
+                    .filter(|v| v.round > selected.proposal_carrier.round)
+                    .cloned()
+                    .collect(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        accepted.vote.as_ref().unwrap().phase,
+        AgreementPhase::Prevote
+    );
+    assert_eq!(owner.signing_outbox().unwrap().len(), 1);
+    let preserved = owner
+        .apply(
+            3,
+            AuthenticatedSlotAgreementRequest::ObserveProposal {
+                proposal: selected.proposal.clone(),
+                carrier: selected.proposal_carrier.clone(),
+                vertices: vec![],
+            },
+        )
+        .unwrap();
+    assert_eq!(preserved, accepted);
+    assert_eq!(owner.signing_outbox().unwrap().len(), 1);
+}
+
+#[test]
 fn presign_proposal_view_recovery_and_view_first_wins() {
     for view in [false, true] {
         let (f, lineage, mut bootstrap) = fixture(true);
@@ -1037,6 +1151,47 @@ fn durable_presign_vote_reservation_retries_and_rejections() {
         Vec::<u8>::new()
     );
     assert_eq!(fs::read(&path).unwrap(), advanced);
+}
+
+#[test]
+fn observed_proposal_rejects_decided_and_stale_slots_without_writes() {
+    let (f, proof, carrier) = crate::slot_application_tests::unified_fixture(true);
+    let bootstrap = AuthenticatedSlotAgreementBootstrap {
+        agreement: SlotAgreementBootstrap {
+            context: f.binding.tip().clone(),
+            set: f.set.clone(),
+            local_validator: f.set.validators[0].validator_id.clone(),
+        },
+        predecessor: None,
+        order: vec![],
+        vertices: vec![],
+    };
+    let proposal = AuthenticatedSlotAgreementRequest::ObserveProposal {
+        proposal: proof.entries[0].proposal.clone(),
+        carrier: proof.entries[0].proposal_carrier.clone(),
+        vertices: vec![],
+    };
+    let dir = TempDir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = store.begin_authenticated_slot_agreement(bootstrap).unwrap();
+    owner
+        .apply(
+            1,
+            AuthenticatedSlotAgreementRequest::ObservePrecommit {
+                proof,
+                carrier,
+                vertices: f.vertices,
+            },
+        )
+        .unwrap();
+    let path = dir.0.join(authenticated_slot_agreement::FILE);
+    let before = fs::read(&path).unwrap();
+    assert!(owner.apply(2, proposal.clone()).is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    owner.advance_slot(2).unwrap();
+    let before = fs::read(&path).unwrap();
+    assert!(owner.apply(3, proposal).is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
 }
 
 #[test]

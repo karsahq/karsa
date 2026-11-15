@@ -123,6 +123,64 @@ fn later_proposal(
 }
 
 #[test]
+fn observed_proposal_requires_exact_causal_checkpoint_predecessor() {
+    let (f, bootstrap) = checkpoint();
+    let AuthenticatedSlotAgreementRequest::Propose { lineage, vertices } =
+        later_proposal(&f, &bootstrap)
+    else {
+        unreachable!()
+    };
+    let entry = &lineage.entries[0];
+    let signed = vertices
+        .iter()
+        .find(|v| v.id().unwrap() == entry.proposal_carrier)
+        .unwrap();
+    let refs = signed
+        .references
+        .iter()
+        .filter(|id| Some(*id) != bootstrap.predecessor.as_ref())
+        .cloned()
+        .collect();
+    let noncausal = signed_vertex(&f.keys, 0, signed.round, refs, signed.payload_hash);
+    let mut dependencies: Vec<_> = vertices
+        .iter()
+        .filter(|v| v.round < signed.round)
+        .cloned()
+        .collect();
+    dependencies.push(noncausal.clone());
+    let dir = TempDir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = store
+        .begin_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    let path = dir.0.join(authenticated_slot_agreement::FILE);
+    let before = fs::read(&path).unwrap();
+    let bad = AuthenticatedSlotAgreementRequest::ObserveProposal {
+        proposal: entry.proposal.clone(),
+        carrier: noncausal.id().unwrap(),
+        vertices: dependencies,
+    };
+    assert!(owner.apply(1, bad).is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    let valid = AuthenticatedSlotAgreementRequest::ObserveProposal {
+        proposal: entry.proposal.clone(),
+        carrier: entry.proposal_carrier.clone(),
+        vertices,
+    };
+    assert!(owner.apply(1, valid).unwrap().vote.is_none());
+    assert!(owner.signing_outbox().unwrap().is_empty());
+    drop(owner);
+    assert!(
+        store
+            .recover_authenticated_slot_agreement(bootstrap)
+            .unwrap()
+            .signing_outbox()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn nonempty_checkpoint_later_proposal_survives_generation_cleanup_and_recovery() {
     let (f, bootstrap) = checkpoint();
     let request = later_proposal(&f, &bootstrap);

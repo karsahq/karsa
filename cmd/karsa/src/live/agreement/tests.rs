@@ -2151,6 +2151,119 @@ fn stale_owner_cannot_reconstruct_or_sign() {
 }
 
 #[test]
+fn received_plain_proposal_is_neutral_durable_and_view_votes_after_recovery() {
+    let (m, bootstrap, request) = fixture();
+    let AuthenticatedSlotAgreementRequest::Propose { lineage, vertices } = request else {
+        unreachable!()
+    };
+    let entry = &lineage.entries[0];
+    let envelope = CarrierEnvelope::from_publication(
+        entry.proposal_carrier.clone(),
+        CarrierPayload::Proposal(entry.proposal.clone()),
+        entry.proposal.digest().unwrap(),
+        &m.set,
+    )
+    .unwrap();
+    let proposal_vertices: Vec<_> = vertices
+        .iter()
+        .filter(|v| v.round <= entry.proposal_carrier.round)
+        .cloned()
+        .collect();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    let path = dir.0.join("authenticated-slot-agreement");
+    let before = std::fs::read(&path).unwrap();
+    for kind in 0..4 {
+        let mut carrier = entry.proposal_carrier.clone();
+        let mut proposal = entry.proposal.clone();
+        let mut evidence = proposal_vertices.clone();
+        match kind {
+            0 => carrier.digest[0] ^= 1,
+            1 => {
+                evidence
+                    .iter_mut()
+                    .find(|v| v.id().unwrap() == carrier)
+                    .unwrap()
+                    .signature[0] ^= 1
+            }
+            2 => proposal.decision.round += 1,
+            _ => evidence.clear(),
+        }
+        let bad = CarrierEnvelope::from_publication(
+            carrier,
+            CarrierPayload::Proposal(proposal.clone()),
+            proposal.digest().unwrap(),
+            &m.set,
+        )
+        .unwrap();
+        assert!(
+            adapter.receive_envelope(bad, evidence).is_err(),
+            "bad evidence {kind}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        adapter = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+        assert_eq!(adapter.driver.sequence(), 0);
+        assert!(adapter.pending().is_empty());
+        assert!(adapter.signing_history().is_empty());
+    }
+    adapter
+        .receive_envelope(envelope, proposal_vertices)
+        .unwrap();
+    assert_eq!(adapter.driver.sequence(), 1);
+    assert_ne!(std::fs::read(&path).unwrap(), before);
+    let neutral = adapter.driver.output().unwrap().transition.unwrap();
+    assert_eq!(neutral.view, AgreementView(0));
+    assert!(neutral.vote.is_none());
+    assert!(neutral.decision.is_none());
+    assert!(adapter.pending().is_empty());
+    assert!(adapter.signing_history().is_empty());
+    adapter = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    assert_eq!(adapter.driver.sequence(), 1);
+    assert!(adapter.pending().is_empty());
+    assert!(adapter.signing_history().is_empty());
+    let view = CarrierEnvelope::from_publication(
+        entry.view_carrier.clone(),
+        CarrierPayload::View(lineage.clone()),
+        lineage.view_digest(0).unwrap(),
+        &m.set,
+    )
+    .unwrap();
+    adapter
+        .receive_envelope(
+            view,
+            vertices
+                .into_iter()
+                .filter(|v| v.round > entry.proposal_carrier.round)
+                .collect(),
+        )
+        .unwrap();
+    assert_eq!(adapter.driver.sequence(), 2);
+    let accepted = adapter.driver.output().unwrap().transition.unwrap();
+    assert_eq!(
+        accepted.vote.as_ref().unwrap().phase,
+        validator::slot_agreement::AgreementPhase::Prevote
+    );
+    assert_eq!(adapter.pending().len(), 1);
+    assert_eq!(adapter.signing_history().len(), 1);
+    let PendingIntent::Vote {
+        payload,
+        lineage: retained,
+        ..
+    } = &adapter.pending()[0]
+    else {
+        panic!("view receive must emit a vote obligation")
+    };
+    assert_eq!(payload.prerequisite, entry.view_carrier);
+    assert_eq!(retained, &lineage);
+    let history = format!("{:?}", adapter.signing_history());
+    let recovered = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    assert_eq!(recovered.driver.sequence(), 2);
+    assert_eq!(format!("{:?}", recovered.signing_history()), history);
+    assert_eq!(recovered.pending().len(), 1);
+}
+
+#[test]
 fn proposal_and_view_durable_local_authoring_and_recovery() {
     let (m, bootstrap, request) = fixture();
     let AuthenticatedSlotAgreementRequest::Propose { lineage, vertices } = request else {
@@ -2202,13 +2315,15 @@ fn proposal_and_view_durable_local_authoring_and_recovery() {
         inspect_envelope(&authored.envelope, &m, &bootstrap, &all, &lineage);
         if !is_view {
             let sequence = adapter.driver.sequence();
-            assert!(
-                adapter
-                    .receive_envelope(authored.envelope.clone(), all)
-                    .unwrap_err()
-                    .contains("unsupported")
-            );
-            assert_eq!(adapter.driver.sequence(), sequence);
+            adapter
+                .receive_envelope(authored.envelope.clone(), all)
+                .unwrap();
+            assert_eq!(adapter.driver.sequence(), sequence + 1);
+            assert!(adapter.pending().is_empty());
+            assert!(adapter.signing_history().is_empty());
+            let transition = adapter.driver.output().unwrap().transition.unwrap();
+            assert!(transition.vote.is_none());
+            assert!(transition.decision.is_none());
         }
         let mut recovered = Adapter::recover(&store, bootstrap, &m, index).unwrap();
         let completed = recovered.completed_carriers().unwrap();

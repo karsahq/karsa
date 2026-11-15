@@ -134,8 +134,12 @@ impl CarrierEnvelope {
     ) -> Result<store::AuthenticatedSlotAgreementRequest, CryptoError> {
         use store::AuthenticatedSlotAgreementRequest;
         Ok(match self.payload {
-            CarrierPayload::Proposal(_) => {
-                return Err(invalid("plain proposal ingress is unsupported"));
+            CarrierPayload::Proposal(proposal) => {
+                AuthenticatedSlotAgreementRequest::ObserveProposal {
+                    proposal,
+                    carrier: self.carrier,
+                    vertices,
+                }
             }
             CarrierPayload::View(lineage) => {
                 AuthenticatedSlotAgreementRequest::Propose { lineage, vertices }
@@ -252,16 +256,9 @@ impl CarrierEnvelope {
     /// carriers, payload hashes, ancestry, signatures or binding.
     pub fn inspect(&self, dag: &Dag, binding: &SlotAgreementBinding) -> Result<(), CryptoError> {
         match &self.payload {
-            CarrierPayload::Proposal(proposal) => {
-                dag.inspect_slot_proposal_envelope(proposal, &self.carrier, binding.tip())?;
-                let mut unsigned = dag
-                    .get(self.carrier.round, &self.carrier.author)
-                    .ok_or_else(|| invalid("missing proposal carrier"))?
-                    .clone();
-                unsigned.signature.clear();
-                dag.inspect_slot_proposal_authoring_cone(&unsigned, proposal, binding)
-                    .map(|_| ())
-            }
+            CarrierPayload::Proposal(proposal) => dag
+                .inspect_slot_bound_proposal(proposal, &self.carrier, binding)
+                .map(|_| ()),
             CarrierPayload::View(lineage) => dag
                 .inspect_slot_agreement_view_lineage(lineage, binding)
                 .map(|_| ()),

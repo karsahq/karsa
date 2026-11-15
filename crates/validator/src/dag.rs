@@ -1403,6 +1403,41 @@ impl Dag {
             .map(|(decision, _)| decision)
     }
 
+    /// Authenticates a received proposal and its exact bound predecessor under one phase budget.
+    ///
+    /// Reauthenticates the signed carrier and its full actual reference cone, including
+    /// ancestors outside selected evidence. Exact pruned boundary IDs remain trusted.
+    /// # Errors
+    /// Rejects invalid proposal evidence, carriers, history, noncausal predecessors,
+    /// and exhausted work budgets.
+    pub fn inspect_slot_bound_proposal(
+        &self,
+        proposal: &crate::SlotProposalEnvelope,
+        carrier: &VertexId,
+        binding: &crate::SlotAgreementBinding,
+    ) -> Result<Decision, CryptoError> {
+        let mut budget = crate::SLOT_AGREEMENT_PHASE_WORK_BUDGET;
+        let (decision, cone) =
+            self.inspect_slot_proposal_with_budget(proposal, carrier, binding.tip(), &mut budget)?;
+        Self::check_slot_proposal_predecessor(carrier.round, &cone, binding)?;
+        Ok(decision)
+    }
+
+    fn check_slot_proposal_predecessor(
+        carrier_round: u64,
+        cone: &HashSet<VertexId>,
+        binding: &crate::SlotAgreementBinding,
+    ) -> Result<(), CryptoError> {
+        if let Some(previous) = binding.carrier()
+            && (previous.round >= carrier_round || !cone.contains(previous))
+        {
+            return Err(crate::slot_agreement_phase::invalid(
+                "plain proposal lacks predecessor",
+            ));
+        }
+        Ok(())
+    }
+
     /// Inspects an unsigned plain proposal carrier before signing, without changing the DAG.
     ///
     /// Reauthenticates the full actual retained reference cone under one phase budget.
@@ -1451,13 +1486,7 @@ impl Dag {
             binding.tip(),
             &mut budget,
         )?;
-        if let Some(previous) = binding.carrier()
-            && (previous.round >= prospective.round || !cone.contains(previous))
-        {
-            return Err(crate::slot_agreement_phase::invalid(
-                "plain proposal lacks predecessor",
-            ));
-        }
+        Self::check_slot_proposal_predecessor(prospective.round, &cone, binding)?;
         Ok(decision)
     }
 
@@ -4666,6 +4695,83 @@ mod tests {
                 .kind(),
             CryptoErrorKind::KeyNotActive,
         );
+    }
+
+    #[test]
+    fn slot_proposal_received_bound_predecessor_full_cone_and_budget() {
+        let (mut f, direct, carrier, tip) = direct_slot_proposal(true);
+        let proposal = crate::SlotProposalEnvelope::from(direct);
+        let previous = f
+            .dag
+            .get(carrier.round, &carrier.author)
+            .unwrap()
+            .references[0]
+            .clone();
+        let binding =
+            crate::SlotAgreementBinding::from_checkpoint(tip.clone(), Some(previous.clone()))
+                .unwrap();
+        let expected = inspect_without_effects(&f.dag, |dag| {
+            dag.inspect_slot_bound_proposal(&proposal, &carrier, &binding)
+        });
+        for mut wrong in [previous.clone(), carrier.clone()] {
+            if wrong.round < carrier.round {
+                wrong.digest[0] ^= 1;
+            }
+            let bad =
+                crate::SlotAgreementBinding::from_checkpoint(tip.clone(), Some(wrong)).unwrap();
+            assert!(
+                f.dag
+                    .inspect_slot_bound_proposal(&proposal, &carrier, &bad)
+                    .is_err()
+            );
+        }
+        // The unselected fourth voter must still be authenticated in the actual cone.
+        let sibling = f
+            .dag
+            .get(carrier.round, &carrier.author)
+            .unwrap()
+            .references
+            .last()
+            .unwrap()
+            .clone();
+        let key = (sibling.round, sibling.author.clone());
+        let original = f.dag.vertices.remove(&key).unwrap();
+        assert!(
+            f.dag
+                .inspect_slot_bound_proposal(&proposal, &carrier, &binding)
+                .is_err()
+        );
+        let mut corrupt = original.clone();
+        corrupt.signature.clear();
+        f.dag.vertices.insert(key.clone(), corrupt);
+        assert!(
+            f.dag
+                .inspect_slot_bound_proposal(&proposal, &carrier, &binding)
+                .is_err()
+        );
+        f.dag.vertices.insert(key, original);
+
+        let mut budget = crate::SLOT_AGREEMENT_PHASE_WORK_BUDGET;
+        let (decision, cone) = f
+            .dag
+            .inspect_slot_proposal_with_budget(&proposal, &carrier, binding.tip(), &mut budget)
+            .unwrap();
+        assert_eq!(decision, expected);
+        Dag::check_slot_proposal_predecessor(carrier.round, &cone, &binding).unwrap();
+        let used = crate::SLOT_AGREEMENT_PHASE_WORK_BUDGET - budget;
+        let mut exact = used;
+        assert!(
+            f.dag
+                .inspect_slot_proposal_with_budget(&proposal, &carrier, binding.tip(), &mut exact,)
+                .is_ok()
+        );
+        assert_eq!(exact, 0);
+        let mut short = used - 1;
+        let error = f
+            .dag
+            .inspect_slot_proposal_with_budget(&proposal, &carrier, binding.tip(), &mut short)
+            .unwrap_err();
+        assert!(error.to_string().contains("budget exhausted"));
     }
 
     #[test]

@@ -40,6 +40,16 @@ pub struct AuthenticatedSlotAgreementBootstrap {
 pub enum AuthenticatedSlotAgreementRequest {
     /// Apply the first durable deciding proof and derive the next same-set slot.
     AdvanceSlot,
+    /// Retains an authenticated plain proposal without accepting a view or voting.
+    /// Only the active undecided slot is eligible; no agreement view is implied.
+    ObserveProposal {
+        /// Plain proposal evidence.
+        proposal: SlotProposalEnvelope,
+        /// Actual signed proposal carrier.
+        carrier: VertexId,
+        /// Signed carrier and complete dependencies not already retained.
+        vertices: Vec<Vertex>,
+    },
     /// Persist the exact signed publication for an existing reservation.
     CompleteCarrier {
         /// Original one-based reservation WAL sequence.
@@ -273,6 +283,16 @@ impl AuthenticatedSlotAgreementRequest {
         e.put_u16(1);
         match self {
             Self::AdvanceSlot => e.put_u8(6),
+            Self::ObserveProposal {
+                proposal,
+                carrier,
+                vertices,
+            } => {
+                e.put_u8(9);
+                e.put_bytes(&proposal.encode()?)?;
+                put_id(&mut e, carrier)?;
+                put_vertices(&mut e, vertices)?;
+            }
             Self::CompleteCarrier {
                 reservation_sequence,
                 signed,
@@ -367,6 +387,11 @@ impl AuthenticatedSlotAgreementRequest {
         let tag = d.read_u8()?;
         let value = match tag {
             6 => Self::AdvanceSlot,
+            9 => Self::ObserveProposal {
+                proposal: SlotProposalEnvelope::decode(d.read_bytes()?)?,
+                carrier: get_id(&mut d)?,
+                vertices: get_vertices(&mut d)?,
+            },
             8 => Self::CompleteCarrier {
                 reservation_sequence: d.read_u64()?,
                 signed: Vertex::decode(d.read_bytes()?)?,
@@ -835,7 +860,8 @@ fn replay(
     let mut completed: Vec<AgreementCompletedCarrier> = Vec::new();
     for (index, event) in events.iter().enumerate() {
         let incoming = match event {
-            AuthenticatedSlotAgreementRequest::ReserveCarrier { vertices, .. }
+            AuthenticatedSlotAgreementRequest::ObserveProposal { vertices, .. }
+            | AuthenticatedSlotAgreementRequest::ReserveCarrier { vertices, .. }
             | AuthenticatedSlotAgreementRequest::Propose { vertices, .. }
             | AuthenticatedSlotAgreementRequest::ObservePrevote { vertices, .. }
             | AuthenticatedSlotAgreementRequest::ObservePrecommit { vertices, .. }
@@ -893,6 +919,30 @@ fn replay(
                 signed: signed.clone(),
             });
             // Publication is not a reducer input or a new signing authorization.
+            continue;
+        }
+        if let AuthenticatedSlotAgreementRequest::ObserveProposal {
+            proposal,
+            carrier,
+            vertices: incoming,
+        } = event
+        {
+            if reducer.decision().is_some()
+                || proposal.decision.round != active.context.next_round()
+            {
+                return Err(invalid(
+                    "observed proposal is not for the active undecided slot",
+                ));
+            }
+            ingest(&mut dag, &mut vertices, incoming)?;
+            reservation_bounds(&vertices, &reserved, None)?;
+            dag.dag()
+                .inspect_slot_bound_proposal(proposal, carrier, &binding)?;
+            result.get_or_insert_with(|| AgreementTransitionResult {
+                vote: None,
+                view: reducer.view(),
+                decision: reducer.decision().cloned(),
+            });
             continue;
         }
         if let AuthenticatedSlotAgreementRequest::ReserveCarrier {
@@ -1200,7 +1250,8 @@ fn replay(
                 unreachable!("publication handled above")
             }
             AuthenticatedSlotAgreementRequest::AdvanceSlot => unreachable!("advance handled above"),
-            AuthenticatedSlotAgreementRequest::ObserveVote { .. } => {
+            AuthenticatedSlotAgreementRequest::ObserveVote { .. }
+            | AuthenticatedSlotAgreementRequest::ObserveProposal { .. } => {
                 unreachable!("observations handled without reducer input")
             }
             AuthenticatedSlotAgreementRequest::Propose {
