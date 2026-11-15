@@ -142,6 +142,93 @@ pub struct AuthoredCarrier {
 pub type AuthoredVote = AuthoredCarrier;
 
 impl Adapter {
+    /// Reserves, signs and completes a plain proposal without authorizing a view.
+    /// # Errors
+    /// Rejects stale owners, mismatched Nodes, invalid evidence and durable conflicts.
+    pub fn author_proposal(
+        &mut self,
+        proposal: &validator::SlotProposalEnvelope,
+        node: &mut net::Node,
+    ) -> Result<Option<AuthoredCarrier>, String> {
+        let output = self.local_authoring_output(node)?;
+        CarrierEnvelope::preflight_local(
+            node.id(),
+            proposal.encode().map_err(|e| e.to_string())?.len(),
+        )
+        .map_err(|e| e.to_string())?;
+        let Ok(prepared) = node.prepare_slot_proposal(proposal, &output.binding) else {
+            return Ok(None);
+        };
+        let sequence = self.reserve_carrier(
+            prepared.unsigned(),
+            store::AgreementCarrierEvidence::Proposal {
+                proposal: proposal.clone(),
+            },
+            prepared.dag(),
+        )?;
+        let Some(vertex) = prepared.author().map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        self.complete_carrier(sequence, vertex).map(Some)
+    }
+
+    /// Reserves, signs and completes an elected view using exact current store policy.
+    /// # Errors
+    /// Rejects stale owners, mismatched Nodes, invalid evidence and durable conflicts.
+    pub fn author_view(
+        &mut self,
+        candidate: &validator::SlotAgreementViewCandidate,
+        node: &mut net::Node,
+    ) -> Result<Option<AuthoredCarrier>, String> {
+        let output = self.local_authoring_output(node)?;
+        CarrierEnvelope::preflight_local(
+            node.id(),
+            candidate
+                .bound_lineage_len(node.id(), &self.set)
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let Ok(prepared) = node.prepare_slot_view(candidate, &output.binding) else {
+            return Ok(None);
+        };
+        let lineage = candidate
+            .clone()
+            .bind_carrier(prepared.unsigned().id().map_err(|e| e.to_string())?);
+        let sequence = self.reserve_carrier(
+            prepared.unsigned(),
+            store::AgreementCarrierEvidence::View { lineage },
+            prepared.dag(),
+        )?;
+        let Some(vertex) = prepared.author().map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        self.complete_carrier(sequence, vertex).map(Some)
+    }
+
+    fn local_authoring_output(
+        &mut self,
+        node: &net::Node,
+    ) -> Result<SlotAgreementDriverOutput, String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before carrier signing".into());
+        }
+        let output = self.driver.output().map_err(|error| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            error.to_string()
+        })?;
+        if !node.matches_authoring_context(
+            output.binding.tip(),
+            &self.set,
+            &self.validator_id,
+            &self.private_key,
+        ) {
+            return Err(
+                "Node differs from pinned agreement identity, chain, epoch, set or key".into(),
+            );
+        }
+        Ok(output)
+    }
+
     /// Durably reserves and authors a current POL candidate, never historical evidence.
     /// Returns `None` for stale digests or unavailable local evidence; never publishes.
     /// # Errors
@@ -413,6 +500,12 @@ impl Adapter {
                     let set = &completed.reservation.agreement.set;
                     let carrier = completed.signed.id().map_err(|e| e.to_string())?;
                     let payload = match completed.reservation.evidence {
+                        store::AgreementCarrierEvidence::Proposal { proposal } => {
+                            CarrierPayload::Proposal(proposal)
+                        }
+                        store::AgreementCarrierEvidence::View { lineage } => {
+                            CarrierPayload::View(lineage)
+                        }
                         store::AgreementCarrierEvidence::Vote { lineage, payload } => {
                             CarrierPayload::Vote { lineage, payload }
                         }
@@ -596,7 +689,7 @@ impl Adapter {
         envelope: CarrierEnvelope,
         vertices: Vec<validator::Vertex>,
     ) -> Result<(), String> {
-        self.apply(envelope.into_request(vertices))
+        self.apply(envelope.into_request(vertices).map_err(|e| e.to_string())?)
     }
 
     /// Accepts only authenticated requests and reconstructs the durable signing outbox.

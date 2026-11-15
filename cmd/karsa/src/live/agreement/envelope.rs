@@ -8,7 +8,8 @@ use crypto::encoding::{Decoder, Encoder, MAX_FIELD_LEN};
 use crypto::{CryptoError, CryptoErrorKind};
 use validator::{
     Dag, SlotAgreementBinding, SlotAgreementProof, SlotAgreementViewLineage,
-    SlotAgreementVotePayload, SlotAgreementVoteWitness, ValidatorSet, VertexId,
+    SlotAgreementVotePayload, SlotAgreementVoteWitness, SlotProposalEnvelope, ValidatorSet,
+    VertexId,
 };
 
 /// One MiB including framing, consistent with the existing evidence codec bound.
@@ -19,6 +20,10 @@ const VERSION: u16 = 2;
 /// Owned, self-contained payload evidence, immutable through an envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CarrierPayload {
+    /// Plain proposal, without elected-view authority.
+    Proposal(SlotProposalEnvelope),
+    /// Complete elected-view authorization lineage.
+    View(SlotAgreementViewLineage),
     /// Individual nonnil prevote or precommit, including its prerequisite.
     Vote {
         /// Existing protocol vote, still the sole payload-digest authority.
@@ -116,14 +121,25 @@ impl CarrierEnvelope {
         preflight_body_len(author.len(), len)
     }
 
+    /// Preflights proposal/view framing before any carrier signing.
+    pub(super) fn preflight_local(author: &[u8], body_len: usize) -> Result<(), CryptoError> {
+        preflight_body_len(author.len(), body_len)
+    }
+
     /// Converts owned evidence into a closed request, without asserting authentication.
     /// The receiving session must reauthenticate against its own pinned binding and DAG.
     pub(super) fn into_request(
         self,
         vertices: Vec<validator::Vertex>,
-    ) -> store::AuthenticatedSlotAgreementRequest {
+    ) -> Result<store::AuthenticatedSlotAgreementRequest, CryptoError> {
         use store::AuthenticatedSlotAgreementRequest;
-        match self.payload {
+        Ok(match self.payload {
+            CarrierPayload::Proposal(_) => {
+                return Err(invalid("plain proposal ingress is unsupported"));
+            }
+            CarrierPayload::View(lineage) => {
+                AuthenticatedSlotAgreementRequest::Propose { lineage, vertices }
+            }
             CarrierPayload::Vote { payload, lineage } => {
                 AuthenticatedSlotAgreementRequest::ObserveVote {
                     lineage,
@@ -142,7 +158,7 @@ impl CarrierEnvelope {
                 carrier: self.carrier,
                 vertices,
             },
-        }
+        })
     }
 
     fn checked(
@@ -153,6 +169,18 @@ impl CarrierEnvelope {
     ) -> Result<Self, CryptoError> {
         bound(carrier.author.len(), MAX_AUTHOR_BYTES)?;
         let actual = match &payload {
+            CarrierPayload::Proposal(proposal) => proposal.digest()?,
+            CarrierPayload::View(lineage) => {
+                let index = lineage
+                    .entries
+                    .len()
+                    .checked_sub(1)
+                    .ok_or_else(|| invalid("empty view lineage"))?;
+                if lineage.entries[index].view_carrier != carrier {
+                    return Err(invalid("selected view carrier association mismatch"));
+                }
+                lineage.view_digest(index)?
+            }
             CarrierPayload::Vote {
                 payload: vote,
                 lineage,
@@ -224,6 +252,19 @@ impl CarrierEnvelope {
     /// carriers, payload hashes, ancestry, signatures or binding.
     pub fn inspect(&self, dag: &Dag, binding: &SlotAgreementBinding) -> Result<(), CryptoError> {
         match &self.payload {
+            CarrierPayload::Proposal(proposal) => {
+                dag.inspect_slot_proposal_envelope(proposal, &self.carrier, binding.tip())?;
+                let mut unsigned = dag
+                    .get(self.carrier.round, &self.carrier.author)
+                    .ok_or_else(|| invalid("missing proposal carrier"))?
+                    .clone();
+                unsigned.signature.clear();
+                dag.inspect_slot_proposal_authoring_cone(&unsigned, proposal, binding)
+                    .map(|_| ())
+            }
+            CarrierPayload::View(lineage) => dag
+                .inspect_slot_agreement_view_lineage(lineage, binding)
+                .map(|_| ()),
             CarrierPayload::Vote { payload, lineage } => dag.inspect_slot_agreement_vote(
                 lineage,
                 &SlotAgreementVoteWitness {
@@ -243,7 +284,7 @@ impl CarrierEnvelope {
 
     /// Encodes inactive transport/storage bytes with no embedded validator-set authority.
     ///
-    /// Layout: u16 version, u8 kind (0 vote, 1 POL, 2 final), u64 round,
+    /// Layout: u16 version, u8 kind (0 vote, 1 POL, 2 final, 3 proposal, 4 view), u64 round,
     /// length-prefixed author, vertex digest, payload digest, length-prefixed body.
     /// Integers and byte fields follow the existing crypto codec conventions.
     /// # Errors
@@ -263,6 +304,8 @@ impl CarrierEnvelope {
                 body.put_bytes(&vote)?;
                 (0, body.finish())
             }
+            CarrierPayload::Proposal(p) => (3, p.encode()?),
+            CarrierPayload::View(p) => (4, p.encode(set)?),
             CarrierPayload::Pol(p) => (1, p.encode(set)?),
             CarrierPayload::Final(p) => (2, p.encode(set)?),
         };
@@ -291,7 +334,7 @@ impl CarrierEnvelope {
             return Err(invalid("unknown carrier envelope version"));
         }
         let tag = d.read_u8()?;
-        if tag > 2 {
+        if tag > 4 {
             return Err(invalid("unknown carrier envelope kind"));
         }
         let round = d.read_u64()?;
@@ -320,6 +363,8 @@ impl CarrierEnvelope {
                 }
             }
             1 => CarrierPayload::Pol(SlotAgreementViewLineage::decode(body, set)?),
+            3 => CarrierPayload::Proposal(SlotProposalEnvelope::decode(body)?),
+            4 => CarrierPayload::View(SlotAgreementViewLineage::decode(body, set)?),
             2 => CarrierPayload::Final(SlotAgreementProof::decode(body, set)?),
             _ => unreachable!("kind preflighted"),
         };

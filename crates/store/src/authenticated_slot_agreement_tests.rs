@@ -60,6 +60,100 @@ pub(super) fn fixture(
     (f, lineage, bootstrap)
 }
 #[test]
+fn presign_proposal_view_recovery_and_view_first_wins() {
+    for view in [false, true] {
+        let (f, lineage, mut bootstrap) = fixture(true);
+        let selected = &lineage.entries[0];
+        let id = if view {
+            &selected.view_carrier
+        } else {
+            &selected.proposal_carrier
+        };
+        let signed = f
+            .vertices
+            .iter()
+            .find(|v| v.id().unwrap() == *id)
+            .unwrap()
+            .clone();
+        bootstrap.agreement.local_validator = signed.author.clone();
+        let mut unsigned = signed.clone();
+        unsigned.signature.clear();
+        let evidence = if view {
+            AgreementCarrierEvidence::View {
+                lineage: lineage.clone(),
+            }
+        } else {
+            AgreementCarrierEvidence::Proposal {
+                proposal: selected.proposal.clone(),
+            }
+        };
+        let request = AuthenticatedSlotAgreementRequest::ReserveCarrier {
+            evidence,
+            unsigned: unsigned.clone(),
+            vertices: f
+                .vertices
+                .iter()
+                .filter(|v| v.round < signed.round)
+                .cloned()
+                .collect(),
+        };
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let mut owner = store
+            .begin_authenticated_slot_agreement(bootstrap.clone())
+            .unwrap();
+        let mut bad = request.clone();
+        if let AuthenticatedSlotAgreementRequest::ReserveCarrier { unsigned, .. } = &mut bad {
+            unsigned.signature = signed.signature.clone();
+        }
+        assert!(owner.apply(1, bad).is_err());
+        if view {
+            let mut bad = request.clone();
+            if let AuthenticatedSlotAgreementRequest::ReserveCarrier {
+                evidence: AgreementCarrierEvidence::View { lineage },
+                ..
+            } = &mut bad
+            {
+                lineage.entries[0].view_carrier.digest[0] ^= 1;
+            }
+            assert!(owner.apply(1, bad).is_err());
+        }
+        owner.apply(1, request.clone()).unwrap();
+        owner.apply(1, request.clone()).unwrap();
+        assert!(owner.apply(2, request.clone()).is_err());
+        if view {
+            let mut conflict = request;
+            if let AuthenticatedSlotAgreementRequest::ReserveCarrier {
+                unsigned,
+                evidence: AgreementCarrierEvidence::View { lineage },
+                ..
+            } = &mut conflict
+            {
+                unsigned.round += 1;
+                lineage.entries[0].view_carrier = unsigned.id().unwrap();
+            }
+            assert!(owner.apply(2, conflict).is_err());
+        }
+        owner
+            .apply(
+                2,
+                AuthenticatedSlotAgreementRequest::CompleteCarrier {
+                    reservation_sequence: 1,
+                    signed: signed.clone(),
+                },
+            )
+            .unwrap();
+        drop(owner);
+        let recovered = store
+            .recover_authenticated_slot_agreement(bootstrap)
+            .unwrap();
+        assert_eq!(recovered.reserved_carriers().unwrap().len(), 1);
+        assert_eq!(recovered.completed_carriers().unwrap()[0].signed, signed);
+        assert!(recovered.signing_outbox().unwrap().is_empty());
+    }
+}
+
+#[test]
 fn authenticated_commit_skip_restart_and_exact_envelope() {
     for commit in [true, false] {
         let (f, lineage, bootstrap) = fixture(commit);

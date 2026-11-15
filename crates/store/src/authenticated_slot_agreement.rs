@@ -5,8 +5,9 @@ use validator::slot_agreement::{
     AgreementView, AgreementVote, SlotAgreement,
 };
 use validator::{
-    CertifiedDag, Dag, SlotAgreementBinding, SlotAgreementProof, SlotAgreementViewLineage,
-    SlotAgreementVotePayload, SlotAgreementVoteWitness, SlotDecisionBinding, Vertex, VertexId,
+    CertifiedDag, Dag, SlotAgreementBinding, SlotAgreementProof, SlotAgreementViewCandidate,
+    SlotAgreementViewLineage, SlotAgreementVotePayload, SlotAgreementVoteWitness,
+    SlotDecisionBinding, SlotProposalEnvelope, Vertex, VertexId,
 };
 
 pub(super) const FILE: &str = "authenticated-slot-agreement";
@@ -103,6 +104,16 @@ pub enum AuthenticatedSlotAgreementRequest {
 /// Typed evidence for a pre-sign reservation of a VOTE, POL or FINAL carrier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgreementCarrierEvidence {
+    /// Semantically authenticated proposal without elected-view authority.
+    Proposal {
+        /// Exact proposal carried by the unsigned vertex.
+        proposal: SlotProposalEnvelope,
+    },
+    /// Current elected authorization bound to the actual unsigned carrier.
+    View {
+        /// Exact retained prefix and selected carrier-bound view.
+        lineage: SlotAgreementViewLineage,
+    },
     /// A signed inner vote matching a durable local signing obligation.
     Vote {
         /// Full authenticated authorization.
@@ -276,8 +287,16 @@ impl AuthenticatedSlotAgreementRequest {
                 vertices,
             } => {
                 e.put_u8(7);
-                // Persisted inner tags: 0 VOTE, 1 POL, 2 FINAL. Existing VOTE bytes stay unchanged.
+                // Persisted inner tags: 0 VOTE, 1 POL, 2 FINAL, 3 PROPOSAL, 4 VIEW.
                 match evidence {
+                    AgreementCarrierEvidence::Proposal { proposal } => {
+                        e.put_u8(3);
+                        e.put_bytes(&proposal.encode()?)?;
+                    }
+                    AgreementCarrierEvidence::View { lineage } => {
+                        e.put_u8(4);
+                        e.put_bytes(&lineage.encode(set)?)?;
+                    }
                     AgreementCarrierEvidence::Vote { lineage, payload } => {
                         e.put_u8(0);
                         e.put_bytes(&lineage.encode(set)?)?;
@@ -363,6 +382,12 @@ impl AuthenticatedSlotAgreementRequest {
                     },
                     2 => AgreementCarrierEvidence::Final {
                         proof: SlotAgreementProof::decode(d.read_bytes()?, set)?,
+                    },
+                    3 => AgreementCarrierEvidence::Proposal {
+                        proposal: SlotProposalEnvelope::decode(d.read_bytes()?)?,
+                    },
+                    4 => AgreementCarrierEvidence::View {
+                        lineage: SlotAgreementViewLineage::decode(d.read_bytes()?, set)?,
                     },
                     _ => return Err(invalid("unsupported reservation evidence")),
                 };
@@ -893,6 +918,64 @@ fn replay(
                     })
             };
             match evidence {
+                AgreementCarrierEvidence::Proposal { proposal } => {
+                    if reducer.decision().is_some()
+                        || proposal.decision.round != active.context.next_round()
+                    {
+                        return Err(invalid(
+                            "proposal reservation is not for the active undecided slot",
+                        ));
+                    }
+                    dag.dag()
+                        .inspect_slot_proposal_authoring_cone(unsigned, proposal, &binding)?;
+                }
+                AgreementCarrierEvidence::View { lineage } => {
+                    let mut prefix = lineage.entries.clone();
+                    let selected = prefix
+                        .pop()
+                        .ok_or_else(|| invalid("empty view reservation"))?;
+                    if reducer.decision().is_some()
+                        || selected.view != reducer.view()
+                        || selected.proposal.decision.round != active.context.next_round()
+                    {
+                        return Err(invalid(
+                            "view reservation is not for the active current undecided slot",
+                        ));
+                    }
+                    let required = reproposal
+                        .as_ref()
+                        .map(|candidate: &AgreementReproposalCandidate| {
+                            candidate.lineage.entries.as_slice()
+                        })
+                        .unwrap_or(&[]);
+                    if prefix != required {
+                        return Err(invalid(
+                            "view reservation differs from retained highest-valid prefix",
+                        ));
+                    }
+                    let candidate = SlotAgreementViewCandidate::new(
+                        prefix,
+                        selected.proposal,
+                        selected.proposal_carrier,
+                        selected.view,
+                        &active.set,
+                    )?;
+                    candidate.bound_lineage_len(&unsigned.author, &active.set)?;
+                    if candidate.clone().bind_carrier(unsigned.id()?) != *lineage {
+                        return Err(invalid(
+                            "view reservation has noncanonical selected binding",
+                        ));
+                    }
+                    if reserved.iter().any(|old| {
+                        old.agreement.context == active.context
+                            && matches!(&old.evidence, AgreementCarrierEvidence::View { lineage: prior }
+                                if prior.entries.last().is_some_and(|entry| entry.view == selected.view))
+                    }) {
+                        return Err(invalid("view already reserved; retry original sequence"));
+                    }
+                    dag.dag()
+                        .inspect_slot_view_authoring_cone(unsigned, &candidate, &binding)?;
+                }
                 AgreementCarrierEvidence::Vote { lineage, payload } => {
                     let eligible = authorable_votes(&outbox, &reducer, &active);
                     if !outbox.iter().any(|intent| {
@@ -992,7 +1075,12 @@ fn replay(
                 evidence: evidence.clone(),
                 unsigned: unsigned.clone(),
             });
-            // No reducer input: retain its last transition and skip vote emission.
+            // Publication may be the first event; report state without a reducer input.
+            result.get_or_insert_with(|| AgreementTransitionResult {
+                vote: None,
+                view: reducer.view(),
+                decision: reducer.decision().cloned(),
+            });
             continue;
         }
         if matches!(event, AuthenticatedSlotAgreementRequest::AdvanceSlot) {

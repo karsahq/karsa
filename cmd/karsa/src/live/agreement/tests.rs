@@ -93,6 +93,12 @@ fn inspect_envelope(
             p.entries.last_mut().unwrap().pol.as_mut().unwrap().carrier = wrong_id.clone();
             CarrierPayload::Pol(p)
         }
+        CarrierPayload::Proposal(p) => CarrierPayload::Proposal(p.clone()),
+        CarrierPayload::View(p) => {
+            let mut p = p.clone();
+            p.entries.last_mut().unwrap().view_carrier = wrong_id.clone();
+            CarrierPayload::View(p)
+        }
         CarrierPayload::Final(p) => CarrierPayload::Final(p.clone()),
     };
     let body = match &payload {
@@ -102,6 +108,8 @@ fn inspect_envelope(
             body.put_bytes(&payload.encode(&m.set).unwrap()).unwrap();
             body.finish()
         }
+        CarrierPayload::Proposal(p) => p.encode().unwrap(),
+        CarrierPayload::View(p) => p.encode(&m.set).unwrap(),
         CarrierPayload::Pol(p) => p.encode(&m.set).unwrap(),
         CarrierPayload::Final(p) => p.encode(&m.set).unwrap(),
     };
@@ -111,6 +119,8 @@ fn inspect_envelope(
         CarrierPayload::Vote { .. } => 0,
         CarrierPayload::Pol(_) => 1,
         CarrierPayload::Final(_) => 2,
+        CarrierPayload::Proposal(_) => 3,
+        CarrierPayload::View(_) => 4,
     });
     e.put_u64(wrong_id.round);
     e.put_bytes(&wrong_id.author).unwrap();
@@ -2138,4 +2148,93 @@ fn stale_owner_cannot_reconstruct_or_sign() {
         stale.readiness(),
         Readiness::RecoveryRequiredHistoricalIntentsUnavailable
     );
+}
+
+#[test]
+fn proposal_and_view_durable_local_authoring_and_recovery() {
+    let (m, bootstrap, request) = fixture();
+    let AuthenticatedSlotAgreementRequest::Propose { lineage, vertices } = request else {
+        unreachable!()
+    };
+    for is_view in [false, true] {
+        let entry = &lineage.entries[0];
+        let index = if is_view {
+            m.consensus
+                .iter()
+                .position(|id| id.id == entry.view_carrier.author)
+                .unwrap()
+        } else {
+            0
+        };
+        let mut bootstrap = bootstrap.clone();
+        bootstrap.agreement.local_validator = m.consensus[index].id.clone();
+        let dir = Dir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, index).unwrap();
+        let round = if is_view { 4 } else { 3 };
+        let history: Vec<_> = vertices
+            .iter()
+            .filter(|v| v.round < round)
+            .cloned()
+            .collect();
+        let mut node = authoring_node_index(&m, &history, index);
+        node.set_round(round);
+        let candidate = validator::SlotAgreementViewCandidate::new(
+            vec![],
+            entry.proposal.clone(),
+            entry.proposal_carrier.clone(),
+            entry.view,
+            &m.set,
+        )
+        .unwrap();
+        let authored = if is_view {
+            adapter.author_view(&candidate, &mut node)
+        } else {
+            adapter.author_proposal(&entry.proposal, &mut node)
+        }
+        .unwrap()
+        .unwrap();
+        check_envelope(&authored.envelope, &m.set);
+        assert_eq!(adapter.driver.reserved_carriers().unwrap().len(), 1);
+        assert_eq!(adapter.completed_carriers().unwrap().len(), 1);
+        let mut all = history.clone();
+        all.push(authored.vertex.clone());
+        inspect_envelope(&authored.envelope, &m, &bootstrap, &all, &lineage);
+        if !is_view {
+            let sequence = adapter.driver.sequence();
+            assert!(
+                adapter
+                    .receive_envelope(authored.envelope.clone(), all)
+                    .unwrap_err()
+                    .contains("unsupported")
+            );
+            assert_eq!(adapter.driver.sequence(), sequence);
+        }
+        let mut recovered = Adapter::recover(&store, bootstrap, &m, index).unwrap();
+        let completed = recovered.completed_carriers().unwrap();
+        assert_eq!(completed[0].vertex, authored.vertex);
+        assert_eq!(completed[0].envelope, authored.envelope);
+        // A changed reference cone at the reserved author/round cannot sign again.
+        let mut conflicting = authoring_node_index(&m, &history, index);
+        conflicting.set_round(round);
+        let before = conflicting.authored();
+        let result = if is_view {
+            let wrong = validator::SlotAgreementViewCandidate::new(
+                vec![],
+                entry.proposal.clone(),
+                entry.proposal_carrier.clone(),
+                AgreementView(1),
+                &m.set,
+            )
+            .unwrap();
+            recovered.author_view(&wrong, &mut conflicting)
+        } else {
+            let mut wrong = entry.proposal.clone();
+            wrong.decision.previous[0] ^= 1;
+            recovered.author_proposal(&wrong, &mut conflicting)
+        };
+        assert!(result.is_err() || result.unwrap().is_none());
+        assert_eq!(conflicting.authored(), before);
+        assert_eq!(recovered.completed_carriers().unwrap().len(), 1);
+    }
 }
