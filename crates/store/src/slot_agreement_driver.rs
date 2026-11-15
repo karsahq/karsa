@@ -67,6 +67,14 @@ impl SlotAgreementDriver {
         self.session.completed_carriers()
     }
 
+    /// Returns durable signed nil publications, including historical slots and views.
+    ///
+    /// # Errors
+    /// Rejects stale or uncertain sessions and invalid durable evidence.
+    pub fn completed_nil_votes(&self) -> Result<Vec<crate::AgreementCompletedNilVote>, StoreError> {
+        self.session.completed_nil_votes()
+    }
+
     /// Returns the number of durable requests installed by this owner.
     pub fn sequence(&self) -> u64 {
         self.session.sequence()

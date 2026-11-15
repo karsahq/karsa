@@ -5,9 +5,9 @@ use validator::slot_agreement::{
     AgreementView, AgreementVote, SlotAgreement,
 };
 use validator::{
-    CertifiedDag, Dag, SlotAgreementBinding, SlotAgreementProof, SlotAgreementViewCandidate,
-    SlotAgreementViewLineage, SlotAgreementVotePayload, SlotAgreementVoteWitness,
-    SlotDecisionBinding, SlotProposalEnvelope, Vertex, VertexId,
+    CertifiedDag, Dag, SlotAgreementBinding, SlotAgreementNilVote, SlotAgreementProof,
+    SlotAgreementViewCandidate, SlotAgreementViewLineage, SlotAgreementVotePayload,
+    SlotAgreementVoteWitness, SlotDecisionBinding, SlotProposalEnvelope, Vertex, VertexId,
 };
 
 pub(super) const FILE: &str = "authenticated-slot-agreement";
@@ -40,6 +40,18 @@ pub struct AuthenticatedSlotAgreementBootstrap {
 pub enum AuthenticatedSlotAgreementRequest {
     /// Apply the first durable deciding proof and derive the next same-set slot.
     AdvanceSlot,
+    /// Persist an exact signed nil publication for a current durable intent.
+    CompleteNilVote {
+        /// Stable original signing intent identity.
+        intent_id: [u8; 32],
+        /// Exact locally signed nil statement.
+        message: SlotAgreementNilVote,
+    },
+    /// Authenticate current-view nil evidence and deliver its first quorum once.
+    ObserveNilVote {
+        /// Individually authenticated nil statement.
+        message: SlotAgreementNilVote,
+    },
     /// Retains an authenticated plain proposal without accepting a view or voting.
     /// Only the active undecided slot is eligible; no agreement view is implied.
     ObserveProposal {
@@ -171,6 +183,17 @@ pub struct AgreementCompletedCarrier {
     pub signed: Vertex,
 }
 
+/// Replay-derived signed nil publication retained across slots and views.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgreementCompletedNilVote {
+    /// Original durable signing obligation.
+    pub intent_id: [u8; 32],
+    /// Original one-based completion WAL sequence.
+    pub sequence: u64,
+    /// Exact signed publication.
+    pub message: SlotAgreementNilVote,
+}
+
 fn put_id(e: &mut Encoder, id: &VertexId) -> Result<(), StoreError> {
     if id.author.len() > 1024 {
         return Err(invalid("carrier author exceeds bound"));
@@ -283,6 +306,15 @@ impl AuthenticatedSlotAgreementRequest {
         e.put_u16(1);
         match self {
             Self::AdvanceSlot => e.put_u8(6),
+            Self::CompleteNilVote { intent_id, message } => {
+                e.put_u8(10);
+                e.put_bytes(intent_id)?;
+                e.put_bytes(&message.encode(set)?)?;
+            }
+            Self::ObserveNilVote { message } => {
+                e.put_u8(11);
+                e.put_bytes(&message.encode(set)?)?;
+            }
             Self::ObserveProposal {
                 proposal,
                 carrier,
@@ -387,6 +419,16 @@ impl AuthenticatedSlotAgreementRequest {
         let tag = d.read_u8()?;
         let value = match tag {
             6 => Self::AdvanceSlot,
+            10 => Self::CompleteNilVote {
+                intent_id: d
+                    .read_bytes()?
+                    .try_into()
+                    .map_err(|_| invalid("invalid nil intent ID"))?,
+                message: SlotAgreementNilVote::decode(d.read_bytes()?, set)?,
+            },
+            11 => Self::ObserveNilVote {
+                message: SlotAgreementNilVote::decode(d.read_bytes()?, set)?,
+            },
             9 => Self::ObserveProposal {
                 proposal: SlotProposalEnvelope::decode(d.read_bytes()?)?,
                 carrier: get_id(&mut d)?,
@@ -771,6 +813,8 @@ pub enum AgreementSigningPrerequisite {
     UnsupportedNil,
 }
 
+type NilVoteBucket = (BTreeMap<Vec<u8>, validator::ValidatorSignature>, bool);
+
 type ReplayState = (
     Option<AgreementTransitionResult>,
     Vec<AgreementQuorumCandidate>,
@@ -781,6 +825,7 @@ type ReplayState = (
     Vec<[u8; 32]>,
     Vec<AgreementReservedCarrier>,
     Vec<AgreementCompletedCarrier>,
+    Vec<AgreementCompletedNilVote>,
 );
 
 fn reservation_bounds(
@@ -858,6 +903,8 @@ fn replay(
     let mut outbox: Vec<AgreementSigningIntent> = Vec::new();
     let mut reserved: Vec<AgreementReservedCarrier> = Vec::new();
     let mut completed: Vec<AgreementCompletedCarrier> = Vec::new();
+    let mut completed_nil: Vec<AgreementCompletedNilVote> = Vec::new();
+    let mut nil_buckets: BTreeMap<Vec<u8>, NilVoteBucket> = BTreeMap::new();
     for (index, event) in events.iter().enumerate() {
         let incoming = match event {
             AuthenticatedSlotAgreementRequest::ObserveProposal { vertices, .. }
@@ -881,6 +928,33 @@ fn replay(
                     ));
                 }
             }
+        }
+        if let AuthenticatedSlotAgreementRequest::CompleteNilVote { intent_id, message } = event {
+            let intent = outbox
+                .iter()
+                .find(|intent| intent.id == *intent_id)
+                .ok_or_else(|| invalid("nil completion lacks durable intent"))?;
+            if completed_nil.iter().any(|old| old.intent_id == *intent_id) {
+                return Err(invalid(
+                    "nil vote already completed; retry original sequence",
+                ));
+            }
+            if !authorable_votes(&outbox, &reducer, &active).contains(intent_id)
+                || intent.vote != *message.vote()
+                || intent.vote.value != AgreementValue::Nil
+                || message.signature().validator_id != intent.agreement.local_validator
+            {
+                return Err(invalid(
+                    "nil completion differs from current local obligation",
+                ));
+            }
+            message.verify(&intent.agreement.context, &intent.agreement.set)?;
+            completed_nil.push(AgreementCompletedNilVote {
+                intent_id: *intent_id,
+                sequence: index as u64 + 1,
+                message: message.clone(),
+            });
+            continue;
         }
         if let AuthenticatedSlotAgreementRequest::CompleteCarrier {
             reservation_sequence,
@@ -1148,6 +1222,7 @@ fn replay(
             active.context = binding.tip().clone();
             reducer = SlotAgreement::new(active.context.clone(), active.set.clone())?;
             buckets.clear();
+            nil_buckets.clear();
             reproposal = None;
             result = Some(AgreementTransitionResult {
                 vote: None,
@@ -1186,7 +1261,7 @@ fn replay(
             key.put_bytes(&witness.payload.vote.signing_payload(&b.agreement.set)?)?;
             put_id(&mut key, &witness.payload.prerequisite)?;
             let key = key.finish();
-            if !buckets.contains_key(&key) && buckets.len() >= MAX_EVENTS {
+            if !buckets.contains_key(&key) && buckets.len() + nil_buckets.len() >= MAX_EVENTS {
                 return Err(invalid("vote bucket bound exceeded"));
             }
             let bucket = buckets.entry(key).or_default();
@@ -1245,6 +1320,61 @@ fn replay(
             continue;
         }
         let (input, decision) = match event {
+            AuthenticatedSlotAgreementRequest::CompleteNilVote { .. } => {
+                unreachable!("publication handled above")
+            }
+            AuthenticatedSlotAgreementRequest::ObserveNilVote { message } => {
+                if reducer.decision().is_some() || message.vote().view != reducer.view() {
+                    return Err(invalid(
+                        "nil evidence is not for the current undecided view",
+                    ));
+                }
+                message.verify(&active.context, &active.set)?;
+                let key = message.vote().signing_payload(&active.set)?;
+                if !nil_buckets.contains_key(&key)
+                    && nil_buckets.len() + buckets.len() >= MAX_EVENTS
+                {
+                    return Err(invalid("vote bucket bound exceeded"));
+                }
+                let (signatures, delivered) = nil_buckets.entry(key).or_default();
+                let signer = &message.signature().validator_id;
+                let mut qc = None;
+                if !*delivered && !signatures.contains_key(signer) {
+                    witness_count += 1;
+                    evidence_bytes =
+                        evidence_bytes.saturating_add(event.encode(&active.set)?.len());
+                    if witness_count > MAX_EVENTS || evidence_bytes > MAX_BYTES as usize {
+                        return Err(invalid("retained vote evidence bound exceeded"));
+                    }
+                    signatures.insert(signer.clone(), message.signature().clone());
+                    let certificate = AgreementQc {
+                        vote: message.vote().clone(),
+                        signatures: signatures.values().cloned().collect(),
+                    };
+                    if certificate.verify(&active.context, &active.set).is_ok() {
+                        *delivered = true;
+                        // A nil POL cannot replace a precommit already emitted for this view.
+                        let already_precommitted = outbox.iter().any(|intent| {
+                            intent.agreement.context == active.context
+                                && intent.vote.view == reducer.view()
+                                && intent.vote.phase == AgreementPhase::Precommit
+                        });
+                        if message.vote().phase != AgreementPhase::Prevote || !already_precommitted
+                        {
+                            qc = Some(certificate);
+                        }
+                    }
+                }
+                let Some(qc) = qc else {
+                    result = Some(AgreementTransitionResult {
+                        vote: None,
+                        view: reducer.view(),
+                        decision: None,
+                    });
+                    continue;
+                };
+                (AgreementInput::Evidence { qc }, None)
+            }
             AuthenticatedSlotAgreementRequest::ReserveCarrier { .. }
             | AuthenticatedSlotAgreementRequest::CompleteCarrier { .. } => {
                 unreachable!("publication handled above")
@@ -1425,6 +1555,7 @@ fn replay(
         authorable,
         reserved,
         completed,
+        completed_nil,
     ))
 }
 pub(super) fn validate(root: &Path) -> Result<(), StoreError> {
@@ -1589,6 +1720,30 @@ impl AuthenticatedSlotAgreement {
         Ok(replay(&journal.bootstrap, &journal.events)?.8)
     }
 
+    /// Returns all durable signed nil publications in completion WAL order.
+    ///
+    /// # Errors
+    /// Rejects uncertain or stale owners and invalid durable evidence.
+    pub fn completed_nil_votes(&self) -> Result<Vec<AgreementCompletedNilVote>, StoreError> {
+        if self.uncertain {
+            return Err(invalid("uncertain authenticated write requires recovery"));
+        }
+        let root = self
+            .store
+            .slot_decisions
+            .lock()
+            .expect("slot decision lock poisoned");
+        exclusions(&root)?;
+        let journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
+        if journal.header != self.header
+            || journal.events.len() as u64 != self.sequence
+            || journal.tip != self.tip
+        {
+            return Err(invalid("stale authenticated owner"));
+        }
+        Ok(replay(&journal.bootstrap, &journal.events)?.9)
+    }
+
     /// Reauthenticates durable evidence and returns frozen candidates without mutable state access.
     ///
     /// # Errors
@@ -1619,7 +1774,7 @@ impl AuthenticatedSlotAgreement {
         {
             return Err(invalid("stale authenticated owner"));
         }
-        let (transition, candidates, active, binding, reproposal, _, authorable, _, _) =
+        let (transition, candidates, active, binding, reproposal, _, authorable, _, _, _) =
             replay(&journal.bootstrap, &journal.events)?;
         Ok((
             active, transition, candidates, reproposal, binding, authorable,
@@ -1701,6 +1856,7 @@ impl AuthenticatedSlotAgreement {
             request,
             AuthenticatedSlotAgreementRequest::ReserveCarrier { .. }
                 | AuthenticatedSlotAgreementRequest::CompleteCarrier { .. }
+                | AuthenticatedSlotAgreementRequest::CompleteNilVote { .. }
         ) && sequence > 0
             && journal.events.get((sequence - 1) as usize) == Some(&request);
         let retry = reservation_retry

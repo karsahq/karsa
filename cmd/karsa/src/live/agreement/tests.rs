@@ -7,6 +7,149 @@ use validator::{
     SlotOutcome, SlotProposal, Vertex,
 };
 
+#[test]
+fn nil_signing_publication_recovery_and_quorum_without_node() {
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, _) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    adapter
+        .apply(AuthenticatedSlotAgreementRequest::Timeout {
+            view: AgreementView(0),
+            phase: AgreementPhase::Prevote,
+        })
+        .unwrap();
+    let intent = adapter.signing_history()[0].clone();
+    assert!(matches!(
+        adapter.pending()[0],
+        PendingIntent::UnsupportedNil { .. }
+    ));
+    let sequence = adapter.driver.sequence();
+    assert!(adapter.author_nil_vote([255; 32]).is_err());
+    assert_eq!(adapter.driver.sequence(), sequence);
+    assert!(adapter.completed_nil_votes().unwrap().is_empty());
+    let message = adapter.author_nil_vote(intent.id).unwrap().unwrap();
+    message
+        .verify(&bootstrap.agreement.context, &m.set)
+        .unwrap();
+    assert_eq!(message.vote(), &intent.vote);
+    verify_signature(
+        ALG_ED25519,
+        &adapter.public_key,
+        &intent.vote.signing_payload(&m.set).unwrap(),
+        &message.signature().signature,
+    )
+    .unwrap();
+    let bytes = message.encode(&m.set).unwrap();
+    let completed = adapter.completed_nil_votes().unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].intent_id, intent.id);
+    assert_eq!(completed[0].sequence, sequence + 1);
+    assert_eq!(completed[0].message.encode(&m.set).unwrap(), bytes);
+    assert!(adapter.author_nil_vote(intent.id).unwrap().is_none());
+    drop(adapter);
+    let mut adapter = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    // Retrieval must not depend on signing again, even if the private key is unavailable.
+    let private = std::mem::take(&mut adapter.private_key);
+    assert_eq!(
+        adapter.completed_nil_votes().unwrap()[0]
+            .message
+            .encode(&m.set)
+            .unwrap(),
+        bytes
+    );
+    assert!(adapter.author_nil_vote(intent.id).unwrap().is_none());
+    adapter.private_key = private;
+    let sign = |vote: validator::slot_agreement::AgreementVote, i: usize| {
+        validator::SlotAgreementNilVote::new(
+            vote.clone(),
+            ValidatorSignature {
+                validator_id: m.consensus[i].id.clone(),
+                key_id: m.set.validators[i].keys[0].key_id.clone(),
+                signature: Ed25519Scheme
+                    .sign(
+                        &m.consensus[i].private_key,
+                        &vote.signing_payload(&m.set).unwrap(),
+                    )
+                    .unwrap(),
+            },
+            &m.set,
+        )
+        .unwrap()
+    };
+    for i in 0..3 {
+        adapter
+            .receive_nil_vote(sign(intent.vote.clone(), i))
+            .unwrap();
+    }
+    assert_eq!(adapter.signing_history().len(), 2);
+    let precommit = adapter.signing_history()[1].clone();
+    assert_eq!(precommit.vote.phase, AgreementPhase::Precommit);
+    assert_eq!(precommit.vote.value, AgreementValue::Nil);
+    let sequence = adapter.driver.sequence();
+    assert!(adapter.author_nil_vote(intent.id).unwrap().is_none());
+    assert_eq!(adapter.driver.sequence(), sequence);
+    let signed = adapter.author_nil_vote(precommit.id).unwrap().unwrap();
+    assert_eq!(signed.vote(), &precommit.vote);
+    for i in 0..3 {
+        adapter
+            .receive_nil_vote(sign(precommit.vote.clone(), i))
+            .unwrap();
+    }
+    let output = adapter.driver.output().unwrap();
+    let transition = output.transition.unwrap();
+    assert_eq!(transition.view, AgreementView(0));
+    assert!(transition.decision.is_none());
+    assert!(output.candidates.is_empty());
+    assert!(adapter.completed_carriers().unwrap().is_empty());
+    let mut recovered = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    let completed = recovered.completed_nil_votes().unwrap();
+    assert_eq!(completed.len(), 2);
+    assert_eq!(completed[0].message.encode(&m.set).unwrap(), bytes);
+    assert_eq!(completed[1].message, signed);
+}
+
+#[test]
+fn nil_signing_rejects_nonnil_stale_owner_and_bad_key_before_publication() {
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, request) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    adapter.apply(request).unwrap();
+    let nonnil = adapter.signing_history()[0].id;
+    let sequence = adapter.driver.sequence();
+    assert!(adapter.author_nil_vote(nonnil).unwrap().is_none());
+    assert_eq!(adapter.driver.sequence(), sequence);
+    adapter
+        .apply(AuthenticatedSlotAgreementRequest::Timeout {
+            view: AgreementView(0),
+            phase: AgreementPhase::Precommit,
+        })
+        .unwrap();
+    let nil = adapter.signing_history().last().unwrap().id;
+    let key = adapter.private_key.clone();
+    adapter.private_key[0] ^= 1;
+    assert!(adapter.author_nil_vote(nil).is_err());
+    assert!(adapter.completed_nil_votes().unwrap().is_empty());
+    adapter.private_key = key;
+    let mut other = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    other
+        .apply(AuthenticatedSlotAgreementRequest::AdvanceView {
+            from: AgreementView(0),
+        })
+        .unwrap();
+    assert!(adapter.author_nil_vote(nil).is_err());
+    assert_eq!(
+        adapter.readiness(),
+        Readiness::RecoveryRequiredHistoricalIntentsUnavailable
+    );
+    let mut recovered = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    assert!(recovered.author_nil_vote(nil).unwrap().is_none());
+    assert!(recovered.completed_nil_votes().unwrap().is_empty());
+}
+
 fn inspect_envelope(
     envelope: &CarrierEnvelope,
     m: &chain::Membership,

@@ -16,7 +16,7 @@ use validator::{SlotAgreementVotePayload, ValidatorSet, ValidatorSignature, Vert
 /// Carrier intent whose dependencies still require causal-readiness inspection.
 #[derive(Debug)]
 pub enum PendingIntent {
-    /// Durable nil obligation retained without a signature or fabricated carrier.
+    /// Durable nil obligation with no DAG carrier; signed nil publication is supported separately.
     UnsupportedNil {
         /// Full original immutable signing context.
         intent: AgreementSigningIntent,
@@ -443,6 +443,114 @@ impl Adapter {
             .map(Some)
     }
 
+    /// Signs a current durable nil obligation and persists its exact publication before release.
+    /// The intent itself is the pre-sign lock; no Node or fabricated DAG carrier is used.
+    /// Returns `None` for known nonnil or inactive intents. Completed publications are
+    /// retrieved separately, including after recovery, without signing again.
+    /// # Errors
+    /// Rejects unknown IDs, stale owners, pinned-key mismatch and persistence failures.
+    pub fn author_nil_vote(
+        &mut self,
+        intent_id: [u8; 32],
+    ) -> Result<Option<validator::SlotAgreementNilVote>, String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before nil signing".into());
+        }
+        let output = self.driver.output().map_err(|error| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            error.to_string()
+        })?;
+        let history = self.driver.signing_outbox().map_err(|error| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            error.to_string()
+        })?;
+        let intent = history
+            .iter()
+            .find(|intent| intent.id == intent_id)
+            .ok_or("unknown durable nil vote intent ID")?;
+        if !output.authorable_vote_ids.contains(&intent_id)
+            || intent.vote.value != AgreementValue::Nil
+            || intent.prerequisite != AgreementSigningPrerequisite::UnsupportedNil
+        {
+            return Ok(None);
+        }
+        if self
+            .completed_nil_votes()?
+            .iter()
+            .any(|done| done.intent_id == intent_id)
+        {
+            return Ok(None);
+        }
+        if intent.agreement.context != *output.binding.tip()
+            || intent.vote.context != intent.agreement.context
+            || intent.agreement.set != self.set
+            || intent.agreement.local_validator != self.validator_id
+        {
+            return Err("nil signing identity or context mismatch".into());
+        }
+        validate_intent_lineage(intent)?;
+        let bootstrap = AuthenticatedSlotAgreementBootstrap {
+            agreement: intent.agreement.clone(),
+            predecessor: None,
+            order: Vec::new(),
+            vertices: Vec::new(),
+        };
+        if checked_key(&bootstrap, &self.private_key)?
+            != (self.key_id.clone(), self.public_key.clone())
+        {
+            return Err("nil signing active key mismatch".into());
+        }
+        let bytes = intent
+            .vote
+            .signing_payload(&self.set)
+            .map_err(|e| e.to_string())?;
+        let signature = Ed25519Scheme
+            .sign(&self.private_key, &bytes)
+            .map_err(|e| e.to_string())?;
+        let message = validator::SlotAgreementNilVote::new(
+            intent.vote.clone(),
+            ValidatorSignature {
+                validator_id: self.validator_id.clone(),
+                key_id: self.key_id.clone(),
+                signature,
+            },
+            &self.set,
+        )
+        .map_err(|e| e.to_string())?;
+        message
+            .verify(&intent.agreement.context, &self.set)
+            .map_err(|e| e.to_string())?;
+        self.apply(AuthenticatedSlotAgreementRequest::CompleteNilVote {
+            intent_id,
+            message: message.clone(),
+        })?;
+        Ok(Some(message))
+    }
+
+    /// Retrieves exact durable nil publications across historical views and slots, without signing.
+    /// # Errors
+    /// Stale owners, uncertain writes and invalid durable evidence require recovery.
+    pub fn completed_nil_votes(&mut self) -> Result<Vec<store::AgreementCompletedNilVote>, String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before publication retrieval".into());
+        }
+        self.driver.completed_nil_votes().map_err(|error| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            error.to_string()
+        })
+    }
+
+    /// Receives carrier-free nil evidence through the authenticated durable request path.
+    /// This neither advances the view nor applies a decision.
+    /// # Errors
+    /// Invalid evidence or driver failures require recovery before further operations.
+    pub fn receive_nil_vote(
+        &mut self,
+        message: validator::SlotAgreementNilVote,
+    ) -> Result<(), String> {
+        self.apply(AuthenticatedSlotAgreementRequest::ObserveNilVote { message })
+    }
+
     fn complete_carrier(
         &mut self,
         reservation_sequence: u64,
@@ -667,7 +775,7 @@ impl Adapter {
         self.readiness
     }
 
-    /// Original contexts and stable IDs retained across slots, including unsupported nil.
+    /// Original contexts and stable IDs retained across slots, including carrier-free nil.
     /// No acknowledgement or removal is supported; this is not send authorization.
     pub fn signing_history(&self) -> &[AgreementSigningIntent] {
         &self.history
@@ -731,8 +839,8 @@ impl Adapter {
         history: Vec<AgreementSigningIntent>,
     ) -> Result<(), String> {
         self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
-        // Validate every historical identity before producing any signature. Nil is an
-        // unsupported obligation, not a reason to discard valid nonnil history.
+        // Validate every historical identity before producing any signature. Nil has
+        // no DAG carrier and is signed only by the explicit durable publication path.
         for intent in &history {
             if intent.agreement.set != self.set
                 || intent.agreement.local_validator != self.validator_id
