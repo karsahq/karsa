@@ -24,6 +24,7 @@ mod slot_agreement_nil_vote;
 mod slot_agreement_phase;
 mod slot_agreement_proof;
 mod slot_agreement_view;
+mod slot_agreement_view_request;
 pub use slot_agreement_proof::{
     SLOT_AGREEMENT_PROOF_DOMAIN, SLOT_AGREEMENT_PROOF_MAX_BYTES, SLOT_AGREEMENT_PROOF_MAX_ENTRIES,
     SlotAgreementPolCandidate, SlotAgreementProof, SlotAgreementProofEntry, SlotAgreementProofPol,
@@ -32,6 +33,9 @@ pub use slot_agreement_proof::{
 pub use slot_agreement_view::{
     SLOT_AGREEMENT_VIEW_DOMAIN, SlotAgreementPreviousPol, SlotAgreementViewProposal,
     slot_agreement_view_proposer,
+};
+pub use slot_agreement_view_request::{
+    SLOT_AGREEMENT_VIEW_REQUEST_DOMAIN, SlotAgreementViewRequest,
 };
 mod slot_certificate;
 mod slot_decision;
