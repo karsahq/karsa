@@ -7,6 +7,605 @@ use validator::{
     SlotOutcome, SlotProposal, Vertex,
 };
 
+fn signed_view_request(
+    m: &chain::Membership,
+    bootstrap: &AuthenticatedSlotAgreementBootstrap,
+    signer: usize,
+    target: u64,
+) -> validator::SlotAgreementViewRequest {
+    let target = AgreementView(target);
+    let bytes = validator::SlotAgreementViewRequest::signing_payload(
+        &bootstrap.agreement.context,
+        target,
+        &m.set,
+    )
+    .unwrap();
+    validator::SlotAgreementViewRequest::new(
+        bootstrap.agreement.context.clone(),
+        target,
+        ValidatorSignature {
+            validator_id: m.consensus[signer].id.clone(),
+            key_id: m.set.validators[signer].keys[0].key_id.clone(),
+            signature: Ed25519Scheme
+                .sign(&m.consensus[signer].private_key, &bytes)
+                .unwrap(),
+        },
+        &m.set,
+    )
+    .unwrap()
+}
+
+#[test]
+fn view_request_signing_skew_recovery_and_exact_quorum_convergence() {
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, _) = fixture();
+    let dirs: Vec<_> = (0..4).map(|_| Dir::new()).collect();
+    let stores: Vec<_> = dirs.iter().map(|d| Store::open(&d.0).unwrap()).collect();
+    let mut adapters: Vec<_> = stores
+        .iter()
+        .enumerate()
+        .map(|(i, store)| {
+            let mut b = bootstrap.clone();
+            b.agreement.local_validator = m.consensus[i].id.clone();
+            let mut a = Adapter::begin(store, b, &m, i).unwrap();
+            for v in 0..i {
+                a.apply(AuthenticatedSlotAgreementRequest::AdvanceView {
+                    from: AgreementView(v as u64),
+                })
+                .unwrap();
+            }
+            a
+        })
+        .collect();
+    // A previous nil obligation is never repurposed into request signing authority.
+    adapters[0]
+        .apply(AuthenticatedSlotAgreementRequest::Timeout {
+            view: AgreementView(0),
+            phase: AgreementPhase::Prevote,
+        })
+        .unwrap();
+    let nil = adapters[0].signing_history()[0].id;
+    let messages: Vec<_> = adapters
+        .iter_mut()
+        .take(3)
+        .map(|a| a.author_view_request(AgreementView(9)).unwrap())
+        .collect();
+    for (i, message) in messages.iter().enumerate() {
+        message
+            .verify(&bootstrap.agreement.context, &m.set)
+            .unwrap();
+        assert_eq!(message.signature().validator_id, m.consensus[i].id);
+        let sequence = adapters[i].driver.sequence();
+        assert_eq!(
+            adapters[i].author_view_request(AgreementView(9)).unwrap(),
+            *message
+        );
+        assert_eq!(adapters[i].driver.sequence(), sequence);
+    }
+    let other_target = adapters[2].author_view_request(AgreementView(8)).unwrap();
+    for adapter in &mut adapters[..3] {
+        for message in &messages[..2] {
+            adapter.receive_view_request(message.clone()).unwrap();
+        }
+        adapter.receive_view_request(other_target.clone()).unwrap();
+        assert_ne!(
+            adapter.driver.output().unwrap().transition.unwrap().view,
+            AgreementView(9),
+            "mixed targets are not a quorum"
+        );
+    }
+    // Crash with q-1 volatile observations: recovery must lose partial support.
+    let sequence = adapters[3].driver.sequence();
+    for message in &messages[..2] {
+        adapters[3].receive_view_request(message.clone()).unwrap();
+    }
+    assert_eq!(adapters[3].driver.sequence(), sequence);
+    drop(adapters);
+    let mut adapters: Vec<_> = stores
+        .iter()
+        .enumerate()
+        .map(|(i, store)| {
+            let mut b = bootstrap.clone();
+            b.agreement.local_validator = m.consensus[i].id.clone();
+            Adapter::recover(store, b, &m, i).unwrap()
+        })
+        .collect();
+    assert_eq!(
+        adapters[0].completed_view_requests().unwrap(),
+        vec![messages[0].clone()]
+    );
+    assert!(
+        adapters
+            .iter()
+            .all(|a| a.observed_view_requests().unwrap().is_empty())
+    );
+    let now = std::time::Instant::now();
+    let wait = std::time::Duration::from_secs(1);
+    for (i, adapter) in adapters.iter_mut().enumerate() {
+        let entry_sequence = adapter.driver.sequence();
+        adapter.configure_pacemaker(pacemaker::Policy::new(wait, wait, wait).unwrap());
+        assert_eq!(adapter.tick(now).unwrap(), None);
+        for message in &messages[..2] {
+            adapter.receive_view_request(message.clone()).unwrap();
+        }
+        assert_eq!(adapter.driver.sequence(), entry_sequence);
+        assert_eq!(
+            adapter
+                .driver
+                .output()
+                .unwrap()
+                .transition
+                .as_ref()
+                .map_or(AgreementView(0), |t| t.view),
+            AgreementView(i as u64)
+        );
+        adapter.receive_view_request(messages[2].clone()).unwrap();
+        assert_eq!(
+            adapter.driver.sequence(),
+            entry_sequence + 1,
+            "only the full entry certificate is durable"
+        );
+        let transition = adapter.driver.output().unwrap().transition.unwrap();
+        assert_eq!(transition.view, AgreementView(9));
+        assert!(transition.vote.is_none());
+        assert!(transition.decision.is_none());
+        assert!(
+            adapter.author_view_request(AgreementView(9)).is_err(),
+            "entered targets are no longer authorable; use publication retrieval"
+        );
+        assert_eq!(
+            adapter
+                .observed_view_requests()
+                .unwrap()
+                .iter()
+                .filter(|r| r.target_view() == AgreementView(9))
+                .count(),
+            3
+        );
+        assert_eq!(
+            adapter.tick(now + wait * 100).unwrap(),
+            None,
+            "entry rearms rather than firing an old-view deadline"
+        );
+        assert_eq!(
+            adapter.tick(now + wait * 101).unwrap(),
+            Some(pacemaker::Action::Timeout {
+                view: AgreementView(9),
+                phase: AgreementPhase::Prevote
+            })
+        );
+        let history = adapter.signing_history().len();
+        let sequence = adapter.driver.sequence();
+        for message in &messages {
+            adapter.receive_view_request(message.clone()).unwrap();
+        }
+        assert_eq!(
+            adapter.driver.sequence(),
+            sequence,
+            "duplicates must not consume WAL"
+        );
+        assert_eq!(adapter.signing_history().len(), history);
+        assert!(
+            adapter
+                .author_nil_vote(adapter.signing_history().last().unwrap().id)
+                .unwrap()
+                .is_some(),
+            "duplicates preserve the phase obligation"
+        );
+    }
+    assert!(adapters[0].author_nil_vote(nil).unwrap().is_none());
+    // Certificate export from one peer drives entry on another without local authoring.
+    let exported: Vec<_> = adapters[0]
+        .observed_view_requests()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.target_view() == AgreementView(9))
+        .collect();
+    assert_eq!(exported.len(), m.set.quorum_size());
+}
+
+#[test]
+fn view_request_signer_moves_do_not_accumulate_quorum_support() {
+    let (m, bootstrap, _) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    for signer in [0, 1] {
+        adapter
+            .receive_view_request(signed_view_request(&m, &bootstrap, signer, 9))
+            .unwrap();
+    }
+    adapter
+        .receive_view_request(signed_view_request(&m, &bootstrap, 1, 10))
+        .unwrap();
+    adapter
+        .receive_view_request(signed_view_request(&m, &bootstrap, 2, 9))
+        .unwrap();
+    let retained = adapter.observed_view_requests().unwrap();
+    assert_eq!(retained.len(), 3);
+    assert_eq!(
+        retained
+            .iter()
+            .filter(|r| r.target_view() == AgreementView(9))
+            .count(),
+        2
+    );
+    assert_eq!(
+        retained
+            .iter()
+            .filter(|r| r.signature().validator_id == m.consensus[1].id)
+            .count(),
+        1
+    );
+    assert!(
+        adapter.driver.output().unwrap().transition.is_none(),
+        "partial support is not a durable transition"
+    );
+    assert_eq!(adapter.driver.sequence(), 0);
+    let sequence = adapter.driver.sequence();
+    adapter
+        .receive_view_request(signed_view_request(&m, &bootstrap, 1, 9))
+        .unwrap();
+    assert_eq!(
+        adapter.driver.sequence(),
+        sequence,
+        "lower signer target must not resurrect removed support"
+    );
+    assert_eq!(adapter.observed_view_requests().unwrap(), retained);
+    drop(adapter);
+    let mut adapter = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    assert!(adapter.observed_view_requests().unwrap().is_empty());
+    for request in &retained {
+        adapter.receive_view_request(request.clone()).unwrap();
+    }
+    for signer in [0, 2] {
+        adapter
+            .receive_view_request(signed_view_request(&m, &bootstrap, signer, 10))
+            .unwrap();
+    }
+    assert_eq!(
+        adapter.driver.output().unwrap().transition.unwrap().view,
+        AgreementView(10)
+    );
+    assert!(
+        adapter
+            .observed_view_requests()
+            .unwrap()
+            .iter()
+            .all(|r| r.target_view() == AgreementView(10)),
+        "empty old buckets are removed"
+    );
+}
+
+#[test]
+fn view_request_late_and_old_support_are_authenticated_no_write_no_ops() {
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, _) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    for signer in 0..3 {
+        adapter
+            .receive_view_request(signed_view_request(&m, &bootstrap, signer, 9))
+            .unwrap();
+    }
+    adapter
+        .apply(AuthenticatedSlotAgreementRequest::Timeout {
+            view: AgreementView(9),
+            phase: AgreementPhase::Prevote,
+        })
+        .unwrap();
+    let sequence = adapter.driver.sequence();
+    let before = adapter.driver.output().unwrap();
+    let phase = format!("{:?}", before.transition);
+    let authorable = before.authorable_vote_ids;
+    let retained = adapter.observed_view_requests().unwrap();
+    let history = format!("{:?}", adapter.signing_history());
+    let readiness = adapter.readiness();
+    // Previously unseen fourth-signer and old-view support are harmless at receipt.
+    for target in [9, 8, 1] {
+        let message = signed_view_request(&m, &bootstrap, 3, target);
+        adapter.receive_view_request(message).unwrap();
+        assert_eq!(adapter.driver.sequence(), sequence);
+        assert_eq!(adapter.readiness(), readiness);
+        assert_eq!(
+            format!("{:?}", adapter.driver.output().unwrap().transition),
+            phase
+        );
+        assert_eq!(
+            adapter.driver.output().unwrap().authorable_vote_ids,
+            authorable
+        );
+        assert_eq!(format!("{:?}", adapter.signing_history()), history);
+        assert_eq!(adapter.observed_view_requests().unwrap(), retained);
+    }
+    // Authentication is mandatory even when the target is already obsolete.
+    let message = signed_view_request(&m, &bootstrap, 3, 9);
+    let mut signature = message.signature().clone();
+    signature.signature[0] ^= 1;
+    let forged = validator::SlotAgreementViewRequest::new(
+        message.context().clone(),
+        message.target_view(),
+        signature,
+        &m.set,
+    )
+    .unwrap();
+    assert!(adapter.receive_view_request(forged).is_err());
+    assert_eq!(adapter.driver.sequence(), sequence);
+    assert_eq!(adapter.readiness(), readiness);
+    assert!(
+        adapter.author_nil_vote(authorable[0]).unwrap().is_some(),
+        "phase remains authorable without recovery"
+    );
+}
+
+#[test]
+fn view_request_stale_owner_fails_closed_before_volatile_collection() {
+    let (m, bootstrap, _) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut stale = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    let first = signed_view_request(&m, &bootstrap, 1, 9);
+    stale.receive_view_request(first.clone()).unwrap();
+    assert_eq!(stale.driver.sequence(), 0);
+    let mut owner = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    assert!(owner.observed_view_requests().unwrap().is_empty());
+    owner
+        .apply(AuthenticatedSlotAgreementRequest::AdvanceView {
+            from: AgreementView(0),
+        })
+        .unwrap();
+    assert!(
+        stale.observed_view_requests().is_err(),
+        "export must check fresh ownership"
+    );
+    // Even a duplicate/no-op receipt must check durable ownership first.
+    assert!(stale.receive_view_request(first.clone()).is_err());
+    assert_eq!(stale.view_requests, vec![first]);
+    assert_eq!(
+        stale.readiness(),
+        Readiness::RecoveryRequiredHistoricalIntentsUnavailable
+    );
+    assert!(
+        stale
+            .receive_view_request(signed_view_request(&m, &bootstrap, 2, 9))
+            .is_err()
+    );
+    assert_eq!(stale.view_requests.len(), 1);
+    assert_eq!(owner.driver.sequence(), 1);
+    assert!(owner.observed_view_requests().unwrap().is_empty());
+}
+
+#[test]
+fn view_request_pending_authorization_recovery_is_not_a_voting_floor() {
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, _) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    assert!(adapter.author_view_request(AgreementView(0)).is_err());
+    assert_eq!(adapter.driver.sequence(), 0);
+    adapter
+        .apply(AuthenticatedSlotAgreementRequest::ReserveViewRequest {
+            target_view: AgreementView(99),
+        })
+        .unwrap();
+    drop(adapter);
+    let mut adapter = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    let message = adapter.author_view_request(AgreementView(99)).unwrap();
+    assert_eq!(
+        adapter.driver.sequence(),
+        2,
+        "recovery reuses the original authorization"
+    );
+    assert_eq!(
+        adapter.driver.view_request_reservations().unwrap()[0].sequence,
+        1
+    );
+    adapter
+        .apply(AuthenticatedSlotAgreementRequest::Timeout {
+            view: AgreementView(0),
+            phase: AgreementPhase::Prevote,
+        })
+        .unwrap();
+    let nil = adapter.signing_history()[0].id;
+    assert!(
+        adapter.author_nil_vote(nil).unwrap().is_some(),
+        "advisory support must not suppress lower-view votes"
+    );
+    let sequence = adapter.driver.sequence();
+    let reservations = adapter.driver.view_request_reservations().unwrap();
+    assert_eq!(reservations[0].message, Some(message.clone()));
+    // Exact historical retries cannot replace completion or allocate a new event.
+    adapter
+        .driver
+        .apply(
+            2,
+            AuthenticatedSlotAgreementRequest::CompleteViewRequest {
+                reservation_sequence: 1,
+                message,
+            },
+        )
+        .unwrap();
+    assert_eq!(adapter.driver.sequence(), sequence);
+    assert!(
+        adapter
+            .driver
+            .apply(
+                sequence + 1,
+                AuthenticatedSlotAgreementRequest::ReserveViewRequest {
+                    target_view: AgreementView(99)
+                }
+            )
+            .is_err()
+    );
+    adapter
+        .apply(AuthenticatedSlotAgreementRequest::AdvanceView {
+            from: AgreementView(0),
+        })
+        .unwrap();
+    assert!(adapter.author_view_request(AgreementView(1)).is_err());
+}
+
+#[test]
+fn view_request_authorization_completion_and_observation_bounds() {
+    let (m, bootstrap, _) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    let message = adapter.author_view_request(AgreementView(20)).unwrap();
+    let sequence = adapter.driver.sequence();
+    let other_dir = Dir::new();
+    let other_store = Store::open(&other_dir.0).unwrap();
+    let mut other_bootstrap = bootstrap.clone();
+    other_bootstrap.agreement.local_validator = m.consensus[1].id.clone();
+    let mut other = Adapter::begin(&other_store, other_bootstrap, &m, 1).unwrap();
+    assert!(
+        other
+            .driver
+            .apply(
+                1,
+                AuthenticatedSlotAgreementRequest::CompleteViewRequest {
+                    reservation_sequence: 1,
+                    message: message.clone()
+                }
+            )
+            .is_err(),
+        "completion without authorization"
+    );
+    other
+        .apply(AuthenticatedSlotAgreementRequest::ReserveViewRequest {
+            target_view: AgreementView(20),
+        })
+        .unwrap();
+    assert!(
+        other
+            .driver
+            .apply(
+                2,
+                AuthenticatedSlotAgreementRequest::CompleteViewRequest {
+                    reservation_sequence: 1,
+                    message: message.clone()
+                }
+            )
+            .is_err(),
+        "completion must use pinned local signer"
+    );
+    let own = other.author_view_request(AgreementView(20)).unwrap();
+    assert_eq!(own.signature().validator_id, m.consensus[1].id);
+    assert_eq!(other.driver.sequence(), 2);
+    let mut forged_signature = message.signature().clone();
+    forged_signature.signature[0] ^= 1;
+    let forged = validator::SlotAgreementViewRequest::new(
+        message.context().clone(),
+        message.target_view(),
+        forged_signature,
+        &m.set,
+    )
+    .unwrap();
+    // Decode and construction are structural only; replay must authenticate explicitly.
+    let forged =
+        validator::SlotAgreementViewRequest::decode(&forged.encode(&m.set).unwrap(), &m.set)
+            .unwrap();
+    assert!(adapter.receive_view_request(forged).is_err());
+    assert_eq!(adapter.driver.sequence(), sequence);
+    assert!(
+        adapter
+            .driver
+            .apply(
+                sequence + 1,
+                AuthenticatedSlotAgreementRequest::CompleteViewRequest {
+                    reservation_sequence: 1,
+                    message: message.clone()
+                }
+            )
+            .is_err()
+    );
+    assert_eq!(
+        adapter.completed_view_requests().unwrap(),
+        vec![message.clone()]
+    );
+    // Increasing singleton support never consumes shared WAL events, regardless of
+    // how many targets are sent; the only remote-write path requires a full quorum.
+    let singleton_sequence = adapter.driver.sequence();
+    for target in 1..=32 {
+        let bytes = validator::SlotAgreementViewRequest::signing_payload(
+            &bootstrap.agreement.context,
+            AgreementView(target),
+            &m.set,
+        )
+        .unwrap();
+        let request = validator::SlotAgreementViewRequest::new(
+            bootstrap.agreement.context.clone(),
+            AgreementView(target),
+            ValidatorSignature {
+                validator_id: m.consensus[1].id.clone(),
+                key_id: m.set.validators[1].keys[0].key_id.clone(),
+                signature: Ed25519Scheme
+                    .sign(&m.consensus[1].private_key, &bytes)
+                    .unwrap(),
+            },
+            &m.set,
+        )
+        .unwrap();
+        adapter.receive_view_request(request.clone()).unwrap();
+        assert_eq!(adapter.driver.sequence(), singleton_sequence);
+        let sequence = adapter.driver.sequence();
+        adapter.receive_view_request(request).unwrap();
+        assert_eq!(adapter.driver.sequence(), sequence);
+    }
+    let retained = adapter.observed_view_requests().unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].target_view(), AgreementView(32));
+    let sequence = adapter.driver.sequence();
+    for target in (1..=32).rev() {
+        adapter
+            .receive_view_request(signed_view_request(&m, &bootstrap, 1, target))
+            .unwrap();
+    }
+    assert_eq!(
+        adapter.driver.sequence(),
+        sequence,
+        "obsolete signer targets do not append"
+    );
+    // Recovery loses partial remote support but preserves local publication history.
+    drop(adapter);
+    let mut adapter = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    assert!(adapter.observed_view_requests().unwrap().is_empty());
+    assert_eq!(adapter.completed_view_requests().unwrap(), vec![message]);
+    // A fresh honest exact-target quorum is still usable after the signed flood.
+    for signer in [0, 2] {
+        adapter
+            .receive_view_request(signed_view_request(&m, &bootstrap, signer, 100))
+            .unwrap();
+        assert_eq!(adapter.driver.sequence(), sequence);
+        assert_eq!(
+            adapter.driver.output().unwrap().transition.unwrap().view,
+            AgreementView(0)
+        );
+    }
+    adapter
+        .receive_view_request(signed_view_request(&m, &bootstrap, 3, 100))
+        .unwrap();
+    assert_eq!(
+        adapter.driver.output().unwrap().transition.unwrap().view,
+        AgreementView(100)
+    );
+    assert_eq!(
+        adapter.observed_view_requests().unwrap().len(),
+        m.set.quorum_size()
+    );
+    assert_eq!(adapter.driver.sequence(), sequence + 1);
+    drop(adapter);
+    let adapter = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    assert!(adapter.observed_view_requests().unwrap().is_empty());
+    assert_eq!(
+        adapter.driver.output().unwrap().transition.unwrap().view,
+        AgreementView(100)
+    );
+    assert_eq!(adapter.driver.sequence(), sequence + 1);
+}
+
 #[test]
 fn nil_signing_publication_recovery_and_quorum_without_node() {
     use validator::slot_agreement::AgreementPhase;
@@ -2165,6 +2764,54 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             .decision
             .is_some()
     );
+    // Advisory scheduling cannot reopen a decided slot, even with a real quorum.
+    let requests: Vec<_> = (0..3)
+        .map(|i| {
+            let bytes = validator::SlotAgreementViewRequest::signing_payload(
+                &bootstrap.agreement.context,
+                AgreementView(99),
+                &m.set,
+            )
+            .unwrap();
+            validator::SlotAgreementViewRequest::new(
+                bootstrap.agreement.context.clone(),
+                AgreementView(99),
+                ValidatorSignature {
+                    validator_id: m.consensus[i].id.clone(),
+                    key_id: m.set.validators[i].keys[0].key_id.clone(),
+                    signature: Ed25519Scheme
+                        .sign(&m.consensus[i].private_key, &bytes)
+                        .unwrap(),
+                },
+                &m.set,
+            )
+            .unwrap()
+        })
+        .collect();
+    let decided_sequence = adapters[0].driver.sequence();
+    assert!(adapters[0].author_view_request(AgreementView(99)).is_err());
+    let decided_readiness = adapters[0].readiness();
+    let decided_transition = format!("{:?}", adapters[0].driver.output().unwrap().transition);
+    for request in &requests {
+        adapters[0].receive_view_request(request.clone()).unwrap();
+    }
+    assert_eq!(adapters[0].readiness(), decided_readiness);
+    assert_eq!(
+        format!("{:?}", adapters[0].driver.output().unwrap().transition),
+        decided_transition
+    );
+    assert_eq!(format!("{:?}", adapters[0].signing_history()), history);
+    assert_eq!(adapters[0].driver.sequence(), decided_sequence);
+    assert!(
+        adapters[0]
+            .driver
+            .apply(
+                decided_sequence + 1,
+                AuthenticatedSlotAgreementRequest::EnterRequestedView { requests }
+            )
+            .is_err()
+    );
+    assert_eq!(adapters[0].driver.sequence(), decided_sequence);
     // The cache still contains historical aggregate material, but fresh driver
     // output has no candidates after final receipt.
     assert!(
@@ -2286,8 +2933,29 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
     assert_eq!((final_node.round(), final_node.authored()), (9, 1));
 }
 
+#[derive(Clone, Copy)]
+enum LockPreservingViewEntry {
+    Timed,
+    Certified,
+}
+
 #[test]
 fn timed_advance_and_recovery_preserve_lock_against_authenticated_conflict() {
+    advance_and_recovery_preserve_lock_against_authenticated_conflict(
+        LockPreservingViewEntry::Timed,
+    );
+}
+
+#[test]
+fn certified_advance_and_recovery_preserve_lock_against_authenticated_conflict() {
+    advance_and_recovery_preserve_lock_against_authenticated_conflict(
+        LockPreservingViewEntry::Certified,
+    );
+}
+
+fn advance_and_recovery_preserve_lock_against_authenticated_conflict(
+    entry: LockPreservingViewEntry,
+) {
     use pacemaker::{Action, Policy};
     use std::time::{Duration, Instant};
     use validator::slot_agreement::AgreementPhase;
@@ -2491,16 +3159,60 @@ fn timed_advance_and_recovery_preserve_lock_against_authenticated_conflict() {
         vertices.push(signed(&m, i, 9, ids(&vertices, 8), [42; 32]));
     }
     let reproposal = adapter.driver.output().unwrap().reproposal.unwrap();
-    let wait = Duration::from_secs(1);
-    let now = Instant::now();
-    adapter.configure_pacemaker(Policy::new(wait, wait, wait).unwrap());
-    assert_eq!(adapter.tick(now).unwrap(), None);
-    assert_eq!(
-        adapter.tick(now + wait).unwrap(),
-        Some(Action::AdvanceView {
-            from: AgreementView(0)
-        })
-    );
+    match entry {
+        LockPreservingViewEntry::Timed => {
+            let wait = Duration::from_secs(1);
+            let now = Instant::now();
+            adapter.configure_pacemaker(Policy::new(wait, wait, wait).unwrap());
+            assert_eq!(adapter.tick(now).unwrap(), None);
+            assert_eq!(
+                adapter.tick(now + wait).unwrap(),
+                Some(Action::AdvanceView {
+                    from: AgreementView(0)
+                })
+            );
+        }
+        LockPreservingViewEntry::Certified => {
+            let requests: Vec<_> = [0, 1, 3]
+                .into_iter()
+                .map(|i| adapters[i].author_view_request(AgreementView(1)).unwrap())
+                .collect();
+            assert_eq!(requests.len(), m.set.quorum_size());
+            let adapter = &mut adapters[2];
+            for request in &requests[..requests.len() - 1] {
+                adapter.receive_view_request(request.clone()).unwrap();
+                assert_eq!(
+                    adapter.timer_snapshot().unwrap().view,
+                    AgreementView(0),
+                    "q-1 exact-target requests cannot enter"
+                );
+            }
+            adapter
+                .receive_view_request(requests.last().unwrap().clone())
+                .unwrap();
+            let transition = adapter.driver.output().unwrap().transition.unwrap();
+            assert_eq!(
+                transition.view,
+                AgreementView(1),
+                "receive must automatically enter on q exact-target requests"
+            );
+            assert!(
+                transition.vote.is_none(),
+                "advisory entry must not emit a vote"
+            );
+            assert!(transition.decision.is_none());
+            assert_eq!(
+                adapter
+                    .signing_history()
+                    .iter()
+                    .map(|i| (i.id, i.vote.clone()))
+                    .collect::<Vec<_>>(),
+                history,
+                "advisory entry must preserve existing signing obligations"
+            );
+        }
+    }
+    let adapter = &mut adapters[2];
     recover_envelope_adapter(adapter, &stores[2], &bootstrap, &m, 2);
     assert_eq!(adapter.timer_snapshot().unwrap().view, AgreementView(1));
     assert_eq!(

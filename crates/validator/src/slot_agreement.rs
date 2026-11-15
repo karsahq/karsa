@@ -510,6 +510,52 @@ impl SlotAgreement {
         }
     }
 
+    /// Enters an exact future view supported by distinct authenticated advisory requests.
+    ///
+    /// This is scheduling authorization only, not a POL, a timer-expiry proof, or a
+    /// signing-floor promise. It emits no vote and preserves lock and valid evidence.
+    /// Callers must durably journal this transition before exposing signing authority.
+    ///
+    /// # Errors
+    /// Rejects decided instances, stale targets, mixed contexts/targets, noncanonical
+    /// signer order, insufficient quorum, oversized evidence, or invalid signatures.
+    /// Errors leave the instance unchanged.
+    pub fn enter_requested_view(
+        &mut self,
+        requests: &[crate::SlotAgreementViewRequest],
+    ) -> Result<(), CryptoError> {
+        self.active()?;
+        if requests.len() < self.set.quorum_size() || requests.len() > self.set.validators.len() {
+            return Err(invalid("view request certificate has no bounded quorum"));
+        }
+        let target = requests[0].target_view();
+        if target <= self.view {
+            return Err(invalid("view request target is not strictly future"));
+        }
+        let mut bytes = 0usize;
+        let mut previous: Option<&[u8]> = None;
+        for request in requests {
+            let signer = request.signature().validator_id.as_slice();
+            if request.target_view() != target || previous.is_some_and(|old| old >= signer) {
+                return Err(invalid(
+                    "view request target or canonical signer order mismatch",
+                ));
+            }
+            bytes = bytes
+                .checked_add(request.encode(&self.set)?.len())
+                .ok_or_else(|| invalid("view request certificate size overflow"))?;
+            if bytes > crypto::encoding::MAX_FIELD_LEN {
+                return Err(invalid("view request certificate exceeds one MiB"));
+            }
+            request.verify(&self.context, &self.set)?;
+            previous = Some(signer);
+        }
+        self.view = target;
+        self.prevote = None;
+        self.precommit = None;
+        Ok(())
+    }
+
     /// Advances exactly one view on an external simulation timeout, preserving locks.
     ///
     /// # Errors
@@ -606,6 +652,93 @@ mod tests {
             .collect();
         AgreementQc { vote, signatures }
     }
+    fn requests(
+        k: &SlotAgreement,
+        keys: &[Vec<u8>],
+        target: u64,
+    ) -> Vec<crate::SlotAgreementViewRequest> {
+        let target = AgreementView(target);
+        let payload =
+            crate::SlotAgreementViewRequest::signing_payload(&k.context, target, &k.set).unwrap();
+        (0..3u8)
+            .map(|i| {
+                crate::SlotAgreementViewRequest::new(
+                    k.context.clone(),
+                    target,
+                    ValidatorSignature {
+                        validator_id: vec![i],
+                        key_id: vec![i],
+                        signature: Ed25519Scheme.sign(&keys[usize::from(i)], &payload).unwrap(),
+                    },
+                    &k.set,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn requested_jump_preserves_lock_and_old_decision_without_reopening_phase() {
+        let (mut k, keys, decision) = fixture();
+        let pol = qc(
+            &k,
+            &keys,
+            0,
+            AgreementPhase::Prevote,
+            AgreementValue::Decision(decision.clone()),
+        );
+        k.evidence(&pol, |_| Ok(())).unwrap().unwrap();
+        let certificate = requests(&k, &keys, 17);
+        k.enter_requested_view(&certificate).unwrap();
+        assert_eq!(k.view(), AgreementView(17));
+        assert_eq!(k.lock(), Some(&(AgreementView(0), decision.clone())));
+        assert_eq!(k.valid(), Some(&pol));
+        assert!(
+            k.propose(AgreementView(17), other(&decision), None, |_| Ok(()))
+                .is_err()
+        );
+        k.timeout(AgreementPhase::Prevote).unwrap();
+        assert!(k.enter_requested_view(&certificate).is_err());
+        assert!(k.timeout(AgreementPhase::Prevote).is_err());
+        let final_qc = qc(
+            &k,
+            &keys,
+            0,
+            AgreementPhase::Precommit,
+            AgreementValue::Decision(decision.clone()),
+        );
+        k.evidence(&final_qc, |_| Ok(())).unwrap();
+        assert_eq!(k.decision(), Some(&decision));
+        assert!(k.enter_requested_view(&requests(&k, &keys, 18)).is_err());
+    }
+
+    #[test]
+    fn requested_jump_rejects_subquorum_duplicates_mixed_target_and_bad_signature() {
+        let (mut k, keys, _) = fixture();
+        let certificate = requests(&k, &keys, 9);
+        assert!(k.enter_requested_view(&certificate[..2]).is_err());
+        let mut bad = certificate.clone();
+        bad[1] = bad[0].clone();
+        assert!(k.enter_requested_view(&bad).is_err());
+        bad = certificate.clone();
+        bad[1] = requests(&k, &keys, 10)[1].clone();
+        assert!(k.enter_requested_view(&bad).is_err());
+        bad = certificate.clone();
+        let mut signature = bad[1].signature().clone();
+        signature.signature[0] ^= 1;
+        bad[1] = crate::SlotAgreementViewRequest::new(
+            k.context.clone(),
+            AgreementView(9),
+            signature,
+            &k.set,
+        )
+        .unwrap();
+        assert!(k.enter_requested_view(&bad).is_err());
+        assert_eq!(k.view(), AgreementView(0));
+        k.enter_requested_view(&certificate).unwrap();
+        assert_eq!(k.view(), AgreementView(9));
+    }
+
     fn other(d: &SlotDecision) -> SlotDecision {
         let mut d = d.clone();
         d.outcome = SlotOutcome::Skip {

@@ -40,6 +40,23 @@ pub struct AuthenticatedSlotAgreementBootstrap {
 pub enum AuthenticatedSlotAgreementRequest {
     /// Apply the first durable deciding proof and derive the next same-set slot.
     AdvanceSlot,
+    /// Explicit local authorization, durable before signing an advisory request.
+    ReserveViewRequest {
+        /// Exact positive future target; not a voting floor.
+        target_view: AgreementView,
+    },
+    /// Persist the exact locally signed request before publication.
+    CompleteViewRequest {
+        /// One-based sequence of the original authorization.
+        reservation_sequence: u64,
+        /// Signed advisory request, independently verified on replay.
+        message: validator::SlotAgreementViewRequest,
+    },
+    /// Enter a future view using a distinct-signer exact-target quorum, without voting.
+    EnterRequestedView {
+        /// Complete certificate, verified by the reducer.
+        requests: Vec<validator::SlotAgreementViewRequest>,
+    },
     /// Persist an exact signed nil publication for a current durable intent.
     CompleteNilVote {
         /// Stable original signing intent identity.
@@ -305,6 +322,28 @@ impl AuthenticatedSlotAgreementRequest {
         let mut e = Encoder::new();
         e.put_u16(1);
         match self {
+            Self::ReserveViewRequest { target_view } => {
+                e.put_u8(12);
+                e.put_u64(target_view.0);
+            }
+            Self::CompleteViewRequest {
+                reservation_sequence,
+                message,
+            } => {
+                e.put_u8(13);
+                e.put_u64(*reservation_sequence);
+                e.put_bytes(&message.encode(set)?)?;
+            }
+            Self::EnterRequestedView { requests } => {
+                if requests.len() > set.validators.len() {
+                    return Err(invalid("view request certificate exceeds set size"));
+                }
+                e.put_u8(15);
+                e.put_u32(requests.len() as u32);
+                for request in requests {
+                    e.put_bytes(&request.encode(set)?)?;
+                }
+            }
             Self::AdvanceSlot => e.put_u8(6),
             Self::CompleteNilVote { intent_id, message } => {
                 e.put_u8(10);
@@ -418,6 +457,27 @@ impl AuthenticatedSlotAgreementRequest {
         }
         let tag = d.read_u8()?;
         let value = match tag {
+            12 => Self::ReserveViewRequest {
+                target_view: AgreementView(d.read_u64()?),
+            },
+            13 => Self::CompleteViewRequest {
+                reservation_sequence: d.read_u64()?,
+                message: validator::SlotAgreementViewRequest::decode(d.read_bytes()?, set)?,
+            },
+            15 => {
+                let count = d.read_u32()? as usize;
+                if count > set.validators.len() {
+                    return Err(invalid("view request certificate exceeds set size"));
+                }
+                let mut requests = Vec::with_capacity(count);
+                for _ in 0..count {
+                    requests.push(validator::SlotAgreementViewRequest::decode(
+                        d.read_bytes()?,
+                        set,
+                    )?);
+                }
+                Self::EnterRequestedView { requests }
+            }
             6 => Self::AdvanceSlot,
             10 => Self::CompleteNilVote {
                 intent_id: d
@@ -815,6 +875,26 @@ pub enum AgreementSigningPrerequisite {
 
 type NilVoteBucket = (BTreeMap<Vec<u8>, validator::ValidatorSignature>, bool);
 
+/// Durable local advisory authorization and its immutable signed publication, if completed.
+#[derive(Debug, Clone)]
+pub struct AgreementViewRequestReservation {
+    /// Original one-based reservation WAL sequence.
+    pub sequence: u64,
+    /// Pinned slot context, validator set and local signing identity.
+    pub agreement: SlotAgreementBootstrap,
+    /// Exact authorized positive future target; not a voting floor.
+    pub target_view: AgreementView,
+    /// Exact signed publication, installed only after verified durable completion.
+    pub message: Option<validator::SlotAgreementViewRequest>,
+}
+#[derive(Default)]
+struct ViewRequests {
+    reservations: Vec<AgreementViewRequestReservation>,
+}
+
+// Explicit local authorizations are separate from remotely supplied observations.
+const MAX_LOCAL_REQUEST_TARGETS: usize = 16;
+
 type ReplayState = (
     Option<AgreementTransitionResult>,
     Vec<AgreementQuorumCandidate>,
@@ -826,6 +906,7 @@ type ReplayState = (
     Vec<AgreementReservedCarrier>,
     Vec<AgreementCompletedCarrier>,
     Vec<AgreementCompletedNilVote>,
+    ViewRequests,
 );
 
 fn reservation_bounds(
@@ -905,6 +986,7 @@ fn replay(
     let mut completed: Vec<AgreementCompletedCarrier> = Vec::new();
     let mut completed_nil: Vec<AgreementCompletedNilVote> = Vec::new();
     let mut nil_buckets: BTreeMap<Vec<u8>, NilVoteBucket> = BTreeMap::new();
+    let mut view_requests = ViewRequests::default();
     for (index, event) in events.iter().enumerate() {
         let incoming = match event {
             AuthenticatedSlotAgreementRequest::ObserveProposal { vertices, .. }
@@ -928,6 +1010,85 @@ fn replay(
                     ));
                 }
             }
+        }
+        match event {
+            AuthenticatedSlotAgreementRequest::ReserveViewRequest { target_view } => {
+                validator::SlotAgreementViewRequest::signing_payload(
+                    &active.context,
+                    *target_view,
+                    &active.set,
+                )?;
+                if reducer.decision().is_some() || *target_view <= reducer.view() {
+                    return Err(invalid(
+                        "view request authorization is not for a future undecided view",
+                    ));
+                }
+                let local: Vec<_> = view_requests
+                    .reservations
+                    .iter()
+                    .filter(|r| r.agreement.context == active.context)
+                    .collect();
+                if local.len() >= MAX_LOCAL_REQUEST_TARGETS
+                    || local.iter().any(|r| r.target_view == *target_view)
+                {
+                    return Err(invalid(
+                        "view request authorization bound or duplicate target",
+                    ));
+                }
+                view_requests
+                    .reservations
+                    .push(AgreementViewRequestReservation {
+                        sequence: index as u64 + 1,
+                        agreement: active.clone(),
+                        target_view: *target_view,
+                        message: None,
+                    });
+            }
+            AuthenticatedSlotAgreementRequest::CompleteViewRequest {
+                reservation_sequence,
+                message,
+            } => {
+                let reservation = view_requests
+                    .reservations
+                    .iter_mut()
+                    .find(|r| r.sequence == *reservation_sequence)
+                    .ok_or_else(|| invalid("view request completion lacks authorization"))?;
+                if reservation.message.is_some()
+                    || reservation.agreement.context != active.context
+                    || reducer.decision().is_some()
+                    || reservation.target_view <= reducer.view()
+                    || message.target_view() != reservation.target_view
+                    || message.signature().validator_id != reservation.agreement.local_validator
+                {
+                    return Err(invalid(
+                        "view request completion differs from pending local authorization",
+                    ));
+                }
+                message.verify(&reservation.agreement.context, &reservation.agreement.set)?;
+                reservation.message = Some(message.clone());
+            }
+            AuthenticatedSlotAgreementRequest::EnterRequestedView { requests } => {
+                reducer.enter_requested_view(requests)?;
+                result = Some(AgreementTransitionResult {
+                    vote: None,
+                    view: reducer.view(),
+                    decision: None,
+                });
+            }
+            _ => {}
+        }
+        if matches!(
+            event,
+            AuthenticatedSlotAgreementRequest::ReserveViewRequest { .. }
+                | AuthenticatedSlotAgreementRequest::CompleteViewRequest { .. }
+                | AuthenticatedSlotAgreementRequest::EnterRequestedView { .. }
+        ) {
+            result.get_or_insert_with(|| AgreementTransitionResult {
+                vote: None,
+                view: reducer.view(),
+                decision: reducer.decision().cloned(),
+            });
+            continue;
         }
         if let AuthenticatedSlotAgreementRequest::CompleteNilVote { intent_id, message } = event {
             let intent = outbox
@@ -1320,7 +1481,10 @@ fn replay(
             continue;
         }
         let (input, decision) = match event {
-            AuthenticatedSlotAgreementRequest::CompleteNilVote { .. } => {
+            AuthenticatedSlotAgreementRequest::ReserveViewRequest { .. }
+            | AuthenticatedSlotAgreementRequest::CompleteViewRequest { .. }
+            | AuthenticatedSlotAgreementRequest::EnterRequestedView { .. }
+            | AuthenticatedSlotAgreementRequest::CompleteNilVote { .. } => {
                 unreachable!("publication handled above")
             }
             AuthenticatedSlotAgreementRequest::ObserveNilVote { message } => {
@@ -1556,6 +1720,7 @@ fn replay(
         reserved,
         completed,
         completed_nil,
+        view_requests,
     ))
 }
 pub(super) fn validate(root: &Path) -> Result<(), StoreError> {
@@ -1744,6 +1909,35 @@ impl AuthenticatedSlotAgreement {
         Ok(replay(&journal.bootstrap, &journal.events)?.9)
     }
 
+    fn view_requests(&self) -> Result<ViewRequests, StoreError> {
+        if self.uncertain {
+            return Err(invalid("uncertain authenticated write requires recovery"));
+        }
+        let root = self
+            .store
+            .slot_decisions
+            .lock()
+            .expect("slot decision lock poisoned");
+        exclusions(&root)?;
+        let journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
+        if journal.header != self.header
+            || journal.events.len() as u64 != self.sequence
+            || journal.tip != self.tip
+        {
+            return Err(invalid("stale authenticated owner"));
+        }
+        Ok(replay(&journal.bootstrap, &journal.events)?.10)
+    }
+
+    /// Returns durable authorizations and their exact signed completions, including history.
+    /// # Errors
+    /// Rejects stale or uncertain owners and invalid journals.
+    pub fn view_request_reservations(
+        &self,
+    ) -> Result<Vec<AgreementViewRequestReservation>, StoreError> {
+        Ok(self.view_requests()?.reservations)
+    }
+
     /// Reauthenticates durable evidence and returns frozen candidates without mutable state access.
     ///
     /// # Errors
@@ -1774,7 +1968,7 @@ impl AuthenticatedSlotAgreement {
         {
             return Err(invalid("stale authenticated owner"));
         }
-        let (transition, candidates, active, binding, reproposal, _, authorable, _, _, _) =
+        let (transition, candidates, active, binding, reproposal, _, authorable, _, _, _, _) =
             replay(&journal.bootstrap, &journal.events)?;
         Ok((
             active, transition, candidates, reproposal, binding, authorable,
@@ -1857,6 +2051,8 @@ impl AuthenticatedSlotAgreement {
             AuthenticatedSlotAgreementRequest::ReserveCarrier { .. }
                 | AuthenticatedSlotAgreementRequest::CompleteCarrier { .. }
                 | AuthenticatedSlotAgreementRequest::CompleteNilVote { .. }
+                | AuthenticatedSlotAgreementRequest::ReserveViewRequest { .. }
+                | AuthenticatedSlotAgreementRequest::CompleteViewRequest { .. }
         ) && sequence > 0
             && journal.events.get((sequence - 1) as usize) == Some(&request);
         let retry = reservation_retry

@@ -75,6 +75,15 @@ impl SlotAgreementDriver {
         self.session.completed_nil_votes()
     }
 
+    /// Returns original local request authorizations with immutable signed completions.
+    /// # Errors
+    /// Rejects stale or uncertain owners and invalid durable evidence.
+    pub fn view_request_reservations(
+        &self,
+    ) -> Result<Vec<crate::AgreementViewRequestReservation>, StoreError> {
+        self.session.view_request_reservations()
+    }
+
     /// Returns the number of durable requests installed by this owner.
     pub fn sequence(&self) -> u64 {
         self.session.sequence()

@@ -122,6 +122,8 @@ pub struct Adapter {
     history: Vec<AgreementSigningIntent>,
     readiness: Readiness,
     pacemaker: Option<pacemaker::Pacemaker>,
+    // Partial remote support is never journaled and is lost on recovery.
+    view_requests: Vec<validator::SlotAgreementViewRequest>,
 }
 
 #[derive(Clone, Copy)]
@@ -517,6 +519,196 @@ impl Adapter {
             .map(Some)
     }
 
+    /// Explicitly authorizes and durably publishes advisory support for one exact future view.
+    /// Retrying a completed, still-future target returns its immutable publication without signing.
+    /// Historical publications remain available through `completed_view_requests`.
+    /// # Errors
+    /// Rejects inactive targets, key mismatch, stale ownership and uncertain durability.
+    pub fn author_view_request(
+        &mut self,
+        target: validator::slot_agreement::AgreementView,
+    ) -> Result<validator::SlotAgreementViewRequest, String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before request signing".into());
+        }
+        let output = self.driver.output().map_err(|e| e.to_string())?;
+        let reservations = self
+            .driver
+            .view_request_reservations()
+            .map_err(|e| e.to_string())?;
+        let existing = reservations
+            .iter()
+            .find(|r| r.agreement.context == *output.binding.tip() && r.target_view == target);
+        if output
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.decision.is_some() || target <= t.view)
+            || target.0 == 0
+        {
+            return Err("request target is not a future undecided view".into());
+        }
+        if let Some(message) = existing.and_then(|reservation| reservation.message.as_ref()) {
+            return Ok(message.clone());
+        }
+        // Validate the pinned key before authorizing or invoking the signer.
+        let bootstrap = AuthenticatedSlotAgreementBootstrap {
+            agreement: store::SlotAgreementBootstrap {
+                context: output.binding.tip().clone(),
+                set: self.set.clone(),
+                local_validator: self.validator_id.clone(),
+            },
+            predecessor: None,
+            order: Vec::new(),
+            vertices: Vec::new(),
+        };
+        if checked_key(&bootstrap, &self.private_key)?
+            != (self.key_id.clone(), self.public_key.clone())
+        {
+            return Err("view request signing key mismatch".into());
+        }
+        let reservation_sequence = if let Some(reservation) = existing {
+            let agreement = &reservation.agreement;
+            if agreement.context != bootstrap.agreement.context
+                || agreement.set != bootstrap.agreement.set
+                || agreement.local_validator != bootstrap.agreement.local_validator
+            {
+                return Err("view request authorization identity mismatch".into());
+            }
+            reservation.sequence
+        } else {
+            self.apply(AuthenticatedSlotAgreementRequest::ReserveViewRequest {
+                target_view: target,
+            })?;
+            self.driver.sequence()
+        };
+        let bytes = validator::SlotAgreementViewRequest::signing_payload(
+            output.binding.tip(),
+            target,
+            &self.set,
+        )
+        .map_err(|e| e.to_string())?;
+        let signature = Ed25519Scheme
+            .sign(&self.private_key, &bytes)
+            .map_err(|e| e.to_string())?;
+        let message = validator::SlotAgreementViewRequest::new(
+            output.binding.tip().clone(),
+            target,
+            ValidatorSignature {
+                validator_id: self.validator_id.clone(),
+                key_id: self.key_id.clone(),
+                signature,
+            },
+            &self.set,
+        )
+        .map_err(|e| e.to_string())?;
+        message
+            .verify(output.binding.tip(), &self.set)
+            .map_err(|e| e.to_string())?;
+        self.apply(AuthenticatedSlotAgreementRequest::CompleteViewRequest {
+            reservation_sequence,
+            message: message.clone(),
+        })?;
+        Ok(message)
+    }
+
+    /// Returns exact durable signed request publications, including historical slots.
+    /// # Errors
+    /// Rejects uncertain or stale owners and invalid durable evidence.
+    pub fn completed_view_requests(
+        &self,
+    ) -> Result<Vec<validator::SlotAgreementViewRequest>, String> {
+        self.driver
+            .view_request_reservations()
+            .map(|items| items.into_iter().filter_map(|r| r.message).collect())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Exports volatile current-slot support in target/signer order; recovery starts empty.
+    /// Only complete entry certificates are durable, not this rebroadcast collection.
+    /// # Errors
+    /// Rejects uncertain or stale owners and invalid retained evidence.
+    pub fn observed_view_requests(
+        &self,
+    ) -> Result<Vec<validator::SlotAgreementViewRequest>, String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before request export".into());
+        }
+        let output = self.driver.output().map_err(|e| e.to_string())?;
+        let mut requests = Vec::new();
+        for request in &self.view_requests {
+            if request.context() == output.binding.tip() {
+                request
+                    .verify(output.binding.tip(), &self.set)
+                    .map_err(|e| e.to_string())?;
+                requests.push(request.clone());
+            }
+        }
+        requests.sort_by(|a, b| {
+            (a.target_view(), &a.signature().validator_id)
+                .cmp(&(b.target_view(), &b.signature().validator_id))
+        });
+        Ok(requests)
+    }
+
+    /// Collects bounded volatile latest-per-signer support; only a full entry is journaled.
+    /// Partial support is lost on recovery and must be redelivered. Authenticated obsolete,
+    /// late and decided-slot support does not change phase state or consume WAL capacity.
+    /// # Errors
+    /// Rejects invalid evidence, stale ownership and uncertain durability.
+    pub fn receive_view_request(
+        &mut self,
+        message: validator::SlotAgreementViewRequest,
+    ) -> Result<(), String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before request receipt".into());
+        }
+        // Recheck ownership even for duplicates and late support before touching the
+        // volatile collection. Quorum entry independently rechecks it during apply.
+        let output = self.driver.output().map_err(|e| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            e.to_string()
+        })?;
+        message
+            .verify(output.binding.tip(), &self.set)
+            .map_err(|e| e.to_string())?;
+        self.view_requests
+            .retain(|r| r.context() == output.binding.tip());
+        let target = message.target_view();
+        if output
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.decision.is_some() || target <= t.view)
+        {
+            return Ok(());
+        }
+        if let Some(old) = self
+            .view_requests
+            .iter_mut()
+            .find(|r| r.signature().validator_id == message.signature().validator_id)
+        {
+            if old.target_view() >= target {
+                return Ok(());
+            }
+            *old = message;
+        } else {
+            if self.view_requests.len() >= self.set.validators.len() {
+                return Err("view request signer bound exceeded".into());
+            }
+            self.view_requests.push(message);
+        }
+        let mut requests: Vec<_> = self
+            .view_requests
+            .iter()
+            .filter(|r| r.target_view() == target)
+            .cloned()
+            .collect();
+        if requests.len() >= self.set.quorum_size() {
+            requests.sort_by(|a, b| a.signature().validator_id.cmp(&b.signature().validator_id));
+            self.apply(AuthenticatedSlotAgreementRequest::EnterRequestedView { requests })?;
+        }
+        Ok(())
+    }
+
     /// Signs a current durable nil obligation and persists its exact publication before release.
     /// The intent itself is the pre-sign lock; no Node or fabricated DAG carrier is used.
     /// Returns `None` for known nonnil or inactive intents. Completed publications are
@@ -811,6 +1003,7 @@ impl Adapter {
             pending: Vec::new(),
             history: Vec::new(),
             pacemaker: None,
+            view_requests: Vec::new(),
             readiness: Readiness::DisabledMissingCausalReadinessAndTransport,
         })
     }
@@ -839,6 +1032,7 @@ impl Adapter {
             pending: Vec::new(),
             history: Vec::new(),
             pacemaker: None,
+            view_requests: Vec::new(),
             readiness: Readiness::RecoveryRequiredHistoricalIntentsUnavailable,
         };
         let output = adapter.driver.output();
@@ -915,6 +1109,8 @@ impl Adapter {
         history: Vec<AgreementSigningIntent>,
     ) -> Result<(), String> {
         self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+        self.view_requests
+            .retain(|r| r.context() == output.binding.tip());
         // Validate every historical identity before producing any signature. Nil has
         // no DAG carrier and is signed only by the explicit durable publication path.
         for intent in &history {
