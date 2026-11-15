@@ -7,6 +7,96 @@ use validator::{
     SlotOutcome, SlotProposal, Vertex,
 };
 
+fn inspect_envelope(
+    envelope: &CarrierEnvelope,
+    m: &chain::Membership,
+    bootstrap: &AuthenticatedSlotAgreementBootstrap,
+    vertices: &[Vertex],
+    lineage: &SlotAgreementViewLineage,
+) {
+    let binding =
+        validator::SlotAgreementBinding::from_checkpoint(bootstrap.agreement.context.clone(), None)
+            .unwrap();
+    let mut dag = Dag::new(m.set.clone());
+    dag.set_chain_id(b"live-adapter-tests".to_vec());
+    let is_vote = matches!(envelope.payload(), CarrierPayload::Vote(_));
+    let external = is_vote.then_some(lineage);
+    // No retained ancestry, even though the wrapper itself is codec-consistent.
+    assert!(envelope.inspect(&dag, &binding, external).is_err());
+    for vertex in vertices {
+        dag.insert(vertex.clone()).unwrap();
+    }
+    let decoded = CarrierEnvelope::decode(&envelope.encode(&m.set).unwrap(), &m.set).unwrap();
+    decoded.inspect(&dag, &binding, external).unwrap();
+    let wrong_binding = validator::SlotAgreementBinding::from_checkpoint(
+        bootstrap.agreement.context.clone(),
+        Some(envelope.carrier().clone()),
+    )
+    .unwrap();
+    assert!(decoded.inspect(&dag, &wrong_binding, external).is_err());
+    if is_vote {
+        assert!(decoded.inspect(&dag, &binding, None).is_err());
+        let mut wrong = lineage.clone();
+        wrong.entries[0].view_carrier.digest[0] ^= 1;
+        assert!(decoded.inspect(&dag, &binding, Some(&wrong)).is_err());
+    } else {
+        assert!(decoded.inspect(&dag, &binding, Some(lineage)).is_err());
+    }
+
+    // A real signed carrier with an unrelated payload_hash is not authenticated
+    // merely because the wrapper's digest and nested codecs agree.
+    let original = vertices
+        .iter()
+        .find(|v| v.id().unwrap() == *envelope.carrier())
+        .unwrap();
+    let author = m
+        .consensus
+        .iter()
+        .position(|id| id.id == original.author)
+        .unwrap();
+    let wrong = signed(
+        m,
+        author,
+        original.round,
+        original.references.clone(),
+        [99; 32],
+    );
+    let mut wrong_dag = Dag::new(m.set.clone());
+    wrong_dag.set_chain_id(b"live-adapter-tests".to_vec());
+    for vertex in vertices.iter().filter(|v| v.round < original.round) {
+        wrong_dag.insert(vertex.clone()).unwrap();
+    }
+    let wrong_id = wrong_dag.insert(wrong).unwrap();
+    let payload = match envelope.payload() {
+        CarrierPayload::Vote(p) => CarrierPayload::Vote(p.clone()),
+        CarrierPayload::Pol(p) => {
+            let mut p = p.clone();
+            p.entries.last_mut().unwrap().pol.as_mut().unwrap().carrier = wrong_id.clone();
+            CarrierPayload::Pol(p)
+        }
+        CarrierPayload::Final(p) => CarrierPayload::Final(p.clone()),
+    };
+    let body = match &payload {
+        CarrierPayload::Vote(p) => p.encode(&m.set).unwrap(),
+        CarrierPayload::Pol(p) => p.encode(&m.set).unwrap(),
+        CarrierPayload::Final(p) => p.encode(&m.set).unwrap(),
+    };
+    let mut e = crypto::encoding::Encoder::new();
+    e.put_u16(1);
+    e.put_u8(match payload {
+        CarrierPayload::Vote(_) => 0,
+        CarrierPayload::Pol(_) => 1,
+        CarrierPayload::Final(_) => 2,
+    });
+    e.put_u64(wrong_id.round);
+    e.put_bytes(&wrong_id.author).unwrap();
+    e.put_raw(&wrong_id.digest);
+    e.put_raw(&envelope.payload_digest());
+    e.put_bytes(&body).unwrap();
+    let wrong = CarrierEnvelope::decode(&e.finish(), &m.set).unwrap();
+    assert!(wrong.inspect(&wrong_dag, &binding, external).is_err());
+}
+
 fn check_envelope(envelope: &CarrierEnvelope, set: &ValidatorSet) {
     let bytes = envelope.encode(set).unwrap();
     let decoded = CarrierEnvelope::decode(&bytes, set).unwrap();
@@ -406,6 +496,9 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             .unwrap();
             assert_eq!(envelope.payload(), &CarrierPayload::Vote(payload.clone()));
             check_envelope(&envelope, &m.set);
+            let mut inspection_vertices = vertices.clone();
+            inspection_vertices.push(v.clone());
+            inspect_envelope(&envelope, &m, &bootstrap, &inspection_vertices, &lineage);
             let mut oversized = payload.clone();
             oversized
                 .signature
@@ -537,6 +630,10 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
     let lineage = candidate.bind_carrier(pol_carrier.clone());
     assert_eq!(envelope.payload(), &CarrierPayload::Pol(lineage.clone()));
     assert_eq!(lineage.pol_digest(0, &m.set).unwrap(), pol_digest);
+    let mut inspection_vertices = vertices.clone();
+    inspection_vertices.extend(vote_vertices.clone());
+    inspection_vertices.extend(pol_vertices.clone());
+    inspect_envelope(&envelope, &m, &bootstrap, &inspection_vertices, &lineage);
     let mut incoming = vote_vertices;
     incoming.extend(pol_vertices.clone());
     for adapter in &mut adapters {
@@ -661,11 +758,24 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
     };
     assert_eq!(intent.prerequisite_carriers().unwrap(), expected);
     let refs = precommit_vertices.iter().map(|v| v.id().unwrap()).collect();
-    let final_carrier = signed(&m, 0, 8, refs, *digest).id().unwrap();
+    let final_vertex = signed(&m, 0, 8, refs, *digest);
+    let final_carrier = final_vertex.id().unwrap();
     let envelope = intent.into_envelope(final_carrier.clone(), &m.set).unwrap();
     assert_eq!(envelope.payload(), &CarrierPayload::Final(proof.clone()));
     assert_eq!(envelope.payload_digest(), *digest);
     check_envelope(&envelope, &m.set);
+    inspection_vertices.extend(precommit_vertices.clone());
+    inspection_vertices.push(final_vertex);
+    inspect_envelope(&envelope, &m, &bootstrap, &inspection_vertices, &lineage);
+    for witness in &witnesses {
+        let vote = PendingIntent::Vote {
+            payload: witness.payload.clone(),
+            digest: witness.payload.digest(&m.set).unwrap(),
+        }
+        .into_envelope(witness.carrier.clone(), &m.set)
+        .unwrap();
+        inspect_envelope(&vote, &m, &bootstrap, &inspection_vertices, &lineage);
+    }
     assert!(
         PendingIntent::FinalProof {
             proof: proof.clone(),

@@ -1,10 +1,14 @@
-//! Inactive complete carrier representation; construction and decoding are not authentication.
+//! Inactive carrier representation; construction and decoding are not authentication.
+//!
+//! Vote envelopes are not self-contained lineage: inspection requires the caller's full
+//! retained view lineage. POL and final envelopes retain their full inner lineage.
 
 use super::PendingIntent;
 use crypto::encoding::{Decoder, Encoder, MAX_FIELD_LEN};
 use crypto::{CryptoError, CryptoErrorKind};
 use validator::{
-    SlotAgreementProof, SlotAgreementViewLineage, SlotAgreementVotePayload, ValidatorSet, VertexId,
+    Dag, SlotAgreementBinding, SlotAgreementProof, SlotAgreementViewLineage,
+    SlotAgreementVotePayload, SlotAgreementVoteWitness, ValidatorSet, VertexId,
 };
 
 /// One MiB including framing, consistent with the existing evidence codec bound.
@@ -12,7 +16,7 @@ pub const MAX_ENVELOPE_BYTES: usize = MAX_FIELD_LEN;
 const MAX_AUTHOR_BYTES: usize = 1024;
 const VERSION: u16 = 1;
 
-/// Complete owned evidence. Access through an envelope is immutable.
+/// Owned payload evidence, immutable through an envelope; votes require external lineage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CarrierPayload {
     /// Individual nonnil prevote or precommit, including its prerequisite.
@@ -100,7 +104,7 @@ impl CarrierEnvelope {
         &self.carrier
     }
 
-    /// Returns full immutable evidence, including every retained witness and lineage entry.
+    /// Returns immutable payload evidence; vote payloads do not contain full view lineage.
     pub fn payload(&self) -> &CarrierPayload {
         &self.payload
     }
@@ -108,6 +112,51 @@ impl CarrierEnvelope {
     /// Returns the exact existing protocol payload digest.
     pub fn payload_digest(&self) -> [u8; 32] {
         self.payload_digest
+    }
+
+    /// Authenticates evidence against the current DAG and a caller-trusted binding.
+    ///
+    /// Votes require the full retained `vote_lineage`; POL and final payloads carry
+    /// their own lineage and reject an external one. Success is only an inspection
+    /// result for this DAG borrow, not a reusable authentication token or permission
+    /// to persist, sign, publish, or apply a decision. This boundary is inactive.
+    ///
+    /// # Errors
+    /// Rejects missing/irrelevant vote lineage and all unified DAG inspection errors,
+    /// including incorrect carriers, payload hashes, ancestry, signatures or binding.
+    pub fn inspect(
+        &self,
+        dag: &Dag,
+        binding: &SlotAgreementBinding,
+        vote_lineage: Option<&SlotAgreementViewLineage>,
+    ) -> Result<(), CryptoError> {
+        match &self.payload {
+            CarrierPayload::Vote(payload) => {
+                let lineage = vote_lineage.ok_or_else(|| invalid("vote requires full lineage"))?;
+                dag.inspect_slot_agreement_vote(
+                    lineage,
+                    &SlotAgreementVoteWitness {
+                        payload: payload.clone(),
+                        carrier: self.carrier.clone(),
+                    },
+                    binding,
+                )
+            }
+            CarrierPayload::Pol(lineage) => {
+                if vote_lineage.is_some() {
+                    return Err(invalid("external vote lineage supplied for POL"));
+                }
+                dag.inspect_slot_agreement_view_lineage(lineage, binding)
+                    .map(|_| ())
+            }
+            CarrierPayload::Final(proof) => {
+                if vote_lineage.is_some() {
+                    return Err(invalid("external vote lineage supplied for final proof"));
+                }
+                dag.inspect_slot_agreement_proof(proof, &self.carrier, binding)
+                    .map(|_| ())
+            }
+        }
     }
 
     /// Encodes inactive transport/storage bytes with no embedded validator-set authority.
@@ -140,7 +189,8 @@ impl CarrierEnvelope {
         Ok(e.finish())
     }
 
-    /// Decodes complete evidence against a caller-pinned set, without authenticating it.
+    /// Decodes payload evidence against a caller-pinned set, without authenticating it.
+    /// Vote envelopes still require external full lineage for inspection.
     /// # Errors
     /// Rejects all outer lengths/trailing bytes before nested decode, unknown tags or
     /// versions, malformed bodies, digest mismatch and selected-carrier mismatch.
@@ -187,7 +237,8 @@ impl CarrierEnvelope {
 }
 
 impl PendingIntent {
-    /// Binds owned complete evidence to a supplied actual carrier ID.
+    /// Binds owned payload evidence to a supplied actual carrier ID.
+    /// Vote intents do not contain the full lineage required for inspection.
     /// This checks construction consistency only, not authentication, readiness,
     /// carrier payload_hash, signing, publication or application authority.
     /// # Errors
