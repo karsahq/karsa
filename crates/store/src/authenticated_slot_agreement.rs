@@ -898,18 +898,55 @@ struct ViewRequests {
 // Explicit local authorizations are separate from remotely supplied observations.
 const MAX_LOCAL_REQUEST_TARGETS: usize = 16;
 
+/// One certified slot application after the original checkpoint, including skips.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgreementApplicationBoundary {
+    round: u64,
+    order_len: usize,
+    is_commit: bool,
+}
+
+impl AgreementApplicationBoundary {
+    /// Returns the applied slot's round.
+    pub fn round(&self) -> u64 {
+        self.round
+    }
+
+    /// Returns the cumulative order length immediately after this application.
+    pub fn order_len(&self) -> usize {
+        self.order_len
+    }
+
+    /// Returns whether the actual application committed rather than skipped.
+    pub fn is_commit(&self) -> bool {
+        self.is_commit
+    }
+}
+
 /// Immutable replay-derived ordering at the last durable slot-application boundary.
 /// A decided but unadvanced slot is excluded. This contains the complete retained
 /// checkpoint prefix and subsequent certified applications, not transaction execution
 /// state or permission to mutate a live DAG. No acknowledgement or compaction occurs.
 #[derive(Debug, Clone)]
 pub struct AgreementOrderingSnapshot {
+    checkpoint_binding: SlotAgreementBinding,
+    applications: Vec<AgreementApplicationBoundary>,
     binding: SlotAgreementBinding,
     order: Vec<VertexId>,
     vertices: Vec<Vertex>,
 }
 
 impl AgreementOrderingSnapshot {
+    /// Returns the original trusted checkpoint binding, before replayed applications.
+    pub fn checkpoint_binding(&self) -> &SlotAgreementBinding {
+        &self.checkpoint_binding
+    }
+
+    /// Returns replayed applications, including skips but excluding the checkpoint itself.
+    pub fn applications(&self) -> &[AgreementApplicationBoundary] {
+        &self.applications
+    }
+
     /// Returns the active next-slot binding derived from the same replay as the order.
     pub fn binding(&self) -> &SlotAgreementBinding {
         &self.binding
@@ -940,6 +977,7 @@ type ReplayState = (
     Vec<AgreementCompletedNilVote>,
     ViewRequests,
     CertifiedDag,
+    Vec<AgreementApplicationBoundary>,
 );
 
 fn reservation_bounds(
@@ -1020,6 +1058,7 @@ fn replay(
     let mut completed_nil: Vec<AgreementCompletedNilVote> = Vec::new();
     let mut nil_buckets: BTreeMap<Vec<u8>, NilVoteBucket> = BTreeMap::new();
     let mut view_requests = ViewRequests::default();
+    let mut applications = Vec::new();
     for (index, event) in events.iter().enumerate() {
         let incoming = match event {
             AuthenticatedSlotAgreementRequest::ObserveProposal { vertices, .. }
@@ -1408,7 +1447,14 @@ fn replay(
             let (proof, carrier) = finalization
                 .take()
                 .ok_or_else(|| invalid("missing durable deciding proof"))?;
-            dag.prepare_agreement(&proof, &carrier)?.apply();
+            let application = dag.prepare_agreement(&proof, &carrier)?.apply();
+            if let validator::SlotApplicationResult::Applied { round, decision } = application {
+                applications.push(AgreementApplicationBoundary {
+                    round,
+                    order_len: dag.dag().order().len(),
+                    is_commit: matches!(decision, validator::Decision::Commit(_)),
+                });
+            }
             binding = SlotAgreementBinding::from_checkpoint(
                 dag.binding().tip().clone(),
                 dag.binding().carrier().cloned(),
@@ -1755,6 +1801,7 @@ fn replay(
         completed_nil,
         view_requests,
         dag,
+        applications,
     ))
 }
 pub(super) fn validate(root: &Path) -> Result<(), StoreError> {
@@ -2043,7 +2090,7 @@ impl AuthenticatedSlotAgreement {
     }
 
     pub(super) fn driver_snapshot(&self) -> Result<DriverSnapshot, StoreError> {
-        let (transition, candidates, active, binding, reproposal, _, authorable, _, _, _, _, _) =
+        let (transition, candidates, active, binding, reproposal, _, authorable, _, _, _, _, _, _) =
             self.replay_owned()?;
         Ok((
             active, transition, candidates, reproposal, binding, authorable,
@@ -2057,7 +2104,12 @@ impl AuthenticatedSlotAgreement {
     /// # Errors
     /// Rejects stale or uncertain owners, corrupt evidence, and missing ordered vertices.
     pub fn ordering_snapshot(&self) -> Result<AgreementOrderingSnapshot, StoreError> {
-        let (_, _, _, binding, _, _, _, _, _, _, _, dag) = self.replay_owned()?;
+        let (_, _, _, binding, _, _, _, _, _, _, _, dag, applications) = self.replay_owned()?;
+        let bootstrap = AuthenticatedSlotAgreementBootstrap::decode(&self.header)?;
+        let checkpoint_binding = SlotAgreementBinding::from_checkpoint(
+            bootstrap.agreement.context,
+            bootstrap.predecessor,
+        )?;
         let order = dag.dag().order().to_vec();
         let vertices = order
             .iter()
@@ -2069,6 +2121,8 @@ impl AuthenticatedSlotAgreement {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(AgreementOrderingSnapshot {
+            checkpoint_binding,
+            applications,
             binding,
             order,
             vertices,

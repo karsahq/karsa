@@ -1910,8 +1910,10 @@ pub(super) fn disabled_guard(store: &Store) -> Result<(), String> {
 
 mod envelope;
 mod execution;
+mod finalization;
 mod ordering;
 pub use execution::CertifiedExecution;
+pub use finalization::CertifiedFinalization;
 pub mod pacemaker;
 pub use envelope::{CarrierEnvelope, CarrierPayload, MAX_ENVELOPE_BYTES};
 pub use ordering::OrderingConsumer;

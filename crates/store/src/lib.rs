@@ -66,11 +66,12 @@ pub use slot_agreement_driver::{
 };
 mod slot_agreement_journal;
 pub use authenticated_slot_agreement::{
-    AgreementCarrierEvidence, AgreementCompletedCarrier, AgreementCompletedNilVote,
-    AgreementExecutionCheckpoint, AgreementOrderingSnapshot, AgreementQuorumCandidate,
-    AgreementReproposalCandidate, AgreementReservedCarrier, AgreementSigningIntent,
-    AgreementSigningPrerequisite, AgreementViewRequestReservation, AuthenticatedSlotAgreement,
-    AuthenticatedSlotAgreementBootstrap, AuthenticatedSlotAgreementRequest,
+    AgreementApplicationBoundary, AgreementCarrierEvidence, AgreementCompletedCarrier,
+    AgreementCompletedNilVote, AgreementExecutionCheckpoint, AgreementOrderingSnapshot,
+    AgreementQuorumCandidate, AgreementReproposalCandidate, AgreementReservedCarrier,
+    AgreementSigningIntent, AgreementSigningPrerequisite, AgreementViewRequestReservation,
+    AuthenticatedSlotAgreement, AuthenticatedSlotAgreementBootstrap,
+    AuthenticatedSlotAgreementRequest,
 };
 #[cfg(test)]
 mod slot_agreement_signing_tests;

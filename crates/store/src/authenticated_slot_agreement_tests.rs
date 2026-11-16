@@ -207,6 +207,8 @@ fn ordering_snapshot_tracks_only_applied_certified_prefix_and_recovers() {
             before.order().is_empty(),
             "a decision is not an applied slot"
         );
+        assert!(before.applications().is_empty());
+        assert_eq!(before.checkpoint_binding(), before.binding());
         assert_eq!(before.binding().tip(), &bootstrap.agreement.context);
         let stale = store
             .recover_authenticated_slot_agreement(bootstrap.clone())
@@ -219,6 +221,12 @@ fn ordering_snapshot_tracks_only_applied_certified_prefix_and_recovers() {
         let path = dir.0.join(authenticated_slot_agreement::FILE);
         let wal = fs::read(&path).unwrap();
         let applied = owner.ordering_snapshot().unwrap();
+        assert_eq!(applied.checkpoint_binding(), before.checkpoint_binding());
+        assert_eq!(applied.applications().len(), 1);
+        let boundary = &applied.applications()[0];
+        assert_eq!(boundary.round(), decision.round);
+        assert_eq!(boundary.order_len(), applied.order().len());
+        assert_eq!(boundary.is_commit(), committing);
         assert_eq!(applied.order().len() as u64, decision.after_len);
         assert_eq!(validator::commit_root(applied.order()), decision.after_root);
         assert_eq!(applied.binding().tip().order_len(), decision.after_len);
@@ -263,6 +271,7 @@ fn ordering_snapshot_tracks_only_applied_certified_prefix_and_recovers() {
             .recover_authenticated_slot_agreement(bootstrap)
             .unwrap();
         let recovered = owner.ordering_snapshot().unwrap();
+        assert_eq!(recovered.applications(), applied.applications());
         assert_eq!(format!("{recovered:?}"), format!("{applied:?}"));
         assert_eq!(fs::read(&path).unwrap(), wal);
         let mut torn = wal.clone();
@@ -293,10 +302,12 @@ fn ordering_snapshot_tracks_only_applied_certified_prefix_and_recovers() {
         let next_owner = next_store
             .begin_authenticated_slot_agreement(checkpoint)
             .unwrap();
-        assert_eq!(
-            format!("{:?}", next_owner.ordering_snapshot().unwrap()),
-            format!("{applied:?}")
-        );
+        let checkpoint_snapshot = next_owner.ordering_snapshot().unwrap();
+        assert_eq!(checkpoint_snapshot.binding(), applied.binding());
+        assert_eq!(checkpoint_snapshot.checkpoint_binding(), applied.binding());
+        assert_eq!(checkpoint_snapshot.order(), applied.order());
+        assert_eq!(checkpoint_snapshot.vertices(), applied.vertices());
+        assert!(checkpoint_snapshot.applications().is_empty());
     }
 }
 

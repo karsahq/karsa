@@ -8,6 +8,446 @@ use validator::{
 };
 
 #[test]
+fn certified_finalization_replays_two_authenticated_commit_boundaries() {
+    use std::collections::{BTreeMap, BTreeSet};
+    use validator::slot_agreement::{AgreementPhase, AgreementQc, AgreementValue, AgreementVote};
+    use validator::{
+        SlotAgreementProof, SlotAgreementProofPol, SlotAgreementVotePayload,
+        SlotAgreementVoteWitness,
+    };
+
+    // Like store's append_unified_proof fixture, retain signed witnesses for both
+    // phases and bind each aggregate to its actual causal carrier.
+    fn append_proof(
+        m: &Membership,
+        chain_id: &[u8],
+        vertices: &mut Vec<Vertex>,
+        context: SlotDecisionTip,
+        proposal: SlotProposal,
+        proposal_carrier: VertexId,
+        first_round: u64,
+    ) -> (SlotAgreementProof, VertexId) {
+        vertices.retain(|v| v.round < first_round);
+        let qc = |phase| {
+            let vote = AgreementVote {
+                context: context.clone(),
+                view: AgreementView(0),
+                phase,
+                value: AgreementValue::Decision(proposal.decision.clone()),
+            };
+            let bytes = vote.signing_payload(&m.set).unwrap();
+            let mut signatures: Vec<_> = (0..3)
+                .map(|i| ValidatorSignature {
+                    validator_id: m.consensus[i].id.clone(),
+                    key_id: m.set.validators[i].keys[0].key_id.clone(),
+                    signature: Ed25519Scheme
+                        .sign(&m.consensus[i].private_key, &bytes)
+                        .unwrap(),
+                })
+                .collect();
+            signatures.sort_by(|a, b| a.validator_id.cmp(&b.validator_id));
+            AgreementQc { vote, signatures }
+        };
+        let prevote = qc(AgreementPhase::Prevote);
+        let mut proof = SlotAgreementProof {
+            certificate: qc(AgreementPhase::Precommit),
+            entries: vec![SlotAgreementProofEntry {
+                proposal: proposal.clone().into(),
+                proposal_carrier: proposal_carrier.clone(),
+                view: AgreementView(0),
+                view_carrier: proposal_carrier.clone(),
+                previous_pol: None,
+                pol: None,
+            }],
+            votes: vec![],
+        };
+        let proposer = validator::slot_agreement_view_proposer(
+            &m.set,
+            proposal.decision.round,
+            AgreementView(0),
+        )
+        .unwrap();
+        let author = m.consensus.iter().position(|v| v.id == proposer).unwrap();
+        let mut refs: Vec<_> = vertices
+            .iter()
+            .filter(|v| v.round == first_round - 1)
+            .map(|v| v.id().unwrap())
+            .collect();
+        for offset in 0..=4 {
+            let round = first_round + offset;
+            let mut hashes = [[9; 32]; 4];
+            if offset == 0 {
+                hashes[author] = proof.view_digest(0).unwrap();
+            }
+            if offset == 1 || offset == 3 {
+                let certificate = if offset == 1 {
+                    &prevote
+                } else {
+                    &proof.certificate
+                };
+                for signature in &certificate.signatures {
+                    let i = m
+                        .consensus
+                        .iter()
+                        .position(|identity| identity.id == signature.validator_id)
+                        .unwrap();
+                    let payload = SlotAgreementVotePayload {
+                        vote: certificate.vote.clone(),
+                        signature: signature.clone(),
+                        prerequisite: if offset == 1 {
+                            proof.entries[0].view_carrier.clone()
+                        } else {
+                            proof.entries[0].pol.as_ref().unwrap().carrier.clone()
+                        },
+                    };
+                    hashes[i] = payload.digest(&m.set).unwrap();
+                    let vertex = signed_for_chain(m, i, round, refs.clone(), hashes[i], chain_id);
+                    let witness = SlotAgreementVoteWitness {
+                        payload,
+                        carrier: vertex.id().unwrap(),
+                    };
+                    if offset == 1 {
+                        proof.entries[0]
+                            .pol
+                            .get_or_insert(SlotAgreementProofPol {
+                                certificate: prevote.clone(),
+                                votes: vec![],
+                                carrier: proposal_carrier.clone(),
+                            })
+                            .votes
+                            .push(witness);
+                    } else {
+                        proof.votes.push(witness);
+                    }
+                }
+            }
+            if offset == 2 {
+                hashes[0] = proof.pol_digest(0, &m.set).unwrap();
+            }
+            if offset == 4 {
+                hashes[0] = proof.digest(&m.set).unwrap();
+            }
+            let mut next = vec![];
+            for (i, hash) in hashes.into_iter().enumerate() {
+                let vertex = signed_for_chain(m, i, round, refs.clone(), hash, chain_id);
+                next.push(vertex.id().unwrap());
+                vertices.push(vertex);
+            }
+            if offset == 0 {
+                proof.entries[0].view_carrier = next[author].clone();
+            }
+            if offset == 2 {
+                proof.entries[0].pol.as_mut().unwrap().carrier = next[0].clone();
+            }
+            refs = next;
+        }
+        (proof, refs[0].clone())
+    }
+
+    let chain_id = b"certified-finalization-backlog";
+    let accounts = chain::accounts(4).unwrap();
+    let mut batches = BTreeMap::new();
+    let mut hashes = BTreeMap::new();
+    for round in 0..=2 {
+        for author in 0..4 {
+            let batch = chain::demo_batch(chain_id, &accounts, author, round, 1).unwrap();
+            let hash = batch.digest().unwrap();
+            hashes.insert((author, round), hash);
+            batches.insert(hash, batch);
+        }
+    }
+    let (m, bootstrap, request) =
+        fixture_for_chain_with_payload(chain_id, |author, round| hashes[&(author, round)]);
+    let AuthenticatedSlotAgreementRequest::Propose {
+        lineage,
+        mut vertices,
+    } = request
+    else {
+        unreachable!()
+    };
+    let validator::SlotProposalEvidence::Direct { voters } = &lineage.entries[0].proposal.evidence
+    else {
+        panic!("fixture must supply direct proposal evidence")
+    };
+    let first_proposal = SlotProposal {
+        decision: lineage.entries[0].proposal.decision.clone(),
+        voters: voters.clone(),
+    };
+    let (proof, carrier) = append_proof(
+        &m,
+        chain_id,
+        &mut vertices,
+        bootstrap.agreement.context.clone(),
+        first_proposal,
+        lineage.entries[0].proposal_carrier.clone(),
+        4,
+    );
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    adapter
+        .apply(AuthenticatedSlotAgreementRequest::ObservePrecommit {
+            proof,
+            carrier,
+            vertices: vertices.clone(),
+        })
+        .unwrap();
+    adapter
+        .apply(AuthenticatedSlotAgreementRequest::AdvanceSlot)
+        .unwrap();
+    let first = adapter.ordering_snapshot().unwrap();
+
+    let mut dag = Dag::new(m.set.clone());
+    dag.set_chain_id(chain_id.to_vec());
+    for vertex in &vertices {
+        dag.insert(vertex.clone()).unwrap();
+    }
+    dag.seed_order(first.order().to_vec());
+    let validator::Decision::Commit(suffix) = dag.inspect_commit(2).unwrap() else {
+        panic!("round-three voters must commit round two")
+    };
+    assert!(!suffix.is_empty());
+    let mut order = first.order().to_vec();
+    order.extend(suffix);
+    let mut proposal = SlotProposal {
+        decision: SlotDecision {
+            chain_id: chain_id.to_vec(),
+            validator_set_id: m.set.id().unwrap(),
+            epoch: m.set.epoch,
+            round: 2,
+            previous: *first.binding().tip().previous_id(),
+            before_len: first.order().len() as u64,
+            before_root: validator::commit_root(first.order()),
+            after_len: order.len() as u64,
+            after_root: validator::commit_root(&order),
+            outcome: SlotOutcome::Commit {
+                leader: dag.leader(2).unwrap().id().unwrap(),
+            },
+        },
+        voters: vertices
+            .iter()
+            .filter(|v| v.round == 3)
+            .take(3)
+            .map(|v| v.id().unwrap())
+            .collect(),
+    };
+    proposal
+        .voters
+        .sort_by(|a, b| (&a.round, &a.author, &a.digest).cmp(&(&b.round, &b.author, &b.digest)));
+    let refs: Vec<_> = vertices
+        .iter()
+        .filter(|v| v.round == 8)
+        .map(|v| v.id().unwrap())
+        .collect();
+    let mut proposal_carrier = None;
+    for author in 0..4 {
+        let hash = if author == 0 {
+            proposal.digest().unwrap()
+        } else {
+            [9; 32]
+        };
+        let vertex = signed_for_chain(&m, author, 9, refs.clone(), hash, chain_id);
+        if author == 0 {
+            proposal_carrier = Some(vertex.id().unwrap());
+        }
+        vertices.push(vertex);
+    }
+    let (proof, carrier) = append_proof(
+        &m,
+        chain_id,
+        &mut vertices,
+        first.binding().tip().clone(),
+        proposal,
+        proposal_carrier.unwrap(),
+        10,
+    );
+    adapter
+        .apply(AuthenticatedSlotAgreementRequest::ObservePrecommit {
+            proof,
+            carrier,
+            vertices,
+        })
+        .unwrap();
+    adapter
+        .apply(AuthenticatedSlotAgreementRequest::AdvanceSlot)
+        .unwrap();
+    let complete = adapter.ordering_snapshot().unwrap();
+    assert_eq!(complete.order(), order);
+    assert_eq!(complete.applications().len(), 2);
+    assert!(
+        complete
+            .applications()
+            .iter()
+            .all(|boundary| boundary.is_commit())
+    );
+    assert!(complete.applications()[0].order_len() < complete.applications()[1].order_len());
+    let wal = std::fs::read(dir.0.join("authenticated-slot-agreement")).unwrap();
+    drop(adapter);
+    drop(store);
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    let recovered = adapter.ordering_snapshot().unwrap();
+    assert_eq!(format!("{recovered:?}"), format!("{complete:?}"));
+
+    let genesis = chain::genesis_state(&accounts).unwrap();
+    let mut expected = genesis.clone();
+    let mut rejected = BTreeMap::new();
+    let mut applied = 0;
+    let mut expected_prefixes = vec![];
+    for (index, vertex) in recovered.vertices().iter().enumerate() {
+        applied += chain::apply_batch(
+            &mut expected,
+            &accounts,
+            &batches[&vertex.payload_hash],
+            &mut rejected,
+        ) as u64;
+        if recovered
+            .applications()
+            .iter()
+            .any(|boundary| boundary.order_len() == index + 1)
+        {
+            expected_prefixes.push((expected.state_root(), applied));
+        }
+    }
+    assert!(rejected.is_empty());
+    assert_eq!(expected_prefixes.len(), 2);
+    assert_ne!(expected_prefixes[0].0, expected_prefixes[1].0);
+    assert!(expected_prefixes[0].1 < expected_prefixes[1].1);
+    let anchor = validator::Header {
+        chain_id: chain_id.to_vec(),
+        epoch: m.set.epoch,
+        height: 0,
+        round: 0,
+        state_root: genesis.state_root(),
+        dag_root: *recovered.checkpoint_binding().tip().order_root(),
+        previous: [0; 32],
+        applied: 0,
+    };
+    let finalizer = validator::Finalizer::new(
+        validator::SetSchedule::single(m.set.clone()),
+        validator::EpochSchedule::single(m.set.epoch),
+        chain_id.to_vec(),
+        m.consensus[0].id.clone(),
+        m.consensus[0].private_key.clone(),
+        anchor.clone(),
+        0,
+    )
+    .unwrap();
+    let mut coordinator =
+        CertifiedFinalization::begin(recovered.clone(), genesis, finalizer).unwrap();
+    let controls = BTreeSet::new();
+    let built = coordinator
+        .build_ready(&m, &batches, &controls, 42)
+        .unwrap();
+    assert_eq!(built.shares.len(), 2);
+    assert!(built.certified.is_empty());
+    let mut previous = anchor.id().unwrap();
+    for (index, share) in built.shares.iter().enumerate() {
+        let boundary = &recovered.applications()[index];
+        assert_eq!(share.header.height, index as u64 + 1);
+        assert_eq!(share.header.round, boundary.round());
+        assert_eq!(share.header.previous, previous);
+        assert_eq!(share.header.state_root, expected_prefixes[index].0);
+        assert_eq!(share.header.applied, expected_prefixes[index].1);
+        assert_eq!(
+            share.header.dag_root,
+            validator::commit_root(&recovered.order()[..boundary.order_len()])
+        );
+        assert_eq!(share.signer, 0);
+        assert_eq!(share.at, 42);
+        assert_eq!(
+            share.signature,
+            Ed25519Scheme
+                .sign(
+                    &m.consensus[0].private_key,
+                    &validator::signing_payload(&share.header).unwrap()
+                )
+                .unwrap()
+        );
+        previous = share.header.id().unwrap();
+    }
+    assert_eq!(coordinator.execution().state(), &expected);
+    assert_eq!(coordinator.execution().applied(), applied);
+    assert_eq!(coordinator.execution().consumed_order(), recovered.order());
+    for at in 43..46 {
+        coordinator.update(recovered.clone()).unwrap();
+        let duplicate = coordinator
+            .build_ready(&m, &batches, &controls, at)
+            .unwrap();
+        assert!(duplicate.shares.is_empty() && duplicate.certified.is_empty());
+        assert_eq!(coordinator.finalizer().built_headers(), 2);
+        assert_eq!(
+            coordinator.finalizer().last_built(),
+            &built.shares[1].header
+        );
+        assert_eq!(
+            coordinator.finalizer().last_built_order(),
+            recovered.order().len()
+        );
+    }
+    let make_coordinator = || {
+        CertifiedFinalization::begin(
+            recovered.clone(),
+            chain::genesis_state(&accounts).unwrap(),
+            validator::Finalizer::new(
+                validator::SetSchedule::single(m.set.clone()),
+                validator::EpochSchedule::single(m.set.epoch),
+                chain_id.to_vec(),
+                m.consensus[0].id.clone(),
+                m.consensus[0].private_key.clone(),
+                anchor.clone(),
+                0,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    let boundary = recovered.applications()[0].order_len();
+    let second_hash = recovered.vertices()[boundary].payload_hash;
+    let mut missing = batches.clone();
+    missing.remove(&second_hash);
+    let mut partial = make_coordinator();
+    let first_build = partial.build_ready(&m, &missing, &controls, 50).unwrap();
+    assert_eq!(first_build.shares.len(), 1);
+    assert_eq!(first_build.shares[0].header, built.shares[0].header);
+    assert_eq!(
+        partial.execution().consumed_order(),
+        &recovered.order()[..boundary]
+    );
+    assert_eq!(
+        partial.execution().state().state_root(),
+        expected_prefixes[0].0
+    );
+    let second_build = partial.build_ready(&m, &batches, &controls, 51).unwrap();
+    assert_eq!(second_build.shares.len(), 1);
+    assert_eq!(second_build.shares[0].header, built.shares[1].header);
+
+    // If a later batch is invalid, retain already built output until a successful retry.
+    let mut wrong = batches.clone();
+    let foreign = batches
+        .iter()
+        .find(|(hash, _)| **hash != second_hash)
+        .unwrap()
+        .1
+        .clone();
+    wrong.insert(second_hash, foreign);
+    let mut retry = make_coordinator();
+    assert!(retry.build_ready(&m, &wrong, &controls, 60).is_err());
+    assert_eq!(retry.finalizer().built_headers(), 1);
+    let retried = retry.build_ready(&m, &batches, &controls, 61).unwrap();
+    assert_eq!(retried.shares.len(), 2);
+    assert_eq!(retried.shares[0].header, built.shares[0].header);
+    assert_eq!(retried.shares[0].at, 60);
+    assert_eq!(retried.shares[1].header, built.shares[1].header);
+    assert_eq!(retried.shares[1].at, 61);
+    assert_eq!(retry.finalizer().built_headers(), 2);
+    assert_eq!(
+        std::fs::read(dir.0.join("authenticated-slot-agreement")).unwrap(),
+        wal
+    );
+}
+
+#[test]
 fn certified_execution_consumes_empty_controls_and_rejected_batches_in_order() {
     let (m, mut bootstrap, _) = fixture();
     let dir = Dir::new();
@@ -62,9 +502,35 @@ fn certified_execution_consumes_empty_controls_and_rejected_batches_in_order() {
     assert_eq!(execution.consumed_order(), &order[..1]);
     assert_eq!(execution.state(), &genesis);
     assert_eq!(execution.applied(), 0);
-    execution
-        .execute_ready(&m, &batches, &std::collections::BTreeSet::from([control]))
-        .unwrap();
+    let controls = std::collections::BTreeSet::from([control]);
+    assert!(
+        execution
+            .execute_through(2, &m, &batches, &controls)
+            .unwrap()
+    );
+    assert_eq!(execution.consumed_order(), &order[..2]);
+    assert_eq!(execution.state(), &genesis);
+    assert!(
+        execution
+            .execute_through(3, &m, &batches, &controls)
+            .unwrap()
+    );
+    assert_eq!(execution.consumed_order(), &order[..3]);
+    assert_eq!(execution.applied(), 1);
+    let intermediate = execution.state().clone();
+    assert!(
+        execution
+            .execute_through(2, &m, &batches, &controls)
+            .is_err()
+    );
+    assert!(
+        execution
+            .execute_through(5, &m, &batches, &controls)
+            .is_err()
+    );
+    assert_eq!(execution.state(), &intermediate);
+    assert_eq!(execution.consumed_order(), &order[..3]);
+    execution.execute_ready(&m, &batches, &controls).unwrap();
     assert_eq!(execution.consumed_order(), order);
     assert_eq!(
         execution.applied(),
@@ -634,6 +1100,7 @@ fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen
     drop(stores);
     let mut agreed_order = None;
     let mut agreed_execution = None;
+    let mut agreed_header = None;
     for i in 0..3 {
         let store = Store::open(&dirs[i].0).unwrap();
         let mut adapter = Adapter::recover(&store, bootstraps[i].clone(), &m, i).unwrap();
@@ -734,6 +1201,130 @@ fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen
             );
         } else {
             agreed_execution = Some(result);
+        }
+        // This real carrier fixture supplies one applied commit, not a multi-slot backlog.
+        assert_eq!(recovered.applications().len(), 1);
+        assert!(recovered.applications()[0].is_commit());
+        let genesis = chain::genesis_state(&accounts).unwrap();
+        let anchor = validator::Header {
+            chain_id: chain_id.to_vec(),
+            epoch: recovered.checkpoint_binding().tip().epoch(),
+            height: 0,
+            round: 0,
+            state_root: genesis.state_root(),
+            dag_root: *recovered.checkpoint_binding().tip().order_root(),
+            previous: [0; 32],
+            applied: 0,
+        };
+        let make_finalizer = |anchor| {
+            validator::Finalizer::new(
+                validator::SetSchedule::single(m.set.clone()),
+                validator::EpochSchedule::single(m.set.epoch),
+                chain_id.to_vec(),
+                m.consensus[i].id.clone(),
+                m.consensus[i].private_key.clone(),
+                anchor,
+                0,
+            )
+            .unwrap()
+        };
+        if i == 0 {
+            let mut speculative = make_finalizer(anchor.clone());
+            speculative.record_commit(99, recovered.order().len());
+            assert!(
+                CertifiedFinalization::begin(recovered.clone(), genesis.clone(), speculative)
+                    .is_err(),
+                "legacy pending commits must not enter certified finalization"
+            );
+            let mut incompatible = anchor.clone();
+            incompatible.state_root[0] ^= 1;
+            let error = CertifiedFinalization::begin(
+                recovered.clone(),
+                genesis.clone(),
+                make_finalizer(incompatible),
+            )
+            .err()
+            .expect("incompatible genesis state root must be rejected");
+            assert!(error.contains("matching pristine genesis anchor"));
+        }
+        let mut finalization = CertifiedFinalization::begin(
+            recovered.clone(),
+            genesis.clone(),
+            make_finalizer(anchor.clone()),
+        )
+        .unwrap();
+        let controls = std::collections::BTreeSet::new();
+        let blocked = finalization
+            .build_ready(&m, &std::collections::BTreeMap::new(), &controls, 10)
+            .unwrap();
+        assert!(blocked.shares.is_empty() && blocked.certified.is_empty());
+        assert_eq!(finalization.execution().state(), &genesis);
+        assert!(finalization.execution().consumed_order().is_empty());
+        assert_eq!(finalization.execution().applied(), 0);
+        assert_eq!(finalization.finalizer().built_headers(), 0);
+        assert_eq!(finalization.finalizer().last_built(), &anchor);
+        let mut missing = batches.clone();
+        missing.remove(&recovered.vertices()[1].payload_hash);
+        let partial = finalization
+            .build_ready(&m, &missing, &controls, 11)
+            .unwrap();
+        assert!(partial.shares.is_empty() && partial.certified.is_empty());
+        assert_eq!(
+            finalization.execution().consumed_order(),
+            &recovered.order()[..1]
+        );
+        assert_eq!(finalization.execution().applied(), 1);
+        assert_ne!(finalization.execution().state(), &genesis);
+        assert_eq!(finalization.finalizer().built_headers(), 0);
+        assert_eq!(finalization.finalizer().last_built_order(), 0);
+        finalization.update(recovered.clone()).unwrap();
+        let built = finalization
+            .build_ready(&m, &batches, &controls, 12)
+            .unwrap();
+        assert_eq!(built.shares.len(), 1);
+        assert!(
+            built.certified.is_empty(),
+            "one local signer is not a quorum"
+        );
+        let share = &built.shares[0];
+        assert_eq!(share.signer, i);
+        assert_eq!(share.at, 12);
+        assert_eq!(
+            share.signature,
+            Ed25519Scheme
+                .sign(
+                    &m.consensus[i].private_key,
+                    &validator::signing_payload(&share.header).unwrap(),
+                )
+                .unwrap()
+        );
+        let header = &share.header;
+        assert_eq!(header.height, 1);
+        assert_eq!(header.round, decision.round);
+        assert_eq!(header.previous, anchor.id().unwrap());
+        assert_eq!(header.state_root, result.0);
+        assert_eq!(header.applied, result.1);
+        assert_eq!(header.dag_root, decision.after_root);
+        assert_eq!(finalization.execution().state(), honest_execution.state());
+        assert_eq!(finalization.execution().consumed_order(), recovered.order());
+        assert_eq!(
+            finalization.finalizer().last_built_order(),
+            recovered.order().len()
+        );
+        if let Some(expected) = &agreed_header {
+            assert_eq!(header, expected, "honest finalizers build the same header");
+        } else {
+            agreed_header = Some(header.clone());
+        }
+        for at in 13..16 {
+            finalization.update(recovered.clone()).unwrap();
+            let duplicate = finalization
+                .build_ready(&m, &batches, &controls, at)
+                .unwrap();
+            assert!(duplicate.shares.is_empty() && duplicate.certified.is_empty());
+            assert_eq!(finalization.finalizer().built_headers(), 1);
+            assert_eq!(finalization.finalizer().last_built(), header);
+            assert_eq!(finalization.execution().applied(), result.1);
         }
         if i == 0 {
             assert_ordering_consumer_rejects_conflicting_checkpoints(

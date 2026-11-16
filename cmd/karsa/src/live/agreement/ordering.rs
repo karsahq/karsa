@@ -55,6 +55,12 @@ impl OrderingConsumer {
         if !snapshot.order().starts_with(self.snapshot.order()) {
             return Err("certified ordering prefix regressed or conflicted".into());
         }
+        if !snapshot
+            .applications()
+            .starts_with(self.snapshot.applications())
+        {
+            return Err("certified application history regressed or conflicted".into());
+        }
         self.snapshot = snapshot;
         Ok(())
     }
@@ -70,7 +76,23 @@ impl OrderingConsumer {
         &mut self,
         mut consume: impl FnMut(&Vertex) -> Result<bool, String>,
     ) -> Result<(), String> {
-        while let Some(vertex) = self.snapshot.vertices().get(self.consumed) {
+        self.consume_through(self.snapshot.order().len(), &mut consume)
+    }
+
+    pub(super) fn snapshot(&self) -> &AgreementOrderingSnapshot {
+        &self.snapshot
+    }
+
+    pub(super) fn consume_through(
+        &mut self,
+        order_len: usize,
+        mut consume: impl FnMut(&Vertex) -> Result<bool, String>,
+    ) -> Result<(), String> {
+        if order_len < self.consumed || order_len > self.snapshot.order().len() {
+            return Err("execution boundary is outside the remaining certified order".into());
+        }
+        while self.consumed < order_len {
+            let vertex = &self.snapshot.vertices()[self.consumed];
             if !consume(vertex)? {
                 break;
             }

@@ -36,6 +36,15 @@ impl CertifiedExecution {
         })
     }
 
+    pub(super) fn from_empty_consumer(consumer: OrderingConsumer, state: State) -> Self {
+        Self {
+            consumer,
+            state,
+            applied: 0,
+            rejected: BTreeMap::new(),
+        }
+    }
+
     /// Restores state and cursor from one locally validated checkpoint, if present.
     /// # Errors
     /// Propagates corrupt, stale, incompatible or undecodable checkpoint errors.
@@ -71,13 +80,32 @@ impl CertifiedExecution {
         batches: &BTreeMap<[u8; 32], Batch>,
         authenticated_controls: &BTreeSet<[u8; 32]>,
     ) -> Result<(), String> {
+        self.execute_through(
+            self.consumer.snapshot().order().len(),
+            membership,
+            batches,
+            authenticated_controls,
+        )
+        .map(|_| ())
+    }
+
+    /// Executes no further than a certified prefix, returning whether it was reached.
+    /// # Errors
+    /// Rejects backward/out-of-range boundaries and the same batch failures as `execute_ready`.
+    pub fn execute_through(
+        &mut self,
+        order_len: usize,
+        membership: &Membership,
+        batches: &BTreeMap<[u8; 32], Batch>,
+        authenticated_controls: &BTreeSet<[u8; 32]>,
+    ) -> Result<bool, String> {
         let Self {
             consumer,
             state,
             applied,
             rejected,
         } = self;
-        consumer.consume_ready(|vertex| {
+        consumer.consume_through(order_len, |vertex| {
             let hash = &vertex.payload_hash;
             if *hash == [0; 32] {
                 return Ok(true);
@@ -104,7 +132,12 @@ impl CertifiedExecution {
             let count = chain::apply_batch(state, &membership.accounts, batch, rejected);
             *applied += count as u64;
             Ok(true)
-        })
+        })?;
+        Ok(consumer.consumed_order().len() == order_len)
+    }
+
+    pub(super) fn snapshot(&self) -> &AgreementOrderingSnapshot {
+        self.consumer.snapshot()
     }
 
     /// Atomically persists the owned state/count and exact consumed certified cursor.
