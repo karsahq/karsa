@@ -1,5 +1,7 @@
 //! Inactive durable signing boundary with explicit local carrier authoring, never live transport.
 
+use std::time::{Duration, Instant};
+
 use crypto::registry::{self, ALG_ED25519};
 use crypto::scheme::{Ed25519Scheme, verify_signature};
 use store::{AgreementSigningIntent, AgreementSigningPrerequisite};
@@ -122,8 +124,17 @@ pub struct Adapter {
     history: Vec<AgreementSigningIntent>,
     readiness: Readiness,
     pacemaker: Option<pacemaker::Pacemaker>,
+    retransmission: Option<Retransmission>,
     // Partial remote support is never journaled and is lost on recovery.
     view_requests: Vec<validator::SlotAgreementViewRequest>,
+}
+
+// Volatile scheduling only: never retain durable messages or export authority here.
+struct Retransmission {
+    interval: Duration,
+    last_poll: Option<Instant>,
+    last_sent: Option<Instant>,
+    cursor: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -145,6 +156,131 @@ pub struct AuthoredCarrier {
 pub type AuthoredVote = AuthoredCarrier;
 
 impl Adapter {
+    /// Opts into control-only retransmission, resetting the volatile schedule.
+    /// Recovery starts disabled; this does not activate live transport.
+    /// # Errors
+    /// Rejects zero intervals and intervals greater than one day.
+    pub fn configure_retransmission(&mut self, interval: Duration) -> Result<(), String> {
+        if interval.is_zero() || interval > Duration::from_secs(86_400) {
+            return Err(
+                "agreement retransmission interval must be positive and at most one day".into(),
+            );
+        }
+        self.retransmission = Some(Retransmission {
+            interval,
+            last_poll: None,
+            last_sent: None,
+            cursor: 0,
+        });
+        Ok(())
+    }
+
+    /// Exports at most one durable control message per due poll, without signing or sending.
+    /// The first poll is immediate; delayed polls never cause catch-up bursts. Empty polls
+    /// still enforce monotonic time. No echo, persistence, or acknowledgement is performed.
+    /// Durable getters replay the full WAL: this API is not recommended for a hot loop.
+    /// Carriers are excluded until complete causal-cone availability can be established.
+    /// # Errors
+    /// Rejects stale/recovery-required owners, backwards time, invalid durable evidence,
+    /// and any candidate exceeding the wire codec's bounds.
+    pub fn retransmit(&mut self, now: Instant) -> Result<Option<net::wire::Message>, String> {
+        use net::wire::Message;
+        use validator::slot_agreement::{AgreementPhase, AgreementView};
+
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before retransmission".into());
+        }
+        // Freshness must be checked even when disabled, empty, or not yet due.
+        let output = self.driver.output().map_err(|error| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            error.to_string()
+        })?;
+        let Some(schedule) = self.retransmission.as_mut() else {
+            return Ok(None);
+        };
+        if schedule.last_poll.is_some_and(|last| now < last) {
+            return Err("agreement retransmission time moved backwards".into());
+        }
+        schedule.last_poll = Some(now);
+        if schedule
+            .last_sent
+            .is_some_and(|last| now.duration_since(last) < schedule.interval)
+        {
+            return Ok(None);
+        }
+
+        let slot = output.binding.tip();
+        let view = output
+            .transition
+            .as_ref()
+            .map_or(AgreementView(0), |t| t.view);
+        let decided = output
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.decision.is_some());
+        // Fixed class positions preserve fairness even when a class appears or disappears.
+        let mut candidates: [Option<Message>; 4] = std::array::from_fn(|_| None);
+        if let Some(request) = self
+            .completed_view_requests()?
+            .into_iter()
+            .filter(|r| r.context() == slot && r.signature().validator_id == self.validator_id)
+            .max_by_key(|r| r.target_view())
+        {
+            candidates[0] = Some(Message::AgreementViewRequest(
+                request.encode(&self.set).map_err(|e| e.to_string())?,
+            ));
+        }
+        // An entered certificate remains exportable after a decision.
+        if let Some(requests) = self.entered_view_certificate()? {
+            let bodies = requests
+                .iter()
+                .map(|r| r.encode(&self.set))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            candidates[1] = Some(Message::AgreementViewCertificate(bodies));
+        }
+        if !decided {
+            for completed in self.completed_nil_votes()? {
+                let message = completed.message;
+                if message.vote().context != *slot
+                    || message.vote().view != view
+                    || message.signature().validator_id != self.validator_id
+                {
+                    continue;
+                }
+                let index = match message.vote().phase {
+                    AgreementPhase::Prevote => 2,
+                    AgreementPhase::Precommit => 3,
+                };
+                if candidates[index].is_none() {
+                    candidates[index] = Some(Message::AgreementNilVote(
+                        message.encode(&self.set).map_err(|e| e.to_string())?,
+                    ));
+                }
+            }
+        }
+        // Validate every candidate, not just the selected class; never silently omit
+        // durable evidence that cannot fit the transport's actual frame bounds.
+        for candidate in candidates.iter().flatten() {
+            net::wire::frame(candidate, 0).map_err(|e| {
+                format!("agreement retransmission candidate exceeds wire bounds: {e}")
+            })?;
+        }
+        let schedule = self
+            .retransmission
+            .as_mut()
+            .expect("configured retransmission");
+        for offset in 0..candidates.len() {
+            let index = (schedule.cursor + offset) % candidates.len();
+            if let Some(message) = candidates[index].take() {
+                schedule.cursor = (index + 1) % candidates.len();
+                schedule.last_sent = Some(now);
+                return Ok(Some(message));
+            }
+        }
+        Ok(None)
+    }
+
     /// Opts into explicit local ticks, resetting volatile timers. Recovery starts disabled.
     pub fn configure_pacemaker(&mut self, policy: pacemaker::Policy) {
         self.pacemaker = Some(pacemaker::Pacemaker::new(policy));
@@ -1113,6 +1249,7 @@ impl Adapter {
             pending: Vec::new(),
             history: Vec::new(),
             pacemaker: None,
+            retransmission: None,
             view_requests: Vec::new(),
             readiness: Readiness::DisabledMissingCausalReadinessAndTransport,
         })
@@ -1142,6 +1279,7 @@ impl Adapter {
             pending: Vec::new(),
             history: Vec::new(),
             pacemaker: None,
+            retransmission: None,
             view_requests: Vec::new(),
             readiness: Readiness::RecoveryRequiredHistoricalIntentsUnavailable,
         };

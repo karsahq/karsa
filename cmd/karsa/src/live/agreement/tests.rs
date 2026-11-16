@@ -36,6 +36,348 @@ fn signed_view_request(
 }
 
 #[test]
+fn retransmission_round_robin_cadence_recovery_and_tcp_certificate() {
+    use net::wire::Message;
+    use std::time::{Duration, Instant};
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, _) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut author = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    author.author_view_request(AgreementView(3)).unwrap();
+    let request = author.author_view_request(AgreementView(9)).unwrap();
+    author.receive_view_request(request.clone()).unwrap();
+    for signer in [1, 2] {
+        let remote = signed_view_request(&m, &bootstrap, signer, 9);
+        author.receive_view_request(remote).unwrap();
+    }
+    let certificate = author.entered_view_certificate().unwrap().unwrap();
+    let mut expected = vec![
+        Message::AgreementViewRequest(request.encode(&m.set).unwrap()),
+        Message::AgreementViewCertificate(
+            certificate
+                .iter()
+                .map(|r| r.encode(&m.set).unwrap())
+                .collect(),
+        ),
+    ];
+    for phase in [AgreementPhase::Prevote, AgreementPhase::Precommit] {
+        author
+            .apply(AuthenticatedSlotAgreementRequest::Timeout {
+                view: AgreementView(9),
+                phase,
+            })
+            .unwrap();
+        let id = author.signing_history().last().unwrap().id;
+        let nil = author.author_nil_vote(id).unwrap().unwrap();
+        expected.push(Message::AgreementNilVote(nil.encode(&m.set).unwrap()));
+    }
+    let wal = dir.0.join("authenticated-slot-agreement");
+    let before = std::fs::read(&wal).unwrap();
+    let history = format!("{:?}", author.signing_history());
+    let pending = format!("{:?}", author.pending());
+    let sequence = author.driver.sequence();
+    let wait = Duration::from_secs(1);
+    let now = Instant::now();
+    assert_eq!(author.retransmit(now).unwrap(), None);
+    author.configure_retransmission(wait).unwrap();
+    for cycle in 0..2 {
+        for (index, message) in expected.iter().enumerate() {
+            let at = now + wait * (cycle * 4 + index as u32);
+            assert_eq!(author.retransmit(at).unwrap(), Some(message.clone()));
+            assert_eq!(author.retransmit(at).unwrap(), None);
+            assert_eq!(author.retransmit(at + wait / 2).unwrap(), None);
+        }
+    }
+    assert!(author.retransmit(now).unwrap_err().contains("backwards"));
+    let delayed = now + wait * 100;
+    assert_eq!(
+        author.retransmit(delayed).unwrap(),
+        Some(expected[0].clone())
+    );
+    assert_eq!(
+        author.retransmit(delayed).unwrap(),
+        None,
+        "no catch-up burst"
+    );
+    assert_eq!(
+        author.retransmit(delayed + wait).unwrap(),
+        Some(expected[1].clone())
+    );
+    assert_eq!(author.driver.sequence(), sequence);
+    assert_eq!(format!("{:?}", author.signing_history()), history);
+    assert_eq!(format!("{:?}", author.pending()), pending);
+    assert_eq!(std::fs::read(&wal).unwrap(), before);
+    drop(author);
+    drop(store);
+    let store = Store::open(&dir.0).unwrap();
+    let mut author = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    assert_eq!(
+        author.retransmit(delayed).unwrap(),
+        None,
+        "recovery disables schedule"
+    );
+    author.configure_retransmission(wait).unwrap();
+    let receiver_dir = Dir::new();
+    let receiver_store = Store::open(&receiver_dir.0).unwrap();
+    let mut b = bootstrap.clone();
+    b.agreement.local_validator = m.consensus[3].id.clone();
+    let mut receiver = Adapter::begin(&receiver_store, b, &m, 3).unwrap();
+    for (index, message) in expected.iter().enumerate() {
+        let replay = author
+            .retransmit(now + wait * index as u32)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            net::wire::frame(&replay, 0).unwrap(),
+            net::wire::frame(message, 0).unwrap()
+        );
+        receiver
+            .receive_message(tcp_agreement_message(replay))
+            .unwrap();
+    }
+    assert_eq!(receiver.timer_snapshot().unwrap().view, AgreementView(9));
+    assert_eq!(
+        receiver.entered_view_certificate().unwrap(),
+        Some(certificate)
+    );
+    assert!(
+        receiver.signing_history().is_empty(),
+        "receipt alone must not sign"
+    );
+    assert_eq!(std::fs::read(&wal).unwrap(), before);
+}
+
+#[test]
+fn retransmission_dropped_publication_retry_reopen_and_quorum_without_ack() {
+    use net::wire::Message;
+    use std::time::{Duration, Instant};
+    let (m, bootstrap, _) = fixture();
+    let dirs: Vec<_> = (0..4).map(|_| Dir::new()).collect();
+    let wait = Duration::from_millis(10);
+    let now = Instant::now();
+    let mut retries = Vec::new();
+    for (i, dir) in dirs[..3].iter().enumerate() {
+        let store = Store::open(&dir.0).unwrap();
+        let mut b = bootstrap.clone();
+        b.agreement.local_validator = m.consensus[i].id.clone();
+        let mut author = Adapter::begin(&store, b.clone(), &m, i).unwrap();
+        let request = author.author_view_request(AgreementView(9)).unwrap();
+        author.configure_retransmission(wait).unwrap();
+        // Deliberately drop the first exported publication; no transport ACK is supplied.
+        let lost = author.retransmit(now).unwrap().unwrap();
+        assert_eq!(
+            lost,
+            Message::AgreementViewRequest(request.encode(&m.set).unwrap())
+        );
+        let wal = dir.0.join("authenticated-slot-agreement");
+        let before = std::fs::read(&wal).unwrap();
+        assert_eq!(author.retransmit(now + wait / 2).unwrap(), None);
+        let retry = author.retransmit(now + wait).unwrap().unwrap();
+        assert_eq!(
+            net::wire::frame(&retry, 0).unwrap(),
+            net::wire::frame(&lost, 0).unwrap()
+        );
+        drop(author);
+        drop(store);
+        let store = Store::open(&dir.0).unwrap();
+        let mut author = Adapter::recover(&store, b, &m, i).unwrap();
+        assert_eq!(author.retransmit(now).unwrap(), None);
+        author.configure_retransmission(wait).unwrap();
+        assert_eq!(author.retransmit(now).unwrap(), Some(lost));
+        assert_eq!(std::fs::read(&wal).unwrap(), before);
+        retries.push(retry);
+    }
+    let store = Store::open(&dirs[3].0).unwrap();
+    let mut b = bootstrap.clone();
+    b.agreement.local_validator = m.consensus[3].id.clone();
+    let mut receiver = Adapter::begin(&store, b, &m, 3).unwrap();
+    for (index, retry) in retries.into_iter().enumerate() {
+        receiver
+            .receive_message(tcp_agreement_message(retry))
+            .unwrap();
+        assert_eq!(
+            receiver.timer_snapshot().unwrap().view,
+            AgreementView(if index + 1 == m.set.quorum_size() {
+                9
+            } else {
+                0
+            })
+        );
+    }
+    assert!(receiver.completed_view_requests().unwrap().is_empty());
+    assert!(receiver.signing_history().is_empty());
+    receiver.configure_retransmission(wait).unwrap();
+    let certificate = receiver.retransmit(now).unwrap().unwrap();
+    assert!(matches!(certificate, Message::AgreementViewCertificate(_)));
+    assert_eq!(
+        receiver.retransmit(now + wait).unwrap(),
+        Some(certificate.clone())
+    );
+    let laggard_dir = Dir::new();
+    let laggard_store = Store::open(&laggard_dir.0).unwrap();
+    let mut laggard = Adapter::begin(&laggard_store, bootstrap, &m, 0).unwrap();
+    laggard
+        .receive_message(tcp_agreement_message(certificate))
+        .unwrap();
+    assert_eq!(laggard.timer_snapshot().unwrap().view, AgreementView(9));
+    assert_eq!(
+        laggard.entered_view_certificate().unwrap(),
+        receiver.entered_view_certificate().unwrap()
+    );
+}
+
+#[test]
+fn retransmission_stale_disabled_not_due_and_uncertain_owners_fail_closed() {
+    use std::time::{Duration, Instant};
+    let (m, bootstrap, _) = fixture();
+    let wait = Duration::from_secs(1);
+    let now = Instant::now();
+    for configured in [false, true] {
+        let dir = Dir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let mut stale = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+        stale.author_view_request(AgreementView(9)).unwrap();
+        if configured {
+            stale.configure_retransmission(wait).unwrap();
+            assert!(stale.retransmit(now).unwrap().is_some());
+        }
+        let mut owner = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+        owner.author_view_request(AgreementView(10)).unwrap();
+        let wal = dir.0.join("authenticated-slot-agreement");
+        let before = std::fs::read(&wal).unwrap();
+        let history = format!("{:?}", stale.signing_history());
+        let sequence = stale.driver.sequence();
+        assert!(
+            stale.retransmit(now).is_err(),
+            "disabled/not-due must check ownership"
+        );
+        assert_eq!(
+            stale.readiness(),
+            Readiness::RecoveryRequiredHistoricalIntentsUnavailable
+        );
+        stale.configure_retransmission(wait).unwrap();
+        assert_eq!(
+            stale.retransmit(now + wait).unwrap_err(),
+            "agreement owner requires recovery before retransmission"
+        );
+        assert_eq!(stale.driver.sequence(), sequence);
+        assert_eq!(format!("{:?}", stale.signing_history()), history);
+        assert_eq!(std::fs::read(&wal).unwrap(), before);
+    }
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut author = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    author.author_view_request(AgreementView(9)).unwrap();
+    let wal = dir.0.join("authenticated-slot-agreement");
+    let before = std::fs::read(&wal).unwrap();
+    let result = Err(StoreError::Io(std::io::Error::other(
+        "injected sync uncertainty",
+    )));
+    assert!(author.consume_durable_result(result, None).is_err());
+    author.configure_retransmission(wait).unwrap();
+    assert_eq!(
+        author.retransmit(now).unwrap_err(),
+        "agreement owner requires recovery before retransmission"
+    );
+    assert_eq!(std::fs::read(&wal).unwrap(), before);
+    let mut recovered = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    assert_eq!(recovered.retransmit(now).unwrap(), None);
+    recovered.configure_retransmission(wait).unwrap();
+    assert!(recovered.retransmit(now).unwrap().is_some());
+}
+
+#[test]
+fn retransmission_interval_empty_time_remote_support_and_old_view_filtering() {
+    use net::wire::Message;
+    use std::time::{Duration, Instant};
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, _) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut author = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    let now = Instant::now();
+    let wait = Duration::from_secs(1);
+    for interval in [
+        Duration::ZERO,
+        Duration::from_secs(86_400) + Duration::from_nanos(1),
+    ] {
+        assert!(author.configure_retransmission(interval).is_err());
+    }
+    author
+        .configure_retransmission(Duration::from_secs(86_400))
+        .unwrap();
+    assert_eq!(author.retransmit(now).unwrap(), None);
+    assert!(
+        author
+            .retransmit(now - wait)
+            .unwrap_err()
+            .contains("backwards")
+    );
+    author.configure_retransmission(wait).unwrap();
+    let wal = dir.0.join("authenticated-slot-agreement");
+    let before = std::fs::read(&wal).unwrap();
+    author
+        .receive_view_request(signed_view_request(&m, &bootstrap, 1, 20))
+        .unwrap();
+    assert_eq!(
+        author.retransmit(now).unwrap(),
+        None,
+        "remote volatile support is not publication"
+    );
+    assert_eq!(std::fs::read(&wal).unwrap(), before);
+    author
+        .apply(AuthenticatedSlotAgreementRequest::Timeout {
+            view: AgreementView(0),
+            phase: AgreementPhase::Prevote,
+        })
+        .unwrap();
+    let nil = author
+        .author_nil_vote(author.signing_history()[0].id)
+        .unwrap()
+        .unwrap();
+    // An empty poll did not consume a send interval.
+    assert_eq!(
+        author.retransmit(now).unwrap(),
+        Some(Message::AgreementNilVote(nil.encode(&m.set).unwrap()))
+    );
+    author
+        .apply(AuthenticatedSlotAgreementRequest::AdvanceView {
+            from: AgreementView(0),
+        })
+        .unwrap();
+    assert_eq!(
+        author.completed_nil_votes().unwrap().len(),
+        1,
+        "old completion remains durable"
+    );
+    let before = std::fs::read(&wal).unwrap();
+    assert_eq!(
+        author.retransmit(now + wait).unwrap(),
+        None,
+        "old-view nil must not escape"
+    );
+    let local = author.author_view_request(AgreementView(9)).unwrap();
+    assert_eq!(
+        author.retransmit(now + wait).unwrap(),
+        Some(Message::AgreementViewRequest(local.encode(&m.set).unwrap()))
+    );
+    assert_eq!(author.retransmit(now + wait).unwrap(), None);
+    assert!(author.configure_retransmission(Duration::ZERO).is_err());
+    assert_eq!(
+        author.retransmit(now + wait).unwrap(),
+        None,
+        "invalid configuration preserves cadence"
+    );
+    assert_eq!(author.completed_view_requests().unwrap(), vec![local]);
+    assert_ne!(
+        std::fs::read(&wal).unwrap(),
+        before,
+        "only local authoring changed WAL"
+    );
+}
+
+#[test]
 fn echo_exact_target_converges_after_restart() {
     let (m, bootstrap, _) = fixture();
     let dirs: Vec<_> = (0..4).map(|_| Dir::new()).collect();
@@ -3140,6 +3482,21 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         Some(entry_certificate.clone())
     );
     let before_advance = publication_bytes(&mut adapters[0]);
+    let old_requests = adapters[0].completed_view_requests().unwrap();
+    assert!(!old_requests.is_empty());
+    let retry_now = std::time::Instant::now();
+    let retry_interval = std::time::Duration::from_secs(1);
+    adapters[0]
+        .configure_retransmission(retry_interval)
+        .unwrap();
+    assert!(matches!(
+        adapters[0].retransmit(retry_now).unwrap(),
+        Some(net::wire::Message::AgreementViewRequest(_))
+    ));
+    assert!(matches!(
+        adapters[0].retransmit(retry_now + retry_interval).unwrap(),
+        Some(net::wire::Message::AgreementViewCertificate(_))
+    ));
     assert!(
         before_advance.len() >= 3,
         "vote, POL and FINAL completions persisted"
@@ -3148,7 +3505,18 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         .apply(AuthenticatedSlotAgreementRequest::AdvanceSlot)
         .unwrap();
     assert_eq!(publication_bytes(&mut adapters[0]), before_advance);
+    assert_eq!(adapters[0].completed_view_requests().unwrap(), old_requests);
     assert!(adapters[0].entered_view_certificate().unwrap().is_none());
+    let advanced_wal = dirs[0].0.join("authenticated-slot-agreement");
+    let advanced_bytes = std::fs::read(&advanced_wal).unwrap();
+    assert_eq!(
+        adapters[0]
+            .retransmit(retry_now + retry_interval * 2)
+            .unwrap(),
+        None,
+        "durable requests and certificate from the decided old slot must not escape"
+    );
+    assert_eq!(std::fs::read(&advanced_wal).unwrap(), advanced_bytes);
     let advanced_sequence = adapters[0].driver.sequence();
     assert!(
         adapters[0]
