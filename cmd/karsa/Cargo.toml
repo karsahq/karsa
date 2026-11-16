@@ -25,6 +25,7 @@ tx = { path = "../../crates/tx" }
 validator = { path = "../../crates/validator" }
 
 [dev-dependencies]
+store = { path = "../../crates/store", features = ["test-support"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 

@@ -6,6 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 description = "Karsa append-only on-disk state for vertices, batches, and roots"
 
+[features]
+# Owner-local publication faults for cross-crate recovery tests only.
+test-support = []
+
 [dependencies]
 fs2 = "0.4"
 crypto = { path = "../crypto" }

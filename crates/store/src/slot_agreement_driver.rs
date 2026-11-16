@@ -36,6 +36,11 @@ pub struct SlotAgreementDriverOutput {
 }
 
 impl SlotAgreementDriver {
+    /// Arms an owner-local share publication fault for recovery tests.
+    #[cfg(feature = "test-support")]
+    pub fn fail_share_publication(&mut self, stage: crate::SharePublicationStage, skip: usize) {
+        self.session.fail_share_publication(stage, skip);
+    }
     /// Takes exclusive ownership of a new or recovered authenticated session.
     pub fn new(session: AuthenticatedSlotAgreement) -> Self {
         Self { session }

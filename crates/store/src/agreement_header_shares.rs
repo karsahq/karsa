@@ -10,6 +10,20 @@ const DOMAIN: &[u8] = b"KARSA/STORE/AGREEMENT_HEADER_SHARES/v1";
 // Whole-file replacement has a hard lifetime bound; records are never pruned.
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Operation boundaries in the real share publication pipeline (test support only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SharePublicationStage {
+    /// Before writing the temporary file.
+    Write,
+    /// After writing, before syncing the temporary file.
+    FileSync,
+    /// After syncing, before renaming the temporary file.
+    Rename,
+    /// After rename, before each directory durability barrier.
+    DirectorySync,
+}
+
 struct Journal {
     bootstrap: Vec<u8>,
     anchor: Header,
@@ -174,7 +188,37 @@ impl AuthenticatedSlotAgreement {
         anchor: &Header,
         share: &Share,
     ) -> Result<(), StoreError> {
+        #[cfg(feature = "test-support")]
+        {
+            let fault = match self.share_publication_fault.as_mut() {
+                Some((_, remaining)) if *remaining > 0 => {
+                    *remaining -= 1;
+                    None
+                }
+                Some(_) => self.share_publication_fault.take().map(|(stage, _)| stage),
+                None => None,
+            };
+            self.reserve_header_share_with_io(anchor, share, |root, bytes| {
+                publish_with(root, bytes, |stage| {
+                    if Some(stage) == fault {
+                        return Err(std::io::Error::other(format!(
+                            "injected share publication {stage:?} failure"
+                        ))
+                        .into());
+                    }
+                    Ok(())
+                })
+            })
+        }
+        #[cfg(not(feature = "test-support"))]
         self.reserve_header_share_with_io(anchor, share, publish)
+    }
+
+    /// Arms a one-shot owner-local fault after `skip` share publication calls.
+    /// Only available with `test-support`; does not repair an uncertain owner.
+    #[cfg(feature = "test-support")]
+    pub fn fail_share_publication(&mut self, stage: SharePublicationStage, skip: usize) {
+        self.share_publication_fault = Some((stage, skip));
     }
 
     fn reserve_header_share_with_io(
@@ -229,17 +273,33 @@ impl AuthenticatedSlotAgreement {
     }
 }
 
+#[cfg(not(feature = "test-support"))]
 fn publish(root: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    publish_with(root, bytes, |_| Ok(()))
+}
+
+fn publish_with(
+    root: &Path,
+    bytes: &[u8],
+    mut before: impl FnMut(SharePublicationStage) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
     let temporary = root.join(TEMPORARY_FILE);
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
         .open(&temporary)?;
+    before(SharePublicationStage::Write)?;
     file.write_all(bytes)?;
+    before(SharePublicationStage::FileSync)?;
     file.sync_all()?;
+    before(SharePublicationStage::Rename)?;
     fs::rename(&temporary, root.join(FILE))?;
-    slot_decision_journal::sync_ancestors(root, |path| File::open(path)?.sync_all())?;
+    slot_decision_journal::sync_ancestors(root, |path| {
+        before(SharePublicationStage::DirectorySync)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        File::open(path)?.sync_all()
+    })?;
     Ok(())
 }
 
@@ -335,7 +395,12 @@ mod tests {
 
     #[test]
     fn publication_failures_poison_owner_and_duplicates_repeat_sibling_barrier() {
-        for renamed in [false, true] {
+        for failure in [
+            SharePublicationStage::Write,
+            SharePublicationStage::FileSync,
+            SharePublicationStage::Rename,
+            SharePublicationStage::DirectorySync,
+        ] {
             let dir = TempDir::new();
             let (store, mut owner, bootstrap, anchor, header) =
                 header_intents::tests::fixture(&dir, true);
@@ -353,25 +418,46 @@ mod tests {
             assert!(
                 owner
                     .reserve_header_share_with_io(&anchor, &share, |root, bytes| {
-                        if renamed {
-                            fs::write(root.join(TEMPORARY_FILE), bytes)?;
-                            File::open(root.join(TEMPORARY_FILE))?.sync_all()?;
-                            fs::rename(root.join(TEMPORARY_FILE), root.join(FILE))?;
-                        }
-                        Err(std::io::Error::other("injected publication failure").into())
+                        publish_with(root, bytes, |stage| {
+                            if stage == failure {
+                                Err(std::io::Error::other("injected publication failure").into())
+                            } else {
+                                Ok(())
+                            }
+                        })
                     })
                     .is_err()
             );
+            assert_eq!(
+                dir.0.join(FILE).exists(),
+                failure == SharePublicationStage::DirectorySync
+            );
             assert!(owner.header_shares().is_err());
             assert!(owner.reserve_header_share(&anchor, &share).is_err());
-            let mut called = false;
+            let mut stages = Vec::new();
             sibling
                 .reserve_header_share_with_io(&anchor, &share, |root, bytes| {
-                    called = true;
-                    publish(root, bytes)
+                    publish_with(root, bytes, |stage| {
+                        stages.push(stage);
+                        Ok(())
+                    })
                 })
                 .unwrap();
-            assert!(called);
+            assert_eq!(
+                &stages[..3],
+                &[
+                    SharePublicationStage::Write,
+                    SharePublicationStage::FileSync,
+                    SharePublicationStage::Rename
+                ]
+            );
+            assert!(
+                stages[3..]
+                    .iter()
+                    .all(|stage| *stage == SharePublicationStage::DirectorySync)
+            );
+            assert!(stages.len() > 3);
+            assert!(owner.reserve_header_share(&anchor, &share).is_err());
             assert_eq!(sibling.header_shares().unwrap(), vec![share]);
         }
     }

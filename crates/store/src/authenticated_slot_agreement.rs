@@ -7,6 +7,8 @@ mod header_intents;
 #[path = "agreement_header_shares.rs"]
 mod header_shares;
 pub use header_intents::AgreementHeaderIntent;
+#[cfg(feature = "test-support")]
+pub use header_shares::SharePublicationStage;
 use std::collections::BTreeMap;
 use validator::slot_agreement::{
     AgreementInput, AgreementPhase, AgreementQc, AgreementTransitionResult, AgreementValue,
@@ -1824,6 +1826,8 @@ pub struct AuthenticatedSlotAgreement {
     sequence: u64,
     tip: [u8; 32],
     uncertain: bool,
+    #[cfg(feature = "test-support")]
+    share_publication_fault: Option<(header_shares::SharePublicationStage, usize)>,
 }
 impl Store {
     /// Pins an authenticated-only root and persists its trusted checkpoint.
@@ -1853,6 +1857,8 @@ impl Store {
             header,
             sequence: 0,
             uncertain: false,
+            #[cfg(feature = "test-support")]
+            share_publication_fault: None,
         })
     }
     /// Reauthenticates all retained events and repeats durability barriers.
@@ -1881,6 +1887,8 @@ impl Store {
             sequence: journal.events.len() as u64,
             tip: journal.tip,
             uncertain: false,
+            #[cfg(feature = "test-support")]
+            share_publication_fault: None,
         })
     }
 }

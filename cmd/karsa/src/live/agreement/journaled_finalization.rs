@@ -29,6 +29,14 @@ pub struct JournaledFinalization {
 }
 
 impl JournaledFinalization {
+    #[cfg(test)]
+    pub(super) fn fail_share_publication(
+        &mut self,
+        stage: store::SharePublicationStage,
+        skip: usize,
+    ) {
+        self.adapter.driver.fail_share_publication(stage, skip);
+    }
     /// Opens new or recovered durable agreement history with a pristine genesis finalizer.
     /// No execution or signing occurs until [`Self::build_ready`]. A missing intent journal
     /// means no prior reservation; a corrupt journal is an error, never a fresh start.

@@ -54,6 +54,8 @@ mod authenticated_multislot_tests;
 #[cfg(test)]
 mod authenticated_reproposal_tests;
 mod authenticated_slot_agreement;
+#[cfg(feature = "test-support")]
+pub use authenticated_slot_agreement::SharePublicationStage;
 #[cfg(test)]
 mod authenticated_slot_agreement_tests;
 #[cfg(test)]

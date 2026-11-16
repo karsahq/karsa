@@ -22,11 +22,25 @@ fn certified_finalization_restore_publication_failure_requires_reopening() {
     authenticated_commit_replay_fixture(AuthenticatedReplayMode::RestorePublicationFailure);
 }
 
+#[test]
+fn certified_finalization_restore_io_failures_require_reopening() {
+    use store::SharePublicationStage;
+    for stage in [
+        SharePublicationStage::Write,
+        SharePublicationStage::FileSync,
+        SharePublicationStage::Rename,
+        SharePublicationStage::DirectorySync,
+    ] {
+        authenticated_commit_replay_fixture(AuthenticatedReplayMode::RestoreIoFailure(stage));
+    }
+}
+
 #[derive(Clone, Copy)]
 enum AuthenticatedReplayMode {
     ExistingBoundaries,
     ContinueAfterRecovery,
     RestorePublicationFailure,
+    RestoreIoFailure(store::SharePublicationStage),
 }
 
 fn authenticated_commit_replay_fixture(mode: AuthenticatedReplayMode) {
@@ -679,6 +693,10 @@ fn authenticated_commit_replay_fixture(mode: AuthenticatedReplayMode) {
         )
         .unwrap()
     };
+    // Crash boundary: intents survived but no completed share was journaled.
+    // Recovery must re-execute exact headers rather than infer a completed signature.
+    assert!(adapter.header_shares().unwrap().is_empty());
+    assert!(!dir.0.join("agreement-header-shares").exists());
     // Recovery owns the adapter and cannot accidentally use a no-op reservation callback.
     // Keep earlier rebuilt output private until the entire old reserved history matches.
     let mut replay = open_replay();
@@ -715,7 +733,11 @@ fn authenticated_commit_replay_fixture(mode: AuthenticatedReplayMode) {
             .shares
             .is_empty()
     );
-    if matches!(mode, AuthenticatedReplayMode::RestorePublicationFailure) {
+    if matches!(
+        mode,
+        AuthenticatedReplayMode::RestorePublicationFailure
+            | AuthenticatedReplayMode::RestoreIoFailure(_)
+    ) {
         // Local output has already drained, so the next build has no signing or
         // reservation work. Only restore_shares can re-publish the visible shares.
         assert_eq!(replay.finalization().finalizer().built_headers(), 2);
@@ -731,6 +753,8 @@ fn authenticated_commit_replay_fixture(mode: AuthenticatedReplayMode) {
                     .unwrap();
             }
         }
+        // Simulate a stop after the quorum-closing share's durable reservation,
+        // before wrapper collection/return. No certificate has been delivered here.
         let durable_shares = adapter.header_shares().unwrap();
         assert_eq!(durable_shares.len(), 6);
         assert_eq!(replay.finalization().finalizer().head(), &anchor);
@@ -747,9 +771,17 @@ fn authenticated_commit_replay_fixture(mode: AuthenticatedReplayMode) {
         let before = journal_bytes();
         let temporary = dir.0.join("agreement-header-shares.tmp");
         assert!(!temporary.exists());
-        std::fs::create_dir(&temporary).unwrap();
-        // Reads and owner checks succeed despite the obstruction. The failure is
-        // temporary-path validation during re-publication, not write/rename/fsync.
+        let injected = if let AuthenticatedReplayMode::RestoreIoFailure(stage) = mode {
+            // Five complete re-publications precede the fault on the last record.
+            // Even a complete earlier quorum must not escape the batch barrier.
+            replay.fail_share_publication(stage, durable_shares.len() - 1);
+            Some(stage)
+        } else {
+            std::fs::create_dir(&temporary).unwrap();
+            None
+        };
+        // Reads and owner checks succeed. The directory obstruction exercises
+        // pre-publication validation; injected cases enter the real pipeline.
         assert_eq!(adapter.header_shares().unwrap(), durable_shares);
         assert_eq!(adapter.header_intents().unwrap(), durable_intents);
         assert_eq!(
@@ -757,10 +789,22 @@ fn authenticated_commit_replay_fixture(mode: AuthenticatedReplayMode) {
             format!("{recovered:?}")
         );
         let failed = replay.build_ready(&m, &batches, &controls, 102);
-        assert_eq!(
-            failed.err().as_deref(),
-            Some("store io: pointer is not a regular file")
-        );
+        let error = match failed {
+            Err(error) => error,
+            Ok(_) => panic!("restore must fail without returning a Build"),
+        };
+        if let Some(stage) = injected {
+            assert!(
+                error.contains(&format!("injected share publication {stage:?} failure")),
+                "{error}"
+            );
+            assert_eq!(
+                temporary.exists(),
+                stage != store::SharePublicationStage::DirectorySync
+            );
+        } else {
+            assert_eq!(error, "store io: pointer is not a regular file");
+        }
         assert_eq!(replay.finalization().finalizer().head(), &anchor);
         for height in 1..=2 {
             assert_eq!(
@@ -771,7 +815,11 @@ fn authenticated_commit_replay_fixture(mode: AuthenticatedReplayMode) {
         assert_eq!(replay.finalization().finalizer().built_headers(), 2);
         assert_eq!(replay.finalization().execution().state(), &expected);
         assert_eq!(journal_bytes(), before);
-        std::fs::remove_dir(&temporary).unwrap();
+        if injected.is_none() {
+            std::fs::remove_dir(&temporary).unwrap();
+        } else if temporary.exists() {
+            std::fs::remove_file(&temporary).unwrap();
+        }
         let poisoned = "journaled finalization requires reopening after durable history failure";
         assert_eq!(
             replay
@@ -787,7 +835,26 @@ fn authenticated_commit_replay_fixture(mode: AuthenticatedReplayMode) {
         assert_eq!(replay.finalization().finalizer().head(), &anchor);
         assert_eq!(journal_bytes(), before);
 
-        let mut fresh = open_replay();
+        if injected.is_some() {
+            // A fresh owner cannot treat visible identical bytes as durable. Fail
+            // its first directory barrier, proving it re-enters publication too.
+            let mut retry = open_replay();
+            retry.fail_share_publication(store::SharePublicationStage::DirectorySync, 0);
+            assert!(retry.build_ready(&m, &batches, &controls, 104).is_err());
+            assert_eq!(retry.finalization().finalizer().head(), &anchor);
+            assert_eq!(journal_bytes(), before);
+        }
+        drop(replay);
+        drop(adapter);
+        drop(store);
+        let store = Store::open(&dir.0).unwrap();
+        let mut adapter = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+        let mut fresh = JournaledFinalization::open(
+            Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap(),
+            chain::genesis_state(&accounts).unwrap(),
+            make_finalizer(anchor.clone()),
+        )
+        .unwrap();
         let restored = fresh.build_ready(&m, &batches, &controls, 104).unwrap();
         assert_eq!(restored.shares, replayed.shares);
         assert_eq!(restored.certified.len(), 2);
