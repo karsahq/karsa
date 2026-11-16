@@ -60,6 +60,119 @@ pub(super) fn fixture(
     (f, lineage, bootstrap)
 }
 #[test]
+fn ordering_snapshot_tracks_only_applied_certified_prefix_and_recovers() {
+    for committing in [true, false] {
+        let (f, proof, carrier) = crate::slot_application_tests::unified_fixture(committing);
+        let decision = proof.entries.last().unwrap().proposal.decision.clone();
+        let bootstrap = AuthenticatedSlotAgreementBootstrap {
+            agreement: SlotAgreementBootstrap {
+                context: f.binding.tip().clone(),
+                set: f.set.clone(),
+                local_validator: f.set.validators[0].validator_id.clone(),
+            },
+            predecessor: None,
+            order: vec![],
+            vertices: vec![],
+        };
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let mut owner = store
+            .begin_authenticated_slot_agreement(bootstrap.clone())
+            .unwrap();
+        assert!(owner.ordering_snapshot().unwrap().order().is_empty());
+        owner
+            .apply(
+                1,
+                AuthenticatedSlotAgreementRequest::ObservePrecommit {
+                    proof,
+                    carrier: carrier.clone(),
+                    vertices: f.vertices.clone(),
+                },
+            )
+            .unwrap();
+        let before = owner.ordering_snapshot().unwrap();
+        assert!(
+            before.order().is_empty(),
+            "a decision is not an applied slot"
+        );
+        assert_eq!(before.binding().tip(), &bootstrap.agreement.context);
+        let stale = store
+            .recover_authenticated_slot_agreement(bootstrap.clone())
+            .unwrap();
+        owner.advance_slot(2).unwrap();
+        assert!(
+            stale.ordering_snapshot().is_err(),
+            "snapshots enforce freshness"
+        );
+        let path = dir.0.join(authenticated_slot_agreement::FILE);
+        let wal = fs::read(&path).unwrap();
+        let applied = owner.ordering_snapshot().unwrap();
+        assert_eq!(applied.order().len() as u64, decision.after_len);
+        assert_eq!(validator::commit_root(applied.order()), decision.after_root);
+        assert_eq!(applied.binding().tip().order_len(), decision.after_len);
+        assert_eq!(applied.binding().tip().order_root(), &decision.after_root);
+        assert_eq!(applied.binding().tip().next_round(), decision.round + 1);
+        assert_eq!(applied.binding().carrier(), Some(&carrier));
+        assert_eq!(applied.order().is_empty(), !committing);
+        let ids: Vec<_> = applied.vertices().iter().map(|v| v.id().unwrap()).collect();
+        assert_eq!(ids, applied.order());
+        for vertex in applied.vertices() {
+            assert!(
+                f.vertices.contains(vertex),
+                "snapshot retains exact signed bytes"
+            );
+        }
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            wal,
+            "snapshot getter never writes"
+        );
+        drop(stale);
+        drop(owner);
+        drop(store);
+        let store = Store::open(&dir.0).unwrap();
+        let owner = store
+            .recover_authenticated_slot_agreement(bootstrap)
+            .unwrap();
+        let recovered = owner.ordering_snapshot().unwrap();
+        assert_eq!(format!("{recovered:?}"), format!("{applied:?}"));
+        assert_eq!(fs::read(&path).unwrap(), wal);
+        let mut torn = wal.clone();
+        torn.push(1);
+        fs::write(&path, &torn).unwrap();
+        assert!(
+            owner.ordering_snapshot().is_err(),
+            "corrupt WAL cannot export ordering"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            torn,
+            "failed read does not repair the WAL"
+        );
+        // A nonempty trusted checkpoint prefix is included, not only new commits.
+        let checkpoint = AuthenticatedSlotAgreementBootstrap {
+            agreement: SlotAgreementBootstrap {
+                context: applied.binding().tip().clone(),
+                set: f.set.clone(),
+                local_validator: f.set.validators[0].validator_id.clone(),
+            },
+            predecessor: Some(carrier),
+            order: applied.order().to_vec(),
+            vertices: f.vertices,
+        };
+        let next_dir = TempDir::new();
+        let next_store = Store::open(&next_dir.0).unwrap();
+        let next_owner = next_store
+            .begin_authenticated_slot_agreement(checkpoint)
+            .unwrap();
+        assert_eq!(
+            format!("{:?}", next_owner.ordering_snapshot().unwrap()),
+            format!("{applied:?}")
+        );
+    }
+}
+
+#[test]
 fn observe_plain_proposal_retains_without_voting_and_recovers() {
     let (f, lineage, bootstrap) = fixture(true);
     let selected = &lineage.entries[0];
@@ -417,6 +530,10 @@ fn authenticated_missing_dependency_and_uncertain_write() {
             .is_err()
     );
     assert!(owner.apply(1, request.clone()).is_err());
+    assert!(
+        owner.ordering_snapshot().is_err(),
+        "uncertain writes cannot export ordering"
+    );
     drop(owner);
     drop(store);
     let store = Store::open(&dir.0).unwrap();

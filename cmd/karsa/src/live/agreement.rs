@@ -163,6 +163,21 @@ const MAX_CARRIER_EXPORT_EVENTS: u64 = 4096;
 const MAX_CARRIER_RETRY_IDS: usize = 64;
 
 impl Adapter {
+    /// Exports only the applied certified prefix, never speculative legacy DAG order.
+    /// A durable decision is excluded until an explicit durable `AdvanceSlot` request.
+    /// This read neither advances slots nor executes transactions or mutates a live DAG.
+    /// # Errors
+    /// Rejects recovery-required or stale owners and invalid durable ordering evidence.
+    pub fn ordering_snapshot(&mut self) -> Result<store::AgreementOrderingSnapshot, String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before ordering export".into());
+        }
+        self.driver.ordering_snapshot().map_err(|error| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            error.to_string()
+        })
+    }
+
     /// Enables caller-selected carrier retries independently of control retries.
     /// Recovery disables this volatile schedule. No publication or evidence is cached.
     /// # Errors

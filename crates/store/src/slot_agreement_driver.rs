@@ -93,6 +93,14 @@ impl SlotAgreementDriver {
         self.session.entered_view_certificate()
     }
 
+    /// Exports the applied certified prefix and signed vertices from one durable replay.
+    /// Deciding evidence alone does not extend this prefix; `AdvanceSlot` must be durable.
+    /// # Errors
+    /// Rejects stale or uncertain sessions, corrupt evidence, and missing ordered vertices.
+    pub fn ordering_snapshot(&self) -> Result<crate::AgreementOrderingSnapshot, StoreError> {
+        self.session.ordering_snapshot()
+    }
+
     /// Returns the number of durable requests installed by this owner.
     pub fn sequence(&self) -> u64 {
         self.session.sequence()

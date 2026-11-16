@@ -382,6 +382,7 @@ fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen
         .collect();
     drop(adapters);
     drop(stores);
+    let mut agreed_order = None;
     for i in 0..3 {
         let store = Store::open(&dirs[i].0).unwrap();
         let mut adapter = Adapter::recover(&store, bootstraps[i].clone(), &m, i).unwrap();
@@ -416,7 +417,7 @@ fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen
         drop(adapter);
         drop(store);
         let store = Store::open(&dirs[i].0).unwrap();
-        let adapter = Adapter::recover(&store, bootstraps[i].clone(), &m, i).unwrap();
+        let mut adapter = Adapter::recover(&store, bootstraps[i].clone(), &m, i).unwrap();
         assert_eq!(adapter.driver.sequence(), sequence + 1);
         assert_eq!(
             format!("{:?}", adapter.driver.output().unwrap()),
@@ -428,6 +429,45 @@ fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen
             std::fs::read(dirs[i].0.join("authenticated-slot-agreement")).unwrap(),
             wal,
             "recovery does not append another receipt {i}"
+        );
+        let before = adapter.ordering_snapshot().unwrap();
+        assert_eq!(before.order(), bootstraps[i].order);
+        adapter
+            .apply(AuthenticatedSlotAgreementRequest::AdvanceSlot)
+            .unwrap();
+        let applied = adapter.ordering_snapshot().unwrap();
+        assert!(
+            !applied.order().is_empty(),
+            "acceptance must apply a real nonempty commit"
+        );
+        assert_eq!(applied.order().len() as u64, decision.after_len);
+        assert_eq!(validator::commit_root(applied.order()), decision.after_root);
+        assert_eq!(applied.binding().tip().next_round(), decision.round + 1);
+        let signed_ids: Vec<_> = applied.vertices().iter().map(|v| v.id().unwrap()).collect();
+        assert_eq!(signed_ids, applied.order());
+        if let Some(expected) = &agreed_order {
+            assert_eq!(
+                applied.order(),
+                expected,
+                "honest adapters expose identical applied order"
+            );
+        } else {
+            agreed_order = Some(applied.order().to_vec());
+        }
+        let history = format!("{:?}", adapter.signing_history());
+        let wal = std::fs::read(dirs[i].0.join("authenticated-slot-agreement")).unwrap();
+        drop(adapter);
+        drop(store);
+        let store = Store::open(&dirs[i].0).unwrap();
+        let mut adapter = Adapter::recover(&store, bootstraps[i].clone(), &m, i).unwrap();
+        assert_eq!(
+            format!("{:?}", adapter.ordering_snapshot().unwrap()),
+            format!("{applied:?}")
+        );
+        assert_eq!(format!("{:?}", adapter.signing_history()), history);
+        assert_eq!(
+            std::fs::read(dirs[i].0.join("authenticated-slot-agreement")).unwrap(),
+            wal
         );
     }
 }

@@ -895,6 +895,35 @@ struct ViewRequests {
 // Explicit local authorizations are separate from remotely supplied observations.
 const MAX_LOCAL_REQUEST_TARGETS: usize = 16;
 
+/// Immutable replay-derived ordering at the last durable slot-application boundary.
+/// A decided but unadvanced slot is excluded. This contains the complete retained
+/// checkpoint prefix and subsequent certified applications, not transaction execution
+/// state or permission to mutate a live DAG. No acknowledgement or compaction occurs.
+#[derive(Debug, Clone)]
+pub struct AgreementOrderingSnapshot {
+    binding: SlotAgreementBinding,
+    order: Vec<VertexId>,
+    vertices: Vec<Vertex>,
+}
+
+impl AgreementOrderingSnapshot {
+    /// Returns the active next-slot binding derived from the same replay as the order.
+    pub fn binding(&self) -> &SlotAgreementBinding {
+        &self.binding
+    }
+
+    /// Returns the exact full applied prefix, including the original checkpoint order.
+    pub fn order(&self) -> &[VertexId] {
+        &self.order
+    }
+
+    /// Returns authenticated signed vertices in precisely the applied prefix order.
+    /// These are DAG vertices, not transaction batches or execution receipts.
+    pub fn vertices(&self) -> &[Vertex] {
+        &self.vertices
+    }
+}
+
 type ReplayState = (
     Option<AgreementTransitionResult>,
     Vec<AgreementQuorumCandidate>,
@@ -907,6 +936,7 @@ type ReplayState = (
     Vec<AgreementCompletedCarrier>,
     Vec<AgreementCompletedNilVote>,
     ViewRequests,
+    CertifiedDag,
 );
 
 fn reservation_bounds(
@@ -1721,6 +1751,7 @@ fn replay(
         completed,
         completed_nil,
         view_requests,
+        dag,
     ))
 }
 pub(super) fn validate(root: &Path) -> Result<(), StoreError> {
@@ -1988,7 +2019,7 @@ impl AuthenticatedSlotAgreement {
         Ok(self.driver_snapshot()?.3)
     }
 
-    pub(super) fn driver_snapshot(&self) -> Result<DriverSnapshot, StoreError> {
+    fn replay_owned(&self) -> Result<ReplayState, StoreError> {
         if self.uncertain {
             return Err(invalid("uncertain authenticated write requires recovery"));
         }
@@ -2005,11 +2036,40 @@ impl AuthenticatedSlotAgreement {
         {
             return Err(invalid("stale authenticated owner"));
         }
-        let (transition, candidates, active, binding, reproposal, _, authorable, _, _, _, _) =
-            replay(&journal.bootstrap, &journal.events)?;
+        replay(&journal.bootstrap, &journal.events)
+    }
+
+    pub(super) fn driver_snapshot(&self) -> Result<DriverSnapshot, StoreError> {
+        let (transition, candidates, active, binding, reproposal, _, authorable, _, _, _, _, _) =
+            self.replay_owned()?;
         Ok((
             active, transition, candidates, reproposal, binding, authorable,
         ))
+    }
+
+    /// Reauthenticates the WAL and exports the last applied certified ordering.
+    /// The binding, IDs and signed vertices come from one freshness-checked replay.
+    /// This read does not apply a decided slot, sign, append, or execute transactions.
+    /// Like other durable getters it replays the bounded full WAL, not a hot-loop cache.
+    /// # Errors
+    /// Rejects stale or uncertain owners, corrupt evidence, and missing ordered vertices.
+    pub fn ordering_snapshot(&self) -> Result<AgreementOrderingSnapshot, StoreError> {
+        let (_, _, _, binding, _, _, _, _, _, _, _, dag) = self.replay_owned()?;
+        let order = dag.dag().order().to_vec();
+        let vertices = order
+            .iter()
+            .map(|id| {
+                dag.dag()
+                    .get(id.round, &id.author)
+                    .cloned()
+                    .ok_or_else(|| invalid("applied ordering vertex missing"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AgreementOrderingSnapshot {
+            binding,
+            order,
+            vertices,
+        })
     }
 
     /// Derives the next slot from the durable deciding proof without application effects.
