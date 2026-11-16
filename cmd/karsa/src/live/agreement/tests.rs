@@ -9,6 +9,27 @@ use validator::{
 
 #[test]
 fn certified_finalization_replays_two_authenticated_commit_boundaries() {
+    authenticated_commit_replay_fixture(AuthenticatedReplayMode::ExistingBoundaries);
+}
+
+#[test]
+fn certified_finalization_reopens_and_continues_durable_history() {
+    authenticated_commit_replay_fixture(AuthenticatedReplayMode::ContinueAfterRecovery);
+}
+
+#[test]
+fn certified_finalization_restore_publication_failure_requires_reopening() {
+    authenticated_commit_replay_fixture(AuthenticatedReplayMode::RestorePublicationFailure);
+}
+
+#[derive(Clone, Copy)]
+enum AuthenticatedReplayMode {
+    ExistingBoundaries,
+    ContinueAfterRecovery,
+    RestorePublicationFailure,
+}
+
+fn authenticated_commit_replay_fixture(mode: AuthenticatedReplayMode) {
     use std::collections::{BTreeMap, BTreeSet};
     use validator::slot_agreement::{AgreementPhase, AgreementQc, AgreementValue, AgreementVote};
     use validator::{
@@ -267,7 +288,7 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
         .apply(AuthenticatedSlotAgreementRequest::ObservePrecommit {
             proof,
             carrier,
-            vertices,
+            vertices: vertices.clone(),
         })
         .unwrap();
     adapter
@@ -694,6 +715,111 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
             .shares
             .is_empty()
     );
+    if matches!(mode, AuthenticatedReplayMode::RestorePublicationFailure) {
+        // Local output has already drained, so the next build has no signing or
+        // reservation work. Only restore_shares can re-publish the visible shares.
+        assert_eq!(replay.finalization().finalizer().built_headers(), 2);
+        assert_eq!(
+            replay.finalization().finalizer().last_built(),
+            &built.shares[1].header
+        );
+        assert_eq!(adapter.header_intents().unwrap(), durable_intents);
+        for height in [2, 1] {
+            for signer in [1, 2] {
+                adapter
+                    .reserve_header_share(&anchor, &peer_share(height, signer))
+                    .unwrap();
+            }
+        }
+        let durable_shares = adapter.header_shares().unwrap();
+        assert_eq!(durable_shares.len(), 6);
+        assert_eq!(replay.finalization().finalizer().head(), &anchor);
+        let journal_bytes = || {
+            [
+                "authenticated-slot-agreement",
+                "agreement-header-intents",
+                "agreement-header-shares",
+            ]
+            .into_iter()
+            .map(|name| (name, std::fs::read(dir.0.join(name)).unwrap()))
+            .collect::<BTreeMap<_, _>>()
+        };
+        let before = journal_bytes();
+        let temporary = dir.0.join("agreement-header-shares.tmp");
+        assert!(!temporary.exists());
+        std::fs::create_dir(&temporary).unwrap();
+        // Reads and owner checks succeed despite the obstruction. The failure is
+        // temporary-path validation during re-publication, not write/rename/fsync.
+        assert_eq!(adapter.header_shares().unwrap(), durable_shares);
+        assert_eq!(adapter.header_intents().unwrap(), durable_intents);
+        assert_eq!(
+            format!("{:?}", adapter.ordering_snapshot().unwrap()),
+            format!("{recovered:?}")
+        );
+        let failed = replay.build_ready(&m, &batches, &controls, 102);
+        assert_eq!(
+            failed.err().as_deref(),
+            Some("store io: pointer is not a regular file")
+        );
+        assert_eq!(replay.finalization().finalizer().head(), &anchor);
+        for height in 1..=2 {
+            assert_eq!(
+                replay.finalization().finalizer().certified_order(height),
+                None
+            );
+        }
+        assert_eq!(replay.finalization().finalizer().built_headers(), 2);
+        assert_eq!(replay.finalization().execution().state(), &expected);
+        assert_eq!(journal_bytes(), before);
+        std::fs::remove_dir(&temporary).unwrap();
+        let poisoned = "journaled finalization requires reopening after durable history failure";
+        assert_eq!(
+            replay
+                .build_ready(&m, &batches, &controls, 103)
+                .err()
+                .as_deref(),
+            Some(poisoned)
+        );
+        assert_eq!(
+            replay.receive_share(&m, peer_share(1, 2)).err().as_deref(),
+            Some(poisoned)
+        );
+        assert_eq!(replay.finalization().finalizer().head(), &anchor);
+        assert_eq!(journal_bytes(), before);
+
+        let mut fresh = open_replay();
+        let restored = fresh.build_ready(&m, &batches, &controls, 104).unwrap();
+        assert_eq!(restored.shares, replayed.shares);
+        assert_eq!(restored.certified.len(), 2);
+        for (index, certified) in restored.certified.iter().enumerate() {
+            assert_eq!(certified.header, built.shares[index].header);
+            fresh
+                .finalization()
+                .finalizer()
+                .verify_certificate(&certified.header, &certified.certificate)
+                .unwrap();
+            assert_eq!(
+                fresh
+                    .finalization()
+                    .finalizer()
+                    .certified_order(certified.header.height),
+                Some(recovered.applications()[index].order_len())
+            );
+        }
+        assert_eq!(
+            fresh.finalization().finalizer().head(),
+            &built.shares[1].header
+        );
+        assert_eq!(fresh.finalization().execution().state(), &expected);
+        assert_eq!(fresh.finalization().execution().applied(), applied);
+        assert_eq!(
+            fresh.finalization().execution().consumed_order(),
+            recovered.order()
+        );
+        assert_eq!(adapter.header_shares().unwrap(), durable_shares);
+        assert_eq!(journal_bytes(), before);
+        return;
+    }
     for height in [2, 1] {
         assert!(
             replay
@@ -803,6 +929,258 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
             .is_empty()
     );
     assert_eq!(adapter.header_shares().unwrap(), persisted);
+    if matches!(mode, AuthenticatedReplayMode::ContinueAfterRecovery) {
+        // The third leader is fresh; its authenticated cone includes additional real
+        // batches from round two, not just a synthetic snapshot boundary.
+        let mut dag = Dag::new(m.set.clone());
+        dag.set_chain_id(chain_id.to_vec());
+        for vertex in &vertices {
+            dag.insert(vertex.clone()).unwrap();
+        }
+        dag.seed_order(recovered.order().to_vec());
+        let validator::Decision::Commit(suffix) = dag.inspect_commit(3).unwrap() else {
+            panic!("round-four voters must commit round three")
+        };
+        let leader = dag.leader(3).unwrap().id().unwrap();
+        assert!(!recovered.order().contains(&leader));
+        assert!(suffix.contains(&leader));
+        let mut third_order = recovered.order().to_vec();
+        third_order.extend(suffix);
+        let mut proposal = SlotProposal {
+            decision: SlotDecision {
+                chain_id: chain_id.to_vec(),
+                validator_set_id: m.set.id().unwrap(),
+                epoch: m.set.epoch,
+                round: 3,
+                previous: *recovered.binding().tip().previous_id(),
+                before_len: recovered.order().len() as u64,
+                before_root: validator::commit_root(recovered.order()),
+                after_len: third_order.len() as u64,
+                after_root: validator::commit_root(&third_order),
+                outcome: SlotOutcome::Commit { leader },
+            },
+            voters: vertices
+                .iter()
+                .filter(|v| v.round == 4)
+                .take(3)
+                .map(|v| v.id().unwrap())
+                .collect(),
+        };
+        proposal.voters.sort_by(|a, b| {
+            (&a.round, &a.author, &a.digest).cmp(&(&b.round, &b.author, &b.digest))
+        });
+        let refs = vertices
+            .iter()
+            .filter(|v| v.round == 14)
+            .map(|v| v.id().unwrap())
+            .collect::<Vec<_>>();
+        let mut proposal_carrier = None;
+        for author in 0..4 {
+            let hash = if author == 0 {
+                proposal.digest().unwrap()
+            } else {
+                [9; 32]
+            };
+            let vertex = signed_for_chain(&m, author, 15, refs.clone(), hash, chain_id);
+            if author == 0 {
+                proposal_carrier = Some(vertex.id().unwrap());
+            }
+            vertices.push(vertex);
+        }
+        let (proof, carrier) = append_proof(
+            &m,
+            chain_id,
+            &mut vertices,
+            recovered.binding().tip().clone(),
+            proposal,
+            proposal_carrier.unwrap(),
+            16,
+        );
+        let mut owner = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+        owner
+            .apply(AuthenticatedSlotAgreementRequest::ObservePrecommit {
+                proof,
+                carrier,
+                vertices: vertices.clone(),
+            })
+            .unwrap();
+        owner
+            .apply(AuthenticatedSlotAgreementRequest::AdvanceSlot)
+            .unwrap();
+        let third = owner.ordering_snapshot().unwrap();
+        assert_eq!(third.applications().len(), 3);
+        assert_eq!(third.applications()[2].round(), 3);
+        assert!(third.applications()[2].is_commit());
+        assert_eq!(third.order(), third_order);
+        assert!(third.order().len() > recovered.order().len());
+        let controls: BTreeSet<_> = vertices
+            .iter()
+            .filter(|v| !batches.contains_key(&v.payload_hash))
+            .map(|v| v.payload_hash)
+            .collect();
+        let mut third_expected = chain::genesis_state(&accounts).unwrap();
+        let mut rejected = BTreeMap::new();
+        let mut third_applied = 0;
+        for vertex in third.vertices() {
+            if let Some(batch) = batches.get(&vertex.payload_hash) {
+                third_applied +=
+                    chain::apply_batch(&mut third_expected, &accounts, batch, &mut rejected) as u64;
+            }
+        }
+        assert!(rejected.is_empty());
+        assert!(third_applied > applied);
+        assert_ne!(third_expected.state_root(), expected.state_root());
+
+        coordinator.update(third.clone()).unwrap();
+        let uninterrupted = coordinator
+            .build_ready(&m, &batches, &controls, 200)
+            .unwrap();
+        assert_eq!(uninterrupted.shares.len(), 1);
+        assert!(uninterrupted.certified.is_empty());
+        // A sibling advance invalidates the recovered owner; continuation requires
+        // reopening durable history, not an in-place agreement refresh.
+        let stale = share_replay
+            .build_ready(&m, &batches, &controls, 200)
+            .err()
+            .expect("sibling AdvanceSlot must invalidate the recovered owner");
+        assert_eq!(
+            stale,
+            "store decode: crypto: malformed_certificate: stale authenticated owner"
+        );
+        assert_eq!(
+            share_replay.finalization().finalizer().head(),
+            &built.shares[1].header
+        );
+        assert_eq!(
+            share_replay
+                .build_ready(&m, &batches, &controls, 201)
+                .err()
+                .as_deref(),
+            Some("journaled finalization requires reopening after durable history failure")
+        );
+        assert_eq!(
+            share_replay.finalization().finalizer().head(),
+            &built.shares[1].header
+        );
+        let mut continued = open_replay();
+        let resumed = continued.build_ready(&m, &batches, &controls, 200).unwrap();
+        assert_eq!(resumed.shares.len(), 3);
+        assert_eq!(&resumed.shares[..2], replayed.shares.as_slice());
+        assert_eq!(resumed.shares[2], uninterrupted.shares[0]);
+        assert_eq!(resumed.certified.len(), 2);
+        let local = &resumed.shares[2];
+        assert_eq!(local.at, 200);
+        assert_eq!(local.header.height, 3);
+        assert_eq!(local.header.round, 3);
+        assert_eq!(local.header.previous, built.shares[1].header.id().unwrap());
+        assert_eq!(local.header.state_root, third_expected.state_root());
+        assert_eq!(local.header.applied, third_applied);
+        assert_eq!(local.header.dag_root, validator::commit_root(third.order()));
+        let peer = |signer: usize, at| {
+            let mut share = local.clone();
+            share.signer = signer;
+            share.at = at;
+            share.signature = Ed25519Scheme
+                .sign(
+                    &m.consensus[signer].private_key,
+                    &validator::signing_payload(&share.header).unwrap(),
+                )
+                .unwrap();
+            share
+        };
+        assert!(
+            coordinator
+                .receive_share(&m, peer(1, 201))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            continued
+                .receive_share(&m, peer(1, 201))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            continued.finalization().finalizer().head(),
+            &built.shares[1].header
+        );
+        assert_eq!(
+            continued.finalization().finalizer().last_built(),
+            &local.header
+        );
+        assert_eq!(
+            continued.finalization().finalizer().certified_order(3),
+            None
+        );
+        drop(continued);
+        let mut continued = open_replay();
+        let partial = continued
+            .build_ready(&m, &batches, &controls, 30_001)
+            .unwrap();
+        assert_eq!(partial.shares.len(), 3);
+        assert_eq!(&partial.shares[..2], replayed.shares.as_slice());
+        assert_eq!(partial.shares[2], *local);
+        assert_eq!(partial.certified.len(), 2);
+        assert_eq!(
+            continued.finalization().finalizer().head(),
+            &built.shares[1].header
+        );
+        assert!(
+            continued
+                .receive_share(&m, peer(1, 999))
+                .unwrap()
+                .is_empty()
+        );
+        let expected_certificate = coordinator.receive_share(&m, peer(2, 202)).unwrap();
+        let actual_certificate = continued.receive_share(&m, peer(2, 202)).unwrap();
+        assert_eq!(actual_certificate.len(), 1);
+        assert_eq!(expected_certificate.len(), 1);
+        assert_eq!(actual_certificate[0].header, expected_certificate[0].header);
+        assert_eq!(
+            actual_certificate[0].certificate,
+            expected_certificate[0].certificate
+        );
+        assert_eq!(actual_certificate[0].at, 202);
+        assert_eq!(actual_certificate[0].at, expected_certificate[0].at);
+        continued
+            .finalization()
+            .finalizer()
+            .verify_certificate(
+                &actual_certificate[0].header,
+                &actual_certificate[0].certificate,
+            )
+            .unwrap();
+        for finalization in [&coordinator, continued.finalization()] {
+            assert_eq!(finalization.finalizer().head(), &local.header);
+            assert_eq!(finalization.finalizer().last_built(), &local.header);
+            assert_eq!(
+                finalization.finalizer().last_built_order(),
+                third.order().len()
+            );
+            assert_eq!(
+                finalization.finalizer().certified_order(3),
+                Some(third.order().len())
+            );
+            assert_eq!(finalization.execution().state(), &third_expected);
+            assert_eq!(finalization.execution().applied(), third_applied);
+            assert_eq!(finalization.execution().consumed_order(), third.order());
+        }
+        let shares = owner.header_shares().unwrap();
+        assert_eq!(shares.len(), persisted.len() + 3);
+        for share in &persisted {
+            assert!(shares.contains(share));
+        }
+        for share in [local.clone(), peer(1, 201), peer(2, 202)] {
+            assert!(shares.contains(&share));
+        }
+        let intents = owner.header_intents().unwrap();
+        assert_eq!(&intents[..2], durable_intents.as_slice());
+        assert_eq!(intents.len(), 3);
+        assert_eq!(intents[2].header(), &local.header);
+        assert_eq!(intents[2].application(), 2);
+        assert_eq!(intents[2].order_len(), third.order().len());
+        return;
+    }
     let mut wrong_anchor = anchor.clone();
     wrong_anchor.previous[0] ^= 1;
     assert!(
