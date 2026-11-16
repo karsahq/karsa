@@ -7,6 +7,49 @@ use validator::{
     SlotOutcome, SlotProposal, Vertex,
 };
 
+#[test]
+fn ordering_consumer_rejects_chain_set_and_epoch_changes() {
+    let (_, bootstrap, _) = fixture();
+    let snapshot = |bootstrap: AuthenticatedSlotAgreementBootstrap| {
+        let dir = Dir::new();
+        let store = Store::open(&dir.0).unwrap();
+        store
+            .begin_authenticated_slot_agreement(bootstrap)
+            .unwrap()
+            .ordering_snapshot()
+            .unwrap()
+    };
+    let original = snapshot(bootstrap.clone());
+    let mut consumer = OrderingConsumer::restore(original.clone(), &[]).unwrap();
+    for kind in 0..3 {
+        let mut changed = bootstrap.clone();
+        let mut chain_id = original.binding().tip().chain_id().to_vec();
+        match kind {
+            0 => chain_id.push(1),
+            1 => {
+                changed.agreement.set.validators.pop();
+            }
+            2 => changed.agreement.set.epoch += 1,
+            _ => unreachable!(),
+        }
+        changed.agreement.context = SlotDecisionTip::from_checkpoint(
+            chain_id,
+            &changed.agreement.set,
+            original.binding().tip().next_round() + 1,
+            *original.binding().tip().previous_id(),
+            0,
+            validator::commit_root(&[]),
+        )
+        .unwrap();
+        assert!(
+            consumer.update(snapshot(changed)).is_err(),
+            "context case {kind}"
+        );
+        consumer.update(original.clone()).unwrap();
+        assert!(consumer.consumed_order().is_empty());
+    }
+}
+
 fn assert_ordering_consumer(
     before: &store::AgreementOrderingSnapshot,
     applied: &store::AgreementOrderingSnapshot,
@@ -61,6 +104,65 @@ fn assert_ordering_consumer(
     let mut longer = applied.order().to_vec();
     longer.push(longer[0].clone());
     assert!(OrderingConsumer::restore(applied.clone(), &longer).is_err());
+}
+
+fn assert_ordering_consumer_rejects_conflicting_checkpoints(
+    bootstrap: &AuthenticatedSlotAgreementBootstrap,
+    vertices: &[Vertex],
+    applied: &store::AgreementOrderingSnapshot,
+) {
+    // Independently trusted checkpoints can be internally valid without extending
+    // this consumer's history. Store authentication alone cannot establish that link.
+    let checkpoint = |order: Vec<VertexId>, round: u64, previous: [u8; 32]| {
+        let mut bootstrap = bootstrap.clone();
+        bootstrap.agreement.context = SlotDecisionTip::from_checkpoint(
+            applied.binding().tip().chain_id().to_vec(),
+            &bootstrap.agreement.set,
+            round,
+            previous,
+            order.len() as u64,
+            validator::commit_root(&order),
+        )
+        .unwrap();
+        bootstrap.predecessor = applied.binding().carrier().cloned();
+        bootstrap.order = order;
+        bootstrap.vertices = vertices.to_vec();
+        let dir = Dir::new();
+        let store = Store::open(&dir.0).unwrap();
+        store
+            .begin_authenticated_slot_agreement(bootstrap)
+            .unwrap()
+            .ordering_snapshot()
+            .unwrap()
+    };
+    let tip = applied.binding().tip();
+    assert!(applied.order().len() > 1);
+    let mut rewritten = applied.order().to_vec();
+    rewritten.swap(0, 1);
+    let truncated = applied.order()[..applied.order().len() - 1].to_vec();
+    let mut previous = *tip.previous_id();
+    previous[0] ^= 1;
+    let conflicts = [
+        checkpoint(rewritten, tip.next_round() + 1, *tip.previous_id()),
+        checkpoint(truncated, tip.next_round() + 1, *tip.previous_id()),
+        checkpoint(applied.order().to_vec(), tip.next_round(), previous),
+    ];
+    let mut consumer = OrderingConsumer::restore(applied.clone(), &[]).unwrap();
+    for conflict in conflicts {
+        assert!(consumer.update(conflict).is_err());
+        assert!(consumer.consumed_order().is_empty());
+    }
+    // Failed updates must preserve the previously accepted vertices, not merely
+    // the cursor: otherwise a rejected unconsumed tail could still be executed.
+    let mut consumed = Vec::new();
+    consumer
+        .consume_ready(|vertex| {
+            consumed.push(vertex.id().unwrap());
+            Ok(true)
+        })
+        .unwrap();
+    assert_eq!(consumed, applied.order());
+    assert_eq!(consumer.consumed_order(), applied.order());
 }
 
 // Explicit acceptance-test orchestration, not a production scheduler: every signing
@@ -519,11 +621,105 @@ fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen
         let recovered = adapter.ordering_snapshot().unwrap();
         assert_eq!(format!("{recovered:?}"), format!("{applied:?}"));
         assert_ordering_consumer(&before, &recovered);
+        if i == 0 {
+            assert_ordering_consumer_rejects_conflicting_checkpoints(
+                &bootstraps[i],
+                &available,
+                &recovered,
+            );
+        }
         assert_eq!(format!("{:?}", adapter.signing_history()), history);
         assert_eq!(
             std::fs::read(dirs[i].0.join("authenticated-slot-agreement")).unwrap(),
             wal
         );
+        if i == 0 {
+            assert!(adapter.restore_execution().unwrap().is_none());
+            let mut consumer = OrderingConsumer::restore(recovered.clone(), &[]).unwrap();
+            let mut state = exec::State::new();
+            let mut count = 0u64;
+            // Deliberately simple deterministic state transitions, not real batch execution.
+            consumer
+                .consume_ready(|vertex| {
+                    if count == 1 {
+                        return Ok(false);
+                    }
+                    state.credit(&vertex.author, 1).unwrap();
+                    count += 1;
+                    Ok(true)
+                })
+                .unwrap();
+            adapter
+                .checkpoint_execution(&mut consumer, &state, count)
+                .unwrap();
+            let partial_state = state.clone();
+            let checkpoint_path = dirs[i].0.join("agreement-execution-checkpoint");
+            let partial_bytes = std::fs::read(&checkpoint_path).unwrap();
+            consumer
+                .consume_ready(|vertex| {
+                    state.credit(&vertex.author, 1).unwrap();
+                    count += 1;
+                    Ok(true)
+                })
+                .unwrap();
+            let complete_state = state.clone();
+            // A blocked staging path prevents publication; the old complete record survives.
+            let temporary = dirs[i].0.join("agreement-execution-checkpoint.tmp");
+            std::fs::create_dir(&temporary).unwrap();
+            assert!(
+                adapter
+                    .checkpoint_execution(&mut consumer, &state, count)
+                    .is_err()
+            );
+            assert!(adapter.restore_execution().is_err());
+            assert_eq!(std::fs::read(&checkpoint_path).unwrap(), partial_bytes);
+            std::fs::remove_dir(&temporary).unwrap();
+            drop(adapter);
+            drop(store);
+            let store = Store::open(&dirs[i].0).unwrap();
+            let mut adapter = Adapter::recover(&store, bootstraps[i].clone(), &m, i).unwrap();
+            let (mut consumer, mut state, mut count) =
+                adapter.restore_execution().unwrap().unwrap();
+            assert_eq!(state, partial_state);
+            assert_eq!(count, 1);
+            assert_eq!(consumer.consumed_order(), &recovered.order()[..1]);
+            consumer
+                .consume_ready(|vertex| {
+                    state.credit(&vertex.author, 1).unwrap();
+                    count += 1;
+                    Ok(true)
+                })
+                .unwrap();
+            assert_eq!(state, complete_state);
+            assert_eq!(count as usize, recovered.order().len());
+            adapter
+                .checkpoint_execution(&mut consumer, &state, count)
+                .unwrap();
+            let complete_bytes = std::fs::read(&checkpoint_path).unwrap();
+            adapter
+                .checkpoint_execution(&mut consumer, &state, count)
+                .unwrap();
+            assert_eq!(std::fs::read(&checkpoint_path).unwrap(), complete_bytes);
+            drop(adapter);
+            drop(store);
+            let store = Store::open(&dirs[i].0).unwrap();
+            let mut adapter = Adapter::recover(&store, bootstraps[i].clone(), &m, i).unwrap();
+            let (mut consumer, state, count) = adapter.restore_execution().unwrap().unwrap();
+            assert_eq!(state, complete_state);
+            assert_eq!(count as usize, recovered.order().len());
+            consumer
+                .consume_ready(|_| panic!("durably consumed prefix must not replay"))
+                .unwrap();
+            assert_eq!(
+                std::fs::read(dirs[i].0.join("authenticated-slot-agreement")).unwrap(),
+                wal
+            );
+            let mut corrupt = complete_bytes;
+            corrupt.push(1);
+            std::fs::write(&checkpoint_path, &corrupt).unwrap();
+            assert!(adapter.restore_execution().is_err());
+            assert_eq!(std::fs::read(&checkpoint_path).unwrap(), corrupt);
+        }
     }
 }
 

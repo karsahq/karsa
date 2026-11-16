@@ -60,6 +60,118 @@ pub(super) fn fixture(
     (f, lineage, bootstrap)
 }
 #[test]
+fn execution_checkpoint_stays_with_signing_root_across_generation_activation() {
+    let (_, _, bootstrap) = fixture(true);
+    let dir = TempDir::new();
+    let mut store = Store::open(&dir.0).unwrap();
+    let mut owner = store
+        .begin_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    owner
+        .put_execution_checkpoint(&[], 0, b"local state")
+        .unwrap();
+    let staged = store.stage().unwrap();
+    assert!(
+        !staged
+            .store()
+            .root
+            .join("agreement-execution-checkpoint")
+            .exists()
+    );
+    staged.activate().unwrap();
+    assert_eq!(
+        owner.execution_checkpoint().unwrap().unwrap().state(),
+        b"local state"
+    );
+    drop(owner);
+    drop(store);
+    let store = Store::open(&dir.0).unwrap();
+    let owner = store
+        .recover_authenticated_slot_agreement(bootstrap)
+        .unwrap();
+    assert_eq!(
+        owner.execution_checkpoint().unwrap().unwrap().state(),
+        b"local state"
+    );
+}
+
+#[test]
+fn execution_checkpoint_rejects_conflicts_stale_owners_and_corruption() {
+    let (f, lineage, bootstrap) = fixture(true);
+    let dir = TempDir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = store
+        .begin_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    assert!(owner.execution_checkpoint().unwrap().is_none());
+    owner
+        .put_execution_checkpoint(&[], 0, b"initial state")
+        .unwrap();
+    let path = dir.0.join("agreement-execution-checkpoint");
+    let bytes = fs::read(&path).unwrap();
+    owner
+        .put_execution_checkpoint(&[], 0, b"initial state")
+        .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert!(
+        owner
+            .put_execution_checkpoint(&[], 0, b"changed state")
+            .is_err()
+    );
+    assert!(
+        owner
+            .put_execution_checkpoint(&[], 1, b"initial state")
+            .is_err()
+    );
+    assert!(
+        owner
+            .put_execution_checkpoint(&[f.vertices[0].id().unwrap()], 0, b"state")
+            .is_err()
+    );
+    assert!(
+        owner
+            .put_execution_checkpoint(&[], 0, &vec![0; 2 * 1024 * 1024 + 1])
+            .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    let mut stale = store
+        .recover_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    owner
+        .apply(
+            1,
+            AuthenticatedSlotAgreementRequest::Propose {
+                lineage,
+                vertices: f.vertices,
+            },
+        )
+        .unwrap();
+    assert!(stale.execution_checkpoint().is_err());
+    assert!(
+        stale
+            .put_execution_checkpoint(&[], 0, b"initial state")
+            .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    drop(stale);
+    drop(owner);
+    drop(store);
+    let store = Store::open(&dir.0).unwrap();
+    let owner = store
+        .recover_authenticated_slot_agreement(bootstrap)
+        .unwrap();
+    let restored = owner.execution_checkpoint().unwrap().unwrap();
+    assert!(restored.order().is_empty());
+    assert_eq!(restored.applied(), 0);
+    assert_eq!(restored.state(), b"initial state");
+    let mut corrupt = bytes;
+    corrupt[0] ^= 1;
+    fs::write(&path, &corrupt).unwrap();
+    assert!(owner.execution_checkpoint().is_err());
+    assert_eq!(fs::read(&path).unwrap(), corrupt);
+}
+
+#[test]
 fn ordering_snapshot_tracks_only_applied_certified_prefix_and_recovers() {
     for committing in [true, false] {
         let (f, proof, carrier) = crate::slot_application_tests::unified_fixture(committing);
@@ -114,6 +226,22 @@ fn ordering_snapshot_tracks_only_applied_certified_prefix_and_recovers() {
         assert_eq!(applied.binding().tip().next_round(), decision.round + 1);
         assert_eq!(applied.binding().carrier(), Some(&carrier));
         assert_eq!(applied.order().is_empty(), !committing);
+        if committing {
+            owner
+                .put_execution_checkpoint(&applied.order()[..1], 1, b"partial")
+                .unwrap();
+            let checkpoint = fs::read(dir.0.join("agreement-execution-checkpoint")).unwrap();
+            assert!(owner.put_execution_checkpoint(&[], 0, b"initial").is_err());
+            assert!(
+                owner
+                    .put_execution_checkpoint(applied.order(), 0, b"regressed count")
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read(dir.0.join("agreement-execution-checkpoint")).unwrap(),
+                checkpoint
+            );
+        }
         let ids: Vec<_> = applied.vertices().iter().map(|v| v.id().unwrap()).collect();
         assert_eq!(ids, applied.order());
         for vertex in applied.vertices() {

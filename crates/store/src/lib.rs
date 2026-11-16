@@ -23,6 +23,10 @@
 //! in-memory application. It follows the active generation and does not replace
 //! authenticated checkpoint restoration or persist transaction/finalizer effects.
 //!
+//! The inactive authenticated-agreement execution checkpoint separately pairs opaque
+//! local state bytes with a consumed certified prefix in one synced atomic replacement.
+//! It stays at the signing root, does not certify execution, and cannot authorize pruning.
+//!
 //! Other logs do not fsync on every append: durability of the last record is the
 //! caller's tradeoff, and `Store::sync` exists for callers that want it.
 
@@ -63,9 +67,9 @@ pub use slot_agreement_driver::{
 mod slot_agreement_journal;
 pub use authenticated_slot_agreement::{
     AgreementCarrierEvidence, AgreementCompletedCarrier, AgreementCompletedNilVote,
-    AgreementOrderingSnapshot, AgreementQuorumCandidate, AgreementReproposalCandidate,
-    AgreementReservedCarrier, AgreementSigningIntent, AgreementSigningPrerequisite,
-    AgreementViewRequestReservation, AuthenticatedSlotAgreement,
+    AgreementExecutionCheckpoint, AgreementOrderingSnapshot, AgreementQuorumCandidate,
+    AgreementReproposalCandidate, AgreementReservedCarrier, AgreementSigningIntent,
+    AgreementSigningPrerequisite, AgreementViewRequestReservation, AuthenticatedSlotAgreement,
     AuthenticatedSlotAgreementBootstrap, AuthenticatedSlotAgreementRequest,
 };
 #[cfg(test)]
@@ -567,6 +571,8 @@ impl Store {
             if name == slot_decision_journal::FILE
                 || name == slot_agreement_journal::FILE
                 || name == authenticated_slot_agreement::FILE
+                || name == "agreement-execution-checkpoint"
+                || name == "agreement-execution-checkpoint.tmp"
                 || name == ".lock"
                 || name == "CURRENT"
                 || name == "CURRENT.tmp"

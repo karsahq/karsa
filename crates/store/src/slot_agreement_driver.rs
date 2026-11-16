@@ -101,6 +101,27 @@ impl SlotAgreementDriver {
         self.session.ordering_snapshot()
     }
 
+    /// Loads the execution state/cursor pair after validating owner and certified prefix.
+    /// # Errors
+    /// Rejects stale owners, corrupt records, and incompatible certified histories.
+    pub fn execution_checkpoint(
+        &self,
+    ) -> Result<Option<crate::AgreementExecutionCheckpoint>, StoreError> {
+        self.session.execution_checkpoint()
+    }
+
+    /// Publishes opaque execution state and its certified cursor as one synced record.
+    /// # Errors
+    /// Rejects invalid or regressing prefixes, conflicting state, and publication failures.
+    pub fn put_execution_checkpoint(
+        &mut self,
+        order: &[validator::VertexId],
+        applied: u64,
+        state: &[u8],
+    ) -> Result<(), StoreError> {
+        self.session.put_execution_checkpoint(order, applied, state)
+    }
+
     /// Returns the number of durable requests installed by this owner.
     pub fn sequence(&self) -> u64 {
         self.session.sequence()

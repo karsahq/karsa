@@ -163,6 +163,58 @@ const MAX_CARRIER_EXPORT_EVENTS: u64 = 4096;
 const MAX_CARRIER_RETRY_IDS: usize = 64;
 
 impl Adapter {
+    /// Publishes caller-owned execution state and its consumed certified prefix together.
+    /// The caller must ensure the state and transaction count were produced by exactly
+    /// this consumer. No live state, finalizer, or RPC effects are published here.
+    /// # Errors
+    /// Rejects incompatible consumers, invalid state encoding, stale ownership or I/O errors.
+    pub fn checkpoint_execution(
+        &mut self,
+        consumer: &mut OrderingConsumer,
+        state: &exec::State,
+        applied: u64,
+    ) -> Result<(), String> {
+        consumer.update(self.ordering_snapshot()?)?;
+        let bytes = state.encode().map_err(|error| error.to_string())?;
+        self.driver
+            .put_execution_checkpoint(consumer.consumed_order(), applied, &bytes)
+            .map_err(|error| {
+                self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+                error.to_string()
+            })
+    }
+
+    /// Restores state and consumed cursor only from the same local durable record.
+    /// Missing checkpoints are explicit; callers must not silently substitute legacy state.
+    /// This is local recovery, not authenticated snapshot join or finality authority.
+    /// # Errors
+    /// Rejects corrupt/incompatible checkpoints, undecodable state, and stale owners.
+    pub fn restore_execution(
+        &mut self,
+    ) -> Result<Option<(OrderingConsumer, exec::State, u64)>, String> {
+        let snapshot = self.ordering_snapshot()?;
+        let restored = (|| {
+            let Some(checkpoint) = self
+                .driver
+                .execution_checkpoint()
+                .map_err(|error| error.to_string())?
+            else {
+                return Ok(None);
+            };
+            let state =
+                exec::State::decode(checkpoint.state()).map_err(|error| error.to_string())?;
+            if state.encode().map_err(|error| error.to_string())? != checkpoint.state() {
+                return Err("execution checkpoint state is not canonical".into());
+            }
+            let consumer = OrderingConsumer::restore(snapshot, checkpoint.order())?;
+            Ok(Some((consumer, state, checkpoint.applied())))
+        })();
+        if restored.is_err() {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+        }
+        restored
+    }
+
     /// Exports only the applied certified prefix, never speculative legacy DAG order.
     /// A durable decision is excluded until an explicit durable `AdvanceSlot` request.
     /// This read neither advances slots nor executes transactions or mutates a live DAG.

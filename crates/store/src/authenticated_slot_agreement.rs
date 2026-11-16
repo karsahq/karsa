@@ -1,4 +1,7 @@
 use super::*;
+#[path = "agreement_execution_checkpoint.rs"]
+mod execution_checkpoint;
+pub use execution_checkpoint::AgreementExecutionCheckpoint;
 use std::collections::BTreeMap;
 use validator::slot_agreement::{
     AgreementInput, AgreementPhase, AgreementQc, AgreementTransitionResult, AgreementValue,
