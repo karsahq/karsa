@@ -36,6 +36,129 @@ fn signed_view_request(
 }
 
 #[test]
+fn echo_exact_target_converges_after_restart() {
+    let (m, bootstrap, _) = fixture();
+    let dirs: Vec<_> = (0..4).map(|_| Dir::new()).collect();
+    let stores: Vec<_> = dirs.iter().map(|d| Store::open(&d.0).unwrap()).collect();
+    let mut peers: Vec<_> = stores
+        .iter()
+        .enumerate()
+        .map(|(i, store)| {
+            let mut b = bootstrap.clone();
+            b.agreement.local_validator = m.consensus[i].id.clone();
+            Adapter::begin(store, b, &m, i).unwrap()
+        })
+        .collect();
+    let a = peers[0].author_view_request(AgreementView(7)).unwrap();
+    let b = peers[1].author_view_request(AgreementView(7)).unwrap();
+    let low = peers[2].author_view_request(AgreementView(3)).unwrap();
+    peers[2].receive_view_request(a.clone()).unwrap();
+    peers[2].receive_view_request(b.clone()).unwrap();
+    let mut third = bootstrap.clone();
+    third.agreement.local_validator = m.consensus[2].id.clone();
+    peers[2] = Adapter::recover(&stores[2], third, &m, 2).unwrap();
+    assert_eq!(peers[2].completed_view_requests().unwrap(), vec![low]);
+    assert!(peers[2].echo_view_request().unwrap().is_none());
+    peers[2].receive_view_request(a.clone()).unwrap();
+    peers[2].receive_view_request(b.clone()).unwrap();
+    let echo = peers[2].echo_view_request().unwrap().unwrap();
+    assert_eq!(echo.target_view(), AgreementView(7));
+    let sequence = peers[2].driver.sequence();
+    assert!(peers[2].echo_view_request().unwrap().is_none());
+    assert_eq!(peers[2].driver.sequence(), sequence);
+    for peer in &mut peers[..2] {
+        // Local durable support also counts before it has been received locally.
+        peer.receive_view_request(echo.clone()).unwrap();
+        let own = peer.echo_view_request().unwrap().unwrap();
+        let sequence = peer.driver.sequence();
+        assert_eq!(peer.echo_view_request().unwrap(), Some(own));
+        assert_eq!(peer.driver.sequence(), sequence);
+        peer.receive_view_request(a.clone()).unwrap();
+        peer.receive_view_request(b.clone()).unwrap();
+    }
+    for peer in &peers[..3] {
+        assert_eq!(
+            peer.driver.output().unwrap().transition.unwrap().view,
+            AgreementView(7)
+        );
+    }
+    assert!(peers[3].completed_view_requests().unwrap().is_empty());
+}
+
+#[test]
+fn echo_recovers_reservation_preserves_highest_and_respects_cap() {
+    let (m, bootstrap, _) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut peer = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    peer.apply(AuthenticatedSlotAgreementRequest::ReserveViewRequest {
+        target_view: AgreementView(7),
+    })
+    .unwrap();
+    let mut peer = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    for signer in [1, 2] {
+        peer.receive_view_request(signed_view_request(&m, &bootstrap, signer, 7))
+            .unwrap();
+    }
+    let sequence = peer.driver.sequence();
+    assert_eq!(
+        peer.echo_view_request().unwrap().unwrap().target_view(),
+        AgreementView(7)
+    );
+    // Complete the existing reservation and enter q, without a second reservation.
+    assert_eq!(peer.driver.sequence(), sequence + 2);
+    peer.author_view_request(AgreementView(20)).unwrap();
+    for signer in [1, 2] {
+        peer.receive_view_request(signed_view_request(&m, &bootstrap, signer, 10))
+            .unwrap();
+    }
+    let sequence = peer.driver.sequence();
+    assert!(peer.echo_view_request().unwrap().is_none());
+    assert_eq!(peer.driver.sequence(), sequence);
+    for target in 21..35 {
+        peer.author_view_request(AgreementView(target)).unwrap();
+    }
+    assert_eq!(peer.completed_view_requests().unwrap().len(), 16);
+    for signer in [1, 2] {
+        peer.receive_view_request(signed_view_request(&m, &bootstrap, signer, 40))
+            .unwrap();
+    }
+    let sequence = peer.driver.sequence();
+    assert!(peer.echo_view_request().is_err());
+    assert_eq!(peer.driver.sequence(), sequence);
+}
+
+#[test]
+fn echo_requires_exact_distinct_support_and_fresh_owner() {
+    let (m, bootstrap, _) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut peer = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    let sequence = peer.driver.sequence();
+    for target in [10, 100, u64::MAX] {
+        peer.receive_view_request(signed_view_request(&m, &bootstrap, 3, target))
+            .unwrap();
+        assert!(peer.echo_view_request().unwrap().is_none());
+        assert_eq!(peer.driver.sequence(), sequence);
+    }
+    let mut peer = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    for (signer, target) in [(0, 1), (1, 2), (2, 3)] {
+        peer.receive_view_request(signed_view_request(&m, &bootstrap, signer, target))
+            .unwrap();
+    }
+    // Explicit coverage limitation: f+1 different targets cannot trigger an echo.
+    assert!(peer.echo_view_request().unwrap().is_none());
+    assert_eq!(peer.driver.sequence(), sequence);
+    let mut newer = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    newer.author_view_request(AgreementView(9)).unwrap();
+    assert!(peer.echo_view_request().is_err());
+    assert_eq!(
+        peer.readiness(),
+        Readiness::RecoveryRequiredHistoricalIntentsUnavailable
+    );
+}
+
+#[test]
 fn view_certificate_durable_restart_and_single_receipt() {
     use validator::slot_agreement::AgreementPhase;
     let (m, bootstrap, _) = fixture();
@@ -2827,12 +2950,21 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
     assert_eq!(*digest, proof.digest(&m.set).unwrap());
     // Enter only after authoring the final carrier: an authenticated lower-view
     // commit must still decide, and its slot's entry certificate remains exportable.
-    let mut entry_certificate: Vec<_> = adapters
-        .iter_mut()
-        .take(m.set.quorum_size())
-        .map(|a| a.author_view_request(AgreementView(98)).unwrap())
-        .collect();
-    entry_certificate.sort_by(|a, b| a.signature().validator_id.cmp(&b.signature().validator_id));
+    let first = adapters[0].author_view_request(AgreementView(98)).unwrap();
+    let second = adapters[1].author_view_request(AgreementView(98)).unwrap();
+    adapters[2].author_view_request(AgreementView(97)).unwrap();
+    adapters[2].receive_view_request(first).unwrap();
+    adapters[2].receive_view_request(second).unwrap();
+    assert_eq!(
+        adapters[2]
+            .echo_view_request()
+            .unwrap()
+            .unwrap()
+            .target_view(),
+        AgreementView(98)
+    );
+    recover_envelope_adapter(&mut adapters[2], &stores[2], &bootstrap, &m, 2);
+    let entry_certificate = adapters[2].entered_view_certificate().unwrap().unwrap();
     adapters[0]
         .receive_view_certificate(entry_certificate.clone())
         .unwrap();

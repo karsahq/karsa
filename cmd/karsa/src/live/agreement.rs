@@ -611,6 +611,71 @@ impl Adapter {
         Ok(message)
     }
 
+    /// Explicitly echoes the largest exact future target with at least f+1 distinct signers.
+    /// Availability is conditional on exact-target support and the existing 16-request cap.
+    /// Remote support is volatile; completed local publications survive recovery. This does
+    /// not reuse nil authority or promise to echo mixed-target support cumulatively.
+    /// # Errors
+    /// Rejects stale or uncertain ownership and failures in durable request publication.
+    pub fn echo_view_request(
+        &mut self,
+    ) -> Result<Option<validator::SlotAgreementViewRequest>, String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before request echo".into());
+        }
+        let output = self.driver.output().map_err(|error| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            error.to_string()
+        })?;
+        if output
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.decision.is_some())
+        {
+            return Ok(None);
+        }
+        let completed = self.completed_view_requests()?;
+        let local_highest = completed
+            .iter()
+            .filter(|r| r.context() == output.binding.tip())
+            .map(|r| r.target_view())
+            .max();
+        let mut latest = std::collections::BTreeMap::new();
+        for request in self.view_requests.iter().chain(&completed) {
+            if request.context() != output.binding.tip() {
+                continue;
+            }
+            request
+                .verify(output.binding.tip(), &self.set)
+                .map_err(|e| e.to_string())?;
+            let target = request.target_view();
+            let retained = latest
+                .entry(request.signature().validator_id.clone())
+                .or_insert(target);
+            *retained = (*retained).max(target);
+        }
+        let mut support = std::collections::BTreeMap::new();
+        for target in latest.into_values() {
+            if target.0 != 0 && output.transition.as_ref().is_none_or(|t| target > t.view) {
+                *support.entry(target).or_insert(0usize) += 1;
+            }
+        }
+        let Some(target) = support
+            .into_iter()
+            .rev()
+            .find_map(|(target, count)| (count > self.set.max_faulty()).then_some(target))
+        else {
+            return Ok(None);
+        };
+        // A lower echo would be hidden by latest-per-signer retention at other peers.
+        if local_highest.is_some_and(|highest| highest > target) {
+            return Ok(None);
+        }
+        let request = self.author_view_request(target)?;
+        self.receive_view_request(request.clone())?;
+        Ok(Some(request))
+    }
+
     /// Returns exact durable signed request publications, including historical slots.
     /// # Errors
     /// Rejects uncertain or stale owners and invalid durable evidence.
