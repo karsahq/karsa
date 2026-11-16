@@ -34,10 +34,10 @@ impl AgreementHeaderIntent {
     }
 }
 
-struct Journal {
+pub(super) struct Journal {
     bootstrap: Vec<u8>,
-    anchor: Header,
-    intents: Vec<AgreementHeaderIntent>,
+    pub(super) anchor: Header,
+    pub(super) intents: Vec<AgreementHeaderIntent>,
 }
 
 impl Journal {
@@ -63,7 +63,7 @@ impl Journal {
         Ok(e.finish())
     }
 
-    fn validate(
+    pub(super) fn validate(
         &self,
         bootstrap: &[u8],
         snapshot: &AgreementOrderingSnapshot,
@@ -117,7 +117,7 @@ impl Journal {
     }
 }
 
-fn read_intents(root: &Path) -> Result<Option<Journal>, StoreError> {
+pub(super) fn read_intents(root: &Path) -> Result<Option<Journal>, StoreError> {
     let path = root.join(INTENTS_FILE);
     validate_pointer_file(&path)?;
     let file = match File::open(path) {
@@ -284,11 +284,11 @@ fn publish(root: &Path, bytes: &[u8]) -> Result<(), StoreError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::slot_application_tests::TempDir;
 
-    fn fixture(
+    pub(in crate::authenticated_slot_agreement) fn fixture(
         dir: &TempDir,
         commit: bool,
     ) -> (

@@ -206,7 +206,9 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
     let validator::Decision::Commit(suffix) = dag.inspect_commit(2).unwrap() else {
         panic!("round-three voters must commit round two")
     };
-    assert!(!suffix.is_empty());
+    let second_leader = dag.leader(2).unwrap().id().unwrap();
+    assert!(!first.order().contains(&second_leader));
+    assert!(suffix.contains(&second_leader));
     let mut order = first.order().to_vec();
     order.extend(suffix);
     let mut proposal = SlotProposal {
@@ -280,6 +282,10 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
             .iter()
             .all(|boundary| boundary.is_commit())
     );
+    assert_eq!(complete.applications()[0].round(), 1);
+    assert_eq!(complete.applications()[1].round(), 2);
+    // Each authenticated application collects its own leader's history, not the
+    // later evidence carrier's cone. Consecutive fresh leaders extend the order.
     assert!(complete.applications()[0].order_len() < complete.applications()[1].order_len());
     let wal = std::fs::read(dir.0.join("authenticated-slot-agreement")).unwrap();
     drop(adapter);
@@ -351,6 +357,7 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
     for (index, intent) in durable_intents.iter().enumerate() {
         assert_eq!(intent.header(), &built.shares[index].header);
         assert_eq!(intent.application(), index);
+        assert_eq!(intent.header().round, index as u64 + 1);
         assert_eq!(
             intent.order_len(),
             recovered.applications()[index].order_len()
@@ -666,6 +673,13 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
     }
     assert_eq!(replayed.shares[0].at, 99);
     assert_eq!(replayed.shares[1].at, 100);
+    assert_eq!(adapter.header_shares().unwrap(), replayed.shares);
+    let share_journal = dir.0.join("agreement-header-shares");
+    let local_share_bytes = std::fs::read(&share_journal).unwrap();
+    let mut invalid_peer = peer_share(1, 1);
+    invalid_peer.signature[0] ^= 1;
+    assert!(replay.receive_share(&m, invalid_peer).is_err());
+    assert_eq!(std::fs::read(&share_journal).unwrap(), local_share_bytes);
     assert_eq!(replay.finalization().execution().state(), &expected);
     assert_eq!(replay.finalization().execution().applied(), applied);
     assert_eq!(
@@ -697,6 +711,24 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
         &built.shares[1].header
     );
     assert_eq!(adapter.header_intents().unwrap(), durable_intents);
+    let persisted = adapter.header_shares().unwrap();
+    assert_eq!(persisted.len(), 6);
+    for share in &persisted {
+        assert_eq!(
+            share.header,
+            built.shares[share.header.height as usize - 1].header
+        );
+    }
+    // A new owner re-executes rather than trusting the share journal as execution
+    // proof. Local output preserves the first persisted timestamp, not this retry's.
+    let mut share_replay = open_replay();
+    let repeated = share_replay
+        .build_ready(&m, &batches, &controls, 104)
+        .unwrap();
+    assert_eq!(repeated.shares, replayed.shares);
+    assert!(repeated.certified.is_empty());
+    assert_eq!(share_replay.finalization().finalizer().head(), &anchor);
+    assert_eq!(adapter.header_shares().unwrap(), persisted);
     let mut wrong_anchor = anchor.clone();
     wrong_anchor.previous[0] ^= 1;
     assert!(
@@ -756,6 +788,58 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
     );
     assert!(late_conflict.receive_share(&m, peer_share(1, 1)).is_err());
     assert_eq!(adapter.header_intents().unwrap(), durable_intents);
+    // Sibling WAL handles must share this Store's exclusive OS lock. Prepare both
+    // wrappers before journal corruption so stale ownership is checked independently.
+    let mut stale_build = open_replay();
+    let mut stale_share = open_replay();
+    let stale_replayed = stale_share
+        .build_ready(&m, &batches, &controls, 105)
+        .unwrap();
+    assert_eq!(stale_replayed.shares.len(), 2);
+    assert!(stale_replayed.certified.is_empty());
+    assert!(
+        stale_share
+            .receive_share(&m, peer_share(1, 1))
+            .unwrap()
+            .is_empty()
+    );
+
+    // Completed-share corruption must independently stop open, build and peer collection.
+    let mut bad_share_build = open_replay();
+    let mut bad_share_receive = open_replay();
+    bad_share_receive
+        .build_ready(&m, &batches, &controls, 108)
+        .unwrap();
+    let share_bytes = std::fs::read(&share_journal).unwrap();
+    let mut bad_share_bytes = share_bytes.clone();
+    bad_share_bytes[10] ^= 1;
+    std::fs::write(&share_journal, &bad_share_bytes).unwrap();
+    assert!(
+        JournaledFinalization::open(
+            Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap(),
+            chain::genesis_state(&accounts).unwrap(),
+            make_finalizer(anchor.clone()),
+        )
+        .is_err()
+    );
+    assert!(
+        bad_share_build
+            .build_ready(&m, &batches, &controls, 109)
+            .is_err()
+    );
+    assert!(
+        bad_share_receive
+            .receive_share(&m, peer_share(1, 2))
+            .is_err()
+    );
+    std::fs::write(&share_journal, &share_bytes).unwrap();
+    for wrapper in [&mut bad_share_build, &mut bad_share_receive] {
+        assert!(wrapper.build_ready(&m, &batches, &controls, 110).is_err());
+        assert!(wrapper.receive_share(&m, peer_share(1, 2)).is_err());
+        assert_eq!(wrapper.finalization().finalizer().head(), &anchor);
+    }
+    assert_eq!(std::fs::read(&share_journal).unwrap(), share_bytes);
+
     // Independently check both entry points, not just a wrapper already poisoned by one.
     let mut corrupt_build = open_replay();
     let path = dir.0.join("agreement-header-intents");
@@ -783,6 +867,65 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
         std::fs::read(dir.0.join("authenticated-slot-agreement")).unwrap(),
         wal
     );
+
+    // Advance through a sibling from the same Store, not a second Store::open.
+    // Ownership must fail before the independently corrupted intent journal is read.
+    let mut owner = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    let sequence = owner.driver.sequence();
+    owner
+        .apply(AuthenticatedSlotAgreementRequest::AdvanceView {
+            from: AgreementView(0),
+        })
+        .unwrap();
+    assert_eq!(owner.driver.sequence(), sequence + 1);
+    let advanced_wal = std::fs::read(dir.0.join("authenticated-slot-agreement")).unwrap();
+    assert_ne!(advanced_wal, wal);
+    let stale_error = stale_build
+        .build_ready(&m, &batches, &controls, 106)
+        .err()
+        .expect("stale wrapper must not build or release shares");
+    assert!(
+        stale_error.contains("stale authenticated owner"),
+        "{stale_error}"
+    );
+    let stale_error = stale_share
+        .receive_share(&m, peer_share(1, 2))
+        .err()
+        .expect("stale wrapper must not accept a quorum-closing share");
+    assert!(
+        stale_error.contains("stale authenticated owner"),
+        "{stale_error}"
+    );
+    for wrapper in [&mut stale_build, &mut stale_share] {
+        let poisoned = "journaled finalization requires reopening after durable history failure";
+        assert_eq!(
+            wrapper
+                .build_ready(&m, &batches, &controls, 107)
+                .err()
+                .as_deref(),
+            Some(poisoned)
+        );
+        assert_eq!(
+            wrapper.receive_share(&m, peer_share(1, 2)).err().as_deref(),
+            Some(poisoned)
+        );
+        assert_eq!(wrapper.finalization().finalizer().head(), &anchor);
+    }
+    assert_eq!(stale_build.finalization().finalizer().built_headers(), 0);
+    assert!(
+        stale_build
+            .finalization()
+            .execution()
+            .consumed_order()
+            .is_empty()
+    );
+    assert_eq!(stale_share.finalization().finalizer().built_headers(), 2);
+    assert_eq!(stale_share.finalization().execution().state(), &expected);
+    assert_eq!(
+        std::fs::read(dir.0.join("authenticated-slot-agreement")).unwrap(),
+        advanced_wal
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), corrupt);
 }
 
 #[test]

@@ -141,6 +141,26 @@ impl SlotAgreementDriver {
         self.session.reserve_header(anchor, header, order_len)
     }
 
+    /// Loads completed header shares verified against exact intents and the pinned set.
+    /// # Errors
+    /// Rejects stale/uncertain sessions, corrupt records and invalid signatures or history.
+    pub fn header_shares(&self) -> Result<Vec<validator::Share>, StoreError> {
+        self.session.header_shares()
+    }
+
+    /// Durably records a share for an exact existing header intent.
+    /// Exact duplicates include the timestamp and repeat durability barriers.
+    /// # Errors
+    /// Rejects invalid anchors, signatures, conflicts, bounds and publication failures.
+    /// Publication failure makes the session uncertain and requires recovery.
+    pub fn reserve_header_share(
+        &mut self,
+        anchor: &validator::Header,
+        share: &validator::Share,
+    ) -> Result<(), StoreError> {
+        self.session.reserve_header_share(anchor, share)
+    }
+
     /// Returns the number of durable requests installed by this owner.
     pub fn sequence(&self) -> u64 {
         self.session.sequence()

@@ -184,6 +184,22 @@ impl CertifiedFinalization {
         membership: &Membership,
         share: Share,
     ) -> Result<Vec<Certified>, String> {
+        self.validate_share(membership, &share)?;
+        match self.finalizer.receive_share(share) {
+            Ok(certified) => Ok(certified),
+            Err(error) => {
+                self.failed = true;
+                Err(error.to_string())
+            }
+        }
+    }
+
+    // Journaled collection must authenticate before writing or mutating quorum state.
+    pub(super) fn validate_share(
+        &self,
+        membership: &Membership,
+        share: &Share,
+    ) -> Result<(), String> {
         self.ensure_usable()?;
         self.validate_membership(membership)?;
         if self.built_headers.get(&share.header.height) != Some(&share.header) {
@@ -206,14 +222,7 @@ impl CertifiedFinalization {
             &payload,
             &share.signature,
         )
-        .map_err(|error| error.to_string())?;
-        match self.finalizer.receive_share(share) {
-            Ok(certified) => Ok(certified),
-            Err(error) => {
-                self.failed = true;
-                Err(error.to_string())
-            }
-        }
+        .map_err(|error| error.to_string())
     }
 
     fn validate_membership(&self, membership: &Membership) -> Result<(), String> {

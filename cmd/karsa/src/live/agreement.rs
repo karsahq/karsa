@@ -193,6 +193,34 @@ impl Adapter {
             })
     }
 
+    /// Loads verified completed header shares bound to durable pre-sign intents.
+    /// # Errors
+    /// Rejects stale ownership, corrupt journals and invalid signatures or history.
+    pub fn header_shares(&mut self) -> Result<Vec<validator::Share>, String> {
+        self.ordering_snapshot()?;
+        self.driver.header_shares().map_err(|error| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            error.to_string()
+        })
+    }
+
+    /// Persists a verified share before releasing it or collecting its quorum weight.
+    /// # Errors
+    /// Rejects invalid or conflicting shares, stale ownership and publication failure.
+    pub fn reserve_header_share(
+        &mut self,
+        anchor: &validator::Header,
+        share: &validator::Share,
+    ) -> Result<(), String> {
+        self.ordering_snapshot()?;
+        self.driver
+            .reserve_header_share(anchor, share)
+            .map_err(|error| {
+                self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+                error.to_string()
+            })
+    }
+
     /// Publishes caller-owned execution state and its consumed certified prefix together.
     /// The caller must ensure the state and transaction count were produced by exactly
     /// this consumer. No live state, finalizer, or RPC effects are published here.

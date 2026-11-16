@@ -579,6 +579,7 @@ impl Store {
                 || name == "agreement-execution-checkpoint"
                 || name == "agreement-execution-checkpoint.tmp"
                 || name == "agreement-header-intents"
+                || name == "agreement-header-shares"
                 || name == ".lock"
                 || name == "CURRENT"
                 || name == "CURRENT.tmp"

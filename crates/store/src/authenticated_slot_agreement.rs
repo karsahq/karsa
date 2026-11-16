@@ -4,6 +4,8 @@ mod execution_checkpoint;
 pub use execution_checkpoint::AgreementExecutionCheckpoint;
 #[path = "agreement_header_intents.rs"]
 mod header_intents;
+#[path = "agreement_header_shares.rs"]
+mod header_shares;
 pub use header_intents::AgreementHeaderIntent;
 use std::collections::BTreeMap;
 use validator::slot_agreement::{

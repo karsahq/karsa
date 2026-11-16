@@ -12,8 +12,10 @@ use super::{Adapter, CertifiedFinalization, Membership};
 /// Opening rebuilds execution from trusted genesis, not an execution checkpoint. Payloads
 /// and control classification remain caller-trusted inputs. Use isolated signing keys.
 /// Old reservations must all replay exactly before any rebuilt output is released.
-/// Returned shares may repeat across restart with new timestamps; signatures, peer shares,
-/// certificates and delivery acknowledgements are not persisted or restored by this path.
+/// Completed local and accepted peer shares are persisted before release or collection.
+/// Replay returns an existing local share's original bytes and timestamp. Stored peer shares
+/// are not yet restored into quorum state; certificates and delivery acknowledgements are
+/// not persisted. Rebuilt finalizer timestamp metadata can differ after restart.
 /// This bounded offline owner has no live transport, pruning or epoch-transition authority.
 pub struct JournaledFinalization {
     adapter: Adapter,
@@ -36,6 +38,7 @@ impl JournaledFinalization {
     ) -> Result<Self, String> {
         let snapshot = adapter.ordering_snapshot()?;
         let intents = adapter.header_intents()?;
+        adapter.header_shares()?;
         let anchor = finalizer.head().clone();
         let anchor_id = anchor.id().map_err(|error| error.to_string())?;
         if anchor
@@ -93,6 +96,9 @@ impl JournaledFinalization {
                     })
             },
         )?;
+        for share in &mut build.shares {
+            *share = self.persist_share(share)?;
+        }
         self.outbox.shares.append(&mut build.shares);
         self.outbox.certified.append(&mut build.certified);
         let reserved = self.refresh()?;
@@ -116,6 +122,8 @@ impl JournaledFinalization {
         if self.coordinator.finalizer().built_headers() < reserved {
             return Err("journaled finalization must replay all reserved headers first".into());
         }
+        self.coordinator.validate_share(membership, &share)?;
+        let share = self.persist_share(&share)?;
         self.coordinator.receive_share(membership, share)
     }
 
@@ -124,10 +132,36 @@ impl JournaledFinalization {
         &self.coordinator
     }
 
+    fn persist_share(&mut self, share: &Share) -> Result<Share, String> {
+        let result = (|| {
+            let stored = self.adapter.header_shares()?;
+            let canonical = match stored
+                .iter()
+                .find(|old| old.header.height == share.header.height && old.signer == share.signer)
+            {
+                Some(old) if old.header == share.header && old.signature == share.signature => {
+                    old.clone()
+                }
+                Some(_) => return Err("conflicting completed header share".into()),
+                None => share.clone(),
+            };
+            // Re-publish even an old share: a sibling may have observed a rename
+            // whose directory durability barrier failed in another owner.
+            self.adapter
+                .reserve_header_share(&self.anchor, &canonical)?;
+            Ok(canonical)
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
     fn refresh(&mut self) -> Result<usize, String> {
         let result = (|| {
             let snapshot = self.adapter.ordering_snapshot()?;
             let intents = self.adapter.header_intents()?;
+            self.adapter.header_shares()?;
             self.coordinator.update(snapshot)?;
             Ok(intents.len())
         })();
