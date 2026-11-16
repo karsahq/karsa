@@ -629,28 +629,156 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
     drop(adapter);
     drop(store);
     let store = Store::open(&dir.0).unwrap();
-    let mut adapter = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    let mut adapter = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
     assert_eq!(adapter.header_intents().unwrap(), durable_intents);
-    // Replay from trusted genesis can re-reserve identical bytes without a new intent.
-    let mut replay = make_coordinator();
-    let replayed = replay
-        .build_ready_with_reservation(&m, &batches, &controls, 99, |header, coverage| {
-            adapter
-                .reserve_header(&anchor, header, coverage)
-                .map_err(|error| {
-                    crypto::CryptoError::new(crypto::CryptoErrorKind::InvalidVertex, error)
-                })
-        })
-        .unwrap();
+    let make_finalizer = |anchor: validator::Header| {
+        validator::Finalizer::new(
+            validator::SetSchedule::single(m.set.clone()),
+            validator::EpochSchedule::single(m.set.epoch),
+            chain_id.to_vec(),
+            m.consensus[0].id.clone(),
+            m.consensus[0].private_key.clone(),
+            anchor,
+            0,
+        )
+        .unwrap()
+    };
+    let open_replay = || {
+        JournaledFinalization::open(
+            Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap(),
+            chain::genesis_state(&accounts).unwrap(),
+            make_finalizer(anchor.clone()),
+        )
+        .unwrap()
+    };
+    // Recovery owns the adapter and cannot accidentally use a no-op reservation callback.
+    // Keep earlier rebuilt output private until the entire old reserved history matches.
+    let mut replay = open_replay();
+    let deferred = replay.build_ready(&m, &missing, &controls, 99).unwrap();
+    assert!(deferred.shares.is_empty() && deferred.certified.is_empty());
+    assert_eq!(replay.finalization().finalizer().built_headers(), 1);
+    assert!(replay.receive_share(&m, peer_share(1, 1)).is_err());
+    let replayed = replay.build_ready(&m, &batches, &controls, 100).unwrap();
     assert_eq!(replayed.shares.len(), 2);
-    assert_eq!(adapter.header_intents().unwrap(), durable_intents);
-    let mut conflict = built.shares[0].header.clone();
-    conflict.state_root[0] ^= 1;
+    for (index, share) in replayed.shares.iter().enumerate() {
+        assert_eq!(share.header, built.shares[index].header);
+        assert_eq!(share.signature, built.shares[index].signature);
+    }
+    assert_eq!(replayed.shares[0].at, 99);
+    assert_eq!(replayed.shares[1].at, 100);
+    assert_eq!(replay.finalization().execution().state(), &expected);
+    assert_eq!(replay.finalization().execution().applied(), applied);
+    assert_eq!(
+        replay.finalization().finalizer().head(),
+        &anchor,
+        "header intents do not restore old finality certificates"
+    );
     assert!(
-        adapter
-            .reserve_header(&anchor, &conflict, durable_intents[0].order_len())
+        replay
+            .build_ready(&m, &batches, &controls, 101)
+            .unwrap()
+            .shares
+            .is_empty()
+    );
+    for height in [2, 1] {
+        assert!(
+            replay
+                .receive_share(&m, peer_share(height, 1))
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let recertified = replay.receive_share(&m, peer_share(1, 2)).unwrap();
+    assert_eq!(recertified.len(), 1);
+    let recertified = replay.receive_share(&m, peer_share(2, 2)).unwrap();
+    assert_eq!(recertified.len(), 1);
+    assert_eq!(
+        replay.finalization().finalizer().head(),
+        &built.shares[1].header
+    );
+    assert_eq!(adapter.header_intents().unwrap(), durable_intents);
+    let mut wrong_anchor = anchor.clone();
+    wrong_anchor.previous[0] ^= 1;
+    assert!(
+        JournaledFinalization::open(
+            Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap(),
+            chain::genesis_state(&accounts).unwrap(),
+            make_finalizer(wrong_anchor),
+        )
+        .is_err()
+    );
+    // Caller-misclassified payloads change execution, but cannot change reserved bytes.
+    let mut conflicting_replay = open_replay();
+    let wrong_controls: BTreeSet<_> = recovered
+        .vertices()
+        .iter()
+        .map(|v| v.payload_hash)
+        .collect();
+    assert!(
+        conflicting_replay
+            .build_ready(&m, &BTreeMap::new(), &wrong_controls, 102)
             .is_err()
     );
+    assert_eq!(
+        conflicting_replay
+            .finalization()
+            .finalizer()
+            .built_headers(),
+        0
+    );
+    assert!(
+        conflicting_replay
+            .build_ready(&m, &batches, &controls, 103)
+            .is_err()
+    );
+    assert_eq!(adapter.header_intents().unwrap(), durable_intents);
+    // A conflict at the second boundary must not leak the first rebuilt share.
+    let mut late_conflict = open_replay();
+    let late_controls: BTreeSet<_> = recovered.vertices()[boundary..]
+        .iter()
+        .map(|v| v.payload_hash)
+        .collect();
+    let early_batches: BTreeMap<_, _> = batches
+        .iter()
+        .filter(|(hash, _)| !late_controls.contains(*hash))
+        .map(|(hash, batch)| (*hash, batch.clone()))
+        .collect();
+    assert!(
+        late_conflict
+            .build_ready(&m, &early_batches, &late_controls, 103)
+            .is_err()
+    );
+    assert_eq!(late_conflict.finalization().finalizer().built_headers(), 1);
+    assert!(
+        late_conflict
+            .build_ready(&m, &batches, &controls, 104)
+            .is_err()
+    );
+    assert!(late_conflict.receive_share(&m, peer_share(1, 1)).is_err());
+    assert_eq!(adapter.header_intents().unwrap(), durable_intents);
+    // Independently check both entry points, not just a wrapper already poisoned by one.
+    let mut corrupt_build = open_replay();
+    let path = dir.0.join("agreement-header-intents");
+    let mut corrupt = std::fs::read(&path).unwrap();
+    corrupt[0] ^= 1;
+    std::fs::write(&path, &corrupt).unwrap();
+    assert!(replay.receive_share(&m, peer_share(1, 1)).is_err());
+    assert!(
+        corrupt_build
+            .build_ready(&m, &batches, &controls, 104)
+            .is_err()
+    );
+    assert_eq!(corrupt_build.finalization().finalizer().built_headers(), 0);
+    assert!(
+        JournaledFinalization::open(
+            Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap(),
+            chain::genesis_state(&accounts).unwrap(),
+            make_finalizer(anchor.clone()),
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+
     assert_eq!(
         std::fs::read(dir.0.join("authenticated-slot-agreement")).unwrap(),
         wal

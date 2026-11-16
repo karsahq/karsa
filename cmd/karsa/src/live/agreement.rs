@@ -1941,9 +1941,11 @@ pub(super) fn disabled_guard(store: &Store) -> Result<(), String> {
 mod envelope;
 mod execution;
 mod finalization;
+mod journaled_finalization;
 mod ordering;
 pub use execution::CertifiedExecution;
 pub use finalization::CertifiedFinalization;
+pub use journaled_finalization::JournaledFinalization;
 pub mod pacemaker;
 pub use envelope::{CarrierEnvelope, CarrierPayload, MAX_ENVELOPE_BYTES};
 pub use ordering::OrderingConsumer;
