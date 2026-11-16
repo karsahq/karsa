@@ -8,6 +8,85 @@ use validator::{
 };
 
 #[test]
+fn certified_execution_consumes_empty_controls_and_rejected_batches_in_order() {
+    let (m, mut bootstrap, _) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    let before = adapter.driver.ordering_snapshot().unwrap();
+    let accounts = chain::accounts(4).unwrap();
+    let batch = chain::demo_batch(before.binding().tip().chain_id(), &accounts, 0, 0, 1).unwrap();
+    let hash = batch.digest().unwrap();
+    let control = [9; 32];
+    // Trusted-checkpoint fixture for execution behavior, not evidence of a live QC.
+    let vertices: Vec<_> = [[0; 32], control, hash, hash]
+        .into_iter()
+        .enumerate()
+        .map(|(author, payload)| {
+            signed_for_chain(
+                &m,
+                author,
+                0,
+                vec![],
+                payload,
+                before.binding().tip().chain_id(),
+            )
+        })
+        .collect();
+    let order: Vec<_> = vertices.iter().map(|vertex| vertex.id().unwrap()).collect();
+    bootstrap.agreement.context = SlotDecisionTip::from_checkpoint(
+        before.binding().tip().chain_id().to_vec(),
+        &bootstrap.agreement.set,
+        2,
+        [7; 32],
+        order.len() as u64,
+        validator::commit_root(&order),
+    )
+    .unwrap();
+    bootstrap.order = order.clone();
+    bootstrap.vertices = vertices;
+    let checkpoint_dir = Dir::new();
+    let checkpoint_store = Store::open(&checkpoint_dir.0).unwrap();
+    let snapshot = checkpoint_store
+        .begin_authenticated_slot_agreement(bootstrap)
+        .unwrap()
+        .ordering_snapshot()
+        .unwrap();
+    let genesis = chain::genesis_state(&accounts).unwrap();
+    let mut execution = CertifiedExecution::begin(before, genesis.clone()).unwrap();
+    execution.update(snapshot).unwrap();
+    let batches = std::collections::BTreeMap::from([(hash, batch.clone())]);
+    execution
+        .execute_ready(&m, &batches, &std::collections::BTreeSet::new())
+        .unwrap();
+    assert_eq!(execution.consumed_order(), &order[..1]);
+    assert_eq!(execution.state(), &genesis);
+    assert_eq!(execution.applied(), 0);
+    execution
+        .execute_ready(&m, &batches, &std::collections::BTreeSet::from([control]))
+        .unwrap();
+    assert_eq!(execution.consumed_order(), order);
+    assert_eq!(
+        execution.applied(),
+        1,
+        "a repeated sequence is rejected, not reapplied"
+    );
+    assert_eq!(execution.rejected().values().sum::<usize>(), 1);
+    let mut expected = genesis;
+    let mut rejected = std::collections::BTreeMap::new();
+    assert_eq!(
+        chain::apply_batch(&mut expected, &accounts, &batch, &mut rejected),
+        1
+    );
+    assert_eq!(
+        chain::apply_batch(&mut expected, &accounts, &batch, &mut rejected),
+        0
+    );
+    assert_eq!(execution.state(), &expected);
+    assert_eq!(execution.rejected(), &rejected);
+}
+
+#[test]
 fn ordering_consumer_rejects_chain_set_and_epoch_changes() {
     let (_, bootstrap, _) = fixture();
     let snapshot = |bootstrap: AuthenticatedSlotAgreementBootstrap| {
@@ -171,7 +250,20 @@ fn assert_ordering_consumer_rejects_conflicting_checkpoints(
 fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen() {
     use std::time::{Duration, Instant};
 
-    let (m, bootstrap, request) = fixture();
+    let accounts = chain::accounts(4).unwrap();
+    let chain_id = b"live-adapter-tests";
+    let mut batches = std::collections::BTreeMap::new();
+    let mut hashes = std::collections::BTreeMap::new();
+    for round in 0..=2 {
+        for author in 0..4 {
+            let batch = chain::demo_batch(chain_id, &accounts, author, round, 1).unwrap();
+            let hash = batch.digest().unwrap();
+            batches.insert(hash, batch);
+            hashes.insert((author, round), hash);
+        }
+    }
+    let (m, bootstrap, request) =
+        fixture_for_chain_with_payload(chain_id, |author, round| hashes[&(author, round)]);
     let AuthenticatedSlotAgreementRequest::Propose { lineage, vertices } = request else {
         unreachable!()
     };
@@ -541,6 +633,7 @@ fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen
     drop(adapters);
     drop(stores);
     let mut agreed_order = None;
+    let mut agreed_execution = None;
     for i in 0..3 {
         let store = Store::open(&dirs[i].0).unwrap();
         let mut adapter = Adapter::recover(&store, bootstraps[i].clone(), &m, i).unwrap();
@@ -621,6 +714,27 @@ fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen
         let recovered = adapter.ordering_snapshot().unwrap();
         assert_eq!(format!("{recovered:?}"), format!("{applied:?}"));
         assert_ordering_consumer(&before, &recovered);
+        let mut honest_execution =
+            CertifiedExecution::begin(before.clone(), chain::genesis_state(&accounts).unwrap())
+                .unwrap();
+        honest_execution.update(recovered.clone()).unwrap();
+        honest_execution
+            .execute_ready(&m, &batches, &std::collections::BTreeSet::new())
+            .unwrap();
+        assert!(honest_execution.applied() > 0);
+        assert_eq!(honest_execution.consumed_order(), recovered.order());
+        let result = (
+            honest_execution.state().state_root(),
+            honest_execution.applied(),
+        );
+        if let Some(expected) = agreed_execution {
+            assert_eq!(
+                result, expected,
+                "honest certified consumers must agree on execution"
+            );
+        } else {
+            agreed_execution = Some(result);
+        }
         if i == 0 {
             assert_ordering_consumer_rejects_conflicting_checkpoints(
                 &bootstraps[i],
@@ -635,42 +749,61 @@ fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen
         );
         if i == 0 {
             assert!(adapter.restore_execution().unwrap().is_none());
-            let mut consumer = OrderingConsumer::restore(recovered.clone(), &[]).unwrap();
-            let mut state = exec::State::new();
-            let mut count = 0u64;
-            // Deliberately simple deterministic state transitions, not real batch execution.
-            consumer
-                .consume_ready(|vertex| {
-                    if count == 1 {
-                        return Ok(false);
-                    }
-                    state.credit(&vertex.author, 1).unwrap();
-                    count += 1;
-                    Ok(true)
-                })
+            let genesis = chain::genesis_state(&accounts).unwrap();
+            assert!(CertifiedExecution::begin(recovered.clone(), genesis.clone()).is_err());
+            let mut execution = CertifiedExecution::begin(before.clone(), genesis.clone()).unwrap();
+            execution.update(recovered.clone()).unwrap();
+            let controls = std::collections::BTreeSet::new();
+            execution
+                .execute_ready(&m, &std::collections::BTreeMap::new(), &controls)
                 .unwrap();
-            adapter
-                .checkpoint_execution(&mut consumer, &state, count)
-                .unwrap();
-            let partial_state = state.clone();
+            assert!(execution.consumed_order().is_empty());
+            assert_eq!(execution.state(), &genesis);
+            let missing_hash = recovered.vertices()[1].payload_hash;
+            let mut missing = batches.clone();
+            missing.remove(&missing_hash);
+            execution.execute_ready(&m, &missing, &controls).unwrap();
+            assert_eq!(execution.consumed_order(), &recovered.order()[..1]);
+            assert_eq!(execution.applied(), 1);
+            let partial_state = execution.state().clone();
+            let mut wrong = batches.clone();
+            wrong.insert(
+                missing_hash,
+                batches[&recovered.vertices()[0].payload_hash].clone(),
+            );
+            assert!(execution.execute_ready(&m, &wrong, &controls).is_err());
+            let ambiguous = std::collections::BTreeSet::from([missing_hash]);
+            assert!(execution.execute_ready(&m, &batches, &ambiguous).is_err());
+            assert_eq!(execution.state(), &partial_state);
+            assert_eq!(execution.consumed_order(), &recovered.order()[..1]);
+            execution.checkpoint(&mut adapter).unwrap();
             let checkpoint_path = dirs[i].0.join("agreement-execution-checkpoint");
             let partial_bytes = std::fs::read(&checkpoint_path).unwrap();
-            consumer
-                .consume_ready(|vertex| {
-                    state.credit(&vertex.author, 1).unwrap();
-                    count += 1;
-                    Ok(true)
+            execution.execute_ready(&m, &batches, &controls).unwrap();
+            let complete_state = execution.state().clone();
+            let mut expected = genesis;
+            let mut rejected = std::collections::BTreeMap::new();
+            let expected_count: usize = recovered
+                .vertices()
+                .iter()
+                .map(|vertex| {
+                    chain::apply_batch(
+                        &mut expected,
+                        &accounts,
+                        &batches[&vertex.payload_hash],
+                        &mut rejected,
+                    )
                 })
-                .unwrap();
-            let complete_state = state.clone();
+                .sum();
+            assert!(expected_count > 1);
+            assert!(rejected.is_empty());
+            assert_eq!(execution.state(), &expected);
+            assert_eq!(execution.applied() as usize, expected_count);
+            assert!(execution.rejected().is_empty());
             // A blocked staging path prevents publication; the old complete record survives.
             let temporary = dirs[i].0.join("agreement-execution-checkpoint.tmp");
             std::fs::create_dir(&temporary).unwrap();
-            assert!(
-                adapter
-                    .checkpoint_execution(&mut consumer, &state, count)
-                    .is_err()
-            );
+            assert!(execution.checkpoint(&mut adapter).is_err());
             assert!(adapter.restore_execution().is_err());
             assert_eq!(std::fs::read(&checkpoint_path).unwrap(), partial_bytes);
             std::fs::remove_dir(&temporary).unwrap();
@@ -678,38 +811,29 @@ fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen
             drop(store);
             let store = Store::open(&dirs[i].0).unwrap();
             let mut adapter = Adapter::recover(&store, bootstraps[i].clone(), &m, i).unwrap();
-            let (mut consumer, mut state, mut count) =
-                adapter.restore_execution().unwrap().unwrap();
-            assert_eq!(state, partial_state);
-            assert_eq!(count, 1);
-            assert_eq!(consumer.consumed_order(), &recovered.order()[..1]);
-            consumer
-                .consume_ready(|vertex| {
-                    state.credit(&vertex.author, 1).unwrap();
-                    count += 1;
-                    Ok(true)
-                })
-                .unwrap();
-            assert_eq!(state, complete_state);
-            assert_eq!(count as usize, recovered.order().len());
-            adapter
-                .checkpoint_execution(&mut consumer, &state, count)
-                .unwrap();
+            let mut execution = CertifiedExecution::restore(&mut adapter).unwrap().unwrap();
+            assert_eq!(execution.state(), &partial_state);
+            assert_eq!(execution.applied(), 1);
+            assert_eq!(execution.consumed_order(), &recovered.order()[..1]);
+            execution.execute_ready(&m, &batches, &controls).unwrap();
+            assert_eq!(execution.state(), &complete_state);
+            assert_eq!(execution.applied() as usize, expected_count);
+            execution.checkpoint(&mut adapter).unwrap();
             let complete_bytes = std::fs::read(&checkpoint_path).unwrap();
-            adapter
-                .checkpoint_execution(&mut consumer, &state, count)
-                .unwrap();
+            execution.checkpoint(&mut adapter).unwrap();
             assert_eq!(std::fs::read(&checkpoint_path).unwrap(), complete_bytes);
             drop(adapter);
             drop(store);
             let store = Store::open(&dirs[i].0).unwrap();
             let mut adapter = Adapter::recover(&store, bootstraps[i].clone(), &m, i).unwrap();
-            let (mut consumer, state, count) = adapter.restore_execution().unwrap().unwrap();
-            assert_eq!(state, complete_state);
-            assert_eq!(count as usize, recovered.order().len());
-            consumer
-                .consume_ready(|_| panic!("durably consumed prefix must not replay"))
-                .unwrap();
+            let mut execution = CertifiedExecution::restore(&mut adapter).unwrap().unwrap();
+            assert_eq!(execution.state(), &complete_state);
+            assert_eq!(execution.applied() as usize, expected_count);
+            execution.update(recovered.clone()).unwrap();
+            execution.execute_ready(&m, &batches, &controls).unwrap();
+            assert_eq!(execution.state(), &complete_state);
+            assert_eq!(execution.applied() as usize, expected_count);
+            assert_eq!(execution.consumed_order(), recovered.order());
             assert_eq!(
                 std::fs::read(dirs[i].0.join("authenticated-slot-agreement")).unwrap(),
                 wal
@@ -2574,6 +2698,17 @@ fn fixture_for_chain(
     AuthenticatedSlotAgreementBootstrap,
     AuthenticatedSlotAgreementRequest,
 ) {
+    fixture_for_chain_with_payload(chain_id, |_, _| [1; 32])
+}
+
+fn fixture_for_chain_with_payload(
+    chain_id: &[u8],
+    payload: impl Fn(usize, u64) -> [u8; 32],
+) -> (
+    chain::Membership,
+    AuthenticatedSlotAgreementBootstrap,
+    AuthenticatedSlotAgreementRequest,
+) {
     let m = chain::membership(4, None).unwrap();
     let mut dag = Dag::new(m.set.clone());
     dag.set_chain_id(chain_id.to_vec());
@@ -2582,7 +2717,14 @@ fn fixture_for_chain(
     for round in 0..=2 {
         let mut ids = vec![];
         for author in 0..4 {
-            let v = signed_for_chain(&m, author, round, refs.clone(), [1; 32], chain_id);
+            let v = signed_for_chain(
+                &m,
+                author,
+                round,
+                refs.clone(),
+                payload(author, round),
+                chain_id,
+            );
             ids.push(dag.insert(v.clone()).unwrap());
             vertices.push(v);
         }
