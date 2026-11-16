@@ -9,7 +9,7 @@
 //! u32 body length || u64 sent-at nanos || u8 kind || payload
 //! ```
 //!
-//! Sixteen kinds share a link:
+//! Seventeen kinds share a link:
 //!
 //! - [`Message::Hello`] is the first frame on a link and names the chain.
 //! - [`Message::Vertex`] is the broadcast.
@@ -82,13 +82,23 @@ const KIND_WANT_SLOT: u8 = 13;
 const KIND_SNAPSHOT_DECLINED: u8 = 14;
 const KIND_FLOOR: u8 = 15;
 const KIND_SNAPSHOT_RELEASE: u8 = 16;
+const KIND_AGREEMENT_CARRIER: u8 = 17;
+
+/// Maximum opaque agreement envelope length.
+pub const MAX_AGREEMENT_ENVELOPE: usize = 1024 * 1024;
+/// Maximum agreement payload length, excluding transport timestamp and kind.
+pub const MAX_AGREEMENT_PAYLOAD: usize = 2 * 1024 * 1024;
+/// Maximum vertices in one agreement carrier.
+pub const MAX_AGREEMENT_VERTICES: usize = 4096;
+/// Maximum total vertex references in one agreement carrier.
+pub const MAX_AGREEMENT_EDGES: usize = 65536;
 
 /// The framing and message layout this build speaks.
 ///
 /// A peer that answers with another number is not necessarily hostile; it may be a
 /// different build. The link is closed rather than parsed optimistically, because
 /// the next frame kind could mean something else there.
-pub const WIRE_PROTOCOL: u16 = 16;
+pub const WIRE_PROTOCOL: u16 = 17;
 
 /// The first frame on every link: which chain the sender is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +250,13 @@ pub enum Message {
     /// it against its own DAG and rebroadcasts it, so a node that missed the
     /// original frame can still adopt the same decision.
     RoundSkip(Box<RoundSkipProof>),
+    /// Opaque agreement data and supporting vertices, without authentication or activation.
+    AgreementCarrier {
+        /// Uninterpreted agreement envelope.
+        envelope: Vec<u8>,
+        /// Supporting vertices; signatures are not checked by this codec.
+        vertices: Vec<Vertex>,
+    },
 }
 
 /// One decoded frame.
@@ -321,6 +338,87 @@ fn count(value: usize, what: &str) -> Result<u32, CryptoError> {
             CryptoErrorKind::FieldTooLong,
             format!("{what} count does not fit a u32"),
         )
+    })
+}
+
+fn agreement_bound(value: usize, cap: usize, what: &str) -> Result<(), CryptoError> {
+    if value > cap {
+        return Err(CryptoError::new(
+            CryptoErrorKind::FieldTooLong,
+            format!("agreement {what} exceeds the {cap} cap"),
+        ));
+    }
+    Ok(())
+}
+
+fn agreement_size_add(size: &mut usize, extra: usize) -> Result<(), CryptoError> {
+    *size = size.checked_add(extra).ok_or_else(|| {
+        CryptoError::new(CryptoErrorKind::FieldTooLong, "agreement size overflows")
+    })?;
+    agreement_bound(*size, MAX_AGREEMENT_PAYLOAD, "payload")
+}
+
+fn encode_agreement(envelope: &[u8], vertices: &[Vertex]) -> Result<Vec<u8>, CryptoError> {
+    agreement_bound(envelope.len(), MAX_AGREEMENT_ENVELOPE, "envelope")?;
+    agreement_bound(vertices.len(), MAX_AGREEMENT_VERTICES, "vertex count")?;
+    let mut size = 8 + envelope.len();
+    let mut edges = 0;
+    // Preflight the canonical vertex layout before allocating encoded vertices.
+    for vertex in vertices {
+        edges += vertex.references.len();
+        agreement_bound(edges, MAX_AGREEMENT_EDGES, "edge count")?;
+        agreement_size_add(&mut size, 4 + 70)?;
+        for field in [&vertex.chain_id, &vertex.author, &vertex.signature] {
+            agreement_size_add(&mut size, field.len())?;
+        }
+        for reference in &vertex.references {
+            agreement_size_add(&mut size, 48)?;
+            agreement_size_add(&mut size, reference.author.len())?;
+        }
+    }
+    let mut encoder = Encoder::with_capacity(size);
+    encoder.put_bytes(envelope)?;
+    encoder.put_u32(count(vertices.len(), "agreement vertex")?);
+    for vertex in vertices {
+        encoder.put_bytes(&vertex.encode()?)?;
+    }
+    Ok(encoder.finish())
+}
+
+fn decode_agreement(payload: &[u8]) -> Result<Message, CryptoError> {
+    agreement_bound(payload.len(), MAX_AGREEMENT_PAYLOAD, "payload")?;
+    let mut decoder = Decoder::new(payload);
+    let envelope = decoder.read_bytes()?;
+    agreement_bound(envelope.len(), MAX_AGREEMENT_ENVELOPE, "envelope")?;
+    let count = decoder.read_u32()? as usize;
+    agreement_bound(count, MAX_AGREEMENT_VERTICES, "vertex count")?;
+    let mut vertices = Vec::new();
+    let mut edges = 0usize;
+    for _ in 0..count {
+        let bytes = decoder.read_bytes()?;
+        // Inspect the reference count before the vertex decoder allocates references.
+        let mut header = Decoder::new(bytes);
+        header.read_u16()?;
+        header.read_bytes()?;
+        header.read_u64()?;
+        header.read_u64()?;
+        header.read_bytes()?;
+        header.read_bytes()?;
+        edges = edges
+            .checked_add(header.read_u32()? as usize)
+            .ok_or_else(|| {
+                CryptoError::new(
+                    CryptoErrorKind::FieldTooLong,
+                    "agreement edge count overflows",
+                )
+            })?;
+        agreement_bound(edges, MAX_AGREEMENT_EDGES, "edge count")?;
+        vertices.push(Vertex::decode(bytes)?);
+    }
+    decoder.finish()?;
+    Ok(Message::AgreementCarrier {
+        envelope: envelope.to_vec(),
+        vertices,
     })
 }
 
@@ -552,6 +650,10 @@ pub fn frame(message: &Message, sent_at_nanos: u64) -> Result<Vec<u8>, CryptoErr
         }
         Message::Fence(certificate) => (KIND_FENCE, certificate.encode()?),
         Message::RoundSkip(proof) => (KIND_ROUND_SKIP, proof.encode()?),
+        Message::AgreementCarrier { envelope, vertices } => (
+            KIND_AGREEMENT_CARRIER,
+            encode_agreement(envelope, vertices)?,
+        ),
     };
     let length = u32::try_from(8 + 1 + payload.len()).map_err(|_| {
         CryptoError::new(
@@ -593,6 +695,12 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
     let total = 4usize
         .checked_add(body_len)
         .ok_or_else(|| truncated("frame length overflows"))?;
+    if body_len >= HEADER - 4
+        && buffer.len() >= HEADER
+        && buffer[HEADER - 1] == KIND_AGREEMENT_CARRIER
+    {
+        agreement_bound(body_len - (HEADER - 4), MAX_AGREEMENT_PAYLOAD, "payload")?;
+    }
     if buffer.len() < total {
         return Ok(None);
     }
@@ -666,6 +774,7 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
         }
         KIND_FENCE => Message::Fence(Box::new(FenceCertificate::decode(payload)?)),
         KIND_ROUND_SKIP => Message::RoundSkip(Box::new(RoundSkipProof::decode(payload)?)),
+        KIND_AGREEMENT_CARRIER => decode_agreement(payload)?,
         other => return Err(invalid(format!("unknown frame kind {other}"))),
     };
     buffer.drain(..total);
@@ -704,6 +813,153 @@ mod tests {
             author: b"val-2".to_vec(),
             digest: [round as u8; 32],
         }
+    }
+
+    fn agreement_frame(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(9 + payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&42u64.to_le_bytes());
+        bytes.push(KIND_AGREEMENT_CARRIER);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    #[test]
+    fn an_agreement_carrier_round_trips_fragmented() {
+        let message = Message::AgreementCarrier {
+            envelope: vec![0, 255, 7],
+            vertices: vec![vertex(1), vertex(2)],
+        };
+        let bytes = frame(&message, 42).unwrap();
+        let mut buffer = Vec::new();
+        for byte in &bytes[..bytes.len() - 1] {
+            buffer.push(*byte);
+            let before = buffer.clone();
+            assert_eq!(take_frame(&mut buffer).unwrap(), None);
+            assert_eq!(buffer, before);
+        }
+        buffer.push(*bytes.last().unwrap());
+        let decoded = take_frame(&mut buffer).unwrap().unwrap();
+        assert_eq!(decoded.message, message);
+        assert_eq!(decoded.sent_at_nanos, 42);
+        assert_eq!(decoded.len, bytes.len());
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn agreement_malformed_and_trailing_bytes_are_rejected() {
+        let payload = encode_agreement(b"opaque", &[vertex(1)]).unwrap();
+        for end in 0..payload.len() {
+            assert!(take_frame(&mut agreement_frame(&payload[..end])).is_err());
+        }
+        let mut trailing = payload.clone();
+        trailing.push(0);
+        assert_eq!(
+            take_frame(&mut agreement_frame(&trailing))
+                .unwrap_err()
+                .kind(),
+            CryptoErrorKind::TrailingBytes
+        );
+        let mut malformed = payload;
+        // Envelope length prefix, envelope, and vertex count precede vertex length.
+        let version_offset = 4 + b"opaque".len() + 4 + 4;
+        malformed[version_offset..version_offset + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(take_frame(&mut agreement_frame(&malformed)).is_err());
+    }
+
+    #[test]
+    fn agreement_envelope_and_vertex_caps_apply_in_both_directions() {
+        let envelope = vec![0; MAX_AGREEMENT_ENVELOPE];
+        assert!(encode_agreement(&envelope, &[]).is_ok());
+        let oversized = vec![0; MAX_AGREEMENT_ENVELOPE + 1];
+        assert_eq!(
+            encode_agreement(&oversized, &[]).unwrap_err().kind(),
+            CryptoErrorKind::FieldTooLong
+        );
+        let mut payload = ((oversized.len()) as u32).to_le_bytes().to_vec();
+        payload.extend_from_slice(&oversized);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            decode_agreement(&payload).unwrap_err().kind(),
+            CryptoErrorKind::FieldTooLong
+        );
+        assert!(encode_agreement(&[], &vec![vertex(1); MAX_AGREEMENT_VERTICES]).is_ok());
+        assert_eq!(
+            encode_agreement(&[], &vec![vertex(1); MAX_AGREEMENT_VERTICES + 1])
+                .unwrap_err()
+                .kind(),
+            CryptoErrorKind::FieldTooLong
+        );
+        let mut encoder = Encoder::with_capacity(8);
+        encoder.put_bytes(&[]).unwrap();
+        encoder.put_u32((MAX_AGREEMENT_VERTICES + 1) as u32);
+        assert_eq!(
+            decode_agreement(&encoder.finish()).unwrap_err().kind(),
+            CryptoErrorKind::FieldTooLong
+        );
+    }
+
+    #[test]
+    fn agreement_size_and_edge_preflight_are_bounded() {
+        let mut large = vertex(1);
+        large.signature = vec![0; MAX_AGREEMENT_PAYLOAD];
+        assert_eq!(
+            encode_agreement(&[], &[large]).unwrap_err().kind(),
+            CryptoErrorKind::FieldTooLong
+        );
+        let mut many_edges = vertex(1);
+        many_edges.references = vec![want(1); MAX_AGREEMENT_EDGES + 1];
+        assert_eq!(
+            encode_agreement(&[], &[many_edges]).unwrap_err().kind(),
+            CryptoErrorKind::FieldTooLong
+        );
+        let mut encoded = vertex(1).encode().unwrap();
+        let count_offset = 2 + 4 + b"karsa-wire-1".len() + 16 + 4 + b"val-0".len() + 36;
+        encoded[count_offset..count_offset + 4]
+            .copy_from_slice(&((MAX_AGREEMENT_EDGES + 1) as u32).to_le_bytes());
+        let mut encoder = Encoder::with_capacity(encoded.len() + 12);
+        encoder.put_bytes(&[]).unwrap();
+        encoder.put_u32(1);
+        encoder.put_bytes(&encoded).unwrap();
+        assert_eq!(
+            decode_agreement(&encoder.finish()).unwrap_err().kind(),
+            CryptoErrorKind::FieldTooLong
+        );
+    }
+
+    #[test]
+    fn agreement_cumulative_edge_count_rejects_u32_max() {
+        let mut first = vertex(1);
+        first.references.push(want(1));
+        let mut second = vertex(2).encode().unwrap();
+        let count_offset = 2 + 4 + b"karsa-wire-1".len() + 16 + 4 + b"val-0".len() + 36;
+        second[count_offset..count_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut encoder = Encoder::new();
+        encoder.put_bytes(&[]).unwrap();
+        encoder.put_u32(2);
+        encoder.put_bytes(&first.encode().unwrap()).unwrap();
+        encoder.put_bytes(&second).unwrap();
+        assert_eq!(
+            decode_agreement(&encoder.finish()).unwrap_err().kind(),
+            CryptoErrorKind::FieldTooLong
+        );
+    }
+
+    #[test]
+    fn oversized_agreement_is_rejected_from_header_and_kind_only() {
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(&((9 + MAX_AGREEMENT_PAYLOAD + 1) as u32).to_le_bytes());
+        prefix.extend_from_slice(&0u64.to_le_bytes());
+        assert_eq!(take_frame(&mut prefix).unwrap(), None);
+        prefix.push(KIND_AGREEMENT_CARRIER);
+        let before = prefix.clone();
+        assert_eq!(
+            take_frame(&mut prefix).unwrap_err().kind(),
+            CryptoErrorKind::FieldTooLong
+        );
+        assert_eq!(prefix, before);
+        prefix[12] = KIND_VERTEX;
+        assert_eq!(take_frame(&mut prefix).unwrap(), None);
     }
 
     #[test]

@@ -3773,6 +3773,193 @@ fn received_plain_proposal_is_neutral_durable_and_view_votes_after_recovery() {
 }
 
 #[test]
+fn isolated_tcp_envelope_receipt_persists_neutral_proposal() {
+    use net::wire::{self, Message};
+    use std::sync::{Arc, atomic::AtomicU64};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::{mpsc, watch};
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let timeout = Duration::from_secs(5);
+    let chain_id = b"isolated-agreement-test";
+
+    // Exercise the real hello gate, including incompatible and foreign peers.
+    for (protocol, peer_chain, expected) in [
+        (16, chain_id.as_slice(), "protocol"),
+        (wire::WIRE_PROTOCOL, b"other-chain".as_slice(), "chain"),
+    ] {
+        runtime.block_on(async {
+            tokio::time::timeout(timeout, async {
+                let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .await
+                    .unwrap();
+                let mut sender = TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (mut receiver, _) = listener.accept().await.unwrap();
+                let hello = Message::Hello(wire::Hello {
+                    protocol,
+                    chain_id: peer_chain.to_vec(),
+                });
+                sender
+                    .write_all(&wire::frame(&hello, 0).unwrap())
+                    .await
+                    .unwrap();
+                let error = super::super::handshake(&mut receiver, &mut Vec::new(), chain_id)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.contains(expected),
+                    "unexpected hello rejection: {error}"
+                );
+            })
+            .await
+            .expect("hello rejection timed out");
+        });
+    }
+
+    let transfer = |envelope: Vec<u8>, vertices: Vec<Vertex>| {
+        runtime.block_on(async {
+            tokio::time::timeout(timeout, async {
+                let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .await
+                    .unwrap();
+                let mut sender = TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (mut receiver, remote) = listener.accept().await.unwrap();
+                assert!(remote.ip().is_loopback());
+                let mut sender_buffer = Vec::new();
+                let mut receiver_buffer = Vec::new();
+                let (sent_hello, received_hello) = tokio::join!(
+                    super::super::handshake(&mut sender, &mut sender_buffer, chain_id),
+                    super::super::handshake(&mut receiver, &mut receiver_buffer, chain_id),
+                );
+                sent_hello.unwrap();
+                received_hello.unwrap();
+                let bytes =
+                    wire::frame(&Message::AgreementCarrier { envelope, vertices }, 7).unwrap();
+                let (frames, mut received) = mpsc::channel(1);
+                let (shutdown, shutdown_rx) = watch::channel(false);
+                let reader = super::super::read_peer(
+                    receiver,
+                    receiver_buffer,
+                    frames,
+                    Arc::new(AtomicU64::new(0)),
+                    shutdown_rx,
+                );
+                let consumer = async {
+                    sender.write_all(&bytes).await.unwrap();
+                    let frame = received
+                        .recv()
+                        .await
+                        .expect("peer reader closed before carrier");
+                    assert_eq!(frame.sent_at_nanos, 7);
+                    shutdown.send(true).unwrap();
+                    // Deliberately test-only dispatch: no live agreement activation.
+                    let Message::AgreementCarrier { envelope, vertices } = frame.message else {
+                        panic!("expected agreement carrier");
+                    };
+                    (envelope, vertices)
+                };
+                let ((), carrier) = tokio::join!(reader, consumer);
+                carrier
+            })
+            .await
+            .expect("agreement carrier transfer timed out")
+        })
+    };
+
+    let (m, bootstrap, request) = fixture();
+    let AuthenticatedSlotAgreementRequest::Propose { lineage, vertices } = request else {
+        unreachable!()
+    };
+    let history: Vec<_> = vertices.into_iter().filter(|v| v.round < 3).collect();
+    let sender_dir = Dir::new();
+    let sender_store = Store::open(&sender_dir.0).unwrap();
+    let mut sender = Adapter::begin(&sender_store, bootstrap.clone(), &m, 0).unwrap();
+    let mut node = authoring_node_index(&m, &history, 0);
+    node.set_round(3);
+    let authored = sender
+        .author_proposal(&lineage.entries[0].proposal, &mut node)
+        .unwrap()
+        .unwrap();
+    drop(sender);
+    drop(sender_store);
+    let sender_store = Store::open(&sender_dir.0).unwrap();
+    let mut sender = Adapter::recover(&sender_store, bootstrap.clone(), &m, 0).unwrap();
+    let publications = sender.completed_carriers().unwrap();
+    assert_eq!(publications.len(), 1);
+    assert_eq!(publications[0].envelope, authored.envelope);
+    assert_eq!(publications[0].vertex, authored.vertex);
+    let envelope_bytes = publications[0].envelope.encode(&m.set).unwrap();
+    let mut evidence = history;
+    evidence.push(publications[0].vertex.clone());
+
+    let (received_envelope, received_vertices) = transfer(envelope_bytes.clone(), evidence.clone());
+    assert_eq!(received_envelope, envelope_bytes);
+    assert_eq!(received_vertices, evidence);
+
+    let receiver_dir = Dir::new();
+    let store = Store::open(&receiver_dir.0).unwrap();
+    let mut receiver_bootstrap = bootstrap.clone();
+    receiver_bootstrap.agreement.local_validator = m.consensus[1].id.clone();
+    let mut receiver = Adapter::begin(&store, receiver_bootstrap.clone(), &m, 1).unwrap();
+    let wal = receiver_dir.0.join("authenticated-slot-agreement");
+    let before = std::fs::read(&wal).unwrap();
+    let (malformed, malformed_vertices) = transfer(
+        envelope_bytes[..envelope_bytes.len() - 1].to_vec(),
+        evidence,
+    );
+    let rejected = CarrierEnvelope::decode(&malformed, &m.set)
+        .map_err(|error| error.to_string())
+        .and_then(|envelope| {
+            receiver
+                .receive_envelope(envelope, malformed_vertices)
+                .map_err(|error| error.to_string())
+        });
+    assert!(rejected.is_err());
+    assert_eq!(std::fs::read(&wal).unwrap(), before);
+    recover_envelope_adapter(&mut receiver, &store, &receiver_bootstrap, &m, 1);
+    assert_eq!(receiver.driver.sequence(), 0);
+    assert!(receiver.pending().is_empty());
+    assert!(receiver.signing_history().is_empty());
+
+    let envelope = CarrierEnvelope::decode(&received_envelope, &m.set).unwrap();
+    assert_eq!(envelope, publications[0].envelope);
+    receiver
+        .receive_envelope(envelope, received_vertices)
+        .unwrap();
+    assert_eq!(receiver.driver.sequence(), 1);
+    let persisted = std::fs::read(&wal).unwrap();
+    assert_ne!(persisted, before);
+    let output = format!("{:?}", receiver.driver.output().unwrap());
+    drop(receiver);
+    drop(store);
+    let store = Store::open(&receiver_dir.0).unwrap();
+    let mut receiver = Adapter::recover(&store, receiver_bootstrap, &m, 1).unwrap();
+    assert_eq!(std::fs::read(&wal).unwrap(), persisted);
+    assert_eq!(receiver.driver.sequence(), 1);
+    assert_eq!(format!("{:?}", receiver.driver.output().unwrap()), output);
+    let transition = receiver.driver.output().unwrap().transition.unwrap();
+    assert_eq!(transition.view, AgreementView(0));
+    assert!(transition.vote.is_none());
+    assert!(transition.decision.is_none());
+    assert!(receiver.pending().is_empty());
+    assert!(receiver.signing_history().is_empty());
+    assert!(receiver.completed_carriers().unwrap().is_empty());
+    assert_eq!(
+        receiver.readiness(),
+        Readiness::DisabledMissingCausalReadinessAndTransport
+    );
+}
+
+#[test]
 fn proposal_and_view_durable_local_authoring_and_recovery() {
     let (m, bootstrap, request) = fixture();
     let AuthenticatedSlotAgreementRequest::Propose { lineage, vertices } = request else {

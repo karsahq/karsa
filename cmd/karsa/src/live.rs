@@ -3966,6 +3966,8 @@ async fn node_task(
                     // The handshake consumes the hello before this loop starts; a
                     // second one is a peer breaking the protocol.
                     Message::Hello(_) => rejected += 1,
+                    // Agreement receipt is opt-in; legacy consensus must not admit its evidence.
+                    Message::AgreementCarrier { .. } => rejected += 1,
                     Message::Want(id) => {
                         // Answering is a broadcast: the reply is a vertex, and a
                         // vertex is exactly what the original sender would have
@@ -6237,6 +6239,8 @@ async fn archive_task(
                     Message::Floor { .. } => {}
                     // The accept side consumes the hello before the loop starts.
                     Message::Hello(_) => rejected += 1,
+                    // An archive has no authenticated agreement session.
+                    Message::AgreementCarrier { .. } => rejected += 1,
                 }
             }
             _ = shutdown.changed() => break,
