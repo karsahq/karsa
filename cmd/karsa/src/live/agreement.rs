@@ -650,6 +650,51 @@ impl Adapter {
         Ok(requests)
     }
 
+    /// Exports the latest current-slot entry certificate, including after recovery.
+    /// # Errors
+    /// Rejects stale or uncertain owners and invalid durable evidence.
+    pub fn entered_view_certificate(
+        &self,
+    ) -> Result<Option<Vec<validator::SlotAgreementViewRequest>>, String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before certificate export".into());
+        }
+        self.driver
+            .entered_view_certificate()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Authenticates a complete certificate and durably enters only an active future view.
+    /// Obsolete certificates are fully validated but never reopen voting phases.
+    /// # Errors
+    /// Rejects malformed certificates, stale ownership and uncertain durability.
+    pub fn receive_view_certificate(
+        &mut self,
+        requests: Vec<validator::SlotAgreementViewRequest>,
+    ) -> Result<(), String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before certificate receipt".into());
+        }
+        let output = self.driver.output().map_err(|e| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            e.to_string()
+        })?;
+        let target = validator::slot_agreement::SlotAgreement::verify_view_requests(
+            output.binding.tip(),
+            &self.set,
+            &requests,
+        )
+        .map_err(|e| e.to_string())?;
+        if output
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.decision.is_some() || target <= t.view)
+        {
+            return Ok(());
+        }
+        self.apply(AuthenticatedSlotAgreementRequest::EnterRequestedView { requests })
+    }
+
     /// Collects bounded volatile latest-per-signer support; only a full entry is journaled.
     /// Partial support is lost on recovery and must be redelivered. Authenticated obsolete,
     /// late and decided-slot support does not change phase state or consume WAL capacity.

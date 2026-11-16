@@ -84,6 +84,15 @@ impl SlotAgreementDriver {
         self.session.view_request_reservations()
     }
 
+    /// Exports the latest validated current-slot durable view-entry certificate.
+    /// # Errors
+    /// Rejects stale or uncertain owners and invalid durable evidence.
+    pub fn entered_view_certificate(
+        &self,
+    ) -> Result<Option<Vec<validator::SlotAgreementViewRequest>>, StoreError> {
+        self.session.entered_view_certificate()
+    }
+
     /// Returns the number of durable requests installed by this owner.
     pub fn sequence(&self) -> u64 {
         self.session.sequence()

@@ -525,13 +525,37 @@ impl SlotAgreement {
         requests: &[crate::SlotAgreementViewRequest],
     ) -> Result<(), CryptoError> {
         self.active()?;
-        if requests.len() < self.set.quorum_size() || requests.len() > self.set.validators.len() {
-            return Err(invalid("view request certificate has no bounded quorum"));
-        }
-        let target = requests[0].target_view();
+        let target = Self::verify_view_requests(&self.context, &self.set, requests)?;
         if target <= self.view {
             return Err(invalid("view request target is not strictly future"));
         }
+        self.view = target;
+        self.prevote = None;
+        self.precommit = None;
+        Ok(())
+    }
+
+    /// Authenticates an exact-target scheduling quorum without entering or changing state.
+    ///
+    /// Verification also applies to obsolete certificates: successful authentication
+    /// does not authorize reopening a phase, unlocking, or entering a decided slot.
+    ///
+    /// # Errors
+    /// Rejects invalid sets, empty/subquorum/oversized certificates, zero or mixed
+    /// targets, noncanonical signer order, context mismatch, and bad signatures.
+    pub fn verify_view_requests(
+        context: &SlotDecisionTip,
+        set: &ValidatorSet,
+        requests: &[crate::SlotAgreementViewRequest],
+    ) -> Result<AgreementView, CryptoError> {
+        set.validate()?;
+        if requests.is_empty()
+            || requests.len() < set.quorum_size()
+            || requests.len() > set.validators.len()
+        {
+            return Err(invalid("view request certificate has no bounded quorum"));
+        }
+        let target = requests[0].target_view();
         let mut bytes = 0usize;
         let mut previous: Option<&[u8]> = None;
         for request in requests {
@@ -542,18 +566,15 @@ impl SlotAgreement {
                 ));
             }
             bytes = bytes
-                .checked_add(request.encode(&self.set)?.len())
+                .checked_add(request.encode(set)?.len())
                 .ok_or_else(|| invalid("view request certificate size overflow"))?;
             if bytes > crypto::encoding::MAX_FIELD_LEN {
                 return Err(invalid("view request certificate exceeds one MiB"));
             }
-            request.verify(&self.context, &self.set)?;
+            request.verify(context, set)?;
             previous = Some(signer);
         }
-        self.view = target;
-        self.prevote = None;
-        self.precommit = None;
-        Ok(())
+        Ok(target)
     }
 
     /// Advances exactly one view on an external simulation timeout, preserving locks.

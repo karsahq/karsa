@@ -36,6 +36,103 @@ fn signed_view_request(
 }
 
 #[test]
+fn view_certificate_durable_restart_and_single_receipt() {
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, _) = fixture();
+    let dirs: Vec<_> = (0..4).map(|_| Dir::new()).collect();
+    let stores: Vec<_> = dirs.iter().map(|d| Store::open(&d.0).unwrap()).collect();
+    let mut peers: Vec<_> = stores
+        .iter()
+        .enumerate()
+        .map(|(i, store)| {
+            let mut b = bootstrap.clone();
+            b.agreement.local_validator = m.consensus[i].id.clone();
+            Adapter::begin(store, b, &m, i).unwrap()
+        })
+        .collect();
+    let mut requests: Vec<_> = peers
+        .iter_mut()
+        .take(m.set.quorum_size())
+        .map(|a| a.author_view_request(AgreementView(9)).unwrap())
+        .collect();
+    requests.sort_by(|a, b| a.signature().validator_id.cmp(&b.signature().validator_id));
+    for request in &requests {
+        peers[0].receive_view_request(request.clone()).unwrap();
+    }
+    assert_eq!(
+        peers[0].entered_view_certificate().unwrap(),
+        Some(requests.clone())
+    );
+    assert!(peers[3].entered_view_certificate().unwrap().is_none());
+    drop(peers);
+    drop(stores);
+    let store = Store::open(&dirs[0].0).unwrap();
+    let peer = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    assert!(peer.observed_view_requests().unwrap().is_empty());
+    let certificate = peer.entered_view_certificate().unwrap().unwrap();
+    drop(peer);
+    drop(store);
+    let store = Store::open(&dirs[3].0).unwrap();
+    let mut b = bootstrap.clone();
+    b.agreement.local_validator = m.consensus[3].id.clone();
+    let mut laggard = Adapter::recover(&store, b.clone(), &m, 3).unwrap();
+    let before = laggard.driver.sequence();
+    laggard
+        .receive_view_certificate(certificate.clone())
+        .unwrap();
+    assert_eq!(laggard.driver.sequence(), before + 1);
+    assert_eq!(
+        laggard.driver.output().unwrap().transition.unwrap().view,
+        AgreementView(9)
+    );
+    laggard
+        .apply(AuthenticatedSlotAgreementRequest::Timeout {
+            view: AgreementView(9),
+            phase: AgreementPhase::Prevote,
+        })
+        .unwrap();
+    let sequence = laggard.driver.sequence();
+    let history = laggard.signing_history().len();
+    laggard
+        .receive_view_certificate(certificate.clone())
+        .unwrap();
+    assert_eq!(laggard.driver.sequence(), sequence);
+    assert_eq!(laggard.signing_history().len(), history);
+    let intent = laggard.signing_history().last().unwrap().id;
+    assert!(laggard.author_nil_vote(intent).unwrap().is_some());
+    let sequence = laggard.driver.sequence();
+    let mut mixed = certificate.clone();
+    mixed[0] = signed_view_request(&m, &bootstrap, 0, 8);
+    let mut duplicate = certificate.clone();
+    duplicate[1] = duplicate[0].clone();
+    let mut foreign = bootstrap.clone();
+    foreign.agreement.context = SlotDecisionTip::from_checkpoint(
+        b"foreign-certificate-chain".to_vec(),
+        &m.set,
+        1,
+        [0; 32],
+        0,
+        [0; 32],
+    )
+    .unwrap();
+    let wrong: Vec<_> = (0..m.set.quorum_size())
+        .map(|i| signed_view_request(&m, &foreign, i, 9))
+        .collect();
+    for malformed in [mixed, duplicate, wrong, Vec::new()] {
+        assert!(laggard.receive_view_certificate(malformed).is_err());
+        assert_eq!(laggard.driver.sequence(), sequence);
+    }
+    let mut newer = Adapter::recover(&store, b, &m, 3).unwrap();
+    newer
+        .apply(AuthenticatedSlotAgreementRequest::AdvanceView {
+            from: AgreementView(9),
+        })
+        .unwrap();
+    assert!(laggard.entered_view_certificate().is_err());
+    assert!(laggard.receive_view_certificate(certificate).is_err());
+}
+
+#[test]
 fn view_request_signing_skew_recovery_and_exact_quorum_convergence() {
     use validator::slot_agreement::AgreementPhase;
     let (m, bootstrap, _) = fixture();
@@ -2728,6 +2825,21 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
     );
     assert_eq!(proof.encode(&m.set).unwrap(), before);
     assert_eq!(*digest, proof.digest(&m.set).unwrap());
+    // Enter only after authoring the final carrier: an authenticated lower-view
+    // commit must still decide, and its slot's entry certificate remains exportable.
+    let mut entry_certificate: Vec<_> = adapters
+        .iter_mut()
+        .take(m.set.quorum_size())
+        .map(|a| a.author_view_request(AgreementView(98)).unwrap())
+        .collect();
+    entry_certificate.sort_by(|a, b| a.signature().validator_id.cmp(&b.signature().validator_id));
+    adapters[0]
+        .receive_view_certificate(entry_certificate.clone())
+        .unwrap();
+    assert_eq!(
+        adapters[0].entered_view_certificate().unwrap(),
+        Some(entry_certificate.clone())
+    );
     // Arm before receipt so the actual durable decision must cancel elapsed scheduling.
     let timer_now = std::time::Instant::now();
     let timer_wait = std::time::Duration::from_secs(1);
@@ -2765,7 +2877,7 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             .is_some()
     );
     // Advisory scheduling cannot reopen a decided slot, even with a real quorum.
-    let requests: Vec<_> = (0..3)
+    let mut requests: Vec<_> = (0..3)
         .map(|i| {
             let bytes = validator::SlotAgreementViewRequest::signing_payload(
                 &bootstrap.agreement.context,
@@ -2788,10 +2900,37 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             .unwrap()
         })
         .collect();
+    requests.sort_by(|a, b| a.signature().validator_id.cmp(&b.signature().validator_id));
     let decided_sequence = adapters[0].driver.sequence();
     assert!(adapters[0].author_view_request(AgreementView(99)).is_err());
     let decided_readiness = adapters[0].readiness();
     let decided_transition = format!("{:?}", adapters[0].driver.output().unwrap().transition);
+    adapters[0]
+        .receive_view_certificate(requests.clone())
+        .unwrap();
+    adapters[0]
+        .receive_view_certificate(entry_certificate.clone())
+        .unwrap();
+    let mut forged = requests.clone();
+    let mut signature = forged[0].signature().clone();
+    signature.signature[0] ^= 1;
+    forged[0] = validator::SlotAgreementViewRequest::new(
+        forged[0].context().clone(),
+        forged[0].target_view(),
+        signature,
+        &m.set,
+    )
+    .unwrap();
+    let mut duplicate = requests.clone();
+    duplicate[1] = duplicate[0].clone();
+    for malformed in [forged, duplicate, Vec::new()] {
+        assert!(adapters[0].receive_view_certificate(malformed).is_err());
+        assert_eq!(adapters[0].driver.sequence(), decided_sequence);
+    }
+    assert_eq!(
+        adapters[0].entered_view_certificate().unwrap(),
+        Some(entry_certificate.clone())
+    );
     for request in &requests {
         adapters[0].receive_view_request(request.clone()).unwrap();
     }
@@ -2864,6 +3003,10 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
             })
             .collect::<Vec<_>>()
     };
+    assert_eq!(
+        adapters[0].entered_view_certificate().unwrap(),
+        Some(entry_certificate.clone())
+    );
     let before_advance = publication_bytes(&mut adapters[0]);
     assert!(
         before_advance.len() >= 3,
@@ -2873,8 +3016,23 @@ fn quorum_intents_use_existing_hashes_and_precommit_exact_pol_prerequisite() {
         .apply(AuthenticatedSlotAgreementRequest::AdvanceSlot)
         .unwrap();
     assert_eq!(publication_bytes(&mut adapters[0]), before_advance);
+    assert!(adapters[0].entered_view_certificate().unwrap().is_none());
+    let advanced_sequence = adapters[0].driver.sequence();
+    assert!(
+        adapters[0]
+            .receive_view_certificate(entry_certificate.clone())
+            .is_err()
+    );
+    assert_eq!(adapters[0].driver.sequence(), advanced_sequence);
     recover_envelope_adapter(&mut adapters[0], &stores[0], &bootstrap, &m, 0);
     assert_eq!(publication_bytes(&mut adapters[0]), before_advance);
+    assert!(adapters[0].entered_view_certificate().unwrap().is_none());
+    assert!(
+        adapters[0]
+            .receive_view_certificate(entry_certificate)
+            .is_err()
+    );
+    assert_eq!(adapters[0].driver.sequence(), advanced_sequence);
 
     for id in [stale_prevote, precommit_id] {
         assert!(

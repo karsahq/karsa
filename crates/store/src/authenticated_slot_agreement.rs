@@ -1938,6 +1938,43 @@ impl AuthenticatedSlotAgreement {
         Ok(self.view_requests()?.reservations)
     }
 
+    /// Exports the latest durable entry certificate for the current slot, not volatile support.
+    ///
+    /// # Errors
+    /// Rejects stale or uncertain owners and invalid durable evidence.
+    pub fn entered_view_certificate(
+        &self,
+    ) -> Result<Option<Vec<validator::SlotAgreementViewRequest>>, StoreError> {
+        if self.uncertain {
+            return Err(invalid("uncertain authenticated write requires recovery"));
+        }
+        let root = self
+            .store
+            .slot_decisions
+            .lock()
+            .expect("slot decision lock poisoned");
+        exclusions(&root)?;
+        let journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
+        if journal.header != self.header
+            || journal.events.len() as u64 != self.sequence
+            || journal.tip != self.tip
+        {
+            return Err(invalid("stale authenticated owner"));
+        }
+        replay(&journal.bootstrap, &journal.events)?;
+        let mut certificate = None;
+        for event in &journal.events {
+            match event {
+                AuthenticatedSlotAgreementRequest::AdvanceSlot => certificate = None,
+                AuthenticatedSlotAgreementRequest::EnterRequestedView { requests } => {
+                    certificate = Some(requests.clone());
+                }
+                _ => {}
+            }
+        }
+        Ok(certificate)
+    }
+
     /// Reauthenticates durable evidence and returns frozen candidates without mutable state access.
     ///
     /// # Errors
