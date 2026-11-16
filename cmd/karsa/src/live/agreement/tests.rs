@@ -7,6 +7,559 @@ use validator::{
     SlotOutcome, SlotProposal, Vertex,
 };
 
+// Explicit acceptance-test orchestration, not a production scheduler: every signing
+// call is made by the test, and every publication crosses the real TCP receive path.
+#[test]
+fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen() {
+    use std::time::{Duration, Instant};
+
+    let (m, bootstrap, request) = fixture();
+    let AuthenticatedSlotAgreementRequest::Propose { lineage, vertices } = request else {
+        unreachable!()
+    };
+    let dirs: Vec<_> = (0..3).map(|_| Dir::new()).collect();
+    let mut stores: Vec<_> = dirs.iter().map(|d| Store::open(&d.0).unwrap()).collect();
+    let bootstraps: Vec<_> = (0..3)
+        .map(|i| {
+            let mut b = bootstrap.clone();
+            b.agreement.local_validator = m.consensus[i].id.clone();
+            b
+        })
+        .collect();
+    let mut adapters: Vec<_> = (0..3)
+        .map(|i| Adapter::begin(&stores[i], bootstraps[i].clone(), &m, i).unwrap())
+        .collect();
+    let mut available: Vec<_> = vertices.iter().filter(|v| v.round < 4).cloned().collect();
+
+    // Author the actual proposal from the fixture's causal prefix, not a fabricated
+    // envelope; plain proposal receipt must remain neutral.
+    let prefix: Vec<_> = vertices.iter().filter(|v| v.round < 3).cloned().collect();
+    let mut node = authoring_node_index(&m, &prefix, 0);
+    node.set_round(3);
+    let proposal = adapters[0]
+        .author_proposal(&lineage.entries[0].proposal, &mut node)
+        .unwrap()
+        .expect("proposal is authorable");
+    available.retain(|v| !(v.round == 3 && v.author == proposal.vertex.author));
+    available.push(proposal.vertex.clone());
+    let message = adapters[0]
+        .export_carrier(&proposal.vertex.id().unwrap(), node.dag())
+        .unwrap();
+    for adapter in &mut adapters {
+        adapter
+            .receive_message(tcp_agreement_message(message.clone()))
+            .unwrap();
+        assert!(
+            adapter.signing_history().is_empty(),
+            "proposal receipt must not vote"
+        );
+    }
+
+    let proposer = m
+        .consensus
+        .iter()
+        .position(|v| v.id == lineage.entries[0].view_carrier.author)
+        .unwrap();
+    assert!(
+        proposer < adapters.len(),
+        "fixture view proposer must be in the honest quorum"
+    );
+    let mut node = authoring_node_index(&m, &available, proposer);
+    node.set_round(4);
+    let candidate = validator::SlotAgreementViewCandidate::new(
+        vec![],
+        lineage.entries[0].proposal.clone(),
+        proposal.vertex.id().unwrap(),
+        AgreementView(0),
+        &m.set,
+    )
+    .unwrap();
+    let view = adapters[proposer]
+        .author_view(&candidate, &mut node)
+        .unwrap()
+        .expect("elected view");
+    let refs: Vec<_> = available
+        .iter()
+        .filter(|v| v.round == 3)
+        .map(|v| v.id().unwrap())
+        .collect();
+    for i in 0..4 {
+        if i != proposer {
+            available.push(signed(&m, i, 4, refs.clone(), [4; 32]));
+        }
+    }
+    available.push(view.vertex.clone());
+    let message = adapters[proposer]
+        .export_carrier(&view.vertex.id().unwrap(), node.dag())
+        .unwrap();
+    for adapter in &mut adapters {
+        adapter
+            .receive_message(tcp_agreement_message(message.clone()))
+            .unwrap();
+        assert_eq!(
+            adapter.signing_history().len(),
+            1,
+            "view authorizes one explicit prevote intent"
+        );
+        assert!(
+            adapter
+                .completed_carriers()
+                .unwrap()
+                .iter()
+                .all(|c| !matches!(c.envelope.payload(), CarrierPayload::Vote { .. })),
+            "receive must not author vote carriers"
+        );
+    }
+
+    // Both voting phases use real local authoring and durable export. Lose one
+    // prevote entirely, then close/reopen its sender AND a partially fed receiver.
+    for (round, phase) in [
+        (5, validator::slot_agreement::AgreementPhase::Prevote),
+        (7, validator::slot_agreement::AgreementPhase::Precommit),
+    ] {
+        let mut messages = Vec::new();
+        let mut authored_vertices = Vec::new();
+        for (i, adapter) in adapters.iter_mut().enumerate() {
+            let id = adapter
+                .signing_history()
+                .iter()
+                .find(|intent| intent.vote.phase == phase)
+                .expect("phase intent")
+                .id;
+            let mut node = authoring_node_index(&m, &available, i);
+            node.set_round(round);
+            let vote = adapter
+                .author_vote(id, &mut node)
+                .unwrap()
+                .expect("available vote prerequisites");
+            messages.push(
+                adapter
+                    .export_carrier(&vote.vertex.id().unwrap(), node.dag())
+                    .unwrap(),
+            );
+            authored_vertices.push(vote.vertex);
+        }
+        if round == 5 {
+            adapters[2]
+                .receive_message(tcp_agreement_message(messages[0].clone()))
+                .unwrap();
+            assert!(
+                !adapters[2]
+                    .pending()
+                    .iter()
+                    .any(|p| matches!(p, PendingIntent::Pol { .. })),
+                "one vote is not quorum"
+            );
+            let lost = messages[1].clone();
+            let wal = std::fs::read(dirs[1].0.join("authenticated-slot-agreement")).unwrap();
+            // Reopen the actual Store handles, not merely the adapter objects.
+            drop(adapters);
+            drop(stores);
+            stores = dirs.iter().map(|d| Store::open(&d.0).unwrap()).collect();
+            adapters = (0..3)
+                .map(|i| Adapter::recover(&stores[i], bootstraps[i].clone(), &m, i).unwrap())
+                .collect();
+            let mut node = authoring_node_index(&m, &available, 1);
+            node.receive(authored_vertices[1].clone()).unwrap();
+            let retry = adapters[1]
+                .export_carrier(&authored_vertices[1].id().unwrap(), node.dag())
+                .unwrap();
+            assert_eq!(
+                net::wire::frame(&retry, 0).unwrap(),
+                net::wire::frame(&lost, 0).unwrap(),
+                "restart retries exact durable publication"
+            );
+            assert_eq!(
+                std::fs::read(dirs[1].0.join("authenticated-slot-agreement")).unwrap(),
+                wal,
+                "export must not sign or write"
+            );
+            messages[1] = retry;
+        }
+        available.extend(authored_vertices);
+        for message in messages {
+            for adapter in &mut adapters {
+                adapter
+                    .receive_message(tcp_agreement_message(message.clone()))
+                    .unwrap();
+            }
+        }
+        if round == 5 {
+            let digest = adapters[0]
+                .pending()
+                .iter()
+                .find_map(|p| match p {
+                    PendingIntent::Pol { digest, .. } => Some(*digest),
+                    _ => None,
+                })
+                .expect("prevote quorum POL");
+            let mut node = authoring_node_index(&m, &available, 0);
+            node.set_round(6);
+            let pol = adapters[0]
+                .author_pol(digest, &mut node)
+                .unwrap()
+                .expect("POL prerequisites");
+            let message = adapters[0]
+                .export_carrier(&pol.vertex.id().unwrap(), node.dag())
+                .unwrap();
+            let refs: Vec<_> = available
+                .iter()
+                .filter(|v| v.round == 5)
+                .map(|v| v.id().unwrap())
+                .collect();
+            available.push(pol.vertex);
+            for i in 1..3 {
+                available.push(signed(&m, i, 6, refs.clone(), [6; 32]));
+            }
+            for adapter in &mut adapters {
+                adapter
+                    .receive_message(tcp_agreement_message(message.clone()))
+                    .unwrap();
+                assert_eq!(
+                    adapter.signing_history().len(),
+                    2,
+                    "POL authorizes locked precommit"
+                );
+            }
+        }
+    }
+
+    let digest = adapters[0]
+        .pending()
+        .iter()
+        .find_map(|p| match p {
+            PendingIntent::FinalProof { digest, .. } => Some(*digest),
+            _ => None,
+        })
+        .expect("precommit quorum final proof");
+    let mut node = authoring_node_index(&m, &available, 0);
+    node.set_round(8);
+    let final_proof = adapters[0]
+        .author_final_proof(digest, &mut node)
+        .unwrap()
+        .expect("QC prerequisites");
+    let lost_final = adapters[0]
+        .export_carrier(&final_proof.vertex.id().unwrap(), node.dag())
+        .unwrap();
+    available.push(final_proof.vertex.clone());
+
+    // While the QC publication is lost, retransmit dropped control requests to
+    // enter a later view. Old-view final evidence must still settle the same slot.
+    let now = Instant::now();
+    let wait = Duration::from_millis(10);
+    let mut controls = Vec::new();
+    for adapter in &mut adapters {
+        adapter.author_view_request(AgreementView(9)).unwrap();
+        adapter.configure_retransmission(wait).unwrap();
+        let lost = adapter
+            .retransmit(now)
+            .unwrap()
+            .expect("initial control publication");
+        assert_eq!(adapter.retransmit(now + wait / 2).unwrap(), None);
+        let retry = adapter
+            .retransmit(now + wait)
+            .unwrap()
+            .expect("due control retry");
+        assert_eq!(retry, lost);
+        controls.push(retry);
+    }
+    for control in controls {
+        for adapter in &mut adapters {
+            adapter
+                .receive_message(tcp_agreement_message(control.clone()))
+                .unwrap();
+        }
+    }
+    for adapter in &mut adapters {
+        assert_eq!(adapter.timer_snapshot().unwrap().view, AgreementView(9));
+        assert!(
+            adapter
+                .driver
+                .output()
+                .unwrap()
+                .transition
+                .unwrap()
+                .decision
+                .is_none()
+        );
+    }
+    drop(adapters);
+    drop(stores);
+    stores = dirs.iter().map(|d| Store::open(&d.0).unwrap()).collect();
+    adapters = (0..3)
+        .map(|i| Adapter::recover(&stores[i], bootstraps[i].clone(), &m, i).unwrap())
+        .collect();
+    let node = authoring_node_index(&m, &available, 0);
+    assert_eq!(
+        adapters[0].retransmit(now).unwrap(),
+        None,
+        "restart must not enable scheduling"
+    );
+    let retry = adapters[0]
+        .export_carrier(&final_proof.vertex.id().unwrap(), node.dag())
+        .unwrap();
+    assert_eq!(
+        retry, lost_final,
+        "QC survives control advancement and sender restart"
+    );
+    for adapter in &mut adapters {
+        let history = format!("{:?}", adapter.signing_history());
+        adapter
+            .receive_message(tcp_agreement_message(retry.clone()))
+            .unwrap();
+        assert_eq!(
+            format!("{:?}", adapter.signing_history()),
+            history,
+            "QC receipt never signs"
+        );
+    }
+    let decision = adapters[0]
+        .driver
+        .output()
+        .unwrap()
+        .transition
+        .unwrap()
+        .decision
+        .expect("real agreed decision");
+    // Multiple local publications remain independently retryable in a caller-selected
+    // order; control advancement does not replace older evidence for this slot.
+    let retry_dag = authoring_node_index(&m, &available, 0);
+    let publications = adapters[0].completed_carriers().unwrap();
+    let ids: Vec<_> = publications
+        .iter()
+        .map(|p| p.vertex.id().unwrap())
+        .collect();
+    assert!(
+        ids.len() > 1,
+        "round-robin must exercise distinct publications"
+    );
+    adapters[0]
+        .configure_carrier_retransmission(Duration::from_secs(1))
+        .unwrap();
+    let start = Instant::now();
+    for index in 0..=ids.len() {
+        let selected = &ids[index % ids.len()];
+        let expected = adapters[0]
+            .export_carrier(selected, retry_dag.dag())
+            .unwrap();
+        let actual = adapters[0]
+            .retransmit_carrier(
+                start + Duration::from_secs(index as u64),
+                &ids,
+                retry_dag.dag(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            actual, expected,
+            "every selected publication gets its own retry"
+        );
+    }
+    let snapshots: Vec<_> = adapters
+        .iter()
+        .enumerate()
+        .map(|(i, adapter)| {
+            assert_eq!(
+                adapter
+                    .driver
+                    .output()
+                    .unwrap()
+                    .transition
+                    .unwrap()
+                    .decision,
+                Some(decision.clone()),
+                "honest adapter {i} agrees exactly"
+            );
+            assert_eq!(
+                adapter.readiness(),
+                Readiness::DisabledMissingCausalReadinessAndTransport
+            );
+            (
+                format!("{:?}", adapter.driver.output().unwrap()),
+                std::fs::read(dirs[i].0.join("authenticated-slot-agreement")).unwrap(),
+            )
+        })
+        .collect();
+    drop(adapters);
+    drop(stores);
+    for i in 0..3 {
+        let store = Store::open(&dirs[i].0).unwrap();
+        let mut adapter = Adapter::recover(&store, bootstraps[i].clone(), &m, i).unwrap();
+        assert_eq!(
+            format!("{:?}", adapter.driver.output().unwrap()),
+            snapshots[i].0,
+            "reopen preserves exact outcome {i}"
+        );
+        let sequence = adapter.driver.sequence();
+        let history = format!("{:?}", adapter.signing_history());
+        adapter
+            .receive_message(tcp_agreement_message(retry.clone()))
+            .unwrap();
+        assert_eq!(
+            format!("{:?}", adapter.driver.output().unwrap()),
+            snapshots[i].0,
+            "duplicate QC preserves the exact outcome {i}"
+        );
+        assert_eq!(
+            format!("{:?}", adapter.signing_history()),
+            history,
+            "duplicate QC creates no signing obligation {i}"
+        );
+        // Ingress allocates a new sequence even for duplicate evidence; only an
+        // exact session retry at the original sequence avoids a WAL append.
+        assert_eq!(adapter.driver.sequence(), sequence + 1);
+        let wal = std::fs::read(dirs[i].0.join("authenticated-slot-agreement")).unwrap();
+        assert!(
+            wal.len() > snapshots[i].1.len() && wal.starts_with(&snapshots[i].1),
+            "duplicate receipt extends the existing journal {i}"
+        );
+        drop(adapter);
+        drop(store);
+        let store = Store::open(&dirs[i].0).unwrap();
+        let adapter = Adapter::recover(&store, bootstraps[i].clone(), &m, i).unwrap();
+        assert_eq!(adapter.driver.sequence(), sequence + 1);
+        assert_eq!(
+            format!("{:?}", adapter.driver.output().unwrap()),
+            snapshots[i].0,
+            "duplicate receipt replays to the exact outcome {i}"
+        );
+        assert_eq!(format!("{:?}", adapter.signing_history()), history);
+        assert_eq!(
+            std::fs::read(dirs[i].0.join("authenticated-slot-agreement")).unwrap(),
+            wal,
+            "recovery does not append another receipt {i}"
+        );
+    }
+}
+
+#[test]
+fn scheduled_carrier_retry_cadence_failure_and_recovery() {
+    let (m, bootstrap, request) = fixture();
+    let AuthenticatedSlotAgreementRequest::Propose { lineage, vertices } = request else {
+        unreachable!()
+    };
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    let prefix: Vec<_> = vertices.iter().filter(|v| v.round < 3).cloned().collect();
+    let mut node = authoring_node_index(&m, &prefix, 0);
+    node.set_round(3);
+    let publication = adapter
+        .author_proposal(&lineage.entries[0].proposal, &mut node)
+        .unwrap()
+        .unwrap();
+    let id = publication.vertex.id().unwrap();
+    let ids = [id.clone()];
+    let now = Instant::now();
+    let interval = Duration::from_secs(2);
+    let wal = std::fs::read(dir.0.join("authenticated-slot-agreement")).unwrap();
+    let history = format!("{:?}", adapter.signing_history());
+    assert!(
+        adapter
+            .retransmit_carrier(now, &ids, node.dag())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        adapter
+            .configure_carrier_retransmission(Duration::ZERO)
+            .is_err()
+    );
+    assert!(
+        adapter
+            .configure_carrier_retransmission(Duration::from_secs(86_401))
+            .is_err()
+    );
+    adapter.configure_carrier_retransmission(interval).unwrap();
+    assert!(
+        adapter
+            .retransmit_carrier(now, &[], node.dag())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        adapter
+            .retransmit_carrier(now - interval, &ids, node.dag())
+            .is_err()
+    );
+    assert!(
+        adapter
+            .retransmit_carrier(now, &vec![id.clone(); 65], node.dag())
+            .is_err()
+    );
+    assert!(
+        adapter
+            .retransmit_carrier(now, &[id.clone(), id.clone()], node.dag())
+            .is_err()
+    );
+    let missing = Dag::new(m.set.clone());
+    assert!(adapter.retransmit_carrier(now, &ids, &missing).is_err());
+    let first = adapter
+        .retransmit_carrier(now, &ids, node.dag())
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, adapter.export_carrier(&id, node.dag()).unwrap());
+    assert!(
+        adapter
+            .retransmit_carrier(now + interval - Duration::from_nanos(1), &ids, node.dag())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        adapter
+            .retransmit_carrier(now + interval, &ids, node.dag())
+            .unwrap(),
+        Some(first.clone())
+    );
+    let late = now + interval * 10;
+    assert_eq!(
+        adapter.retransmit_carrier(late, &ids, node.dag()).unwrap(),
+        Some(first.clone())
+    );
+    assert!(
+        adapter
+            .retransmit_carrier(late, &ids, node.dag())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        std::fs::read(dir.0.join("authenticated-slot-agreement")).unwrap(),
+        wal
+    );
+    assert_eq!(format!("{:?}", adapter.signing_history()), history);
+    drop(adapter);
+    drop(store);
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    assert!(
+        adapter
+            .retransmit_carrier(now, &ids, node.dag())
+            .unwrap()
+            .is_none()
+    );
+    adapter.configure_carrier_retransmission(interval).unwrap();
+    assert_eq!(
+        adapter.retransmit_carrier(now, &ids, node.dag()).unwrap(),
+        Some(first.clone())
+    );
+    assert_eq!(tcp_agreement_message(first.clone()), first);
+    assert_eq!(
+        std::fs::read(dir.0.join("authenticated-slot-agreement")).unwrap(),
+        wal
+    );
+    let mut stale = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    adapter
+        .apply(AuthenticatedSlotAgreementRequest::Timeout {
+            view: AgreementView(0),
+            phase: validator::slot_agreement::AgreementPhase::Prevote,
+        })
+        .unwrap();
+    assert!(
+        stale.retransmit_carrier(now, &[], node.dag()).is_err(),
+        "disabled empty poll still checks owner freshness"
+    );
+}
+
 #[test]
 fn carrier_export_preflight_limits() {
     let (m, _, _) = fixture();

@@ -125,6 +125,7 @@ pub struct Adapter {
     readiness: Readiness,
     pacemaker: Option<pacemaker::Pacemaker>,
     retransmission: Option<Retransmission>,
+    carrier_retransmission: Option<Retransmission>,
     // Partial remote support is never journaled and is lost on recovery.
     view_requests: Vec<validator::SlotAgreementViewRequest>,
 }
@@ -158,7 +159,90 @@ pub type AuthoredVote = AuthoredCarrier;
 /// Limits event-count replay work for explicit carrier export; recovery does not reset it.
 const MAX_CARRIER_EXPORT_EVENTS: u64 = 4096;
 
+/// Caps caller selection and duplicate-check work per scheduled carrier poll.
+const MAX_CARRIER_RETRY_IDS: usize = 64;
+
 impl Adapter {
+    /// Enables caller-selected carrier retries independently of control retries.
+    /// Recovery disables this volatile schedule. No publication or evidence is cached.
+    /// # Errors
+    /// Rejects zero intervals and intervals greater than one day.
+    pub fn configure_carrier_retransmission(&mut self, interval: Duration) -> Result<(), String> {
+        if interval.is_zero() || interval > Duration::from_secs(86_400) {
+            return Err(
+                "carrier retransmission interval must be positive and at most one day".into(),
+            );
+        }
+        self.carrier_retransmission = Some(Retransmission {
+            interval,
+            last_poll: None,
+            last_sent: None,
+            cursor: 0,
+        });
+        Ok(())
+    }
+
+    /// Exports at most one caller-selected durable carrier on each due poll.
+    /// Up to 64 distinct IDs are visited in caller order with a volatile round-robin
+    /// cursor. Callers must select current-slot publications and provide their full
+    /// ancestry. An unavailable/invalid selected carrier returns an error without
+    /// consuming the send deadline or cursor; this deliberately does not skip evidence.
+    /// First export is immediate, missed intervals never cause catch-up bursts, and
+    /// control retries have an independent cadence. Nothing is signed, persisted or sent.
+    /// Durable freshness is checked even when disabled or not due. Like explicit export,
+    /// this replays the WAL and is not suitable for a hot loop.
+    /// # Errors
+    /// Rejects stale/recovery-required owners, backwards time, oversized/duplicate ID
+    /// lists, and any explicit carrier-export authentication, availability or size error.
+    pub fn retransmit_carrier(
+        &mut self,
+        now: Instant,
+        carriers: &[VertexId],
+        available: &validator::Dag,
+    ) -> Result<Option<net::wire::Message>, String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before carrier retransmission".into());
+        }
+        if self.driver.sequence() > MAX_CARRIER_EXPORT_EVENTS {
+            return Err("carrier retransmission exceeds 4096 durable events".into());
+        }
+        self.driver.output().map_err(|error| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            error.to_string()
+        })?;
+        if carriers.len() > MAX_CARRIER_RETRY_IDS {
+            return Err("carrier retransmission exceeds 64 selected IDs".into());
+        }
+        for (index, id) in carriers.iter().enumerate() {
+            if carriers[..index].contains(id) {
+                return Err("carrier retransmission contains duplicate IDs".into());
+            }
+        }
+        let Some(schedule) = self.carrier_retransmission.as_mut() else {
+            return Ok(None);
+        };
+        if schedule.last_poll.is_some_and(|last| now < last) {
+            return Err("carrier retransmission time moved backwards".into());
+        }
+        schedule.last_poll = Some(now);
+        if carriers.is_empty()
+            || schedule
+                .last_sent
+                .is_some_and(|last| now.duration_since(last) < schedule.interval)
+        {
+            return Ok(None);
+        }
+        let index = schedule.cursor % carriers.len();
+        let message = self.export_carrier(&carriers[index], available)?;
+        let schedule = self
+            .carrier_retransmission
+            .as_mut()
+            .expect("configured carrier retries");
+        schedule.cursor = (index + 1) % carriers.len();
+        schedule.last_sent = Some(now);
+        Ok(Some(message))
+    }
+
     /// Explicitly exports one selected durable carrier with its complete authenticated cone.
     /// This is a separate opt-in API, not a scheduled class: callers select an exact ID
     /// so multiple publications in one slot/view cannot silently hide one another.
@@ -1347,6 +1431,7 @@ impl Adapter {
             history: Vec::new(),
             pacemaker: None,
             retransmission: None,
+            carrier_retransmission: None,
             view_requests: Vec::new(),
             readiness: Readiness::DisabledMissingCausalReadinessAndTransport,
         })
@@ -1377,6 +1462,7 @@ impl Adapter {
             history: Vec::new(),
             pacemaker: None,
             retransmission: None,
+            carrier_retransmission: None,
             view_requests: Vec::new(),
             readiness: Readiness::RecoveryRequiredHistoricalIntentsUnavailable,
         };
