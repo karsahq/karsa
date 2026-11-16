@@ -117,7 +117,26 @@ impl CertifiedFinalization {
         batches: &BTreeMap<[u8; 32], Batch>,
         authenticated_controls: &BTreeSet<[u8; 32]>,
         at: u64,
+        reserve: impl FnMut(&Header, usize) -> Result<(), crypto::CryptoError>,
+    ) -> Result<Build, String> {
+        self.build_with_hooks(
+            membership,
+            batches,
+            authenticated_controls,
+            at,
+            reserve,
+            None,
+        )
+    }
+
+    pub(super) fn build_with_hooks(
+        &mut self,
+        membership: &Membership,
+        batches: &BTreeMap<[u8; 32], Batch>,
+        authenticated_controls: &BTreeSet<[u8; 32]>,
+        at: u64,
         mut reserve: impl FnMut(&Header, usize) -> Result<(), crypto::CryptoError>,
+        mut canonicalize: Option<&mut dyn FnMut(Share) -> Result<Share, crypto::CryptoError>>,
     ) -> Result<Build, String> {
         self.ensure_usable()?;
         self.validate_membership(membership)?;
@@ -150,11 +169,20 @@ impl CertifiedFinalization {
                     self.execution.state().state_root(),
                     self.execution.applied(),
                 );
-                match self.finalizer.build_ready_with_reservation(
-                    self.execution.snapshot().order(),
-                    at,
-                    &mut reserve,
-                ) {
+                let result = match canonicalize.as_mut() {
+                    Some(canonicalize) => self.finalizer.build_ready_with_canonical_share(
+                        self.execution.snapshot().order(),
+                        at,
+                        &mut reserve,
+                        canonicalize,
+                    ),
+                    None => self.finalizer.build_ready_with_reservation(
+                        self.execution.snapshot().order(),
+                        at,
+                        &mut reserve,
+                    ),
+                };
+                match result {
                     Ok(mut build) => {
                         let header = self.finalizer.last_built().clone();
                         self.built_headers.insert(header.height, header);
@@ -186,6 +214,24 @@ impl CertifiedFinalization {
     ) -> Result<Vec<Certified>, String> {
         self.validate_share(membership, &share)?;
         match self.finalizer.receive_share(share) {
+            Ok(certified) => Ok(certified),
+            Err(error) => {
+                self.failed = true;
+                Err(error.to_string())
+            }
+        }
+    }
+
+    /// Authenticates a complete recovery batch before collecting or advancing finality.
+    pub(super) fn restore_shares(
+        &mut self,
+        membership: &Membership,
+        shares: Vec<Share>,
+    ) -> Result<Vec<Certified>, String> {
+        for share in &shares {
+            self.validate_share(membership, share)?;
+        }
+        match self.finalizer.receive_shares(shares) {
             Ok(certified) => Ok(certified),
             Err(error) => {
                 self.failed = true;

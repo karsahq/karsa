@@ -13,9 +13,12 @@ use super::{Adapter, CertifiedFinalization, Membership};
 /// and control classification remain caller-trusted inputs. Use isolated signing keys.
 /// Old reservations must all replay exactly before any rebuilt output is released.
 /// Completed local and accepted peer shares are persisted before release or collection.
-/// Replay returns an existing local share's original bytes and timestamp. Stored peer shares
-/// are not yet restored into quorum state; certificates and delivery acknowledgements are
-/// not persisted. Rebuilt finalizer timestamp metadata can differ after restart.
+/// Replay preserves local timestamps and restores authenticated durable quorum state only
+/// after every reserved header matches execution. Certificates and delivery acknowledgements
+/// are not persisted; recovered certificates may be delivered again. Per-share timestamps
+/// are preserved, but certificate metadata is reconstructed from the deterministic earliest
+/// quorum over all durable records, including post-certification shares, and may therefore
+/// differ from historically emitted certificate metadata.
 /// This bounded offline owner has no live transport, pruning or epoch-transition authority.
 pub struct JournaledFinalization {
     adapter: Adapter,
@@ -81,30 +84,41 @@ impl JournaledFinalization {
     ) -> Result<Build, String> {
         self.ensure_usable()?;
         self.refresh()?;
-        let adapter = &mut self.adapter;
+        let adapter = std::cell::RefCell::new(&mut self.adapter);
         let anchor = &self.anchor;
-        let mut build = self.coordinator.build_ready_with_reservation(
+        let mut canonicalize = |share: Share| {
+            Self::persist_with(&mut adapter.borrow_mut(), anchor, &share).map_err(|error| {
+                crypto::CryptoError::new(crypto::CryptoErrorKind::InvalidVertex, error)
+            })
+        };
+        let result = self.coordinator.build_with_hooks(
             membership,
             batches,
             authenticated_controls,
             at,
             |header, coverage| {
                 adapter
+                    .borrow_mut()
                     .reserve_header(anchor, header, coverage)
                     .map_err(|error| {
                         crypto::CryptoError::new(crypto::CryptoErrorKind::InvalidVertex, error)
                     })
             },
-        )?;
-        for share in &mut build.shares {
-            *share = self.persist_share(share)?;
-        }
+            Some(&mut canonicalize),
+        );
+        // Execution errors are retryable; durable callback errors poison the coordinator.
+        let mut build = result?;
         self.outbox.shares.append(&mut build.shares);
         self.outbox.certified.append(&mut build.certified);
         let reserved = self.refresh()?;
         if self.coordinator.finalizer().built_headers() < reserved {
             return Ok(Build::default());
         }
+        let result = self.restore_shares(membership);
+        if result.is_err() {
+            self.failed = true;
+        }
+        self.outbox.certified.extend(result?);
         Ok(std::mem::take(&mut self.outbox))
     }
 
@@ -133,28 +147,43 @@ impl JournaledFinalization {
     }
 
     fn persist_share(&mut self, share: &Share) -> Result<Share, String> {
-        let result = (|| {
-            let stored = self.adapter.header_shares()?;
-            let canonical = match stored
-                .iter()
-                .find(|old| old.header.height == share.header.height && old.signer == share.signer)
-            {
-                Some(old) if old.header == share.header && old.signature == share.signature => {
-                    old.clone()
-                }
-                Some(_) => return Err("conflicting completed header share".into()),
-                None => share.clone(),
-            };
-            // Re-publish even an old share: a sibling may have observed a rename
-            // whose directory durability barrier failed in another owner.
-            self.adapter
-                .reserve_header_share(&self.anchor, &canonical)?;
-            Ok(canonical)
-        })();
+        let result = Self::persist_with(&mut self.adapter, &self.anchor, share);
         if result.is_err() {
             self.failed = true;
         }
         result
+    }
+
+    fn persist_with(
+        adapter: &mut Adapter,
+        anchor: &Header,
+        share: &Share,
+    ) -> Result<Share, String> {
+        let stored = adapter.header_shares()?;
+        let canonical = match stored
+            .iter()
+            .find(|old| old.header.height == share.header.height && old.signer == share.signer)
+        {
+            Some(old) if old.header == share.header && old.signature == share.signature => {
+                old.clone()
+            }
+            Some(_) => return Err("conflicting completed header share".into()),
+            None => share.clone(),
+        };
+        // Re-publish even an old share: a sibling may have observed a rename
+        // whose directory durability barrier failed in another owner.
+        adapter.reserve_header_share(anchor, &canonical)?;
+        Ok(canonical)
+    }
+
+    fn restore_shares(&mut self, membership: &Membership) -> Result<Vec<Certified>, String> {
+        let shares = self.adapter.header_shares()?;
+        // Validate and re-publish every visible record before allowing any quorum advance.
+        for share in &shares {
+            self.coordinator.validate_share(membership, share)?;
+            self.adapter.reserve_header_share(&self.anchor, share)?;
+        }
+        self.coordinator.restore_shares(membership, shares)
     }
 
     fn refresh(&mut self) -> Result<usize, String> {

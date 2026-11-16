@@ -702,17 +702,49 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
                 .is_empty()
         );
     }
+    // Crash with partial shares at both heights; recovered duplicates add no weight.
+    let mut replay = open_replay();
+    let partial = replay.build_ready(&m, &batches, &controls, 10_000).unwrap();
+    assert_eq!(partial.shares, replayed.shares);
+    assert!(partial.certified.is_empty());
+    assert_eq!(replay.finalization().finalizer().head(), &anchor);
+    assert!(
+        replay
+            .receive_share(&m, peer_share(1, 1))
+            .unwrap()
+            .is_empty()
+    );
+    // A durable future quorum must wait for the missing lower height, even on restart.
+    assert!(
+        replay
+            .receive_share(&m, peer_share(2, 2))
+            .unwrap()
+            .is_empty()
+    );
+    let mut replay = open_replay();
+    let partial = replay.build_ready(&m, &missing, &controls, 20_000).unwrap();
+    assert!(partial.shares.is_empty() && partial.certified.is_empty());
+    assert_eq!(replay.finalization().finalizer().head(), &anchor);
+    let partial = replay.build_ready(&m, &batches, &controls, 20_001).unwrap();
+    assert_eq!(partial.shares, replayed.shares);
+    assert!(partial.certified.is_empty());
+    assert_eq!(replay.finalization().finalizer().built_headers(), 2);
     let recertified = replay.receive_share(&m, peer_share(1, 2)).unwrap();
-    assert_eq!(recertified.len(), 1);
+    assert_eq!(recertified.len(), 2);
     let recertified = replay.receive_share(&m, peer_share(2, 2)).unwrap();
-    assert_eq!(recertified.len(), 1);
+    assert!(recertified.is_empty());
     assert_eq!(
         replay.finalization().finalizer().head(),
         &built.shares[1].header
     );
     assert_eq!(adapter.header_intents().unwrap(), durable_intents);
+    // Late records can change reconstructed certificate metadata, not the certified
+    // header or its execution coverage. Signer order must not select the quorum.
+    let mut late_share = peer_share(1, 3);
+    late_share.at = 1;
+    assert!(replay.receive_share(&m, late_share).unwrap().is_empty());
     let persisted = adapter.header_shares().unwrap();
-    assert_eq!(persisted.len(), 6);
+    assert_eq!(persisted.len(), 7);
     for share in &persisted {
         assert_eq!(
             share.header,
@@ -726,8 +758,50 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
         .build_ready(&m, &batches, &controls, 104)
         .unwrap();
     assert_eq!(repeated.shares, replayed.shares);
-    assert!(repeated.certified.is_empty());
-    assert_eq!(share_replay.finalization().finalizer().head(), &anchor);
+    assert_eq!(repeated.certified.len(), 2);
+    assert_eq!(
+        share_replay.finalization().finalizer().head(),
+        &built.shares[1].header
+    );
+    for (index, certificate) in repeated.certified.iter().enumerate() {
+        let mut times: Vec<_> = persisted
+            .iter()
+            .filter(|share| share.header.height == certificate.header.height)
+            .map(|share| share.at)
+            .collect();
+        times.sort_unstable();
+        assert_eq!(
+            certificate.at,
+            times[m.set.quorum_size() - 1],
+            "reconstructed quorum must consider every durable record, not signer order"
+        );
+        if index == 0 {
+            assert!(
+                certificate.at < 99,
+                "late share changes metadata, not the header"
+            );
+            assert_ne!(certificate.certificate.signer_bitmap[0] & (1 << 3), 0);
+        }
+        assert_eq!(
+            share_replay
+                .finalization()
+                .finalizer()
+                .certified_order(certificate.header.height),
+            Some(recovered.applications()[index].order_len())
+        );
+        share_replay
+            .finalization()
+            .finalizer()
+            .verify_certificate(&certificate.header, &certificate.certificate)
+            .unwrap();
+    }
+    assert!(
+        share_replay
+            .build_ready(&m, &batches, &controls, 30_000)
+            .unwrap()
+            .certified
+            .is_empty()
+    );
     assert_eq!(adapter.header_shares().unwrap(), persisted);
     let mut wrong_anchor = anchor.clone();
     wrong_anchor.previous[0] ^= 1;
@@ -796,7 +870,7 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
         .build_ready(&m, &batches, &controls, 105)
         .unwrap();
     assert_eq!(stale_replayed.shares.len(), 2);
-    assert!(stale_replayed.certified.is_empty());
+    assert_eq!(stale_replayed.certified.len(), 2);
     assert!(
         stale_share
             .receive_share(&m, peer_share(1, 1))
@@ -833,10 +907,13 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
             .is_err()
     );
     std::fs::write(&share_journal, &share_bytes).unwrap();
-    for wrapper in [&mut bad_share_build, &mut bad_share_receive] {
+    for (wrapper, expected_head) in [
+        (&mut bad_share_build, &anchor),
+        (&mut bad_share_receive, &built.shares[1].header),
+    ] {
         assert!(wrapper.build_ready(&m, &batches, &controls, 110).is_err());
         assert!(wrapper.receive_share(&m, peer_share(1, 2)).is_err());
-        assert_eq!(wrapper.finalization().finalizer().head(), &anchor);
+        assert_eq!(wrapper.finalization().finalizer().head(), expected_head);
     }
     assert_eq!(std::fs::read(&share_journal).unwrap(), share_bytes);
 
@@ -896,7 +973,10 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
         stale_error.contains("stale authenticated owner"),
         "{stale_error}"
     );
-    for wrapper in [&mut stale_build, &mut stale_share] {
+    for (wrapper, expected_head) in [
+        (&mut stale_build, &anchor),
+        (&mut stale_share, &built.shares[1].header),
+    ] {
         let poisoned = "journaled finalization requires reopening after durable history failure";
         assert_eq!(
             wrapper
@@ -909,7 +989,7 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
             wrapper.receive_share(&m, peer_share(1, 2)).err().as_deref(),
             Some(poisoned)
         );
-        assert_eq!(wrapper.finalization().finalizer().head(), &anchor);
+        assert_eq!(wrapper.finalization().finalizer().head(), expected_head);
     }
     assert_eq!(stale_build.finalization().finalizer().built_headers(), 0);
     assert!(

@@ -405,7 +405,7 @@ impl Finalizer {
         order: &[VertexId],
         at: u64,
     ) -> Result<Build, CryptoError> {
-        self.build_reserved(prefix, order, at, |_, _| Ok(()))
+        self.build_reserved(prefix, order, at, |_, _| Ok(()), Ok)
     }
 
     /// Reserves each exact header and its order coverage before building or signing it.
@@ -427,7 +427,24 @@ impl Finalizer {
         at: u64,
         reserve: impl FnMut(&Header, usize) -> Result<(), CryptoError>,
     ) -> Result<Build, CryptoError> {
-        self.build_reserved(&CommitFrontier::empty(), order, at, reserve)
+        self.build_reserved(&CommitFrontier::empty(), order, at, reserve, Ok)
+    }
+
+    /// Builds reserved headers using canonical local shares, without advancing finality.
+    ///
+    /// The share callback runs before collection, including for a single-validator quorum.
+    /// It may persist the share or return an authenticated durable copy with its original
+    /// timestamp. Callers must complete execution replay before collecting durable peers.
+    /// # Errors
+    /// Propagates callback and build errors; discard the instance after failure.
+    pub fn build_ready_with_canonical_share(
+        &mut self,
+        order: &[VertexId],
+        at: u64,
+        reserve: impl FnMut(&Header, usize) -> Result<(), CryptoError>,
+        canonicalize: impl FnMut(Share) -> Result<Share, CryptoError>,
+    ) -> Result<Build, CryptoError> {
+        self.build_reserved_inner(&CommitFrontier::empty(), order, at, reserve, canonicalize)
     }
 
     fn build_reserved(
@@ -435,7 +452,21 @@ impl Finalizer {
         prefix: &CommitFrontier,
         order: &[VertexId],
         at: u64,
+        reserve: impl FnMut(&Header, usize) -> Result<(), CryptoError>,
+        canonicalize: impl FnMut(Share) -> Result<Share, CryptoError>,
+    ) -> Result<Build, CryptoError> {
+        let mut build = self.build_reserved_inner(prefix, order, at, reserve, canonicalize)?;
+        build.certified = self.advance_certified()?;
+        Ok(build)
+    }
+
+    fn build_reserved_inner(
+        &mut self,
+        prefix: &CommitFrontier,
+        order: &[VertexId],
+        at: u64,
         mut reserve: impl FnMut(&Header, usize) -> Result<(), CryptoError>,
+        mut canonicalize: impl FnMut(Share) -> Result<Share, CryptoError>,
     ) -> Result<Build, CryptoError> {
         let total = prefix.len().saturating_add(order.len());
         let mut shares = Vec::new();
@@ -498,25 +529,38 @@ impl Finalizer {
             {
                 let payload = signing_payload(&header)?;
                 let signature = Ed25519Scheme.sign(&self.private_key, &payload)?;
+                let share = canonicalize(Share {
+                    header: header.clone(),
+                    signer,
+                    signature,
+                    at,
+                })?;
+                if share.header != header || share.signer != signer {
+                    return Err(invalid("canonical local share changed header or signer"));
+                }
+                let key = set.validators[signer].active_key(epoch)?;
+                crypto::scheme::verify_signature(
+                    key.algorithm_id,
+                    &key.public_key,
+                    &payload,
+                    &share.signature,
+                )?;
                 let entry = self.shares.entry(id).or_insert_with(|| ShareSet {
                     header: header.clone(),
                     signatures: BTreeMap::new(),
                 });
                 entry.signatures.entry(signer).or_insert_with(|| Signed {
-                    signature: signature.clone(),
-                    at,
+                    signature: share.signature.clone(),
+                    at: share.at,
                 });
-                shares.push(Share {
-                    header,
-                    signer,
-                    signature,
-                    at,
-                });
+                shares.push(share);
             }
         }
 
-        let certified = self.advance_certified()?;
-        Ok(Build { shares, certified })
+        Ok(Build {
+            shares,
+            certified: Vec::new(),
+        })
     }
 
     /// Accepts one share and returns the certificates it completes.
@@ -529,6 +573,31 @@ impl Finalizer {
     ///
     /// Every error from header id, certificate verification, or chain advance.
     pub fn receive_share(&mut self, share: Share) -> Result<Vec<Certified>, CryptoError> {
+        if self.collect_share(share)? {
+            return self.advance_certified();
+        }
+        Ok(Vec::new())
+    }
+
+    /// Collects an authenticated recovery batch before selecting any contiguous quorums.
+    ///
+    /// Like [`Self::receive_share`], this does not authenticate individual shares; callers
+    /// must validate the entire batch first. Duplicate signers retain their first record.
+    /// Certificate metadata uses the earliest quorum among all collected records, which
+    /// need not match a historical certificate emitted before late shares were persisted.
+    /// # Errors
+    /// Propagates collection and certification errors; discard the instance after failure.
+    pub fn receive_shares(
+        &mut self,
+        shares: impl IntoIterator<Item = Share>,
+    ) -> Result<Vec<Certified>, CryptoError> {
+        for share in shares {
+            self.collect_share(share)?;
+        }
+        self.advance_certified()
+    }
+
+    fn collect_share(&mut self, share: Share) -> Result<bool, CryptoError> {
         let Share {
             header,
             signer,
@@ -537,14 +606,14 @@ impl Finalizer {
         } = share;
         if header.chain_id != self.chain_id {
             self.conflicts = self.conflicts.saturating_add(1);
-            return Ok(Vec::new());
+            return Ok(false);
         }
         if signer >= self.sets.set_for_epoch(header.epoch).validators.len() {
             self.conflicts = self.conflicts.saturating_add(1);
-            return Ok(Vec::new());
+            return Ok(false);
         }
         if header.height <= self.chain.head().height {
-            return Ok(Vec::new());
+            return Ok(false);
         }
         // Only the first uncertified height can advance the chain; a share for a
         // later height is stored and picked up by `advance_certified` once the
@@ -560,10 +629,7 @@ impl Finalizer {
             .signatures
             .entry(signer)
             .or_insert(Signed { signature, at });
-        if first_missing {
-            return self.advance_certified();
-        }
-        Ok(Vec::new())
+        Ok(first_missing)
     }
 
     /// Adopts a certified header above the current head, as a tail replay does.
@@ -843,6 +909,52 @@ mod tests {
             author: author.to_vec(),
             digest: [round as u8; 32],
         }
+    }
+
+    #[test]
+    fn canonical_local_share_defers_single_validator_quorum_and_preserves_timestamp() {
+        let (set, keys) = fixture(1);
+        let anchor = genesis(b"canonical-local-share", [0; 32]);
+        let mut finalizer = Finalizer::new(
+            SetSchedule::single(set),
+            EpochSchedule::single(1),
+            anchor.chain_id.clone(),
+            b"val-0".to_vec(),
+            keys[0].clone(),
+            anchor.clone(),
+            0,
+        )
+        .unwrap();
+        finalizer.record_commit(1, 0);
+        finalizer.mark_applied(0, [7; 32], 0);
+        let build = finalizer
+            .build_ready_with_canonical_share(
+                &[],
+                10_000,
+                |_, _| Ok(()),
+                |mut share| {
+                    share.at = 17;
+                    Ok(share)
+                },
+            )
+            .unwrap();
+        assert_eq!(build.shares.len(), 1);
+        assert_eq!(build.shares[0].at, 17);
+        assert!(build.certified.is_empty());
+        assert_eq!(
+            finalizer.head(),
+            &anchor,
+            "replay must defer even a local quorum"
+        );
+        let mut duplicate = build.shares[0].clone();
+        duplicate.at = 20_000;
+        let certified = finalizer.receive_share(duplicate).unwrap();
+        assert_eq!(certified.len(), 1);
+        assert_eq!(
+            certified[0].at, 17,
+            "quorum retains canonical internal Signed.at"
+        );
+        assert_eq!(finalizer.certified_order(1), Some(0));
     }
 
     #[test]
