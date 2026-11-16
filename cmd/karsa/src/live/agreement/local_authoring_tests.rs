@@ -112,6 +112,195 @@ async fn driver_author(
 }
 
 #[test]
+fn owned_timeout_nil_publication_receipt_and_reopen_without_causal_rounds() {
+    use super::event_pump::EventPump;
+    use std::time::{Duration, Instant};
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, _) = fixture();
+    let wait = Duration::from_secs(1);
+    let policy = super::pacemaker::Policy::new(wait, wait, wait).unwrap();
+    let now = Instant::now();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut prevotes = Vec::new();
+    let mut precommits = Vec::new();
+    for index in 0..3 {
+        let dir = Dir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let mut b = bootstrap.clone();
+        b.agreement.local_validator = m.consensus[index].id.clone();
+        let mut owner = open_event_pump_owner_index(&store, &b, &m, index);
+        let anchor = owner.finalization().finalizer().head().clone();
+        owner
+            .enable_authoring(authoring_node_index(&m, &[], index), policy, wait)
+            .unwrap();
+        assert!(
+            owner.drive_local(Vec::new()).unwrap().is_empty(),
+            "no nil without durable authority"
+        );
+        let (mut pump, _channels) = EventPump::new(
+            owner,
+            m.clone(),
+            Default::default(),
+            1.try_into().unwrap(),
+            0,
+            0,
+        );
+        pump.enable_scheduling(Duration::from_millis(10)).unwrap();
+        assert!(pump.scheduled_turn(now).unwrap().is_empty());
+        assert!(
+            pump.scheduled_turn(now + wait - Duration::from_nanos(1))
+                .unwrap()
+                .is_empty()
+        );
+        let prevote = pump.scheduled_turn(now + wait).unwrap();
+        assert_eq!(prevote.len(), 1);
+        let net::wire::Message::AgreementNilVote(bytes) = &prevote[0] else {
+            panic!("expected nil prevote")
+        };
+        let vote = validator::SlotAgreementNilVote::decode(bytes, &m.set).unwrap();
+        vote.verify(&b.agreement.context, &m.set).unwrap();
+        assert_eq!(vote.vote().phase, AgreementPhase::Prevote);
+        prevotes.push(prevote[0].clone());
+        let wal = dir.0.join("authenticated-slot-agreement");
+        let before = std::fs::read(&wal).unwrap();
+        for _ in 0..3 {
+            let retry = pump.scheduled_turn(now + wait).unwrap();
+            assert!(
+                retry.is_empty() || retry == prevote,
+                "repeat can only retransmit immutable publication"
+            );
+            assert_eq!(
+                std::fs::read(&wal).unwrap(),
+                before,
+                "no duplicate signing/completion"
+            );
+        }
+        let precommit = pump.scheduled_turn(now + wait * 2).unwrap();
+        assert_eq!(precommit.len(), 1);
+        let net::wire::Message::AgreementNilVote(bytes) = &precommit[0] else {
+            panic!("expected nil precommit")
+        };
+        assert_eq!(
+            validator::SlotAgreementNilVote::decode(bytes, &m.set)
+                .unwrap()
+                .vote()
+                .phase,
+            AgreementPhase::Precommit
+        );
+        precommits.push(precommit[0].clone());
+        let (_, stop) = tokio::sync::watch::channel(true);
+        let (owner, result) = runtime.block_on(pump.run(stop));
+        result.unwrap();
+        assert!(
+            owner
+                .finalization()
+                .execution()
+                .snapshot()
+                .applications()
+                .is_empty()
+        );
+        drop(owner);
+        let mut adapter = Adapter::recover(&store, b, &m, index).unwrap();
+        let completed = adapter.completed_nil_votes().unwrap();
+        assert_eq!(completed.len(), 2);
+        assert_eq!(
+            completed[0].message.encode(&m.set).unwrap(),
+            match &prevote[0] {
+                net::wire::Message::AgreementNilVote(bytes) => bytes.clone(),
+                _ => unreachable!(),
+            }
+        );
+        assert_ne!(completed[0].intent_id, completed[1].intent_id);
+        let finalizer = validator::Finalizer::new(
+            validator::SetSchedule::single(m.set.clone()),
+            validator::EpochSchedule::single(m.set.epoch),
+            bootstrap.agreement.context.chain_id().to_vec(),
+            m.consensus[index].id.clone(),
+            m.consensus[index].private_key.clone(),
+            anchor,
+            0,
+        )
+        .unwrap();
+        let mut reopened = JournaledFinalization::open(
+            adapter,
+            chain::genesis_state(&m.accounts).unwrap(),
+            finalizer,
+        )
+        .unwrap();
+        reopened
+            .enable_authoring(authoring_node_index(&m, &[], index), policy, wait)
+            .unwrap();
+        let before = std::fs::read(&wal).unwrap();
+        assert!(reopened.drive_local(Vec::new()).unwrap().is_empty());
+        let retry = reopened.retry_controls_local(now + wait * 2).unwrap();
+        assert_eq!(
+            retry, prevote,
+            "reopen retrieves signed bytes rather than signing again"
+        );
+        assert_eq!(std::fs::read(&wal).unwrap(), before);
+    }
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut b = bootstrap.clone();
+    b.agreement.local_validator = m.consensus[3].id.clone();
+    let mut receiver = open_event_pump_owner_index(&store, &b, &m, 3);
+    receiver
+        .enable_authoring(authoring_node_index(&m, &[], 3), policy, wait)
+        .unwrap();
+    {
+        let invalid_dir = Dir::new();
+        let invalid_store = Store::open(&invalid_dir.0).unwrap();
+        let mut invalid_receiver = open_event_pump_owner_index(&invalid_store, &b, &m, 3);
+        let wal = invalid_dir.0.join("authenticated-slot-agreement");
+        let before = std::fs::read(&wal).unwrap();
+        let mut invalid = prevotes[0].clone();
+        let net::wire::Message::AgreementNilVote(bytes) = &mut invalid else {
+            unreachable!()
+        };
+        *bytes.last_mut().unwrap() ^= 1;
+        assert!(invalid_receiver.receive_agreement_message(invalid).is_err());
+        assert_eq!(
+            std::fs::read(&wal).unwrap(),
+            before,
+            "bad authentication creates no obligation"
+        );
+    }
+    for message in prevotes {
+        receiver.receive_agreement_message(message).unwrap();
+    }
+    let automatic = receiver.drive_local(Vec::new()).unwrap();
+    let net::wire::Message::AgreementNilVote(bytes) = &automatic[0] else {
+        panic!("nil quorum should create automatic precommit")
+    };
+    assert_eq!(
+        validator::SlotAgreementNilVote::decode(bytes, &m.set)
+            .unwrap()
+            .vote()
+            .phase,
+        AgreementPhase::Precommit
+    );
+    for message in precommits {
+        receiver.receive_agreement_message(message).unwrap();
+    }
+    assert!(receiver.drive_local(Vec::new()).unwrap().is_empty());
+    assert!(
+        receiver.advance_certified_slot().is_err(),
+        "nil quorum never authorizes finality"
+    );
+    assert!(
+        receiver
+            .finalization()
+            .execution()
+            .snapshot()
+            .applications()
+            .is_empty()
+    );
+}
+
+#[test]
 fn owned_event_pump_authors_protocol_over_tcp_then_explicitly_applies() {
     use super::{
         event_pump::{EventPump, LocalEvent},

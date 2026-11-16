@@ -11,7 +11,7 @@ use super::{JournaledFinalization, Membership};
 
 /// Local authority, deliberately separate from decoded network messages.
 pub enum LocalEvent {
-    /// Import bounded trusted causal availability and select one durable positive phase.
+    /// Import bounded trusted causal availability and select one durable nil or positive phase.
     /// Network carrier receipt never supplies this availability or applies a slot.
     Drive(Vec<validator::Vertex>),
     /// Explicit trusted phase driving with independently authenticated causal availability.
@@ -39,7 +39,7 @@ pub enum LocalEvent {
 
 /// One attempted response per processed event; volatile and without publication authority.
 pub struct PumpOutput {
-    /// At most one authenticated durable carrier export per local request.
+    /// At most one authenticated durable carrier or control publication per local turn.
     pub carriers: Vec<Message>,
     /// Volatile shares and certificates; grants no pruning or store-publication authority.
     pub build: Build,
@@ -93,6 +93,7 @@ struct LocalSchedule {
     interval: std::time::Duration,
     next: tokio::time::Instant,
     publication_offset: usize,
+    retry_controls: bool,
 }
 
 impl LocalSchedule {
@@ -112,13 +113,15 @@ impl LocalSchedule {
 
 impl EventPump {
     /// Opts this isolated owner into volatile, fixed-delay local maintenance.
-    /// Requires pinned authoring. Each wake ticks once and attempts one positive durable
+    /// Requires pinned authoring. Each wake ticks once and attempts one nil or positive durable
     /// action, or retries one discovered publication when no new carrier is authored.
     /// Discovery reads at most one 64-ID page per wake under the 4096-event replay cap;
     /// only its first ID is attempted; completion or error advances the offset, while
     /// a not-yet-due retry retains it. Empty pages wrap on the
     /// next wake. Historical/unavailable publications report errors but do not pin the cursor.
-    /// No proposal election, nil/view-change publication, causal import or slot application
+    /// Idle wakes alternate control-first and carrier-only retry turns. Control retries
+    /// include completed nil votes and already-authorized view requests/certificates.
+    /// No proposal election, new future-view authorization, causal import or slot application
     /// is scheduled. Recovery requires opting in again, including authoring setup.
     /// # Errors
     /// Rejects missing authoring, replacement schedules and intervals outside 10ms..=1 day.
@@ -136,6 +139,7 @@ impl EventPump {
             interval,
             next: tokio::time::Instant::now() + interval,
             publication_offset: 0,
+            retry_controls: true,
         });
         Ok(())
     }
@@ -156,6 +160,14 @@ impl EventPump {
             .schedule
             .as_mut()
             .ok_or("local pump scheduling is disabled")?;
+        let controls_first = schedule.retry_controls;
+        schedule.retry_controls = !controls_first;
+        if controls_first {
+            let messages = self.owner.retry_controls_local(now)?;
+            if !messages.is_empty() {
+                return Ok(messages);
+            }
+        }
         let page = self
             .owner
             .completed_publications(schedule.publication_offset)?;
@@ -420,6 +432,7 @@ mod tests {
             interval,
             next: start + interval,
             publication_offset: 63,
+            retry_controls: true,
         };
         let after_backpressure = start + interval * 100;
         schedule.defer(after_backpressure);

@@ -140,6 +140,7 @@ impl JournaledFinalization {
         self.adapter.local_authoring_output(&node)?;
         self.adapter
             .configure_carrier_retransmission(retry_interval)?;
+        self.adapter.configure_retransmission(retry_interval)?;
         self.adapter.configure_pacemaker(policy);
         self.authoring = Some(LocalAuthoring {
             node,
@@ -169,17 +170,46 @@ impl JournaledFinalization {
         self.author_local_action(request.round, request.action)
     }
 
-    /// Imports trusted availability and attempts one durable positive-phase obligation.
+    /// Imports trusted availability and attempts one durable nil or positive-phase obligation.
     /// The only prospective round is one above the highest retained causal round, not
-    /// a protocol-phase counter. An empty DAG waits. Full durable cone validation remains
+    /// a protocol-phase counter. Nil votes use their durable intent, not a fabricated carrier;
+    /// an empty DAG waits only for positive phases. Full durable cone validation remains
     /// authoritative; a high incomplete frontier can stall rather than invent progression.
     /// Completed payloads are not reauthored, including after explicit owner recovery.
     /// Durable selection/reconstruction is capped at 4096 WAL events, not storage bytes.
-    /// Does not tick, retry, elect proposals/views, sign nil votes or apply slots.
+    /// Does not tick, retry, authorize future-view requests, elect proposals/views or apply slots.
     /// # Errors
     /// Propagates bounded import, ownership, round overflow and durable authoring errors.
     pub fn drive_local(&mut self, vertices: Vec<Vertex>) -> Result<Vec<Message>, String> {
         self.import_local(vertices)?;
+        if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
+            return Err("local durable selection exceeds 4096 events".into());
+        }
+        let output = self.adapter.driver.output().map_err(|e| e.to_string())?;
+        let completed = self.adapter.completed_nil_votes()?;
+        let nil_id = self
+            .adapter
+            .signing_history()
+            .iter()
+            .find(|intent| {
+                intent.vote.value == validator::slot_agreement::AgreementValue::Nil
+                    && output.authorable_vote_ids.contains(&intent.id)
+                    && !completed.iter().any(|done| done.intent_id == intent.id)
+            })
+            .map(|intent| intent.id);
+        if let Some(id) = nil_id {
+            let result = self.adapter.author_nil_vote(id).and_then(|vote| {
+                vote.map(|vote| {
+                    vote.encode(&self.adapter.set)
+                        .map(Message::AgreementNilVote)
+                        .map_err(|e| e.to_string())
+                })
+                .transpose()
+                .map(|message| message.into_iter().collect())
+            });
+            self.check_health()?;
+            return result;
+        }
         let local = self
             .authoring
             .as_ref()
@@ -373,7 +403,7 @@ impl JournaledFinalization {
     }
 
     /// Applies at most one pacemaker action, without signing, publishing or applying a slot.
-    /// Nil obligations and view-change publication are not driven by this positive-phase API.
+    /// Nil obligations are published by `drive_local`; ticks themselves never sign.
     /// # Errors
     /// Rejects absent setup, backwards time, arithmetic exhaustion and unhealthy owners.
     pub fn tick_local(&mut self, now: std::time::Instant) -> Result<(), String> {
@@ -382,6 +412,27 @@ impl JournaledFinalization {
             return Err("local authoring is not configured".into());
         }
         let result = self.adapter.tick(now).map(|_| ());
+        self.check_health()?;
+        result
+    }
+
+    /// Retries at most one durable control publication using the adapter's own cadence.
+    /// Includes nil votes and already-authorized view requests/certificates, not new
+    /// future-view authorization. Recovery must explicitly re-enable local authoring.
+    /// # Errors
+    /// Rejects absent setup, histories above 4096 events and adapter retransmission errors.
+    pub(in super::super) fn retry_controls_local(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Result<Vec<Message>, String> {
+        self.check_local_authoring()?;
+        if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
+            return Err("local control retry exceeds 4096 events".into());
+        }
+        let result = self
+            .adapter
+            .retransmit(now)
+            .map(|message| message.into_iter().collect());
         self.check_health()?;
         result
     }
