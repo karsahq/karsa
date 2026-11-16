@@ -84,20 +84,31 @@ async fn driver_author(
     m: &Membership,
 ) -> Vertex {
     use super::{event_pump::LocalEvent, local_authoring::AuthoringRequest};
+    if matches!(action, super::local_authoring::AuthoringAction::Vote(_) | super::local_authoring::AuthoringAction::Pol | super::local_authoring::AuthoringAction::Final) {
+        channels[index].local.send(LocalEvent::Drive(Vec::new())).await.unwrap();
+        let waiting = channels[index].output.recv().await.unwrap();
+        assert!(waiting.error.is_none(), "{:?}", waiting.error);
+        assert!(waiting.carriers.is_empty(), "durable obligation waits for causal availability");
+    }
+    let event = match action {
+        super::local_authoring::AuthoringAction::Vote(_)
+        | super::local_authoring::AuthoringAction::Pol
+        | super::local_authoring::AuthoringAction::Final => LocalEvent::Drive(vertices.to_vec()),
+        action => LocalEvent::Author(AuthoringRequest {
+            round,
+            vertices: vertices.to_vec(),
+            action,
+        }.into()),
+    };
     channels[index]
         .local
-        .send(LocalEvent::Author(
-            AuthoringRequest {
-                round,
-                vertices: vertices.to_vec(),
-                action,
-            }
-            .into(),
-        ))
+        .send(event)
         .await
         .unwrap();
     let output = channels[index].output.recv().await.unwrap();
-    driver_publish(output, channels, m).await
+    let vertex = driver_publish(output, channels, m).await;
+    assert_eq!(vertex.round, round, "causal round selection");
+    vertex
 }
 
 #[test]
@@ -134,7 +145,7 @@ fn owned_event_pump_authors_protocol_over_tcp_then_explicitly_applies() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        tokio::time::timeout(Duration::from_secs(180), async {
             let mut channels = Vec::new();
             let mut tasks = Vec::new();
             let (cancel, stop) = tokio::sync::watch::channel(false);
@@ -279,12 +290,26 @@ fn owned_event_pump_authors_protocol_over_tcp_then_explicitly_applies() {
                         )
                         .await,
                     );
+                    let wal = dirs[i].0.join("authenticated-slot-agreement");
+                    let before = std::fs::read(&wal).unwrap();
+                    channels[i].local.send(LocalEvent::Drive(Vec::new())).await.unwrap();
+                    let repeated = channels[i].output.recv().await.unwrap();
+                    assert!(repeated.error.is_none(), "{:?}", repeated.error);
+                    assert!(repeated.carriers.is_empty());
+                    assert_eq!(std::fs::read(&wal).unwrap(), before, "completed vote does not reserve again");
                 }
                 available.extend(votes);
                 if round == 5 {
                     let pol =
                         driver_author(0, 6, &available, AuthoringAction::Pol, &mut channels, &m)
                             .await;
+                    let wal = dirs[0].0.join("authenticated-slot-agreement");
+                    let before = std::fs::read(&wal).unwrap();
+                    channels[0].local.send(LocalEvent::Drive(Vec::new())).await.unwrap();
+                    let repeated = channels[0].output.recv().await.unwrap();
+                    assert!(repeated.error.is_none(), "{:?}", repeated.error);
+                    assert!(repeated.carriers.is_empty());
+                    assert_eq!(std::fs::read(&wal).unwrap(), before, "completed POL does not reserve again");
                     let refs: Vec<_> = available
                         .iter()
                         .filter(|v| v.round == 5)
@@ -298,6 +323,18 @@ fn owned_event_pump_authors_protocol_over_tcp_then_explicitly_applies() {
             }
             let final_vertex =
                 driver_author(0, 8, &available, AuthoringAction::Final, &mut channels, &m).await;
+            // A completed phase must not reserve a new outer statement at a later round.
+            for (i, channel) in channels.iter_mut().enumerate() {
+                let wal = dirs[i].0.join("authenticated-slot-agreement");
+                let before = std::fs::read(&wal).unwrap();
+                for _ in 0..3 {
+                    channel.local.send(LocalEvent::Drive(Vec::new())).await.unwrap();
+                    let output = channel.output.recv().await.unwrap();
+                    assert!(output.error.is_none(), "{:?}", output.error);
+                    assert!(output.carriers.is_empty());
+                    assert_eq!(std::fs::read(&wal).unwrap(), before, "repeat drive adds no durable obligations");
+                }
+            }
             let now = Instant::now();
             for channel in &mut channels {
                 channel.local.send(LocalEvent::Tick(now)).await.unwrap();
@@ -474,6 +511,10 @@ fn owned_publication_discovery_recovers_lost_output_and_reopen_without_signing()
     );
     let wal_path = dir.0.join("authenticated-slot-agreement");
     let before = std::fs::read(&wal_path).unwrap();
+    for _ in 0..3 {
+        assert!(owner.drive_local(Vec::new()).unwrap().is_empty());
+        assert_eq!(std::fs::read(&wal_path).unwrap(), before, "empty availability creates no obligations");
+    }
     // A valid but conflicting prefix must not be inserted when a later input is invalid.
     let poison = signed(&m, 0, 0, vec![], [99; 32]);
     let mut bad_signature = prefix[1].clone();

@@ -11,6 +11,9 @@ use super::{JournaledFinalization, Membership};
 
 /// Local authority, deliberately separate from decoded network messages.
 pub enum LocalEvent {
+    /// Import bounded trusted causal availability and select one durable positive phase.
+    /// Network carrier receipt never supplies this availability or applies a slot.
+    Drive(Vec<validator::Vertex>),
     /// Explicit trusted phase driving with independently authenticated causal availability.
     Author(Box<super::local_authoring::AuthoringRequest>),
     /// One local pacemaker step; does not sign or apply a certified slot.
@@ -179,6 +182,12 @@ impl EventPump {
             }
             let mut carriers = Vec::new();
             let result = match input {
+                Input::Local(Some(LocalEvent::Drive(vertices))) => {
+                    self.owner.drive_local(vertices).map(|messages| {
+                        carriers = messages;
+                        Build::default()
+                    })
+                }
                 Input::Local(Some(LocalEvent::Author(request))) => {
                     self.owner.author_local(*request).map(|messages| {
                         carriers = messages;
