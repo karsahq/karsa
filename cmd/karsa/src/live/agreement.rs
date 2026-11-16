@@ -155,7 +155,104 @@ pub struct AuthoredCarrier {
 /// Backward-compatible name for the local vote authoring result.
 pub type AuthoredVote = AuthoredCarrier;
 
+/// Limits event-count replay work for explicit carrier export; recovery does not reset it.
+const MAX_CARRIER_EXPORT_EVENTS: u64 = 4096;
+
 impl Adapter {
+    /// Explicitly exports one selected durable carrier with its complete authenticated cone.
+    /// This is a separate opt-in API, not a scheduled class: callers select an exact ID
+    /// so multiple publications in one slot/view cannot silently hide one another.
+    /// The caller DAG supplies availability only; a fresh, unpruned DAG reauthenticates
+    /// every vertex and the envelope against the current durable binding. Nothing is
+    /// signed, persisted, sent, or cached. Historical-slot publications fail inspection.
+    ///
+    /// Work is capped at 4096 WAL events before replay, 4096 cone vertices, 65536
+    /// reference edges, and the wire codec's two-MiB payload limit. Store getters still
+    /// read/replay the WAL; this is not a byte-bounded storage reader or a hot-loop API.
+    /// # Errors
+    /// Rejects stale/recovery-required owners, unknown/nonlocal publications, missing
+    /// ancestors (including below a caller's pruning floor), invalid cones and bounds.
+    pub fn export_carrier(
+        &mut self,
+        carrier: &VertexId,
+        available: &validator::Dag,
+    ) -> Result<net::wire::Message, String> {
+        use std::collections::BTreeMap;
+
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before carrier export".into());
+        }
+        // Limit replay work independently of the size of the caller's DAG.
+        if self.driver.sequence() > MAX_CARRIER_EXPORT_EVENTS {
+            return Err(
+                "carrier export exceeds 4096 durable events; bounded store export is required"
+                    .into(),
+            );
+        }
+        let output = self.driver.output().map_err(|error| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            error.to_string()
+        })?;
+        let publication = self
+            .completed_carriers()?
+            .into_iter()
+            .find(|p| p.envelope.carrier() == carrier)
+            .ok_or("carrier export requires an exact completed local publication")?;
+        if publication.vertex.author != self.validator_id {
+            return Err("carrier export requires a local publication".into());
+        }
+        let envelope = publication
+            .envelope
+            .encode(&self.set)
+            .map_err(|e| e.to_string())?;
+        let mut size = 8usize + envelope.len();
+        let mut edges = 0usize;
+        let mut cone = BTreeMap::new();
+        let mut pending = vec![carrier.clone()];
+        while let Some(id) = pending.pop() {
+            let key = (id.round, id.author.clone());
+            if let Some((seen, _)) = cone.get(&key) {
+                if seen != &id {
+                    return Err("carrier cone contains conflicting vertex IDs".into());
+                }
+                continue;
+            }
+
+            let vertex = if &id == carrier {
+                &publication.vertex
+            } else {
+                available
+                    .get(id.round, &id.author)
+                    .ok_or("carrier cone missing ancestor")?
+            };
+            charge_carrier_vertex(vertex, cone.len(), &mut edges, &mut size)?;
+            if vertex.id().map_err(|e| e.to_string())? != id {
+                return Err("carrier cone ancestor digest mismatch".into());
+            }
+            pending.extend(vertex.references.iter().cloned());
+            cone.insert(key, (id, vertex.clone()));
+        }
+        let mut checked = validator::Dag::new(self.set.clone());
+        checked.set_chain_id(publication.vertex.chain_id.clone());
+        let mut vertices = Vec::with_capacity(cone.len());
+        for (_, (id, vertex)) in cone {
+            if vertex.chain_id != publication.vertex.chain_id {
+                return Err("carrier cone chain mismatch".into());
+            }
+            if checked.insert(vertex.clone()).map_err(|e| e.to_string())? != id {
+                return Err("carrier cone insertion mismatch".into());
+            }
+            vertices.push(vertex);
+        }
+        publication
+            .envelope
+            .inspect(&checked, &output.binding)
+            .map_err(|e| e.to_string())?;
+        let message = net::wire::Message::AgreementCarrier { envelope, vertices };
+        net::wire::frame(&message, 0).map_err(|e| e.to_string())?;
+        Ok(message)
+    }
+
     /// Opts into control-only retransmission, resetting the volatile schedule.
     /// Recovery starts disabled; this does not activate live transport.
     /// # Errors
@@ -179,7 +276,7 @@ impl Adapter {
     /// The first poll is immediate; delayed polls never cause catch-up bursts. Empty polls
     /// still enforce monotonic time. No echo, persistence, or acknowledgement is performed.
     /// Durable getters replay the full WAL: this API is not recommended for a hot loop.
-    /// Carriers are excluded until complete causal-cone availability can be established.
+    /// Carriers use the separate explicit `export_carrier` API with caller DAG availability.
     /// # Errors
     /// Rejects stale/recovery-required owners, backwards time, invalid durable evidence,
     /// and any candidate exceeding the wire codec's bounds.
@@ -1521,6 +1618,41 @@ impl Adapter {
         self.readiness = Readiness::DisabledMissingCausalReadinessAndTransport;
         Ok(())
     }
+}
+
+// Match wire preflight before hashing, cloning, or signature verification.
+fn charge_carrier_vertex(
+    vertex: &validator::Vertex,
+    vertices: usize,
+    edges: &mut usize,
+    bytes: &mut usize,
+) -> Result<(), String> {
+    if vertices >= net::wire::MAX_AGREEMENT_VERTICES {
+        return Err("carrier cone exceeds vertex bound".into());
+    }
+    *edges = edges
+        .checked_add(vertex.references.len())
+        .ok_or("carrier cone edge overflow")?;
+    if *edges > net::wire::MAX_AGREEMENT_EDGES {
+        return Err("carrier cone exceeds edge bound".into());
+    }
+    *bytes = bytes
+        .saturating_add(74)
+        .saturating_add(vertex.chain_id.len())
+        .saturating_add(vertex.author.len())
+        .saturating_add(vertex.signature.len());
+    for reference in &vertex.references {
+        *bytes = bytes
+            .saturating_add(48)
+            .saturating_add(reference.author.len());
+        if reference.round >= vertex.round {
+            return Err("carrier cone reference is not strictly ancestral".into());
+        }
+    }
+    if *bytes > net::wire::MAX_AGREEMENT_PAYLOAD {
+        return Err("carrier cone exceeds wire byte bound".into());
+    }
+    Ok(())
 }
 
 fn validate_intent_lineage(intent: &AgreementSigningIntent) -> Result<(), String> {

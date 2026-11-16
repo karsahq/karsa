@@ -7,6 +7,53 @@ use validator::{
     SlotOutcome, SlotProposal, Vertex,
 };
 
+#[test]
+fn carrier_export_preflight_limits() {
+    let (m, _, _) = fixture();
+    let mut vertex = signed(&m, 0, 0, vec![], [0; 32]);
+    let vertex_bytes = 74 + vertex.chain_id.len() + vertex.author.len() + vertex.signature.len();
+    let mut edges = 0;
+    let mut bytes = net::wire::MAX_AGREEMENT_PAYLOAD - vertex_bytes;
+    charge_carrier_vertex(
+        &vertex,
+        net::wire::MAX_AGREEMENT_VERTICES - 1,
+        &mut edges,
+        &mut bytes,
+    )
+    .unwrap();
+    assert_eq!(bytes, net::wire::MAX_AGREEMENT_PAYLOAD);
+    assert!(
+        charge_carrier_vertex(&vertex, 0, &mut edges, &mut bytes)
+            .unwrap_err()
+            .contains("byte bound")
+    );
+    assert!(
+        charge_carrier_vertex(&vertex, net::wire::MAX_AGREEMENT_VERTICES, &mut 0, &mut 0)
+            .unwrap_err()
+            .contains("vertex bound")
+    );
+    vertex.round = 1;
+    vertex.references = vec![VertexId {
+        round: 0,
+        author: m.consensus[0].id.clone(),
+        digest: [0; 32],
+    }];
+    edges = net::wire::MAX_AGREEMENT_EDGES - 1;
+    charge_carrier_vertex(&vertex, 0, &mut edges, &mut 0).unwrap();
+    assert_eq!(edges, net::wire::MAX_AGREEMENT_EDGES);
+    assert!(
+        charge_carrier_vertex(&vertex, 0, &mut edges, &mut 0)
+            .unwrap_err()
+            .contains("edge bound")
+    );
+    vertex.references[0].round = 1;
+    assert!(
+        charge_carrier_vertex(&vertex, 0, &mut 0, &mut 0)
+            .unwrap_err()
+            .contains("strictly ancestral")
+    );
+}
+
 fn signed_view_request(
     m: &chain::Membership,
     bootstrap: &AuthenticatedSlotAgreementBootstrap,
@@ -4274,10 +4321,88 @@ fn isolated_tcp_envelope_receipt_persists_neutral_proposal() {
     let mut evidence = history;
     evidence.push(publications[0].vertex.clone());
 
-    let received = tcp_agreement_message(Message::AgreementCarrier {
-        envelope: envelope_bytes.clone(),
-        vertices: evidence.clone(),
-    });
+    let mut available = validator::Dag::new(m.set.clone());
+    for vertex in &evidence {
+        available.insert(vertex.clone()).unwrap();
+    }
+    let id = authored.vertex.id().unwrap();
+    let wal_sender = sender_dir.0.join("authenticated-slot-agreement");
+    let before_export = std::fs::read(&wal_sender).unwrap();
+    let sequence = sender.driver.sequence();
+    let lost = sender.export_carrier(&id, &available).unwrap();
+    let retry = sender.export_carrier(&id, &available).unwrap();
+    assert_eq!(
+        wire::frame(&lost, 0).unwrap(),
+        wire::frame(&retry, 0).unwrap()
+    );
+    assert_eq!(sender.driver.sequence(), sequence);
+    assert_eq!(std::fs::read(&wal_sender).unwrap(), before_export);
+    assert!(
+        sender
+            .export_carrier(&id, &validator::Dag::new(m.set.clone()))
+            .unwrap_err()
+            .contains("missing ancestor")
+    );
+    let mut wrong = id.clone();
+    wrong.digest[0] ^= 1;
+    assert!(sender.export_carrier(&wrong, &available).is_err());
+    drop(sender);
+    drop(sender_store);
+    let sender_store = Store::open(&sender_dir.0).unwrap();
+    let mut sender = Adapter::recover(&sender_store, bootstrap.clone(), &m, 0).unwrap();
+    let recovered = sender.export_carrier(&id, &available).unwrap();
+    assert_eq!(
+        wire::frame(&lost, 0).unwrap(),
+        wire::frame(&recovered, 0).unwrap()
+    );
+    assert_eq!(std::fs::read(&wal_sender).unwrap(), before_export);
+    let Message::AgreementCarrier { vertices: cone, .. } = &recovered else {
+        unreachable!()
+    };
+    for missing in cone.iter().filter(|v| v.id().unwrap() != id) {
+        let mut partial = Dag::new(m.set.clone());
+        for vertex in cone.iter().filter(|v| *v != missing) {
+            partial.insert(vertex.clone()).unwrap();
+        }
+        assert!(
+            sender
+                .export_carrier(&id, &partial)
+                .unwrap_err()
+                .contains("missing ancestor"),
+            "must require ancestor at round {}",
+            missing.round
+        );
+    }
+    // A validly signed replacement at the same author/round is not the referenced ID.
+    let ancestor = cone.iter().find(|v| v.round == 0).unwrap();
+    let index = m
+        .consensus
+        .iter()
+        .position(|v| v.id == ancestor.author)
+        .unwrap();
+    let replacement = signed(&m, index, 0, vec![], [73; 32]);
+    let mut conflicting = Dag::new(m.set.clone());
+    conflicting.insert(replacement).unwrap();
+    for vertex in cone {
+        conflicting.insert(vertex.clone()).unwrap();
+    }
+    assert!(
+        sender
+            .export_carrier(&id, &conflicting)
+            .unwrap_err()
+            .contains("digest mismatch")
+    );
+    let mut current = Adapter::recover(&sender_store, bootstrap.clone(), &m, 0).unwrap();
+    current.author_view_request(AgreementView(9)).unwrap();
+    assert!(
+        sender.export_carrier(&id, &available).is_err(),
+        "export must check stale ownership without scheduling"
+    );
+    assert_eq!(
+        sender.readiness(),
+        Readiness::RecoveryRequiredHistoricalIntentsUnavailable
+    );
+    let received = tcp_agreement_message(recovered);
 
     let receiver_dir = Dir::new();
     let store = Store::open(&receiver_dir.0).unwrap();
