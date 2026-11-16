@@ -1972,6 +1972,7 @@ mod execution;
 mod finalization;
 mod journaled_finalization;
 mod ordering;
+pub mod output_dispatcher;
 pub use execution::CertifiedExecution;
 pub use finalization::CertifiedFinalization;
 pub use journaled_finalization::JournaledFinalization;

@@ -57,6 +57,7 @@ fn isolated_event_pump_output_closed_after_reserve_precedes_local_apply() {
 
 #[derive(Clone, Copy)]
 enum AuthenticatedReplayMode {
+    ShareMesh,
     EventPump,
     EventPumpCancelReady,
     EventPumpClosedReady,
@@ -261,6 +262,10 @@ fn authenticated_commit_replay_fixture(mode: AuthenticatedReplayMode) {
             vertices,
         };
         exercise_event_pump_stop(owner, m, message, mode);
+        return;
+    }
+    if matches!(mode, AuthenticatedReplayMode::ShareMesh) {
+        exercise_share_mesh(bootstrap, m, batches, proof, carrier, vertices);
         return;
     }
     if matches!(mode, AuthenticatedReplayMode::EventPump) {
@@ -6978,6 +6983,15 @@ fn open_event_pump_owner(
     bootstrap: &AuthenticatedSlotAgreementBootstrap,
     m: &Membership,
 ) -> JournaledFinalization {
+    open_event_pump_owner_index(store, bootstrap, m, 0)
+}
+
+fn open_event_pump_owner_index(
+    store: &Store,
+    bootstrap: &AuthenticatedSlotAgreementBootstrap,
+    m: &Membership,
+    index: usize,
+) -> JournaledFinalization {
     let chain_id = bootstrap.agreement.context.chain_id().to_vec();
     let genesis = chain::genesis_state(&m.accounts).unwrap();
     let anchor = validator::Header::genesis(
@@ -6990,14 +7004,14 @@ fn open_event_pump_owner(
         validator::SetSchedule::single(m.set.clone()),
         validator::EpochSchedule::single(m.set.epoch),
         chain_id,
-        m.consensus[0].id.clone(),
-        m.consensus[0].private_key.clone(),
+        m.consensus[index].id.clone(),
+        m.consensus[index].private_key.clone(),
         anchor,
         0,
     )
     .unwrap();
     JournaledFinalization::open(
-        Adapter::begin(store, bootstrap.clone(), m, 0).unwrap(),
+        Adapter::begin(store, bootstrap.clone(), m, index).unwrap(),
         genesis,
         finalizer,
     )
@@ -7091,6 +7105,450 @@ fn exercise_event_pump_stop(
                 1
             );
         });
+}
+
+#[test]
+fn isolated_event_pump_share_mesh_quorum() {
+    authenticated_commit_replay_fixture(AuthenticatedReplayMode::ShareMesh);
+}
+
+async fn exercise_dispatcher_false_updates(share: validator::Share) {
+    use super::{
+        event_pump::PumpOutput,
+        output_dispatcher::{self, DispatchOutput, SharePeer},
+    };
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    use tokio::sync::{mpsc, watch};
+
+    let (cancel, cancel_rx) = watch::channel(false);
+    let (input, input_rx) = mpsc::channel(1);
+    let (writer, mut queued) = mpsc::channel(1);
+    let (local, mut results) = mpsc::channel(1);
+    writer.send(vec![7]).await.unwrap();
+    local
+        .send(DispatchOutput {
+            local: PumpOutput {
+                build: validator::Build::default(),
+                error: Some("saturated result".into()),
+            },
+            failed_peers: vec![],
+        })
+        .await
+        .unwrap();
+    let expected = net::wire::frame(&net::wire::Message::Share(share.clone()), 123).unwrap();
+    input
+        .send(PumpOutput {
+            build: validator::Build {
+                shares: vec![share],
+                certified: vec![],
+            },
+            error: None,
+        })
+        .await
+        .unwrap();
+    let mut dispatch = std::pin::pin!(output_dispatcher::dispatch(
+        input_rx,
+        vec![SharePeer { id: 1, writer }],
+        local,
+        cancel_rx,
+        123,
+    ));
+    let mut context = Context::from_waker(Waker::noop());
+    // Explicit polling proves each wait is reached; no sleeps or scheduler assumptions.
+    assert!(dispatch.as_mut().poll(&mut context).is_pending());
+    cancel.send(false).unwrap();
+    assert!(dispatch.as_mut().poll(&mut context).is_pending());
+    assert_eq!(
+        input.capacity(),
+        0,
+        "full result queue must prevent input consumption"
+    );
+    assert_eq!(
+        results.recv().await.unwrap().local.error.as_deref(),
+        Some("saturated result")
+    );
+    assert!(dispatch.as_mut().poll(&mut context).is_pending());
+    assert_eq!(input.capacity(), 1, "fanout now owns the consumed output");
+    cancel.send(false).unwrap();
+    assert!(dispatch.as_mut().poll(&mut context).is_pending());
+    assert!(results.try_recv().is_err(), "writer is still saturated");
+    assert_eq!(queued.recv().await.unwrap(), vec![7]);
+    assert!(dispatch.as_mut().poll(&mut context).is_pending());
+    assert_eq!(queued.recv().await.unwrap(), expected);
+    let delivered = results.recv().await.unwrap();
+    assert!(delivered.local.error.is_none());
+    assert_eq!(delivered.local.build.shares.len(), 1);
+    assert!(delivered.failed_peers.is_empty());
+    // Also exercise a false update while waiting for the next input.
+    assert!(dispatch.as_mut().poll(&mut context).is_pending());
+    cancel.send(false).unwrap();
+    assert!(dispatch.as_mut().poll(&mut context).is_pending());
+    // Sender closure is cancellation even when the final value remains false.
+    drop(cancel);
+    assert!(matches!(
+        dispatch.as_mut().poll(&mut context),
+        Poll::Ready(())
+    ));
+}
+
+fn exercise_share_mesh(
+    bootstrap: AuthenticatedSlotAgreementBootstrap,
+    m: Membership,
+    batches: std::collections::BTreeMap<[u8; 32], tx::batch::Batch>,
+    proof: validator::SlotAgreementProof,
+    carrier: VertexId,
+    vertices: Vec<Vertex>,
+) {
+    use super::{
+        event_pump::{EventPump, LocalEvent},
+        output_dispatcher::{self, SharePeer},
+    };
+    use net::wire::{self, Message};
+    use std::{
+        collections::{BTreeSet, VecDeque},
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        sync::{mpsc, watch},
+    };
+
+    let envelope = CarrierEnvelope::from_publication(
+        carrier,
+        CarrierPayload::Final(proof.clone()),
+        proof.digest(&m.set).unwrap(),
+        &m.set,
+    )
+    .unwrap();
+    let evidence = Message::AgreementCarrier {
+        envelope: envelope.encode(&m.set).unwrap(),
+        vertices,
+    };
+    let chain_id = bootstrap.agreement.context.chain_id().to_vec();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let (cancel, cancel_rx) = watch::channel(false);
+            let mut dirs = Vec::new();
+            let mut stores = Vec::new();
+            let mut channels = Vec::new();
+            let mut pumps = Vec::new();
+            for index in 0..3 {
+                dirs.push(Dir::new());
+                stores.push(Store::open(&dirs[index].0).unwrap());
+                let mut membership = m.clone();
+                for (other, key) in membership.consensus.iter_mut().enumerate() {
+                    if other != index {
+                        key.private_key.clear();
+                    }
+                }
+                let mut checkpoint = bootstrap.clone();
+                checkpoint.agreement.local_validator = membership.consensus[index].id.clone();
+                let owner =
+                    open_event_pump_owner_index(&stores[index], &checkpoint, &membership, index);
+                let (pump, ch) = EventPump::new(
+                    owner,
+                    membership,
+                    BTreeSet::new(),
+                    1.try_into().unwrap(),
+                    batches.len(),
+                    batches
+                        .values()
+                        .map(|batch| batch.encode().unwrap().len())
+                        .sum(),
+                );
+                pumps.push(tokio::spawn(pump.run(cancel_rx.clone())));
+                channels.push(ch);
+            }
+            let mut shares = Vec::new();
+            // Build each owner before routing: early shares are deliberately not staged.
+            for ch in &mut channels {
+                ch.frames
+                    .send(wire::Frame {
+                        sent_at_nanos: u64::MAX,
+                        len: 0,
+                        message: evidence.clone(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(ch.output.recv().await.unwrap().error.is_none());
+                ch.local
+                    .send(LocalEvent::ApplyCertifiedSlot { at: 41 })
+                    .await
+                    .unwrap();
+                assert!(ch.output.recv().await.unwrap().error.is_none());
+                let mut local = Vec::new();
+                for batch in batches.values() {
+                    ch.frames
+                        .send(wire::Frame {
+                            sent_at_nanos: u64::MAX,
+                            len: 0,
+                            message: Message::Payload(batch.clone()),
+                        })
+                        .await
+                        .unwrap();
+                    let out = ch.output.recv().await.unwrap();
+                    // Non-required fixture batches are rejected, without authorizing execution.
+                    local.extend(out.build.shares);
+                }
+                assert_eq!(local.len(), 1);
+                assert_eq!(local[0].at, 41);
+                shares.push(local.remove(0));
+            }
+            assert_eq!(
+                shares
+                    .iter()
+                    .map(|s| s.signer)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                3
+            );
+            assert!(shares.iter().all(|s| s.header == shares[0].header));
+            let mut writers = Vec::new();
+            let mut readers = Vec::new();
+            let mut routes: Vec<Vec<SharePeer>> = (0..3).map(|_| Vec::new()).collect();
+            for (source, route) in routes.iter_mut().enumerate() {
+                for (target, ch) in channels.iter().enumerate() {
+                    if source == target {
+                        continue;
+                    }
+                    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                        .await
+                        .unwrap();
+                    let mut sender = TcpStream::connect(listener.local_addr().unwrap())
+                        .await
+                        .unwrap();
+                    let (mut receiver, _) = listener.accept().await.unwrap();
+                    let mut send_buffer = Vec::new();
+                    let mut receive_buffer = Vec::new();
+                    let (a, b) = tokio::join!(
+                        super::super::handshake(&mut sender, &mut send_buffer, &chain_id),
+                        super::super::handshake(&mut receiver, &mut receive_buffer, &chain_id),
+                    );
+                    a.unwrap();
+                    b.unwrap();
+                    readers.push(tokio::spawn(super::super::read_peer(
+                        receiver,
+                        receive_buffer,
+                        ch.frames.clone(),
+                        Arc::new(AtomicU64::new(0)),
+                        cancel_rx.clone(),
+                    )));
+                    let (control, control_rx) = mpsc::channel(1);
+                    let (_data, data_rx) = mpsc::channel(1);
+                    // Keep the unused data queue open for the writer's lifetime.
+                    writers.push(tokio::spawn({
+                        let cancel_rx = cancel_rx.clone();
+                        let chain_id = chain_id.clone();
+                        async move {
+                            let _data = _data;
+                            super::super::write_peer(
+                                sender,
+                                control_rx,
+                                data_rx,
+                                super::super::LinkTask {
+                                    index: source,
+                                    target: listener.local_addr().unwrap().to_string(),
+                                    chain_id,
+                                    bytes_out: Arc::new(AtomicU64::new(0)),
+                                    up: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                                    recent_shares: Arc::new(Mutex::new(VecDeque::new())),
+                                    recent_vertices: Arc::new(Mutex::new(VecDeque::new())),
+                                    send_buffer: 0,
+                                    shutdown: cancel_rx,
+                                },
+                            )
+                            .await;
+                        }
+                    }));
+                    route.push(SharePeer {
+                        id: target,
+                        writer: control,
+                    });
+                }
+            }
+            // A correctly signed but nonlocal executed header must not contribute.
+            let mut wrong = shares[1].clone();
+            wrong.header.state_root[0] ^= 1;
+            wrong.signature = Ed25519Scheme
+                .sign(
+                    &m.consensus[1].private_key,
+                    &validator::signing_payload(&wrong.header).unwrap(),
+                )
+                .unwrap();
+            routes[1]
+                .iter()
+                .find(|peer| peer.id == 0)
+                .unwrap()
+                .writer
+                .send(wire::frame(&Message::Share(wrong), u64::MAX).unwrap())
+                .await
+                .unwrap();
+            let rejected = channels[0].output.recv().await.unwrap();
+            assert!(rejected.error.is_some());
+            assert!(rejected.build.shares.is_empty() && rejected.build.certified.is_empty());
+            let mut dispatchers = Vec::new();
+            let mut results = Vec::new();
+            for (index, (ch, route)) in channels.iter_mut().zip(routes).enumerate() {
+                let (unused, replacement) = mpsc::channel(1);
+                drop(unused);
+                let input = std::mem::replace(&mut ch.output, replacement);
+                let (local, mut output) = mpsc::channel(1);
+                // Initial shares were extracted above and are explicitly reinjected here;
+                // only subsequent pump outputs use the direct receiver path.
+                let (initial, initial_rx) = mpsc::channel(1);
+                initial
+                    .send(super::event_pump::PumpOutput {
+                        build: validator::Build {
+                            shares: vec![shares[index].clone()],
+                            certified: vec![],
+                        },
+                        error: None,
+                    })
+                    .await
+                    .unwrap();
+                drop(initial);
+                let initial_task = tokio::spawn(output_dispatcher::dispatch(
+                    initial_rx,
+                    route
+                        .iter()
+                        .map(|p| SharePeer {
+                            id: p.id,
+                            writer: p.writer.clone(),
+                        })
+                        .collect(),
+                    local.clone(),
+                    cancel_rx.clone(),
+                    u64::MAX,
+                ));
+                let initial_output = output.recv().await.unwrap();
+                assert!(initial_output.failed_peers.is_empty());
+                assert!(initial_output.local.error.is_none());
+                assert_eq!(initial_output.local.build.shares.len(), 1);
+                assert!(initial_output.local.build.certified.is_empty());
+                initial_task.await.unwrap();
+                results.push(output);
+                dispatchers.push(tokio::spawn(output_dispatcher::dispatch(
+                    input,
+                    route,
+                    local,
+                    cancel_rx.clone(),
+                    u64::MAX,
+                )));
+            }
+            for output in &mut results {
+                let mut certificates = Vec::new();
+                // Initial routing completed and its result was drained before live routing.
+                for _ in 0..2 {
+                    let receipt = output.recv().await.unwrap();
+                    assert!(receipt.local.error.is_none(), "{:?}", receipt.local.error);
+                    assert!(receipt.failed_peers.is_empty());
+                    assert!(
+                        receipt.local.build.shares.is_empty(),
+                        "received shares must not rebroadcast"
+                    );
+                    certificates.extend(receipt.local.build.certified);
+                }
+
+                assert_eq!(certificates.len(), 1);
+                assert_eq!(certificates[0].header, shares[0].header);
+            }
+            exercise_dispatcher_false_updates(shares[0].clone()).await;
+            // Closed peers are reported individually; successful queueing is not delivery.
+            let (closed, receiver) = mpsc::channel(1);
+            drop(receiver);
+            let (healthy, mut queued) = mpsc::channel(1);
+            let (input, input_rx) = mpsc::channel(1);
+            let (local, mut local_rx) = mpsc::channel(1);
+            input
+                .send(super::event_pump::PumpOutput {
+                    build: validator::Build {
+                        shares: vec![shares[0].clone()],
+                        certified: vec![],
+                    },
+                    error: None,
+                })
+                .await
+                .unwrap();
+            let task = tokio::spawn(output_dispatcher::dispatch(
+                input_rx,
+                vec![
+                    SharePeer {
+                        id: 8,
+                        writer: closed,
+                    },
+                    SharePeer {
+                        id: 9,
+                        writer: healthy.clone(),
+                    },
+                ],
+                local,
+                cancel_rx.clone(),
+                0,
+            ));
+            let reported = local_rx.recv().await.unwrap();
+            assert_eq!(reported.failed_peers, vec![8]);
+            assert!(queued.recv().await.is_some());
+            drop(input);
+            task.await.unwrap();
+            // Full writer queues backpressure and cancellation interrupts the wait.
+            healthy.send(vec![1]).await.unwrap();
+            let (input, input_rx) = mpsc::channel(1);
+            let (local, mut local_rx) = mpsc::channel(1);
+            input
+                .send(super::event_pump::PumpOutput {
+                    build: validator::Build {
+                        shares: vec![shares[0].clone()],
+                        certified: vec![],
+                    },
+                    error: None,
+                })
+                .await
+                .unwrap();
+            let task = tokio::spawn(output_dispatcher::dispatch(
+                input_rx,
+                vec![SharePeer {
+                    id: 9,
+                    writer: healthy,
+                }],
+                local,
+                cancel_rx.clone(),
+                0,
+            ));
+            while input.capacity() == 0 {
+                tokio::task::yield_now().await;
+            }
+            assert!(local_rx.try_recv().is_err());
+            cancel.send(true).unwrap();
+            task.await.unwrap();
+            assert!(local_rx.recv().await.is_none());
+            assert_eq!(queued.recv().await.unwrap(), vec![1]);
+            for task in dispatchers {
+                task.await.unwrap();
+            }
+            for task in readers {
+                task.await.unwrap();
+            }
+            for task in writers {
+                task.await.unwrap();
+            }
+            for task in pumps {
+                let (owner, result) = task.await.unwrap();
+                result.unwrap();
+                assert_eq!(owner.finalization().finalizer().built_headers(), 1);
+            }
+        })
+        .await
+        .expect("bounded share mesh timed out");
+    });
 }
 
 fn exercise_event_pump(
