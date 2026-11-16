@@ -2,10 +2,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crypto::scheme::verify_signature;
 use exec::State;
 use store::AgreementOrderingSnapshot;
 use tx::batch::Batch;
-use validator::{Build, Finalizer};
+use validator::{Build, Certified, Finalizer, Header, Share, signing_payload};
 
 use super::{CertifiedExecution, Membership};
 
@@ -19,6 +20,7 @@ pub struct CertifiedFinalization {
     finalizer: Finalizer,
     next_application: usize,
     outbox: Build,
+    built_headers: BTreeMap<u64, Header>,
     failed: bool,
 }
 
@@ -48,6 +50,7 @@ impl CertifiedFinalization {
             || finalizer.built_headers() != 0
             || finalizer.next_height() != 1
             || !finalizer.certified_ids().is_empty()
+            || finalizer.has_pending_work()
         {
             return Err(
                 "certified finalization requires a matching pristine genesis anchor".into(),
@@ -61,6 +64,7 @@ impl CertifiedFinalization {
             finalizer,
             next_application: 0,
             outbox: Build::default(),
+            built_headers: BTreeMap::new(),
             failed: false,
         })
     }
@@ -91,6 +95,7 @@ impl CertifiedFinalization {
         at: u64,
     ) -> Result<Build, String> {
         self.ensure_usable()?;
+        self.validate_membership(membership)?;
         while let Some(boundary) = self
             .execution
             .snapshot()
@@ -125,6 +130,8 @@ impl CertifiedFinalization {
                     .build_ready(self.execution.snapshot().order(), at)
                 {
                     Ok(mut build) => {
+                        let header = self.finalizer.last_built().clone();
+                        self.built_headers.insert(header.height, header);
                         self.outbox.shares.append(&mut build.shares);
                         self.outbox.certified.append(&mut build.certified);
                     }
@@ -137,6 +144,62 @@ impl CertifiedFinalization {
             self.next_application += 1;
         }
         Ok(std::mem::take(&mut self.outbox))
+    }
+
+    /// Authenticates a peer share only for an exact header already built from local execution.
+    /// Unknown or conflicting headers are rejected, not buffered or adopted. A missing payload
+    /// must be obtained and executed before retrying its share. Duplicate signers do not add weight.
+    /// Certificates returned here are volatile; no persistence, transport or pruning is authorized.
+    /// # Errors
+    /// Rejects incompatible membership, unbuilt/conflicting headers, invalid signers and signatures
+    /// before changing finalizer state. An error from the underlying finalizer poisons the instance.
+    pub fn receive_share(
+        &mut self,
+        membership: &Membership,
+        share: Share,
+    ) -> Result<Vec<Certified>, String> {
+        self.ensure_usable()?;
+        self.validate_membership(membership)?;
+        if self.built_headers.get(&share.header.height) != Some(&share.header) {
+            return Err("peer header does not match a locally executed certified boundary".into());
+        }
+        let signer = membership
+            .set
+            .validators
+            .get(share.signer)
+            .ok_or("peer header share signer is outside the pinned validator set")?;
+        let key = signer
+            .active_key(share.header.epoch)
+            .map_err(|error| error.to_string())?;
+        let payload = signing_payload(&share.header).map_err(|error| error.to_string())?;
+        // The underlying finalizer keeps the first signature for each signer. Verify
+        // before insertion so an invalid first arrival cannot suppress a later valid share.
+        verify_signature(
+            key.algorithm_id,
+            &key.public_key,
+            &payload,
+            &share.signature,
+        )
+        .map_err(|error| error.to_string())?;
+        match self.finalizer.receive_share(share) {
+            Ok(certified) => Ok(certified),
+            Err(error) => {
+                self.failed = true;
+                Err(error.to_string())
+            }
+        }
+    }
+
+    fn validate_membership(&self, membership: &Membership) -> Result<(), String> {
+        let tip = self.execution.snapshot().binding().tip();
+        if membership.set.epoch != tip.epoch()
+            || &membership.set.id().map_err(|error| error.to_string())? != tip.set_id()
+        {
+            return Err(
+                "certified finalization membership differs from the pinned validator set".into(),
+            );
+        }
+        Ok(())
     }
 
     /// Execution state and exact consumed prefix; mutable access would bypass boundaries.

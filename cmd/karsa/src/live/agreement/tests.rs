@@ -441,6 +441,141 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
     assert_eq!(retried.shares[1].header, built.shares[1].header);
     assert_eq!(retried.shares[1].at, 61);
     assert_eq!(retry.finalizer().built_headers(), 2);
+
+    let peer_share = |height: usize, signer: usize| {
+        let mut share = built.shares[height - 1].clone();
+        share.signer = signer;
+        share.signature = Ed25519Scheme
+            .sign(
+                &m.consensus[signer].private_key,
+                &validator::signing_payload(&share.header).unwrap(),
+            )
+            .unwrap();
+        share
+    };
+    // A raw finalizer can buffer future peer quorums while still appearing anchored
+    // at genesis. Do not let that hidden queue enter the certified-only coordinator.
+    let mut buffered = validator::Finalizer::new(
+        validator::SetSchedule::single(m.set.clone()),
+        validator::EpochSchedule::single(m.set.epoch),
+        chain_id.to_vec(),
+        m.consensus[0].id.clone(),
+        m.consensus[0].private_key.clone(),
+        anchor.clone(),
+        0,
+    )
+    .unwrap();
+    assert!(!buffered.has_pending_work());
+    for signer in 0..3 {
+        assert!(
+            buffered
+                .receive_share(peer_share(2, signer))
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert_eq!(buffered.head(), &anchor);
+    assert_eq!(buffered.built_headers(), 0);
+    assert_eq!(buffered.next_height(), 1);
+    assert!(buffered.has_pending_work());
+    assert!(
+        CertifiedFinalization::begin(
+            recovered.clone(),
+            chain::genesis_state(&accounts).unwrap(),
+            buffered
+        )
+        .is_err()
+    );
+
+    let mut unexecuted = make_coordinator();
+    assert!(unexecuted.receive_share(&m, peer_share(1, 1)).is_err());
+    assert_eq!(unexecuted.finalizer().head(), &anchor);
+    assert!(unexecuted.execution().consumed_order().is_empty());
+    let foreign_membership = chain::membership(3, None).unwrap();
+    assert!(
+        unexecuted
+            .build_ready(&foreign_membership, &batches, &controls, 70)
+            .is_err()
+    );
+    assert!(unexecuted.execution().consumed_order().is_empty());
+    assert!(
+        coordinator
+            .receive_share(&foreign_membership, peer_share(1, 1))
+            .is_err()
+    );
+    let mut conflicting = peer_share(1, 1);
+    conflicting.header.state_root[0] ^= 1;
+    assert!(coordinator.receive_share(&m, conflicting).is_err());
+    let mut invalid_signature = peer_share(1, 1);
+    invalid_signature.signature[0] ^= 1;
+    assert!(coordinator.receive_share(&m, invalid_signature).is_err());
+    let mut wrong_signer = peer_share(1, 1);
+    wrong_signer.signer = 2;
+    assert!(coordinator.receive_share(&m, wrong_signer).is_err());
+    let mut out_of_range = peer_share(1, 1);
+    out_of_range.signer = m.set.validators.len();
+    assert!(coordinator.receive_share(&m, out_of_range).is_err());
+    assert_eq!(coordinator.finalizer().head(), &anchor);
+    // Future built headers can collect valid shares, but cannot skip the missing height.
+    assert!(
+        coordinator
+            .receive_share(&m, peer_share(2, 1))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        coordinator
+            .receive_share(&m, peer_share(2, 2))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(coordinator.finalizer().head(), &anchor);
+    for _ in 0..3 {
+        assert!(
+            coordinator
+                .receive_share(&m, peer_share(1, 1))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            coordinator.finalizer().head(),
+            &anchor,
+            "duplicates must not count as additional validators"
+        );
+    }
+    let certified = coordinator.receive_share(&m, peer_share(1, 2)).unwrap();
+    assert_eq!(
+        certified.len(),
+        2,
+        "closing height one releases both contiguous certificates"
+    );
+    for (index, finalized) in certified.iter().enumerate() {
+        assert_eq!(finalized.header, built.shares[index].header);
+        coordinator
+            .finalizer()
+            .verify_certificate(&finalized.header, &finalized.certificate)
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .finalizer()
+                .certified_order(finalized.header.height),
+            Some(recovered.applications()[index].order_len())
+        );
+    }
+    assert_eq!(coordinator.finalizer().head(), &built.shares[1].header);
+    for height in 1..=2 {
+        for signer in 0..3 {
+            assert!(
+                coordinator
+                    .receive_share(&m, peer_share(height, signer))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+    assert_eq!(coordinator.finalizer().head(), &built.shares[1].header);
+    assert_eq!(coordinator.execution().state(), &expected);
+    assert_eq!(coordinator.execution().applied(), applied);
     assert_eq!(
         std::fs::read(dir.0.join("authenticated-slot-agreement")).unwrap(),
         wal

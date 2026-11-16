@@ -274,6 +274,14 @@ impl Finalizer {
         self.next_height
     }
 
+    /// Whether unbuilt commits or uncertified share sets remain in this finalizer.
+    /// A fresh consumer must not inherit these queues from another ordering source,
+    /// even when the certified head and built-header count still equal the anchor.
+    #[must_use]
+    pub fn has_pending_work(&self) -> bool {
+        !self.pending.is_empty() || !self.shares.is_empty()
+    }
+
     /// Headers this node has built.
     #[must_use]
     pub fn built_headers(&self) -> usize {
