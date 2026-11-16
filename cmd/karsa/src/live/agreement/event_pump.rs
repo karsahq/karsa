@@ -1,4 +1,4 @@
-//! Isolated async runtime with explicit local driving; not connected to the production node.
+//! Isolated async runtime with opt-in bounded local maintenance, not production integration.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -83,12 +83,91 @@ pub struct EventPump {
     max_payload_bytes: usize,
     max_batches: usize,
     build_at: Option<u64>,
+    schedule: Option<LocalSchedule>,
     frames: mpsc::Receiver<Frame>,
     local: mpsc::Receiver<LocalEvent>,
     output: mpsc::Sender<PumpOutput>,
 }
 
+struct LocalSchedule {
+    interval: std::time::Duration,
+    next: tokio::time::Instant,
+    publication_offset: usize,
+}
+
+impl LocalSchedule {
+    fn finish_retry(&mut self, result: &Result<Vec<Message>, String>) {
+        // Keep the selected ID while cadence is not due, avoiding phase-locked starvation.
+        // Advance on export errors: discovery does not promise current-slot availability.
+        if !matches!(result, Ok(messages) if messages.is_empty()) {
+            self.publication_offset += 1;
+        }
+    }
+
+    fn defer(&mut self, now: tokio::time::Instant) {
+        // Fixed delay, not interval catch-up: a blocked output never accumulates work.
+        self.next = now + self.interval;
+    }
+}
+
 impl EventPump {
+    /// Opts this isolated owner into volatile, fixed-delay local maintenance.
+    /// Requires pinned authoring. Each wake ticks once and attempts one positive durable
+    /// action, or retries one discovered publication when no new carrier is authored.
+    /// Discovery reads at most one 64-ID page per wake under the 4096-event replay cap;
+    /// only its first ID is attempted; completion or error advances the offset, while
+    /// a not-yet-due retry retains it. Empty pages wrap on the
+    /// next wake. Historical/unavailable publications report errors but do not pin the cursor.
+    /// No proposal election, nil/view-change publication, causal import or slot application
+    /// is scheduled. Recovery requires opting in again, including authoring setup.
+    /// # Errors
+    /// Rejects missing authoring, replacement schedules and intervals outside 10ms..=1 day.
+    pub fn enable_scheduling(&mut self, interval: std::time::Duration) -> Result<(), String> {
+        self.owner.check_local_authoring()?;
+        if self.schedule.is_some() {
+            return Err("local pump scheduling is already enabled".into());
+        }
+        if interval < std::time::Duration::from_millis(10)
+            || interval > std::time::Duration::from_secs(86_400)
+        {
+            return Err("local pump interval must be between 10ms and one day".into());
+        }
+        self.schedule = Some(LocalSchedule {
+            interval,
+            next: tokio::time::Instant::now() + interval,
+            publication_offset: 0,
+        });
+        Ok(())
+    }
+
+    pub(super) fn scheduled_turn(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Result<Vec<Message>, String> {
+        if self.schedule.is_none() {
+            return Err("local pump scheduling is disabled".into());
+        }
+        self.owner.tick_local(now)?;
+        let authored = self.owner.drive_local(Vec::new())?;
+        if !authored.is_empty() {
+            return Ok(authored);
+        }
+        let schedule = self
+            .schedule
+            .as_mut()
+            .ok_or("local pump scheduling is disabled")?;
+        let page = self
+            .owner
+            .completed_publications(schedule.publication_offset)?;
+        let Some(id) = page.first() else {
+            schedule.publication_offset = 0;
+            return Ok(Vec::new());
+        };
+        let result = self.owner.retry_local(now, std::slice::from_ref(id));
+        schedule.finish_retry(&result);
+        result
+    }
+
     /// All channel capacities are identical and nonzero. Payload limits cover batch count
     /// and the sum of retained batches' canonical encoded lengths, not total memory usage
     /// (decoded allocations, channel contents, encoding temporaries and journals are extra).
@@ -115,6 +194,7 @@ impl EventPump {
                 max_payload_bytes,
                 max_batches,
                 build_at: None,
+                schedule: None,
                 frames,
                 local,
                 output,
@@ -128,6 +208,8 @@ impl EventPump {
     }
 
     /// Runs until cancellation, ingress closure, lost output, or an owner health failure.
+    /// Opt-in maintenance shares output reservation and cancellation checks with ingress;
+    /// blocked output defers all timer mutation. False watch updates retain the deadline.
     /// Returned errors are fatal; per-event retryable errors travel through the output.
     pub async fn run(
         mut self,
@@ -155,7 +237,9 @@ impl EventPump {
             enum Input {
                 Local(Option<LocalEvent>),
                 Frame(Option<Frame>),
+                Scheduled,
             }
+            let deadline = self.schedule.as_ref().map(|schedule| schedule.next);
             let input = tokio::select! {
                 biased;
                 changed = cancel.changed() => {
@@ -169,6 +253,12 @@ impl EventPump {
                 }
                 input = async {
                     tokio::select! {
+                        _ = async {
+                            match deadline {
+                                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => Input::Scheduled,
                         event = self.local.recv(), if local_open => Input::Local(event),
                         frame = self.frames.recv(), if frames_open => Input::Frame(frame),
                     }
@@ -182,6 +272,18 @@ impl EventPump {
             }
             let mut carriers = Vec::new();
             let result = match input {
+                Input::Scheduled => {
+                    let now = tokio::time::Instant::now();
+                    let result = self.scheduled_turn(now.into_std());
+                    self.schedule
+                        .as_mut()
+                        .expect("scheduled wake requires opt-in")
+                        .defer(tokio::time::Instant::now());
+                    result.map(|messages| {
+                        carriers = messages;
+                        Build::default()
+                    })
+                }
                 Input::Local(Some(LocalEvent::Drive(vertices))) => {
                     self.owner.drive_local(vertices).map(|messages| {
                         carriers = messages;
@@ -303,5 +405,44 @@ impl EventPump {
             }
             _ => Err("message is not isolated agreement input".into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delayed_schedule_defers_without_catch_up_or_cursor_reset() {
+        let start = tokio::time::Instant::now();
+        let interval = std::time::Duration::from_secs(1);
+        let mut schedule = LocalSchedule {
+            interval,
+            next: start + interval,
+            publication_offset: 63,
+        };
+        let after_backpressure = start + interval * 100;
+        schedule.defer(after_backpressure);
+        assert_eq!(schedule.next, after_backpressure + interval);
+        assert_eq!(schedule.publication_offset, 63);
+        schedule.defer(after_backpressure + interval);
+        assert_eq!(schedule.next, after_backpressure + interval * 2);
+        for _ in 0..100 {
+            schedule.finish_retry(&Ok(Vec::new()));
+        }
+        assert_eq!(
+            schedule.publication_offset, 63,
+            "not-due retries retain the selected publication"
+        );
+        schedule.finish_retry(&Ok(vec![Message::WantSlot {
+            round: 1,
+            author: vec![1],
+        }]));
+        assert_eq!(schedule.publication_offset, 64);
+        schedule.finish_retry(&Err("unavailable historical publication".into()));
+        assert_eq!(
+            schedule.publication_offset, 65,
+            "errors cannot pin discovery forever"
+        );
     }
 }

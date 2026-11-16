@@ -613,9 +613,60 @@ fn owned_publication_discovery_recovers_lost_output_and_reopen_without_signing()
         )
         .unwrap();
     let rediscovered = owner.completed_publications(0).unwrap();
-    let retry = owner.retry_local(Instant::now(), &rediscovered).unwrap();
+    let retry_now = Instant::now();
+    let retry = owner.retry_local(retry_now, &rediscovered).unwrap();
     assert_eq!(net::wire::frame(&retry[0], 0).unwrap(), expected);
     assert_eq!(std::fs::read(&wal_path).unwrap(), completed_wal);
+    let (mut pump, mut channels) = super::event_pump::EventPump::new(
+        owner,
+        m.clone(),
+        std::collections::BTreeSet::new(),
+        1.try_into().unwrap(),
+        0,
+        0,
+    );
+    assert!(pump.enable_scheduling(Duration::ZERO).is_err());
+    pump.enable_scheduling(Duration::from_millis(10)).unwrap();
+    assert!(pump.enable_scheduling(Duration::from_secs(1)).is_err());
+    // Explicit monotonic instants make discovery/cadence checks independent of wall time.
+    // The prior manual retry already consumed the adapter's first send deadline.
+    let now = retry_now;
+    assert!(pump.scheduled_turn(now).unwrap().is_empty());
+    assert!(pump.scheduled_turn(now).unwrap().is_empty(), "repeated maintenance cannot bypass retry cadence");
+    let retry = pump.scheduled_turn(now + Duration::from_millis(2)).unwrap();
+    assert_eq!(net::wire::frame(&retry[0], 0).unwrap(), expected);
+    assert_eq!(std::fs::read(&wal_path).unwrap(), completed_wal, "scheduled retries do not add durable obligations");
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let mut owner = runtime.block_on(async {
+        let (cancel, stop) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(pump.run(stop));
+        // The first due wake wraps the exhausted discovery page; the next retries
+        // the recovered publication without a caller-selected ID or manual tick.
+        let empty = tokio::time::timeout(Duration::from_secs(5), channels.output.recv()).await.unwrap().unwrap();
+        assert!(empty.error.is_none(), "{:?}", empty.error);
+        assert!(empty.carriers.is_empty());
+        let retried = tokio::time::timeout(Duration::from_secs(5), channels.output.recv()).await.unwrap().unwrap();
+        assert!(retried.error.is_none(), "{:?}", retried.error);
+        assert_eq!(net::wire::frame(&retried.carriers[0], 0).unwrap(), expected);
+        assert_eq!(std::fs::read(&wal_path).unwrap(), completed_wal);
+        // False cancellation must neither stop the pump nor discard queued local work.
+        cancel.send(false).unwrap();
+        channels.local.send(super::event_pump::LocalEvent::Drive(Vec::new())).await.unwrap();
+        let output = channels.output.recv().await.unwrap();
+        assert!(output.error.is_none(), "{:?}", output.error);
+        channels.local.send(super::event_pump::LocalEvent::Drive(Vec::new())).await.unwrap();
+        // Yield until output fills, then cancellation must work without draining it.
+        for _ in 0..10 { tokio::task::yield_now().await; }
+        assert_eq!(channels.output.len(), 1);
+        cancel.send(false).unwrap();
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        cancel.send(true).unwrap();
+        let (owner, result) = tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        result.unwrap();
+        assert!(channels.output.recv().await.is_some(), "queued output survives cancellation");
+        owner
+    });
     let mut sibling = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
     sibling
         .apply(AuthenticatedSlotAgreementRequest::Timeout {

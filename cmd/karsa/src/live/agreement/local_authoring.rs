@@ -115,6 +115,14 @@ pub(super) struct LocalAuthoring {
 }
 
 impl JournaledFinalization {
+    pub(in super::super) fn check_local_authoring(&mut self) -> Result<(), String> {
+        self.check_health()?;
+        if self.authoring.is_none() {
+            return Err("local authoring is not configured".into());
+        }
+        Ok(())
+    }
+
     /// Pins one causal Node for this owner's lifetime. No mutable handle is returned.
     /// Recovery requires a fresh explicit setup; timers and retry cadence are volatile.
     /// # Errors
