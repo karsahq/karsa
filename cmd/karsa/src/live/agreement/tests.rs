@@ -7,6 +7,62 @@ use validator::{
     SlotOutcome, SlotProposal, Vertex,
 };
 
+fn assert_ordering_consumer(
+    before: &store::AgreementOrderingSnapshot,
+    applied: &store::AgreementOrderingSnapshot,
+) {
+    let mut consumer = OrderingConsumer::restore(before.clone(), before.order()).unwrap();
+    consumer.update(applied.clone()).unwrap();
+    let mut offered = Vec::new();
+    consumer
+        .consume_ready(|vertex| {
+            offered.push(vertex.id().unwrap());
+            Ok(false)
+        })
+        .unwrap();
+    assert_eq!(offered, applied.order()[..1]);
+    assert!(consumer.consumed_order().is_empty());
+
+    let mut calls = 0;
+    assert!(
+        consumer
+            .consume_ready(|_| {
+                calls += 1;
+                if calls == 1 {
+                    Ok(true)
+                } else {
+                    Err("payload application failed without effects".into())
+                }
+            })
+            .is_err()
+    );
+    assert_eq!(consumer.consumed_order(), &applied.order()[..1]);
+    let checkpoint = consumer.consumed_order().to_vec();
+    drop(consumer);
+    let mut consumer = OrderingConsumer::restore(applied.clone(), &checkpoint).unwrap();
+    assert!(consumer.update(before.clone()).is_err());
+    consumer.update(applied.clone()).unwrap();
+    let mut resumed = Vec::new();
+    consumer
+        .consume_ready(|vertex| {
+            resumed.push(vertex.id().unwrap());
+            Ok(true)
+        })
+        .unwrap();
+    assert_eq!(resumed, applied.order()[1..]);
+    assert_eq!(consumer.consumed_order(), applied.order());
+    consumer.update(applied.clone()).unwrap();
+    consumer
+        .consume_ready(|_| panic!("duplicate snapshots must not replay consumed vertices"))
+        .unwrap();
+    let mut conflicting = checkpoint;
+    conflicting[0].digest[0] ^= 1;
+    assert!(OrderingConsumer::restore(applied.clone(), &conflicting).is_err());
+    let mut longer = applied.order().to_vec();
+    longer.push(longer[0].clone());
+    assert!(OrderingConsumer::restore(applied.clone(), &longer).is_err());
+}
+
 // Explicit acceptance-test orchestration, not a production scheduler: every signing
 // call is made by the test, and every publication crosses the real TCP receive path.
 #[test]
@@ -460,10 +516,9 @@ fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen
         drop(store);
         let store = Store::open(&dirs[i].0).unwrap();
         let mut adapter = Adapter::recover(&store, bootstraps[i].clone(), &m, i).unwrap();
-        assert_eq!(
-            format!("{:?}", adapter.ordering_snapshot().unwrap()),
-            format!("{applied:?}")
-        );
+        let recovered = adapter.ordering_snapshot().unwrap();
+        assert_eq!(format!("{recovered:?}"), format!("{applied:?}"));
+        assert_ordering_consumer(&before, &recovered);
         assert_eq!(format!("{:?}", adapter.signing_history()), history);
         assert_eq!(
             std::fs::read(dirs[i].0.join("authenticated-slot-agreement")).unwrap(),

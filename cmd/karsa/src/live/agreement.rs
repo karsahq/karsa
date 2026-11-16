@@ -1857,8 +1857,10 @@ pub(super) fn disabled_guard(store: &Store) -> Result<(), String> {
 }
 
 mod envelope;
+mod ordering;
 pub mod pacemaker;
 pub use envelope::{CarrierEnvelope, CarrierPayload, MAX_ENVELOPE_BYTES};
+pub use ordering::OrderingConsumer;
 
 #[cfg(test)]
 mod tests;
