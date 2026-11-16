@@ -1971,6 +1971,7 @@ pub mod event_pump;
 mod execution;
 mod finalization;
 mod journaled_finalization;
+pub use journaled_finalization::local_authoring;
 mod ordering;
 pub mod output_dispatcher;
 pub use execution::CertifiedExecution;

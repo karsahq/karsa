@@ -1,4 +1,4 @@
-//! Bounded volatile share routing to existing peer writer queues.
+//! Bounded volatile share and agreement carrier routing to existing peer writer queues.
 
 use net::wire::{self, Message};
 use tokio::sync::{mpsc, watch};
@@ -34,7 +34,7 @@ async fn cancelled(cancel: &mut watch::Receiver<bool>) {
     }
 }
 
-/// Routes only locally generated shares, preserving bounded backpressure.
+/// Routes local shares and durable carrier exports, preserving bounded backpressure.
 ///
 /// A slow peer stalls this dispatcher until cancellation or queue closure. Cancellation
 /// (including sender drop) can interrupt a partially routed output; queued frames and
@@ -64,12 +64,19 @@ pub async fn dispatch(
             output = input.recv() => match output { Some(o) => o, None => return },
         };
         let mut failed_peers = Vec::new();
-        for share in &output.build.shares {
-            let frame = match wire::frame(&Message::Share(share.clone()), sent_at_nanos) {
+        let messages = output
+            .build
+            .shares
+            .iter()
+            .cloned()
+            .map(Message::Share)
+            .chain(output.carriers.iter().cloned());
+        for message in messages {
+            let frame = match wire::frame(&message, sent_at_nanos) {
                 Ok(frame) => frame,
                 Err(error) => {
                     let mut output = output;
-                    output.error = Some(format!("share frame encoding failed: {error}"));
+                    output.error = Some(format!("output frame encoding failed: {error}"));
                     permit.send(DispatchOutput {
                         local: output,
                         failed_peers,

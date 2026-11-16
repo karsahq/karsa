@@ -8,6 +8,9 @@ use validator::{Build, Certified, Finalizer, Header, Share};
 
 use super::{Adapter, CertifiedFinalization, Membership};
 
+#[path = "local_authoring.rs"]
+pub mod local_authoring;
+
 /// Owns the agreement handle so header production cannot bypass durable reservation.
 /// Opening rebuilds execution from trusted genesis, not an execution checkpoint. Payloads
 /// and control classification remain caller-trusted inputs. Use isolated signing keys.
@@ -22,6 +25,7 @@ use super::{Adapter, CertifiedFinalization, Membership};
 /// This bounded offline owner has no live transport, pruning or epoch-transition authority.
 pub struct JournaledFinalization {
     adapter: Adapter,
+    authoring: Option<local_authoring::LocalAuthoring>,
     coordinator: CertifiedFinalization,
     anchor: Header,
     outbox: Build,
@@ -68,6 +72,7 @@ impl JournaledFinalization {
         let coordinator = CertifiedFinalization::begin(snapshot, genesis, finalizer)?;
         Ok(Self {
             adapter,
+            authoring: None,
             coordinator,
             anchor,
             outbox: Build::default(),

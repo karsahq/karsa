@@ -1,4 +1,4 @@
-//! Isolated async runtime; not connected to the production node or publication path.
+//! Isolated async runtime with explicit local driving; not connected to the production node.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,6 +11,17 @@ use super::{JournaledFinalization, Membership};
 
 /// Local authority, deliberately separate from decoded network messages.
 pub enum LocalEvent {
+    /// Explicit trusted phase driving with independently authenticated causal availability.
+    Author(Box<super::local_authoring::AuthoringRequest>),
+    /// One local pacemaker step; does not sign or apply a certified slot.
+    Tick(std::time::Instant),
+    /// Bounded retry of selected durable local publications.
+    Retry {
+        /// Trusted monotonic local time, never a wire timestamp.
+        now: std::time::Instant,
+        /// At most 64 selected completed local publications; not an unbounded resend queue.
+        carriers: Vec<validator::VertexId>,
+    },
     /// Apply the decided slot, then attempt execution from journaled ordering.
     ApplyCertifiedSlot {
         /// Caller-trusted local authoring timestamp.
@@ -25,6 +36,8 @@ pub enum LocalEvent {
 
 /// One attempted response per processed event; volatile and without publication authority.
 pub struct PumpOutput {
+    /// At most one authenticated durable carrier export per local request.
+    pub carriers: Vec<Message>,
     /// Volatile shares and certificates; grants no pruning or store-publication authority.
     pub build: Build,
     /// Processing error; fatal ownership errors also terminate `run`.
@@ -164,7 +177,23 @@ impl EventPump {
             if self.output.is_closed() {
                 return (self.owner, Err("event pump output closed".into()));
             }
+            let mut carriers = Vec::new();
             let result = match input {
+                Input::Local(Some(LocalEvent::Author(request))) => {
+                    self.owner.author_local(*request).map(|messages| {
+                        carriers = messages;
+                        Build::default()
+                    })
+                }
+                Input::Local(Some(LocalEvent::Tick(now))) => {
+                    self.owner.tick_local(now).map(|()| Build::default())
+                }
+                Input::Local(Some(LocalEvent::Retry { now, carriers: ids })) => {
+                    self.owner.retry_local(now, &ids).map(|messages| {
+                        carriers = messages;
+                        Build::default()
+                    })
+                }
                 Input::Local(Some(LocalEvent::ApplyCertifiedSlot { at })) => self
                     .owner
                     .advance_certified_slot()
@@ -181,11 +210,19 @@ impl EventPump {
                 }
             };
             let (output, fatal) = match result {
-                Ok(build) => (PumpOutput { build, error: None }, None),
+                Ok(build) => (
+                    PumpOutput {
+                        carriers,
+                        build,
+                        error: None,
+                    },
+                    None,
+                ),
                 Err(error) => {
                     let fatal = self.owner.check_health().err();
                     (
                         PumpOutput {
+                            carriers: Vec::new(),
                             build: Build::default(),
                             error: Some(error),
                         },

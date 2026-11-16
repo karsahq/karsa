@@ -7131,6 +7131,7 @@ async fn exercise_dispatcher_false_updates(share: validator::Share) {
     local
         .send(DispatchOutput {
             local: PumpOutput {
+                carriers: Vec::new(),
                 build: validator::Build::default(),
                 error: Some("saturated result".into()),
             },
@@ -7141,6 +7142,7 @@ async fn exercise_dispatcher_false_updates(share: validator::Share) {
     let expected = net::wire::frame(&net::wire::Message::Share(share.clone()), 123).unwrap();
     input
         .send(PumpOutput {
+            carriers: Vec::new(),
             build: validator::Build {
                 shares: vec![share],
                 certified: vec![],
@@ -7407,6 +7409,7 @@ fn exercise_share_mesh(
                 let (initial, initial_rx) = mpsc::channel(1);
                 initial
                     .send(super::event_pump::PumpOutput {
+                        carriers: Vec::new(),
                         build: validator::Build {
                             shares: vec![shares[index].clone()],
                             certified: vec![],
@@ -7470,6 +7473,7 @@ fn exercise_share_mesh(
             let (local, mut local_rx) = mpsc::channel(1);
             input
                 .send(super::event_pump::PumpOutput {
+                    carriers: Vec::new(),
                     build: validator::Build {
                         shares: vec![shares[0].clone()],
                         certified: vec![],
@@ -7505,6 +7509,7 @@ fn exercise_share_mesh(
             let (local, mut local_rx) = mpsc::channel(1);
             input
                 .send(super::event_pump::PumpOutput {
+                    carriers: Vec::new(),
                     build: validator::Build {
                         shares: vec![shares[0].clone()],
                         certified: vec![],
@@ -8986,3 +8991,5 @@ fn isolated_tcp_invalid_certificate_tails_nil_authentication_and_kind_substituti
         recover_envelope_adapter(&mut receiver, &store, &bootstrap, &m, 0);
     }
 }
+
+include!("local_authoring_tests.rs");
