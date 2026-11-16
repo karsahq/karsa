@@ -1166,6 +1166,63 @@ impl Adapter {
         &self.pending
     }
 
+    /// Dispatches a decoded agreement message through the pinned authenticated session.
+    /// Receipt never signs, echoes, activates legacy transport, or applies an execution decision.
+    /// Wire decoding is structural only; each typed receiver retains its authentication rules.
+    /// # Errors
+    /// Rejects stale/uncertain ownership, nonagreement messages, malformed bodies and evidence.
+    /// Driver failures retain the existing recovery-required boundary.
+    pub fn receive_message(&mut self, message: net::wire::Message) -> Result<(), String> {
+        use net::wire::Message;
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before message receipt".into());
+        }
+        self.driver.output().map_err(|error| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            error.to_string()
+        })?;
+        match message {
+            Message::AgreementCarrier { envelope, vertices } => {
+                let envelope = CarrierEnvelope::decode(&envelope, &self.set)
+                    .map_err(|error| error.to_string())?;
+                self.receive_envelope(envelope, vertices)
+            }
+            Message::AgreementViewRequest(bytes) => {
+                let request = validator::SlotAgreementViewRequest::decode(&bytes, &self.set)
+                    .map_err(|error| error.to_string())?;
+                self.receive_view_request(request)
+            }
+            Message::AgreementViewCertificate(bodies) => {
+                // Also bound direct callers that did not arrive through the wire parser.
+                if bodies.is_empty() || bodies.len() > self.set.validators.len() {
+                    return Err("agreement entry certificate signer count exceeds set".into());
+                }
+                let mut size = 4usize;
+                for body in &bodies {
+                    size = size
+                        .checked_add(4)
+                        .and_then(|n| n.checked_add(body.len()))
+                        .ok_or("agreement entry certificate size overflows")?;
+                    if size > net::wire::MAX_AGREEMENT_ENVELOPE {
+                        return Err("agreement entry certificate exceeds one MiB".into());
+                    }
+                }
+                let requests = bodies
+                    .iter()
+                    .map(|body| validator::SlotAgreementViewRequest::decode(body, &self.set))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                self.receive_view_certificate(requests)
+            }
+            Message::AgreementNilVote(bytes) => {
+                let vote = validator::SlotAgreementNilVote::decode(&bytes, &self.set)
+                    .map_err(|error| error.to_string())?;
+                self.receive_nil_vote(vote)
+            }
+            _ => Err("nonagreement message on authenticated agreement session".into()),
+        }
+    }
+
     /// Receives untrusted owned evidence through the existing authenticated WAL path.
     /// Envelope construction, caller-set decoding and external inspection grant no authority:
     /// the session reauthenticates with its pinned binding and supplied/retained signed DAG.

@@ -9,7 +9,7 @@
 //! u32 body length || u64 sent-at nanos || u8 kind || payload
 //! ```
 //!
-//! Seventeen kinds share a link:
+//! Twenty kinds share a link:
 //!
 //! - [`Message::Hello`] is the first frame on a link and names the chain.
 //! - [`Message::Vertex`] is the broadcast.
@@ -31,6 +31,11 @@
 //!   peer can tell when a want can no longer be served.
 //! - [`Message::SnapshotRelease`] tells a snapshot server that the joiner has
 //!   installed the snapshot, so its floor no longer needs to stay pinned.
+//!
+//! - [`Message::AgreementCarrier`] carries opaque agreement data and supporting vertices.
+//! - [`Message::AgreementViewRequest`], [`Message::AgreementViewCertificate`], and
+//!   [`Message::AgreementNilVote`] carry bounded opaque agreement envelopes;
+//!   authentication and semantic validation belong to the consumer.
 //!
 //! The hello exists because a vertex is only meaningful on one chain: the chain id
 //! is part of what a validator signs, so a peer on another genesis would produce
@@ -83,6 +88,12 @@ const KIND_SNAPSHOT_DECLINED: u8 = 14;
 const KIND_FLOOR: u8 = 15;
 const KIND_SNAPSHOT_RELEASE: u8 = 16;
 const KIND_AGREEMENT_CARRIER: u8 = 17;
+const KIND_AGREEMENT_VIEW_REQUEST: u8 = 18;
+const KIND_AGREEMENT_VIEW_CERTIFICATE: u8 = 19;
+const KIND_AGREEMENT_NIL_VOTE: u8 = 20;
+
+// Matches the slot-decision codec's maximum validator roster; bytes remain capped separately.
+const MAX_AGREEMENT_VIEW_REQUESTS: usize = 4096;
 
 /// Maximum opaque agreement envelope length.
 pub const MAX_AGREEMENT_ENVELOPE: usize = 1024 * 1024;
@@ -98,7 +109,7 @@ pub const MAX_AGREEMENT_EDGES: usize = 65536;
 /// A peer that answers with another number is not necessarily hostile; it may be a
 /// different build. The link is closed rather than parsed optimistically, because
 /// the next frame kind could mean something else there.
-pub const WIRE_PROTOCOL: u16 = 17;
+pub const WIRE_PROTOCOL: u16 = 18;
 
 /// The first frame on every link: which chain the sender is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,6 +261,12 @@ pub enum Message {
     /// it against its own DAG and rebroadcasts it, so a node that missed the
     /// original frame can still adopt the same decision.
     RoundSkip(Box<RoundSkipProof>),
+    /// Opaque view request; not authenticated by this codec.
+    AgreementViewRequest(Vec<u8>),
+    /// Nonempty collection of opaque view requests; not authenticated by this codec.
+    AgreementViewCertificate(Vec<Vec<u8>>),
+    /// Opaque nil vote; not authenticated by this codec.
+    AgreementNilVote(Vec<u8>),
     /// Opaque agreement data and supporting vertices, without authentication or activation.
     AgreementCarrier {
         /// Uninterpreted agreement envelope.
@@ -356,6 +373,62 @@ fn agreement_size_add(size: &mut usize, extra: usize) -> Result<(), CryptoError>
         CryptoError::new(CryptoErrorKind::FieldTooLong, "agreement size overflows")
     })?;
     agreement_bound(*size, MAX_AGREEMENT_PAYLOAD, "payload")
+}
+
+fn encode_view_certificate(items: &[Vec<u8>]) -> Result<Vec<u8>, CryptoError> {
+    agreement_bound(
+        items.len(),
+        MAX_AGREEMENT_VIEW_REQUESTS,
+        "view request count",
+    )?;
+    if items.is_empty() {
+        return Err(invalid("empty agreement view certificate"));
+    }
+    let mut size = 4usize;
+    for item in items {
+        agreement_bound(item.len(), MAX_AGREEMENT_ENVELOPE, "envelope")?;
+        size = size.checked_add(4 + item.len()).ok_or_else(|| {
+            CryptoError::new(CryptoErrorKind::FieldTooLong, "agreement size overflows")
+        })?;
+        agreement_bound(size, MAX_AGREEMENT_ENVELOPE, "view certificate payload")?;
+    }
+    let mut encoder = Encoder::with_capacity(size);
+    encoder.put_u32(count(items.len(), "agreement view request")?);
+    for item in items {
+        encoder.put_bytes(item)?;
+    }
+    Ok(encoder.finish())
+}
+
+fn decode_view_certificate(payload: &[u8]) -> Result<Message, CryptoError> {
+    agreement_bound(
+        payload.len(),
+        MAX_AGREEMENT_ENVELOPE,
+        "view certificate payload",
+    )?;
+    let mut decoder = Decoder::new(payload);
+    let count = decoder.read_u32()? as usize;
+    agreement_bound(count, MAX_AGREEMENT_VIEW_REQUESTS, "view request count")?;
+    if count == 0 {
+        return Err(invalid("empty agreement view certificate"));
+    }
+    // Validate the entire structure before allocating any envelopes or the collection.
+    for _ in 0..count {
+        agreement_bound(
+            decoder.read_bytes()?.len(),
+            MAX_AGREEMENT_ENVELOPE,
+            "envelope",
+        )?;
+    }
+    decoder.finish()?;
+    let mut decoder = Decoder::new(payload);
+    decoder.read_u32()?;
+    let mut items = Vec::with_capacity(count);
+    for _ in 0..count {
+        items.push(decoder.read_bytes()?.to_vec());
+    }
+    decoder.finish()?;
+    Ok(Message::AgreementViewCertificate(items))
 }
 
 fn encode_agreement(envelope: &[u8], vertices: &[Vertex]) -> Result<Vec<u8>, CryptoError> {
@@ -648,6 +721,19 @@ pub fn frame(message: &Message, sent_at_nanos: u64) -> Result<Vec<u8>, CryptoErr
             }
             (KIND_FLOOR, encoder.finish())
         }
+        Message::AgreementViewRequest(envelope) | Message::AgreementNilVote(envelope) => {
+            agreement_bound(envelope.len(), MAX_AGREEMENT_ENVELOPE, "envelope")?;
+            let kind = if matches!(message, Message::AgreementViewRequest(_)) {
+                KIND_AGREEMENT_VIEW_REQUEST
+            } else {
+                KIND_AGREEMENT_NIL_VOTE
+            };
+            (kind, envelope.clone())
+        }
+        Message::AgreementViewCertificate(items) => (
+            KIND_AGREEMENT_VIEW_CERTIFICATE,
+            encode_view_certificate(items)?,
+        ),
         Message::Fence(certificate) => (KIND_FENCE, certificate.encode()?),
         Message::RoundSkip(proof) => (KIND_ROUND_SKIP, proof.encode()?),
         Message::AgreementCarrier { envelope, vertices } => (
@@ -695,11 +781,17 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
     let total = 4usize
         .checked_add(body_len)
         .ok_or_else(|| truncated("frame length overflows"))?;
-    if body_len >= HEADER - 4
-        && buffer.len() >= HEADER
-        && buffer[HEADER - 1] == KIND_AGREEMENT_CARRIER
-    {
-        agreement_bound(body_len - (HEADER - 4), MAX_AGREEMENT_PAYLOAD, "payload")?;
+    if body_len >= HEADER - 4 && buffer.len() >= HEADER {
+        let cap = match buffer[HEADER - 1] {
+            KIND_AGREEMENT_CARRIER => Some(MAX_AGREEMENT_PAYLOAD),
+            KIND_AGREEMENT_VIEW_REQUEST
+            | KIND_AGREEMENT_VIEW_CERTIFICATE
+            | KIND_AGREEMENT_NIL_VOTE => Some(MAX_AGREEMENT_ENVELOPE),
+            _ => None,
+        };
+        if let Some(cap) = cap {
+            agreement_bound(body_len - (HEADER - 4), cap, "payload")?;
+        }
     }
     if buffer.len() < total {
         return Ok(None);
@@ -775,6 +867,9 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
         KIND_FENCE => Message::Fence(Box::new(FenceCertificate::decode(payload)?)),
         KIND_ROUND_SKIP => Message::RoundSkip(Box::new(RoundSkipProof::decode(payload)?)),
         KIND_AGREEMENT_CARRIER => decode_agreement(payload)?,
+        KIND_AGREEMENT_VIEW_REQUEST => Message::AgreementViewRequest(payload.to_vec()),
+        KIND_AGREEMENT_VIEW_CERTIFICATE => decode_view_certificate(payload)?,
+        KIND_AGREEMENT_NIL_VOTE => Message::AgreementNilVote(payload.to_vec()),
         other => return Err(invalid(format!("unknown frame kind {other}"))),
     };
     buffer.drain(..total);
@@ -812,6 +907,172 @@ mod tests {
             round,
             author: b"val-2".to_vec(),
             digest: [round as u8; 32],
+        }
+    }
+
+    fn opaque_frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = agreement_frame(payload);
+        bytes[HEADER - 1] = kind;
+        bytes
+    }
+
+    #[test]
+    fn opaque_agreement_messages_round_trip_fragmented() {
+        for message in [
+            Message::AgreementViewRequest(vec![0, 255, 7]),
+            Message::AgreementViewCertificate(vec![vec![0, 255], vec![], vec![7]]),
+            Message::AgreementNilVote(vec![0, 255, 7]),
+        ] {
+            let bytes = frame(&message, 42).unwrap();
+            let mut buffer = Vec::new();
+            for byte in &bytes[..bytes.len() - 1] {
+                buffer.push(*byte);
+                let before = buffer.clone();
+                assert_eq!(take_frame(&mut buffer).unwrap(), None);
+                assert_eq!(buffer, before);
+            }
+            buffer.push(*bytes.last().unwrap());
+            let decoded = take_frame(&mut buffer).unwrap().unwrap();
+            assert_eq!(decoded.message, message);
+            assert_eq!(decoded.sent_at_nanos, 42);
+            assert_eq!(decoded.len, bytes.len());
+            assert!(buffer.is_empty());
+        }
+    }
+
+    #[test]
+    fn opaque_agreement_envelope_bounds_and_raw_layout() {
+        for (kind, make) in [
+            (
+                KIND_AGREEMENT_VIEW_REQUEST,
+                Message::AgreementViewRequest as fn(Vec<u8>) -> Message,
+            ),
+            (KIND_AGREEMENT_NIL_VOTE, Message::AgreementNilVote),
+        ] {
+            for len in [0, MAX_AGREEMENT_ENVELOPE] {
+                let message = make(vec![255; len]);
+                let mut bytes = frame(&message, 0).unwrap();
+                assert_eq!(bytes.len(), HEADER + len);
+                assert_eq!(bytes[12], kind);
+                assert_eq!(take_frame(&mut bytes).unwrap().unwrap().message, message);
+            }
+            let oversized = vec![0; MAX_AGREEMENT_ENVELOPE + 1];
+            assert_eq!(
+                frame(&make(oversized.clone()), 0).unwrap_err().kind(),
+                CryptoErrorKind::FieldTooLong
+            );
+            assert_eq!(
+                take_frame(&mut opaque_frame(kind, &oversized))
+                    .unwrap_err()
+                    .kind(),
+                CryptoErrorKind::FieldTooLong
+            );
+        }
+    }
+
+    #[test]
+    fn view_certificate_size_and_count_bounds() {
+        for items in [
+            vec![vec![0; MAX_AGREEMENT_ENVELOPE - 8]],
+            vec![vec![]; MAX_AGREEMENT_VIEW_REQUESTS],
+        ] {
+            let message = Message::AgreementViewCertificate(items);
+            let mut bytes = frame(&message, 0).unwrap();
+            assert_eq!(take_frame(&mut bytes).unwrap().unwrap().message, message);
+        }
+        for items in [
+            vec![],
+            vec![vec![]; MAX_AGREEMENT_VIEW_REQUESTS + 1],
+            vec![vec![0; MAX_AGREEMENT_ENVELOPE - 7]],
+            vec![vec![0; MAX_AGREEMENT_ENVELOPE + 1]],
+            vec![vec![0; MAX_AGREEMENT_ENVELOPE / 2]; 2],
+        ] {
+            assert!(frame(&Message::AgreementViewCertificate(items), 0).is_err());
+        }
+        for count in [0, (MAX_AGREEMENT_VIEW_REQUESTS + 1) as u32, u32::MAX] {
+            assert!(
+                take_frame(&mut opaque_frame(
+                    KIND_AGREEMENT_VIEW_CERTIFICATE,
+                    &count.to_le_bytes()
+                ))
+                .is_err()
+            );
+        }
+        let oversized = vec![0; MAX_AGREEMENT_ENVELOPE + 1];
+        assert_eq!(
+            decode_view_certificate(&oversized).unwrap_err().kind(),
+            CryptoErrorKind::FieldTooLong
+        );
+    }
+
+    #[test]
+    fn view_certificate_above_1024_entries_fits_the_byte_budget() {
+        let message = Message::AgreementViewCertificate(vec![vec![7; 256]; 1025]);
+        let mut bytes = frame(&message, 0).unwrap();
+        assert_eq!(take_frame(&mut bytes).unwrap().unwrap().message, message);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn view_certificate_malformed_and_trailing_are_rejected() {
+        let payload = encode_view_certificate(&[vec![0, 255], vec![7]]).unwrap();
+        assert_eq!(&payload[..4], &2u32.to_le_bytes());
+        for end in 0..payload.len() {
+            assert!(
+                take_frame(&mut opaque_frame(
+                    KIND_AGREEMENT_VIEW_CERTIFICATE,
+                    &payload[..end]
+                ))
+                .is_err()
+            );
+        }
+        let mut trailing = payload.clone();
+        trailing.push(0);
+        assert_eq!(
+            take_frame(&mut opaque_frame(
+                KIND_AGREEMENT_VIEW_CERTIFICATE,
+                &trailing
+            ))
+            .unwrap_err()
+            .kind(),
+            CryptoErrorKind::TrailingBytes
+        );
+        let mut malformed = payload;
+        malformed[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(
+            take_frame(&mut opaque_frame(
+                KIND_AGREEMENT_VIEW_CERTIFICATE,
+                &malformed
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn opaque_agreement_caps_reject_at_header_and_kind() {
+        for kind in [
+            KIND_AGREEMENT_VIEW_REQUEST,
+            KIND_AGREEMENT_VIEW_CERTIFICATE,
+            KIND_AGREEMENT_NIL_VOTE,
+        ] {
+            for extra in [0, 1] {
+                let mut prefix = ((9 + MAX_AGREEMENT_ENVELOPE + extra) as u32)
+                    .to_le_bytes()
+                    .to_vec();
+                prefix.extend_from_slice(&0u64.to_le_bytes());
+                assert_eq!(take_frame(&mut prefix).unwrap(), None);
+                prefix.push(kind);
+                let before = prefix.clone();
+                if extra == 0 {
+                    assert_eq!(take_frame(&mut prefix).unwrap(), None);
+                } else {
+                    assert_eq!(
+                        take_frame(&mut prefix).unwrap_err().kind(),
+                        CryptoErrorKind::FieldTooLong
+                    );
+                }
+                assert_eq!(prefix, before);
+            }
         }
     }
 

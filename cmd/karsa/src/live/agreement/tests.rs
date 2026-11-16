@@ -3772,14 +3772,71 @@ fn received_plain_proposal_is_neutral_durable_and_view_votes_after_recovery() {
     assert_eq!(recovered.pending().len(), 1);
 }
 
-#[test]
-fn isolated_tcp_envelope_receipt_persists_neutral_proposal() {
-    use net::wire::{self, Message};
+fn tcp_agreement_message(message: net::wire::Message) -> net::wire::Message {
+    use net::wire;
     use std::sync::{Arc, atomic::AtomicU64};
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{mpsc, watch};
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let timeout = Duration::from_secs(5);
+    let chain_id = b"isolated-agreement-test";
+    runtime.block_on(async {
+        tokio::time::timeout(timeout, async {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let mut sender = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut receiver, remote) = listener.accept().await.unwrap();
+            assert!(remote.ip().is_loopback());
+            let mut sender_buffer = Vec::new();
+            let mut receiver_buffer = Vec::new();
+            let (sent_hello, received_hello) = tokio::join!(
+                super::super::handshake(&mut sender, &mut sender_buffer, chain_id),
+                super::super::handshake(&mut receiver, &mut receiver_buffer, chain_id),
+            );
+            sent_hello.unwrap();
+            received_hello.unwrap();
+            let bytes = wire::frame(&message, 7).unwrap();
+            let (frames, mut received) = mpsc::channel(1);
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let reader = super::super::read_peer(
+                receiver,
+                receiver_buffer,
+                frames,
+                Arc::new(AtomicU64::new(0)),
+                shutdown_rx,
+            );
+            let consumer = async {
+                sender.write_all(&bytes).await.unwrap();
+                let frame = received
+                    .recv()
+                    .await
+                    .expect("peer reader closed before carrier");
+                assert_eq!(frame.sent_at_nanos, 7);
+                shutdown.send(true).unwrap();
+                frame.message
+            };
+            let ((), carrier) = tokio::join!(reader, consumer);
+            carrier
+        })
+        .await
+        .expect("agreement carrier transfer timed out")
+    })
+}
+
+#[test]
+fn isolated_tcp_envelope_receipt_persists_neutral_proposal() {
+    use net::wire::{self, Message};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3823,58 +3880,6 @@ fn isolated_tcp_envelope_receipt_persists_neutral_proposal() {
         });
     }
 
-    let transfer = |envelope: Vec<u8>, vertices: Vec<Vertex>| {
-        runtime.block_on(async {
-            tokio::time::timeout(timeout, async {
-                let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                    .await
-                    .unwrap();
-                let mut sender = TcpStream::connect(listener.local_addr().unwrap())
-                    .await
-                    .unwrap();
-                let (mut receiver, remote) = listener.accept().await.unwrap();
-                assert!(remote.ip().is_loopback());
-                let mut sender_buffer = Vec::new();
-                let mut receiver_buffer = Vec::new();
-                let (sent_hello, received_hello) = tokio::join!(
-                    super::super::handshake(&mut sender, &mut sender_buffer, chain_id),
-                    super::super::handshake(&mut receiver, &mut receiver_buffer, chain_id),
-                );
-                sent_hello.unwrap();
-                received_hello.unwrap();
-                let bytes =
-                    wire::frame(&Message::AgreementCarrier { envelope, vertices }, 7).unwrap();
-                let (frames, mut received) = mpsc::channel(1);
-                let (shutdown, shutdown_rx) = watch::channel(false);
-                let reader = super::super::read_peer(
-                    receiver,
-                    receiver_buffer,
-                    frames,
-                    Arc::new(AtomicU64::new(0)),
-                    shutdown_rx,
-                );
-                let consumer = async {
-                    sender.write_all(&bytes).await.unwrap();
-                    let frame = received
-                        .recv()
-                        .await
-                        .expect("peer reader closed before carrier");
-                    assert_eq!(frame.sent_at_nanos, 7);
-                    shutdown.send(true).unwrap();
-                    // Deliberately test-only dispatch: no live agreement activation.
-                    let Message::AgreementCarrier { envelope, vertices } = frame.message else {
-                        panic!("expected agreement carrier");
-                    };
-                    (envelope, vertices)
-                };
-                let ((), carrier) = tokio::join!(reader, consumer);
-                carrier
-            })
-            .await
-            .expect("agreement carrier transfer timed out")
-        })
-    };
-
     let (m, bootstrap, request) = fixture();
     let AuthenticatedSlotAgreementRequest::Propose { lineage, vertices } = request else {
         unreachable!()
@@ -3901,9 +3906,10 @@ fn isolated_tcp_envelope_receipt_persists_neutral_proposal() {
     let mut evidence = history;
     evidence.push(publications[0].vertex.clone());
 
-    let (received_envelope, received_vertices) = transfer(envelope_bytes.clone(), evidence.clone());
-    assert_eq!(received_envelope, envelope_bytes);
-    assert_eq!(received_vertices, evidence);
+    let received = tcp_agreement_message(Message::AgreementCarrier {
+        envelope: envelope_bytes.clone(),
+        vertices: evidence.clone(),
+    });
 
     let receiver_dir = Dir::new();
     let store = Store::open(&receiver_dir.0).unwrap();
@@ -3912,17 +3918,10 @@ fn isolated_tcp_envelope_receipt_persists_neutral_proposal() {
     let mut receiver = Adapter::begin(&store, receiver_bootstrap.clone(), &m, 1).unwrap();
     let wal = receiver_dir.0.join("authenticated-slot-agreement");
     let before = std::fs::read(&wal).unwrap();
-    let (malformed, malformed_vertices) = transfer(
-        envelope_bytes[..envelope_bytes.len() - 1].to_vec(),
-        evidence,
-    );
-    let rejected = CarrierEnvelope::decode(&malformed, &m.set)
-        .map_err(|error| error.to_string())
-        .and_then(|envelope| {
-            receiver
-                .receive_envelope(envelope, malformed_vertices)
-                .map_err(|error| error.to_string())
-        });
+    let rejected = receiver.receive_message(tcp_agreement_message(Message::AgreementCarrier {
+        envelope: envelope_bytes[..envelope_bytes.len() - 1].to_vec(),
+        vertices: evidence,
+    }));
     assert!(rejected.is_err());
     assert_eq!(std::fs::read(&wal).unwrap(), before);
     recover_envelope_adapter(&mut receiver, &store, &receiver_bootstrap, &m, 1);
@@ -3930,11 +3929,7 @@ fn isolated_tcp_envelope_receipt_persists_neutral_proposal() {
     assert!(receiver.pending().is_empty());
     assert!(receiver.signing_history().is_empty());
 
-    let envelope = CarrierEnvelope::decode(&received_envelope, &m.set).unwrap();
-    assert_eq!(envelope, publications[0].envelope);
-    receiver
-        .receive_envelope(envelope, received_vertices)
-        .unwrap();
+    receiver.receive_message(received).unwrap();
     assert_eq!(receiver.driver.sequence(), 1);
     let persisted = std::fs::read(&wal).unwrap();
     assert_ne!(persisted, before);
@@ -4322,4 +4317,419 @@ fn pacemaker_future_nil_does_not_synchronize_a_slow_adapter() {
         })
     );
     assert_eq!(slow.timer_snapshot().unwrap().view, AgreementView(0));
+}
+
+#[test]
+fn isolated_tcp_view_requests_certificate_catchup_and_duplicate_timeout() {
+    use net::wire::Message;
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, _) = fixture();
+    let dirs: Vec<_> = (0..5).map(|_| Dir::new()).collect();
+    let mut requests = Vec::new();
+    for (i, dir) in dirs[..3].iter().enumerate() {
+        let store = Store::open(&dir.0).unwrap();
+        let mut b = bootstrap.clone();
+        b.agreement.local_validator = m.consensus[i].id.clone();
+        let mut author = Adapter::begin(&store, b, &m, i).unwrap();
+        let request = author.author_view_request(AgreementView(9)).unwrap();
+        assert_eq!(
+            author.completed_view_requests().unwrap(),
+            vec![request.clone()]
+        );
+        requests.push(request.encode(&m.set).unwrap());
+    }
+    let store = Store::open(&dirs[3].0).unwrap();
+    let mut receiver = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    let wal = dirs[3].0.join("authenticated-slot-agreement");
+    let before = std::fs::read(&wal).unwrap();
+    for request in &requests[..m.set.quorum_size() - 1] {
+        receiver
+            .receive_message(tcp_agreement_message(Message::AgreementViewRequest(
+                request.clone(),
+            )))
+            .unwrap();
+    }
+    assert_eq!(std::fs::read(&wal).unwrap(), before);
+    assert_eq!(receiver.driver.sequence(), 0);
+    assert!(
+        receiver.completed_view_requests().unwrap().is_empty(),
+        "receipt must not sign an echo"
+    );
+    receiver
+        .receive_message(tcp_agreement_message(Message::AgreementViewRequest(
+            requests.last().unwrap().clone(),
+        )))
+        .unwrap();
+    assert_eq!(receiver.driver.sequence(), 1);
+    assert_ne!(std::fs::read(&wal).unwrap(), before);
+    drop(receiver);
+    drop(store);
+    let store = Store::open(&dirs[3].0).unwrap();
+    let receiver = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    let certificate: Vec<_> = receiver
+        .entered_view_certificate()
+        .unwrap()
+        .unwrap()
+        .iter()
+        .map(|r| r.encode(&m.set).unwrap())
+        .collect();
+    assert_eq!(certificate.len(), m.set.quorum_size());
+    let laggard_store = Store::open(&dirs[4].0).unwrap();
+    let mut laggard = Adapter::begin(&laggard_store, bootstrap, &m, 0).unwrap();
+    laggard
+        .receive_message(tcp_agreement_message(Message::AgreementViewCertificate(
+            certificate.clone(),
+        )))
+        .unwrap();
+    assert_eq!(laggard.driver.sequence(), 1);
+    let transition = laggard.driver.output().unwrap().transition.unwrap();
+    assert_eq!(transition.view, AgreementView(9));
+    assert!(transition.decision.is_none());
+    assert!(laggard.signing_history().is_empty());
+    laggard
+        .apply(AuthenticatedSlotAgreementRequest::Timeout {
+            view: AgreementView(9),
+            phase: AgreementPhase::Prevote,
+        })
+        .unwrap();
+    let intent = laggard.signing_history().last().unwrap().id;
+    let nil = laggard.author_nil_vote(intent).unwrap().unwrap();
+    let wal = dirs[4].0.join("authenticated-slot-agreement");
+    let before = std::fs::read(&wal).unwrap();
+    let output = format!("{:?}", laggard.driver.output().unwrap());
+    laggard
+        .receive_message(tcp_agreement_message(Message::AgreementViewCertificate(
+            certificate,
+        )))
+        .unwrap();
+    assert_eq!(std::fs::read(&wal).unwrap(), before);
+    assert_eq!(format!("{:?}", laggard.driver.output().unwrap()), output);
+    assert_eq!(laggard.signing_history().len(), 1);
+    assert_eq!(laggard.completed_nil_votes().unwrap()[0].message, nil);
+    assert!(laggard.author_nil_vote(intent).unwrap().is_none());
+}
+
+#[test]
+fn isolated_tcp_nil_quorum_obligations_survive_reopen_without_decision() {
+    use net::wire::Message;
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, _) = fixture();
+    let dirs: Vec<_> = (0..4).map(|_| Dir::new()).collect();
+    let stores: Vec<_> = dirs.iter().map(|d| Store::open(&d.0).unwrap()).collect();
+    let mut authors: Vec<_> = stores[..3]
+        .iter()
+        .enumerate()
+        .map(|(i, store)| {
+            let mut b = bootstrap.clone();
+            b.agreement.local_validator = m.consensus[i].id.clone();
+            Adapter::begin(store, b, &m, i).unwrap()
+        })
+        .collect();
+    let mut votes = Vec::new();
+    for author in &mut authors {
+        author
+            .apply(AuthenticatedSlotAgreementRequest::Timeout {
+                view: AgreementView(0),
+                phase: AgreementPhase::Prevote,
+            })
+            .unwrap();
+        let vote = author
+            .author_nil_vote(author.signing_history()[0].id)
+            .unwrap()
+            .unwrap();
+        votes.push(vote);
+    }
+    let mut receiver = Adapter::begin(&stores[3], bootstrap.clone(), &m, 0).unwrap();
+    for vote in &votes[..2] {
+        receiver
+            .receive_message(tcp_agreement_message(Message::AgreementNilVote(
+                vote.encode(&m.set).unwrap(),
+            )))
+            .unwrap();
+    }
+    assert!(receiver.signing_history().is_empty());
+    let sequence = receiver.driver.sequence();
+    drop(receiver);
+    drop(authors);
+    drop(stores);
+    let stores: Vec<_> = dirs.iter().map(|d| Store::open(&d.0).unwrap()).collect();
+    let mut receiver = Adapter::recover(&stores[3], bootstrap.clone(), &m, 0).unwrap();
+    assert_eq!(receiver.driver.sequence(), sequence);
+    receiver
+        .receive_message(tcp_agreement_message(Message::AgreementNilVote(
+            votes[2].encode(&m.set).unwrap(),
+        )))
+        .unwrap();
+    assert_eq!(
+        receiver.signing_history().len(),
+        1,
+        "the first two receipts must survive reopen"
+    );
+    let intent = receiver.signing_history()[0].clone();
+    assert_eq!(intent.vote.phase, AgreementPhase::Precommit);
+    assert_eq!(intent.vote.value, AgreementValue::Nil);
+    assert!(receiver.completed_nil_votes().unwrap().is_empty());
+    let precommit = receiver.author_nil_vote(intent.id).unwrap().unwrap();
+    drop(receiver);
+    let mut receiver = Adapter::recover(&stores[3], bootstrap, &m, 0).unwrap();
+    assert_eq!(
+        receiver.completed_nil_votes().unwrap()[0].message,
+        precommit
+    );
+    let output = receiver.driver.output().unwrap();
+    assert!(output.candidates.is_empty());
+    let transition = output.transition.unwrap();
+    assert_eq!(transition.view, AgreementView(0));
+    assert!(transition.decision.is_none());
+    assert!(receiver.completed_carriers().unwrap().is_empty());
+}
+
+#[test]
+fn isolated_tcp_message_rejections_preserve_wal_and_check_stale_owner() {
+    use net::wire::Message;
+    let (m, bootstrap, _) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut receiver = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    let mut foreign = bootstrap.clone();
+    foreign.agreement.context = SlotDecisionTip::from_checkpoint(
+        b"foreign-tcp-request".to_vec(),
+        &m.set,
+        1,
+        [0; 32],
+        0,
+        [0; 32],
+    )
+    .unwrap();
+    let wrong_context = signed_view_request(&m, &foreign, 1, 9)
+        .encode(&m.set)
+        .unwrap();
+    let mut forged = signed_view_request(&m, &bootstrap, 1, 9)
+        .encode(&m.set)
+        .unwrap();
+    *forged.last_mut().unwrap() ^= 1;
+    let wal = dir.0.join("authenticated-slot-agreement");
+    let before = std::fs::read(&wal).unwrap();
+    for message in [
+        Message::AgreementViewRequest(wrong_context),
+        Message::AgreementViewRequest(forged),
+        Message::AgreementViewCertificate(vec![vec![0]]),
+        Message::Hello(net::wire::Hello {
+            protocol: net::wire::WIRE_PROTOCOL,
+            chain_id: b"isolated-agreement-test".to_vec(),
+        }),
+    ] {
+        assert!(
+            receiver
+                .receive_message(tcp_agreement_message(message))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&wal).unwrap(), before);
+        recover_envelope_adapter(&mut receiver, &store, &bootstrap, &m, 0);
+    }
+    let mut owner = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+    owner
+        .apply(AuthenticatedSlotAgreementRequest::AdvanceView {
+            from: AgreementView(0),
+        })
+        .unwrap();
+    let before = std::fs::read(&wal).unwrap();
+    let request = signed_view_request(&m, &bootstrap, 1, 9)
+        .encode(&m.set)
+        .unwrap();
+    assert!(
+        receiver
+            .receive_message(tcp_agreement_message(Message::AgreementViewRequest(
+                request
+            )))
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&wal).unwrap(), before);
+    assert_eq!(
+        receiver.readiness(),
+        Readiness::RecoveryRequiredHistoricalIntentsUnavailable
+    );
+}
+
+#[test]
+fn isolated_tcp_malformed_messages_check_ownership_before_decode() {
+    use net::wire::Message;
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, _) = fixture();
+    for malformed in [
+        Message::AgreementViewRequest(vec![0]),
+        Message::AgreementViewCertificate(vec![vec![0]]),
+        Message::AgreementNilVote(vec![0]),
+    ] {
+        let dir = Dir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let mut stale = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+        stale
+            .receive_view_request(signed_view_request(&m, &bootstrap, 1, 9))
+            .unwrap();
+        stale
+            .apply(AuthenticatedSlotAgreementRequest::Timeout {
+                view: AgreementView(0),
+                phase: AgreementPhase::Prevote,
+            })
+            .unwrap();
+        let support = stale.view_requests.clone();
+        let history = format!("{:?}", stale.signing_history());
+        let pending = format!("{:?}", stale.pending());
+        let sequence = stale.driver.sequence();
+        let mut owner = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
+        owner
+            .apply(AuthenticatedSlotAgreementRequest::AdvanceView {
+                from: AgreementView(0),
+            })
+            .unwrap();
+        let ownership_error = stale.driver.output().unwrap_err().to_string();
+        let wal = dir.0.join("authenticated-slot-agreement");
+        let before = std::fs::read(&wal).unwrap();
+        let malformed = tcp_agreement_message(malformed);
+        // First receipt discovers stale ownership; the second exercises the latched
+        // recovery-required boundary, both before attempting structural decoding.
+        assert_eq!(
+            stale.receive_message(malformed.clone()).unwrap_err(),
+            ownership_error
+        );
+        assert_eq!(
+            stale.readiness(),
+            Readiness::RecoveryRequiredHistoricalIntentsUnavailable
+        );
+        assert_eq!(std::fs::read(&wal).unwrap(), before);
+        assert_eq!(stale.view_requests, support);
+        assert_eq!(format!("{:?}", stale.signing_history()), history);
+        assert_eq!(format!("{:?}", stale.pending()), pending);
+        assert_eq!(stale.driver.sequence(), sequence);
+        assert_eq!(
+            stale.receive_message(malformed).unwrap_err(),
+            "agreement owner requires recovery before message receipt"
+        );
+        assert_eq!(std::fs::read(&wal).unwrap(), before);
+        assert_eq!(stale.view_requests, support);
+        assert_eq!(format!("{:?}", stale.signing_history()), history);
+        assert_eq!(format!("{:?}", stale.pending()), pending);
+        assert_eq!(stale.driver.sequence(), sequence);
+    }
+}
+
+#[test]
+fn isolated_tcp_invalid_certificate_tails_nil_authentication_and_kind_substitution_are_atomic() {
+    use net::wire::Message;
+    use validator::slot_agreement::AgreementPhase;
+    let (m, bootstrap, _) = fixture();
+    let mut foreign = bootstrap.clone();
+    foreign.agreement.context = SlotDecisionTip::from_checkpoint(
+        b"foreign-dispatch-evidence".to_vec(),
+        &m.set,
+        1,
+        [0; 32],
+        0,
+        [0; 32],
+    )
+    .unwrap();
+    let prefix: Vec<_> = (0..2)
+        .map(|i| signed_view_request(&m, &bootstrap, i, 9))
+        .collect();
+    let valid_tail = signed_view_request(&m, &bootstrap, 2, 9);
+    let mut signature = valid_tail.signature().clone();
+    signature.signature[0] ^= 1;
+    let forged_tail = validator::SlotAgreementViewRequest::new(
+        bootstrap.agreement.context.clone(),
+        AgreementView(9),
+        signature,
+        &m.set,
+    )
+    .unwrap();
+    let mut messages = Vec::new();
+    for tail in [
+        forged_tail,
+        signed_view_request(&m, &foreign, 2, 9),
+        prefix[0].clone(),
+        signed_view_request(&m, &bootstrap, 2, 8),
+    ] {
+        let certificate: Vec<_> = prefix
+            .iter()
+            .chain(std::iter::once(&tail))
+            .map(|request| request.encode(&m.set).unwrap())
+            .collect();
+        messages.push(Message::AgreementViewCertificate(certificate));
+    }
+    let author_dir = Dir::new();
+    let author_store = Store::open(&author_dir.0).unwrap();
+    let mut author = Adapter::begin(&author_store, bootstrap.clone(), &m, 0).unwrap();
+    author
+        .apply(AuthenticatedSlotAgreementRequest::Timeout {
+            view: AgreementView(0),
+            phase: AgreementPhase::Prevote,
+        })
+        .unwrap();
+    let nil = author
+        .author_nil_vote(author.signing_history()[0].id)
+        .unwrap()
+        .unwrap();
+    let mut signature = nil.signature().clone();
+    signature.signature[0] ^= 1;
+    let forged_nil =
+        validator::SlotAgreementNilVote::new(nil.vote().clone(), signature, &m.set).unwrap();
+    let mut foreign_vote = nil.vote().clone();
+    foreign_vote.context = foreign.agreement.context.clone();
+    let foreign_nil = validator::SlotAgreementNilVote::new(
+        foreign_vote.clone(),
+        ValidatorSignature {
+            validator_id: m.consensus[0].id.clone(),
+            key_id: m.set.validators[0].keys[0].key_id.clone(),
+            signature: Ed25519Scheme
+                .sign(
+                    &m.consensus[0].private_key,
+                    &foreign_vote.signing_payload(&m.set).unwrap(),
+                )
+                .unwrap(),
+        },
+        &m.set,
+    )
+    .unwrap();
+    messages.extend([
+        Message::AgreementNilVote(forged_nil.encode(&m.set).unwrap()),
+        Message::AgreementNilVote(foreign_nil.encode(&m.set).unwrap()),
+        Message::AgreementViewRequest(nil.encode(&m.set).unwrap()),
+        Message::AgreementNilVote(valid_tail.encode(&m.set).unwrap()),
+    ]);
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut receiver = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    let wal = dir.0.join("authenticated-slot-agreement");
+    for (case, message) in messages.into_iter().enumerate() {
+        // Keep real existing support so rejected certificate prefixes cannot clear,
+        // replace, or extend the collection. Recovery may discard it between cases.
+        receiver
+            .receive_view_request(signed_view_request(&m, &bootstrap, 3, 7))
+            .unwrap();
+        let before = std::fs::read(&wal).unwrap();
+        let support = receiver.view_requests.clone();
+        let history = format!("{:?}", receiver.signing_history());
+        let pending = format!("{:?}", receiver.pending());
+        let sequence = receiver.driver.sequence();
+        assert!(
+            receiver
+                .receive_message(tcp_agreement_message(message))
+                .is_err(),
+            "rejection case {case}"
+        );
+        assert_eq!(std::fs::read(&wal).unwrap(), before, "WAL case {case}");
+        assert_eq!(receiver.view_requests, support, "support case {case}");
+        assert_eq!(
+            format!("{:?}", receiver.signing_history()),
+            history,
+            "history case {case}"
+        );
+        assert_eq!(
+            format!("{:?}", receiver.pending()),
+            pending,
+            "pending case {case}"
+        );
+        assert_eq!(receiver.driver.sequence(), sequence, "sequence case {case}");
+        recover_envelope_adapter(&mut receiver, &store, &bootstrap, &m, 0);
+    }
 }
