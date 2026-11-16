@@ -163,6 +163,36 @@ const MAX_CARRIER_EXPORT_EVENTS: u64 = 4096;
 const MAX_CARRIER_RETRY_IDS: usize = 64;
 
 impl Adapter {
+    /// Loads local pre-sign header intents; not certificates or recovered execution state.
+    /// # Errors
+    /// Rejects stale/uncertain owners and corrupt or incompatible durable history.
+    pub fn header_intents(&mut self) -> Result<Vec<store::AgreementHeaderIntent>, String> {
+        self.ordering_snapshot()?;
+        self.driver.header_intents().map_err(|error| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            error.to_string()
+        })
+    }
+
+    /// Reserves the exact header durably before the offline finalizer invokes its signer.
+    /// The genesis state root is caller-trusted; execution correctness is not checked here.
+    /// # Errors
+    /// Rejects conflicting intent, unapplied boundaries, stale owners and publication failure.
+    pub fn reserve_header(
+        &mut self,
+        anchor: &validator::Header,
+        header: &validator::Header,
+        order_len: usize,
+    ) -> Result<(), String> {
+        self.ordering_snapshot()?;
+        self.driver
+            .reserve_header(anchor, header, order_len)
+            .map_err(|error| {
+                self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+                error.to_string()
+            })
+    }
+
     /// Publishes caller-owned execution state and its consumed certified prefix together.
     /// The caller must ensure the state and transaction count were produced by exactly
     /// this consumer. No live state, finalizer, or RPC effects are published here.

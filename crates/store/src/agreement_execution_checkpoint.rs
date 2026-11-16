@@ -126,7 +126,7 @@ impl AuthenticatedSlotAgreement {
         Ok(checkpoint)
     }
 
-    fn check_checkpoint_owner(&self, root: &Path) -> Result<(), StoreError> {
+    pub(super) fn check_checkpoint_owner(&self, root: &Path) -> Result<(), StoreError> {
         exclusions(root)?;
         let journal = read(root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
         if self.uncertain

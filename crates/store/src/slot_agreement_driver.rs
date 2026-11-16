@@ -122,6 +122,25 @@ impl SlotAgreementDriver {
         self.session.put_execution_checkpoint(order, applied, state)
     }
 
+    /// Loads exact pre-sign header intents bound to applied agreement history.
+    /// # Errors
+    /// Rejects stale owners, corrupt records and incompatible history.
+    pub fn header_intents(&self) -> Result<Vec<crate::AgreementHeaderIntent>, StoreError> {
+        self.session.header_intents()
+    }
+
+    /// Reserves a header durably before an external signer is invoked.
+    /// # Errors
+    /// Rejects conflicts, missing application boundaries and publication failures.
+    pub fn reserve_header(
+        &mut self,
+        anchor: &validator::Header,
+        header: &validator::Header,
+        order_len: usize,
+    ) -> Result<(), StoreError> {
+        self.session.reserve_header(anchor, header, order_len)
+    }
+
     /// Returns the number of durable requests installed by this owner.
     pub fn sequence(&self) -> u64 {
         self.session.sequence()

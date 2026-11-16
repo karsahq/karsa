@@ -285,7 +285,7 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
     drop(adapter);
     drop(store);
     let store = Store::open(&dir.0).unwrap();
-    let mut adapter = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    let mut adapter = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
     let recovered = adapter.ordering_snapshot().unwrap();
     assert_eq!(format!("{recovered:?}"), format!("{complete:?}"));
 
@@ -336,9 +336,26 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
     let mut coordinator =
         CertifiedFinalization::begin(recovered.clone(), genesis, finalizer).unwrap();
     let controls = BTreeSet::new();
+    assert!(adapter.header_intents().unwrap().is_empty());
     let built = coordinator
-        .build_ready(&m, &batches, &controls, 42)
+        .build_ready_with_reservation(&m, &batches, &controls, 42, |header, coverage| {
+            adapter
+                .reserve_header(&anchor, header, coverage)
+                .map_err(|error| {
+                    crypto::CryptoError::new(crypto::CryptoErrorKind::InvalidVertex, error)
+                })
+        })
         .unwrap();
+    let durable_intents = adapter.header_intents().unwrap();
+    assert_eq!(durable_intents.len(), 2);
+    for (index, intent) in durable_intents.iter().enumerate() {
+        assert_eq!(intent.header(), &built.shares[index].header);
+        assert_eq!(intent.application(), index);
+        assert_eq!(
+            intent.order_len(),
+            recovered.applications()[index].order_len()
+        );
+    }
     assert_eq!(built.shares.len(), 2);
     assert!(built.certified.is_empty());
     let mut previous = anchor.id().unwrap();
@@ -609,6 +626,31 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
     assert_eq!(coordinator.finalizer().head(), &built.shares[1].header);
     assert_eq!(coordinator.execution().state(), &expected);
     assert_eq!(coordinator.execution().applied(), applied);
+    drop(adapter);
+    drop(store);
+    let store = Store::open(&dir.0).unwrap();
+    let mut adapter = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    assert_eq!(adapter.header_intents().unwrap(), durable_intents);
+    // Replay from trusted genesis can re-reserve identical bytes without a new intent.
+    let mut replay = make_coordinator();
+    let replayed = replay
+        .build_ready_with_reservation(&m, &batches, &controls, 99, |header, coverage| {
+            adapter
+                .reserve_header(&anchor, header, coverage)
+                .map_err(|error| {
+                    crypto::CryptoError::new(crypto::CryptoErrorKind::InvalidVertex, error)
+                })
+        })
+        .unwrap();
+    assert_eq!(replayed.shares.len(), 2);
+    assert_eq!(adapter.header_intents().unwrap(), durable_intents);
+    let mut conflict = built.shares[0].header.clone();
+    conflict.state_root[0] ^= 1;
+    assert!(
+        adapter
+            .reserve_header(&anchor, &conflict, durable_intents[0].order_len())
+            .is_err()
+    );
     assert_eq!(
         std::fs::read(dir.0.join("authenticated-slot-agreement")).unwrap(),
         wal

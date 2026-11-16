@@ -27,6 +27,10 @@
 //! local state bytes with a consumed certified prefix in one synced atomic replacement.
 //! It stays at the signing root, does not certify execution, and cannot authorize pruning.
 //!
+//! Inactive header intents separately reserve exact bytes at applied certified commit
+//! boundaries before signing. Their root-level atomic replacements are synced even on
+//! identical reservations. They do not recover finalizer state or authorize pruning.
+//!
 //! Other logs do not fsync on every append: durability of the last record is the
 //! caller's tradeoff, and `Store::sync` exists for callers that want it.
 
@@ -67,11 +71,11 @@ pub use slot_agreement_driver::{
 mod slot_agreement_journal;
 pub use authenticated_slot_agreement::{
     AgreementApplicationBoundary, AgreementCarrierEvidence, AgreementCompletedCarrier,
-    AgreementCompletedNilVote, AgreementExecutionCheckpoint, AgreementOrderingSnapshot,
-    AgreementQuorumCandidate, AgreementReproposalCandidate, AgreementReservedCarrier,
-    AgreementSigningIntent, AgreementSigningPrerequisite, AgreementViewRequestReservation,
-    AuthenticatedSlotAgreement, AuthenticatedSlotAgreementBootstrap,
-    AuthenticatedSlotAgreementRequest,
+    AgreementCompletedNilVote, AgreementExecutionCheckpoint, AgreementHeaderIntent,
+    AgreementOrderingSnapshot, AgreementQuorumCandidate, AgreementReproposalCandidate,
+    AgreementReservedCarrier, AgreementSigningIntent, AgreementSigningPrerequisite,
+    AgreementViewRequestReservation, AuthenticatedSlotAgreement,
+    AuthenticatedSlotAgreementBootstrap, AuthenticatedSlotAgreementRequest,
 };
 #[cfg(test)]
 mod slot_agreement_signing_tests;
@@ -574,6 +578,7 @@ impl Store {
                 || name == authenticated_slot_agreement::FILE
                 || name == "agreement-execution-checkpoint"
                 || name == "agreement-execution-checkpoint.tmp"
+                || name == "agreement-header-intents"
                 || name == ".lock"
                 || name == "CURRENT"
                 || name == "CURRENT.tmp"

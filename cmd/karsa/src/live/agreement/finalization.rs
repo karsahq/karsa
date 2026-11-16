@@ -12,7 +12,8 @@ use super::{CertifiedExecution, Membership};
 
 /// Captures execution roots at durable application boundaries, never legacy DAG commits.
 /// This offline path can sign headers: use isolated identities, not live signing keys.
-/// Finalizer recovery/signing durability and publication are deliberately unsupported.
+/// Finalizer recovery and publication remain unsupported. Durable signing intent requires
+/// an external reservation callback; the default build method makes no durable reservation.
 /// Chain membership, finalizer set configuration and genesis state are caller-trusted.
 /// Skips do not allocate header heights; every applied commit does, including empty ones.
 pub struct CertifiedFinalization {
