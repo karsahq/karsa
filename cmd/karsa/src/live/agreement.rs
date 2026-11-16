@@ -1967,6 +1967,7 @@ pub(super) fn disabled_guard(store: &Store) -> Result<(), String> {
 }
 
 mod envelope;
+pub mod event_pump;
 mod execution;
 mod finalization;
 mod journaled_finalization;

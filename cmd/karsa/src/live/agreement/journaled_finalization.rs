@@ -149,6 +149,41 @@ impl JournaledFinalization {
         self.coordinator.receive_share(membership, share)
     }
 
+    /// Receives decoded wire evidence without applying a slot or executing payloads.
+    /// # Errors
+    /// Invalid messages retain the adapter's retry semantics; stale ownership and durable
+    /// failures close this owner. No legacy agreement path is used.
+    pub fn receive_agreement_message(&mut self, message: net::wire::Message) -> Result<(), String> {
+        self.ensure_usable()?;
+        let result = self.adapter.receive_message(message);
+        self.refresh()?;
+        result
+    }
+
+    /// Explicitly applies the certified slot, leaving execution to [`Self::build_ready`].
+    /// # Errors
+    /// An undecided slot is retryable. Adapter or durable refresh failures close this owner.
+    pub fn advance_certified_slot(&mut self) -> Result<(), String> {
+        self.ensure_usable()?;
+        self.refresh()?;
+        // Avoid sending a known-invalid local request into Adapter's fail-closed apply path.
+        let output = self.adapter.driver.output().map_err(|error| {
+            self.failed = true;
+            error.to_string()
+        })?;
+        if !output
+            .transition
+            .is_some_and(|transition| transition.decision.is_some())
+        {
+            return Err("cannot advance an undecided slot".into());
+        }
+        let result = self
+            .adapter
+            .apply(store::AuthenticatedSlotAgreementRequest::AdvanceSlot);
+        self.refresh()?;
+        result
+    }
+
     /// Read-only execution and finalizer diagnostics; mutation cannot bypass reservation.
     pub fn finalization(&self) -> &CertifiedFinalization {
         &self.coordinator
@@ -206,6 +241,12 @@ impl JournaledFinalization {
             self.failed = true;
         }
         result
+    }
+
+    /// Checks owner/coordinator poison state without interpreting diagnostic strings.
+    pub(super) fn check_health(&mut self) -> Result<(), String> {
+        self.ensure_usable()?;
+        self.refresh().map(|_| ())
     }
 
     fn ensure_usable(&self) -> Result<(), String> {

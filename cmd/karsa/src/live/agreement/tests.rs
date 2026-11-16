@@ -18,6 +18,11 @@ fn certified_finalization_reopens_and_continues_durable_history() {
 }
 
 #[test]
+fn journaled_finalization_receives_wire_and_explicitly_continues_same_owner() {
+    authenticated_commit_replay_fixture(AuthenticatedReplayMode::SameOwnerWire);
+}
+
+#[test]
 fn certified_finalization_restore_publication_failure_requires_reopening() {
     authenticated_commit_replay_fixture(AuthenticatedReplayMode::RestorePublicationFailure);
 }
@@ -35,10 +40,29 @@ fn certified_finalization_restore_io_failures_require_reopening() {
     }
 }
 
+#[test]
+fn isolated_event_pump_tcp_certified_execution() {
+    authenticated_commit_replay_fixture(AuthenticatedReplayMode::EventPump);
+}
+
+#[test]
+fn isolated_event_pump_ready_cancel_precedes_local_apply() {
+    authenticated_commit_replay_fixture(AuthenticatedReplayMode::EventPumpCancelReady);
+}
+
+#[test]
+fn isolated_event_pump_output_closed_after_reserve_precedes_local_apply() {
+    authenticated_commit_replay_fixture(AuthenticatedReplayMode::EventPumpClosedReady);
+}
+
 #[derive(Clone, Copy)]
 enum AuthenticatedReplayMode {
+    EventPump,
+    EventPumpCancelReady,
+    EventPumpClosedReady,
     ExistingBoundaries,
     ContinueAfterRecovery,
+    SameOwnerWire,
     RestorePublicationFailure,
     RestoreIoFailure(store::SharePublicationStage),
 }
@@ -219,6 +243,30 @@ fn authenticated_commit_replay_fixture(mode: AuthenticatedReplayMode) {
     );
     let dir = Dir::new();
     let store = Store::open(&dir.0).unwrap();
+    if matches!(
+        mode,
+        AuthenticatedReplayMode::EventPumpCancelReady
+            | AuthenticatedReplayMode::EventPumpClosedReady
+    ) {
+        let owner = open_event_pump_owner(&store, &bootstrap, &m);
+        let envelope = CarrierEnvelope::from_publication(
+            carrier,
+            CarrierPayload::Final(proof.clone()),
+            proof.digest(&m.set).unwrap(),
+            &m.set,
+        )
+        .unwrap();
+        let message = net::wire::Message::AgreementCarrier {
+            envelope: envelope.encode(&m.set).unwrap(),
+            vertices,
+        };
+        exercise_event_pump_stop(owner, m, message, mode);
+        return;
+    }
+    if matches!(mode, AuthenticatedReplayMode::EventPump) {
+        exercise_event_pump(&store, bootstrap, m, batches, proof, carrier, vertices);
+        return;
+    }
     let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
     adapter
         .apply(AuthenticatedSlotAgreementRequest::ObservePrecommit {
@@ -996,7 +1044,10 @@ fn authenticated_commit_replay_fixture(mode: AuthenticatedReplayMode) {
             .is_empty()
     );
     assert_eq!(adapter.header_shares().unwrap(), persisted);
-    if matches!(mode, AuthenticatedReplayMode::ContinueAfterRecovery) {
+    if matches!(
+        mode,
+        AuthenticatedReplayMode::ContinueAfterRecovery | AuthenticatedReplayMode::SameOwnerWire
+    ) {
         // The third leader is fresh; its authenticated cone includes additional real
         // batches from round two, not just a synthetic snapshot boundary.
         let mut dag = Dag::new(m.set.clone());
@@ -1063,6 +1114,158 @@ fn authenticated_commit_replay_fixture(mode: AuthenticatedReplayMode) {
             proposal_carrier.unwrap(),
             16,
         );
+        if matches!(mode, AuthenticatedReplayMode::SameOwnerWire) {
+            use net::wire::{self, Message};
+            assert_eq!(
+                share_replay.advance_certified_slot().unwrap_err(),
+                "cannot advance an undecided slot"
+            );
+            // Structural rejection is not a durable failure and must not poison the owner.
+            assert!(
+                share_replay
+                    .receive_agreement_message(Message::AgreementCarrier {
+                        envelope: vec![0],
+                        vertices: Vec::new(),
+                    })
+                    .is_err()
+            );
+            let envelope = CarrierEnvelope::from_publication(
+                carrier,
+                CarrierPayload::Final(proof.clone()),
+                proof.digest(&m.set).unwrap(),
+                &m.set,
+            )
+            .unwrap();
+            let message = Message::AgreementCarrier {
+                envelope: envelope.encode(&m.set).unwrap(),
+                vertices: vertices.clone(),
+            };
+            let receive = |owner: &mut JournaledFinalization| {
+                let mut bytes = wire::frame(&message, 123).unwrap();
+                let frame = wire::take_frame(&mut bytes).unwrap().unwrap();
+                assert!(bytes.is_empty());
+                owner.receive_agreement_message(frame.message).unwrap();
+            };
+            receive(&mut share_replay);
+            receive(&mut share_replay);
+            assert!(
+                share_replay
+                    .build_ready(&m, &batches, &controls, 199)
+                    .unwrap()
+                    .shares
+                    .is_empty()
+            );
+            assert_eq!(share_replay.finalization().execution().state(), &expected);
+            assert_eq!(
+                share_replay.finalization().finalizer().last_built(),
+                &built.shares[1].header
+            );
+            share_replay.advance_certified_slot().unwrap();
+            assert_eq!(
+                share_replay.advance_certified_slot().unwrap_err(),
+                "cannot advance an undecided slot"
+            );
+            let third = Adapter::recover(&store, bootstrap.clone(), &m, 0)
+                .unwrap()
+                .ordering_snapshot()
+                .unwrap();
+            assert_eq!(third.order(), third_order);
+            assert_eq!(third.applications().len(), 3);
+            let controls: BTreeSet<_> = vertices
+                .iter()
+                .filter(|v| !batches.contains_key(&v.payload_hash))
+                .map(|v| v.payload_hash)
+                .collect();
+            let missing = third
+                .vertices()
+                .iter()
+                .find(|v| {
+                    third.order()[recovered.order().len()..].contains(&v.id().unwrap())
+                        && batches.contains_key(&v.payload_hash)
+                })
+                .unwrap()
+                .payload_hash;
+            let mut incomplete = batches.clone();
+            incomplete.remove(&missing);
+            assert!(
+                share_replay
+                    .build_ready(&m, &incomplete, &controls, 200)
+                    .unwrap()
+                    .shares
+                    .is_empty()
+            );
+            assert_eq!(
+                share_replay.finalization().finalizer().last_built(),
+                &built.shares[1].header
+            );
+            coordinator.update(third.clone()).unwrap();
+            let expected_build = coordinator
+                .build_ready(&m, &batches, &controls, 200)
+                .unwrap();
+            let resumed = share_replay
+                .build_ready(&m, &batches, &controls, 200)
+                .unwrap();
+            assert_eq!(resumed.shares, expected_build.shares);
+            assert_eq!(resumed.shares.len(), 1);
+            let local = resumed.shares[0].clone();
+            assert_eq!(local.header.height, 3);
+            assert_eq!(local.header.previous, built.shares[1].header.id().unwrap());
+            assert_eq!(
+                share_replay.finalization().execution().state(),
+                coordinator.execution().state()
+            );
+            assert_eq!(
+                share_replay.finalization().execution().applied(),
+                coordinator.execution().applied()
+            );
+            assert_eq!(
+                share_replay.finalization().execution().consumed_order(),
+                third.order()
+            );
+            for signer in [1, 2] {
+                let mut peer = local.clone();
+                peer.signer = signer;
+                peer.at = 200 + signer as u64;
+                peer.signature = Ed25519Scheme
+                    .sign(
+                        &m.consensus[signer].private_key,
+                        &validator::signing_payload(&peer.header).unwrap(),
+                    )
+                    .unwrap();
+                let expected = coordinator.receive_share(&m, peer.clone()).unwrap();
+                let actual = share_replay.receive_share(&m, peer.clone()).unwrap();
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert_eq!(actual.header, expected.header);
+                    assert_eq!(actual.certificate, expected.certificate);
+                    assert_eq!(actual.at, expected.at);
+                    share_replay
+                        .finalization()
+                        .finalizer()
+                        .verify_certificate(&actual.header, &actual.certificate)
+                        .unwrap();
+                }
+                assert!(share_replay.receive_share(&m, peer).unwrap().is_empty());
+            }
+            assert_eq!(
+                share_replay.finalization().finalizer().head(),
+                &local.header
+            );
+            let applied = share_replay.finalization().execution().applied();
+            assert!(
+                share_replay
+                    .build_ready(&m, &batches, &controls, 999)
+                    .unwrap()
+                    .shares
+                    .is_empty()
+            );
+            assert_eq!(share_replay.finalization().execution().applied(), applied);
+            assert_eq!(
+                share_replay.finalization().finalizer().last_built(),
+                &local.header
+            );
+            return;
+        }
         let mut owner = Adapter::recover(&store, bootstrap.clone(), &m, 0).unwrap();
         owner
             .apply(AuthenticatedSlotAgreementRequest::ObservePrecommit {
@@ -6768,6 +6971,522 @@ fn received_plain_proposal_is_neutral_durable_and_view_votes_after_recovery() {
     assert_eq!(recovered.driver.sequence(), 2);
     assert_eq!(format!("{:?}", recovered.signing_history()), history);
     assert_eq!(recovered.pending().len(), 1);
+}
+
+fn open_event_pump_owner(
+    store: &Store,
+    bootstrap: &AuthenticatedSlotAgreementBootstrap,
+    m: &Membership,
+) -> JournaledFinalization {
+    let chain_id = bootstrap.agreement.context.chain_id().to_vec();
+    let genesis = chain::genesis_state(&m.accounts).unwrap();
+    let anchor = validator::Header::genesis(
+        chain_id.clone(),
+        m.set.epoch,
+        genesis.state_root(),
+        *bootstrap.agreement.context.order_root(),
+    );
+    let finalizer = validator::Finalizer::new(
+        validator::SetSchedule::single(m.set.clone()),
+        validator::EpochSchedule::single(m.set.epoch),
+        chain_id,
+        m.consensus[0].id.clone(),
+        m.consensus[0].private_key.clone(),
+        anchor,
+        0,
+    )
+    .unwrap();
+    JournaledFinalization::open(
+        Adapter::begin(store, bootstrap.clone(), m, 0).unwrap(),
+        genesis,
+        finalizer,
+    )
+    .unwrap()
+}
+
+fn exercise_event_pump_stop(
+    mut owner: JournaledFinalization,
+    m: Membership,
+    evidence: net::wire::Message,
+    mode: AuthenticatedReplayMode,
+) {
+    use super::event_pump::{EventPump, LocalEvent};
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+        time::Duration,
+    };
+    use tokio::sync::watch;
+
+    owner.receive_agreement_message(evidence).unwrap();
+    assert!(
+        owner
+            .finalization()
+            .execution()
+            .snapshot()
+            .applications()
+            .is_empty()
+    );
+    let (pump, channels) =
+        EventPump::new(owner, m, Default::default(), 1.try_into().unwrap(), 0, 0);
+    let (cancel, cancel_rx) = watch::channel(false);
+    let mut output = Some(channels.output);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut run = Box::pin(pump.run(cancel_rx));
+            let mut context = Context::from_waker(Waker::noop());
+            // Poll exactly once while ingress is idle: the output permit is now held
+            // and the second select is pending. No sleep or scheduler timing assumption.
+            assert!(matches!(run.as_mut().poll(&mut context), Poll::Pending));
+            assert_eq!(
+                output.as_ref().unwrap().capacity(),
+                0,
+                "pump must have reserved output"
+            );
+            channels
+                .local
+                .try_send(LocalEvent::ApplyCertifiedSlot { at: 42 })
+                .unwrap();
+            if matches!(mode, AuthenticatedReplayMode::EventPumpCancelReady) {
+                cancel.send(true).unwrap();
+            } else {
+                drop(output.take());
+            }
+            // Both stop notification and mutating local application are ready on
+            // the very next poll. The queued application must remain unconsumed.
+            let (owner, result) = tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .unwrap();
+            if matches!(mode, AuthenticatedReplayMode::EventPumpCancelReady) {
+                result.unwrap();
+            } else {
+                assert!(result.unwrap_err().contains("output closed"));
+            }
+            if let Some(mut output) = output {
+                assert!(output.recv().await.is_none());
+            }
+            assert!(
+                owner
+                    .finalization()
+                    .execution()
+                    .snapshot()
+                    .applications()
+                    .is_empty()
+            );
+            assert_eq!(owner.finalization().execution().applied(), 0);
+            assert_eq!(owner.finalization().finalizer().built_headers(), 0);
+            // Prove this was actionable certified evidence, not an inert test event.
+            let mut owner = owner;
+            owner.advance_certified_slot().unwrap();
+            assert_eq!(
+                owner
+                    .finalization()
+                    .execution()
+                    .snapshot()
+                    .applications()
+                    .len(),
+                1
+            );
+        });
+}
+
+fn exercise_event_pump(
+    store: &Store,
+    bootstrap: AuthenticatedSlotAgreementBootstrap,
+    m: Membership,
+    batches: std::collections::BTreeMap<[u8; 32], tx::batch::Batch>,
+    proof: validator::SlotAgreementProof,
+    carrier: VertexId,
+    vertices: Vec<Vertex>,
+) {
+    use super::event_pump::{EventPump, LocalEvent};
+    use net::wire::{self, Message};
+    use std::{collections::BTreeSet, sync::Arc, time::Duration};
+    use tokio::{
+        io::AsyncWriteExt,
+        net::{TcpListener, TcpStream},
+        sync::watch,
+    };
+
+    let accounts = &m.accounts;
+    let chain_id = bootstrap.agreement.context.chain_id().to_vec();
+    let owner = open_event_pump_owner(store, &bootstrap, &m);
+    let anchor = owner.finalization().finalizer().head().clone();
+    // The authentic fixture commits all round-zero vertices and its round-one
+    // leader. This expected set is test data, not runtime control inference.
+    let validator::slot_agreement::AgreementValue::Decision(decision) =
+        &proof.certificate.vote.value
+    else {
+        panic!("commit fixture");
+    };
+    let SlotOutcome::Commit { leader } = &decision.outcome else {
+        panic!("commit fixture");
+    };
+    let required: BTreeSet<_> = vertices
+        .iter()
+        .filter(|vertex| vertex.round == 0 || vertex.id().unwrap() == *leader)
+        .map(|vertex| vertex.payload_hash)
+        .collect();
+    // Exact retained canonical-byte/count budgets: unrelated traffic must consume
+    // neither. These are not total-memory bounds on decoded batches or channels.
+    let retained_encoded_bytes = required
+        .iter()
+        .map(|hash| batches[hash].encode().unwrap().len())
+        .sum();
+    let (pump, mut channels) = EventPump::new(
+        owner,
+        m.clone(),
+        BTreeSet::new(),
+        1.try_into().unwrap(),
+        required.len(),
+        retained_encoded_bytes,
+    );
+    let envelope = CarrierEnvelope::from_publication(
+        carrier,
+        CarrierPayload::Final(proof.clone()),
+        proof.digest(&m.set).unwrap(),
+        &m.set,
+    )
+    .unwrap();
+    let evidence = Message::AgreementCarrier {
+        envelope: envelope.encode(&m.set).unwrap(),
+        vertices,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let mut sender = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut receiver, _) = listener.accept().await.unwrap();
+            let mut send_buffer = Vec::new();
+            let mut receive_buffer = Vec::new();
+            let (a, b) = tokio::join!(
+                super::super::handshake(&mut sender, &mut send_buffer, &chain_id),
+                super::super::handshake(&mut receiver, &mut receive_buffer, &chain_id),
+            );
+            a.unwrap();
+            b.unwrap();
+            let (cancel, cancel_rx) = watch::channel(false);
+            let (stop_reader, reader_rx) = watch::channel(false);
+            let reader = super::super::read_peer(
+                receiver,
+                receive_buffer,
+                channels.frames.clone(),
+                Arc::new(AtomicU64::new(0)),
+                reader_rx,
+            );
+            let client = async {
+                sender
+                    .write_all(&wire::frame(&evidence, 999).unwrap())
+                    .await
+                    .unwrap();
+                let receipt = channels.output.recv().await.unwrap();
+                assert!(receipt.error.is_none());
+                assert!(receipt.build.shares.is_empty() && receipt.build.certified.is_empty());
+                channels
+                    .local
+                    .send(LocalEvent::BuildReady { at: 40 })
+                    .await
+                    .unwrap();
+                assert!(
+                    channels
+                        .output
+                        .recv()
+                        .await
+                        .unwrap()
+                        .build
+                        .shares
+                        .is_empty()
+                );
+                sender
+                    .write_all(&wire::frame(&evidence, 0).unwrap())
+                    .await
+                    .unwrap();
+                let duplicate = channels.output.recv().await.unwrap();
+                assert!(duplicate.error.is_none());
+                assert!(duplicate.build.shares.is_empty());
+                // Even a required batch arriving before local certified application
+                // is rejected, not staged. The sender must retransmit after apply.
+                let early = batches[required.first().unwrap()].clone();
+                sender
+                    .write_all(&wire::frame(&Message::Payload(early), 0).unwrap())
+                    .await
+                    .unwrap();
+                assert!(
+                    channels
+                        .output
+                        .recv()
+                        .await
+                        .unwrap()
+                        .error
+                        .unwrap()
+                        .contains("retransmit")
+                );
+                channels
+                    .local
+                    .send(LocalEvent::ApplyCertifiedSlot { at: 41 })
+                    .await
+                    .unwrap();
+                let missing = channels.output.recv().await.unwrap();
+                assert!(missing.error.is_none());
+                assert!(missing.build.shares.is_empty());
+                // Flood more unrelated, valid batches than the entire admission
+                // budget, after certification but before any required batch arrives.
+                for round in 100..100 + required.len() as u64 + 2 {
+                    let unrelated = chain::demo_batch(&chain_id, accounts, 0, round, 1).unwrap();
+                    sender
+                        .write_all(&wire::frame(&Message::Payload(unrelated), 0).unwrap())
+                        .await
+                        .unwrap();
+                    let rejected = channels.output.recv().await.unwrap();
+                    assert!(rejected.error.unwrap().contains("not required"));
+                    assert!(rejected.build.shares.is_empty());
+                }
+                let mut resumed = Vec::new();
+                for hash in &required {
+                    let batch = &batches[hash];
+                    sender
+                        .write_all(&wire::frame(&Message::Payload(batch.clone()), 999).unwrap())
+                        .await
+                        .unwrap();
+                    let indexed = channels.output.recv().await.unwrap();
+                    assert!(indexed.error.is_none());
+                    resumed.extend(indexed.build.shares);
+                }
+                channels
+                    .local
+                    .send(LocalEvent::BuildReady { at: 42 })
+                    .await
+                    .unwrap();
+                let built = channels.output.recv().await.unwrap();
+                assert!(built.error.is_none(), "{:?}", built.error);
+                assert!(
+                    built.build.shares.is_empty(),
+                    "payload arrival already resumed the build"
+                );
+                assert_eq!(resumed.len(), 1);
+                let local = resumed[0].clone();
+                assert_eq!(
+                    local.at, 41,
+                    "wire timestamps are not local authoring authority"
+                );
+                assert_eq!(local.header.height, 1);
+                assert_eq!(local.header.previous, anchor.id().unwrap());
+                let validator::slot_agreement::AgreementValue::Decision(decision) =
+                    &proof.certificate.vote.value
+                else {
+                    panic!("commit fixture");
+                };
+                assert_eq!(local.header.dag_root, decision.after_root);
+                channels
+                    .local
+                    .send(LocalEvent::ApplyCertifiedSlot { at: 43 })
+                    .await
+                    .unwrap();
+                assert!(channels.output.recv().await.unwrap().error.is_some());
+                channels
+                    .local
+                    .send(LocalEvent::BuildReady { at: 44 })
+                    .await
+                    .unwrap();
+                assert!(
+                    channels
+                        .output
+                        .recv()
+                        .await
+                        .unwrap()
+                        .build
+                        .shares
+                        .is_empty()
+                );
+                for signer in [1, 2] {
+                    let mut peer = local.clone();
+                    peer.signer = signer;
+                    peer.at = 50 + signer as u64;
+                    peer.signature = Ed25519Scheme
+                        .sign(
+                            &m.consensus[signer].private_key,
+                            &validator::signing_payload(&peer.header).unwrap(),
+                        )
+                        .unwrap();
+                    if signer == 1 {
+                        let mut invalid = peer.clone();
+                        invalid.header.state_root[0] ^= 1;
+                        sender
+                            .write_all(&wire::frame(&Message::Share(invalid), 0).unwrap())
+                            .await
+                            .unwrap();
+                        assert!(channels.output.recv().await.unwrap().error.is_some());
+                    }
+                    sender
+                        .write_all(&wire::frame(&Message::Share(peer.clone()), 0).unwrap())
+                        .await
+                        .unwrap();
+                    if signer == 2 {
+                        // Leave certified output queued while a later ordinary error
+                        // waits behind the output reservation barrier.
+                        sender
+                            .write_all(&wire::frame(&Message::SnapshotWant, 0).unwrap())
+                            .await
+                            .unwrap();
+                    }
+                    let output = channels.output.recv().await.unwrap();
+                    assert!(output.error.is_none());
+                    assert_eq!(output.build.certified.len(), usize::from(signer == 2));
+                    if signer == 2 {
+                        let certified = &output.build.certified[0];
+                        assert_eq!(certified.header, local.header);
+                        assert!(channels.output.recv().await.unwrap().error.is_some());
+                    }
+                    sender
+                        .write_all(&wire::frame(&Message::Share(peer), 0).unwrap())
+                        .await
+                        .unwrap();
+                    let duplicate = channels.output.recv().await.unwrap();
+                    assert!(duplicate.error.is_none());
+                    assert!(duplicate.build.certified.is_empty());
+                }
+                // Cancel while output is full; the completed response remains drainable.
+                channels
+                    .local
+                    .send(LocalEvent::BuildReady { at: 60 })
+                    .await
+                    .unwrap();
+                while channels.output.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+                cancel.send(true).unwrap();
+                stop_reader.send(true).unwrap();
+                let queued = channels.output.recv().await.unwrap();
+                assert!(queued.error.is_none());
+            };
+            let ((owner, result), (), ()) = tokio::join!(pump.run(cancel_rx), reader, client);
+            result.unwrap();
+            assert_eq!(owner.finalization().finalizer().built_headers(), 1);
+            assert_eq!(owner.finalization().finalizer().head().height, 1);
+            assert!(owner.finalization().execution().applied() > 0);
+            let mut expected = chain::genesis_state(accounts).unwrap();
+            let Message::AgreementCarrier { vertices, .. } = &evidence else {
+                unreachable!()
+            };
+            let mut rejected = std::collections::BTreeMap::new();
+            for id in owner.finalization().execution().consumed_order() {
+                let vertex = vertices
+                    .iter()
+                    .find(|vertex| vertex.id().unwrap() == *id)
+                    .unwrap();
+                chain::apply_batch(
+                    &mut expected,
+                    accounts,
+                    &batches[&vertex.payload_hash],
+                    &mut rejected,
+                );
+            }
+            assert!(rejected.is_empty());
+            assert_eq!(owner.finalization().execution().state(), &expected);
+            assert_eq!(
+                owner.finalization().finalizer().head().state_root,
+                expected.state_root()
+            );
+
+            // Index exhaustion and ambiguous classification are ordinary errors;
+            // neither may hide a subsequent loss of durable ownership.
+            let first_batch = batches[required.first().unwrap()].clone();
+            let controls = BTreeSet::from([first_batch.digest().unwrap()]);
+            let (pump, mut bounded) =
+                EventPump::new(owner, m.clone(), controls, 1.try_into().unwrap(), 0, 0);
+            let (_cancel, cancel_rx) = watch::channel(false);
+            let client = async {
+                bounded
+                    .frames
+                    .send(wire::Frame {
+                        sent_at_nanos: 0,
+                        len: wire::frame(&Message::Payload(first_batch.clone()), 0)
+                            .unwrap()
+                            .len(),
+                        message: Message::Payload(first_batch),
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    bounded
+                        .output
+                        .recv()
+                        .await
+                        .unwrap()
+                        .error
+                        .unwrap()
+                        .contains("control")
+                );
+                let other = batches[required.iter().nth(1).unwrap()].clone();
+                bounded
+                    .frames
+                    .send(wire::Frame {
+                        sent_at_nanos: 0,
+                        len: wire::frame(&Message::Payload(other.clone()), 0)
+                            .unwrap()
+                            .len(),
+                        message: Message::Payload(other),
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    bounded
+                        .output
+                        .recv()
+                        .await
+                        .unwrap()
+                        .error
+                        .unwrap()
+                        .contains("index full")
+                );
+                let mut replacement = Adapter::recover(store, bootstrap.clone(), &m, 0).unwrap();
+                replacement
+                    .apply(AuthenticatedSlotAgreementRequest::Timeout {
+                        view: AgreementView(0),
+                        phase: validator::slot_agreement::AgreementPhase::Prevote,
+                    })
+                    .unwrap();
+                bounded
+                    .local
+                    .send(LocalEvent::BuildReady { at: 70 })
+                    .await
+                    .unwrap();
+                assert!(bounded.output.recv().await.unwrap().error.is_some());
+            };
+            let ((owner, result), ()) = tokio::join!(pump.run(cancel_rx), client);
+            assert!(result.is_err(), "stale owner must terminate, not retry");
+            let (pump, closed) = EventPump::new(
+                owner,
+                m.clone(),
+                BTreeSet::new(),
+                1.try_into().unwrap(),
+                0,
+                0,
+            );
+            drop(closed);
+            let (_cancel, cancel_rx) = watch::channel(false);
+            assert!(
+                pump.run(cancel_rx)
+                    .await
+                    .1
+                    .unwrap_err()
+                    .contains("output closed")
+            );
+        })
+        .await
+        .expect("isolated pump TCP test timed out");
+    });
 }
 
 fn tcp_agreement_message(message: net::wire::Message) -> net::wire::Message {

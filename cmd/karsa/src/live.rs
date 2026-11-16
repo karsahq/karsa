@@ -551,12 +551,21 @@ async fn read_peer(
 ) {
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
+        if *shutdown.borrow() {
+            return;
+        }
         // Drain whatever is already buffered before waiting for more bytes.
         loop {
             match wire::take_frame(&mut buffer) {
                 Ok(Some(frame)) => {
-                    if frames.send(frame).await.is_err() {
-                        return;
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.changed() => return,
+                        result = frames.send(frame) => {
+                            if result.is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
                 // Not yet: more bytes are on the way.
@@ -7497,6 +7506,42 @@ mod tests {
         let client = TcpStream::connect(address).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
         (client, server)
+    }
+
+    #[tokio::test]
+    async fn peer_reader_shutdown_interrupts_backpressured_delivery() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let (_client, server) = linked_pair().await;
+        let bytes = wire::frame(&Message::SnapshotWant, 0).unwrap();
+        let mut first = bytes.clone();
+        let (frames, mut received) = mpsc::channel(1);
+        frames
+            .send(wire::take_frame(&mut first).unwrap().unwrap())
+            .await
+            .unwrap();
+        let (stop, shutdown) = watch::channel(false);
+        let mut reader = std::pin::pin!(read_peer(
+            server,
+            bytes,
+            frames,
+            Arc::new(AtomicU64::new(0)),
+            shutdown,
+        ));
+        {
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(matches!(reader.as_mut().poll(&mut context), Poll::Pending));
+        }
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), reader)
+            .await
+            .expect("shutdown must interrupt the blocked channel send");
+        assert!(received.recv().await.is_some());
+        assert!(
+            received.recv().await.is_none(),
+            "blocked frame must not be forwarded after shutdown"
+        );
     }
 
     #[test]

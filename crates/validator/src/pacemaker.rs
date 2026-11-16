@@ -986,6 +986,15 @@ mod tests {
                 .unwrap();
             if !decide_before_fence {
                 assert_eq!(fixture.dag.held_voters(1).unwrap(), 1);
+                assert_eq!(fixture.dag.inspect_commit(1).unwrap(), Decision::Undecided);
+                assert!(fixture.dag.can_skip_with_fence(1).unwrap());
+                assert_eq!(fixture.dag.is_anchored(3).unwrap(), Some(anchor.clone()));
+                // The fence excludes a voter, not the honest anchor's path to
+                // the leader. A direct-quorum bound does not exclude this commit.
+                assert!(matches!(
+                    fixture.dag.inspect_indirect_decide(1, &anchor).unwrap(),
+                    Decision::Commit(history) if history.contains(&leader)
+                ));
                 assert!(matches!(
                     pacemaker.tick_one(&mut fixture.dag).unwrap(),
                     Step::Advanced {
@@ -1022,7 +1031,9 @@ mod tests {
             .position(|(a, b)| a != b);
         assert!(
             early_order == late_order && early_root == late_root,
-            "fence delivery across an indirect decision must preserve order/root: first_difference={first_difference:?}, early_root={early_root:02x?}, late_root={late_root:02x?}"
+            "fence delivery across an indirect decision must preserve order/root: first_difference={first_difference:?}, early_entry={:?}, late_entry={:?}, early_root={early_root:02x?}, late_root={late_root:02x?}",
+            first_difference.map(|index| &early_order[index]),
+            first_difference.map(|index| &late_order[index])
         );
     }
 
