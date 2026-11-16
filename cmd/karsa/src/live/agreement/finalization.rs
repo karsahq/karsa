@@ -94,6 +94,30 @@ impl CertifiedFinalization {
         authenticated_controls: &BTreeSet<[u8; 32]>,
         at: u64,
     ) -> Result<Build, String> {
+        self.build_ready_with_reservation(
+            membership,
+            batches,
+            authenticated_controls,
+            at,
+            |_, _| Ok(()),
+        )
+    }
+
+    /// Reserves each executed commit's exact header and coverage before any local signing.
+    /// The callback must durably bind the header to its agreement history before succeeding.
+    /// Header round/height distinguish commits that share an order length. This hook alone
+    /// does not restore execution, finalizer queues, certificates or application progress.
+    /// # Errors
+    /// As with [`Self::build_ready`]; a reservation failure also poisons this instance,
+    /// since storage publication can be uncertain and earlier headers may already be signed.
+    pub fn build_ready_with_reservation(
+        &mut self,
+        membership: &Membership,
+        batches: &BTreeMap<[u8; 32], Batch>,
+        authenticated_controls: &BTreeSet<[u8; 32]>,
+        at: u64,
+        mut reserve: impl FnMut(&Header, usize) -> Result<(), crypto::CryptoError>,
+    ) -> Result<Build, String> {
         self.ensure_usable()?;
         self.validate_membership(membership)?;
         while let Some(boundary) = self
@@ -125,10 +149,11 @@ impl CertifiedFinalization {
                     self.execution.state().state_root(),
                     self.execution.applied(),
                 );
-                match self
-                    .finalizer
-                    .build_ready(self.execution.snapshot().order(), at)
-                {
+                match self.finalizer.build_ready_with_reservation(
+                    self.execution.snapshot().order(),
+                    at,
+                    &mut reserve,
+                ) {
                     Ok(mut build) => {
                         let header = self.finalizer.last_built().clone();
                         self.built_headers.insert(header.height, header);

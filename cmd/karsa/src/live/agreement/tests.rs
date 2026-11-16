@@ -402,6 +402,39 @@ fn certified_finalization_replays_two_authenticated_commit_boundaries() {
         )
         .unwrap()
     };
+    let mut reserved_coordinator = make_coordinator();
+    let mut intents = Vec::new();
+    let reserved_build = reserved_coordinator
+        .build_ready_with_reservation(&m, &batches, &controls, 42, |header, coverage| {
+            intents.push((header.clone(), coverage));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(intents.len(), 2);
+    for (index, (header, coverage)) in intents.iter().enumerate() {
+        assert_eq!(header, &built.shares[index].header);
+        assert_eq!(header, &reserved_build.shares[index].header);
+        assert_eq!(*coverage, recovered.applications()[index].order_len());
+    }
+    let mut reservation_failed = make_coordinator();
+    assert!(
+        reservation_failed
+            .build_ready_with_reservation(&m, &batches, &controls, 42, |_, _| {
+                Err(crypto::CryptoError::new(
+                    crypto::CryptoErrorKind::InvalidVertex,
+                    "reservation publication uncertain",
+                ))
+            })
+            .is_err()
+    );
+    assert_eq!(reservation_failed.finalizer().built_headers(), 0);
+    assert_eq!(reservation_failed.finalizer().last_built(), &anchor);
+    assert!(reservation_failed.update(recovered.clone()).is_err());
+    assert!(
+        reservation_failed
+            .build_ready(&m, &batches, &controls, 43)
+            .is_err()
+    );
     let boundary = recovered.applications()[0].order_len();
     let second_hash = recovered.vertices()[boundary].payload_hash;
     let mut missing = batches.clone();

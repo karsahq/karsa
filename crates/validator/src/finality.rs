@@ -405,6 +405,38 @@ impl Finalizer {
         order: &[VertexId],
         at: u64,
     ) -> Result<Build, CryptoError> {
+        self.build_reserved(prefix, order, at, |_, _| Ok(()))
+    }
+
+    /// Reserves each exact header and its order coverage before building or signing it.
+    ///
+    /// The callback runs for every header, including when this node is not a signer.
+    /// A durable caller must persist the intent before returning success and reject
+    /// conflicting intents after restart. This method itself provides no persistence.
+    /// It uses the complete order, not a compact retained prefix.
+    ///
+    /// # Errors
+    ///
+    /// Propagates reservation failures and every error from [`Self::build_ready`].
+    /// Failure can consume pending commits, and earlier headers in the same call
+    /// may already be signed. Discard the instance and recover from durable intents;
+    /// do not blindly retry. No signature is made for a rejected reservation.
+    pub fn build_ready_with_reservation(
+        &mut self,
+        order: &[VertexId],
+        at: u64,
+        reserve: impl FnMut(&Header, usize) -> Result<(), CryptoError>,
+    ) -> Result<Build, CryptoError> {
+        self.build_reserved(&CommitFrontier::empty(), order, at, reserve)
+    }
+
+    fn build_reserved(
+        &mut self,
+        prefix: &CommitFrontier,
+        order: &[VertexId],
+        at: u64,
+        mut reserve: impl FnMut(&Header, usize) -> Result<(), CryptoError>,
+    ) -> Result<Build, CryptoError> {
         let total = prefix.len().saturating_add(order.len());
         let mut shares = Vec::new();
         while self
@@ -445,6 +477,7 @@ impl Finalizer {
                 applied: pending.applied,
             };
             let id = header.id()?;
+            reserve(&header, pending.order_len)?;
 
             if let Some(certified) = self.certified_ids.get(&pending.height)
                 && *certified != id
@@ -810,6 +843,79 @@ mod tests {
             author: author.to_vec(),
             digest: [round as u8; 32],
         }
+    }
+
+    #[test]
+    fn reservation_failure_precedes_signing_and_header_bookkeeping() {
+        let (set, _) = fixture(4);
+        let anchor = genesis(b"reservation-failure", [0; 32]);
+        let mut finalizer = Finalizer::new(
+            SetSchedule::single(set),
+            EpochSchedule::single(1),
+            anchor.chain_id.clone(),
+            b"val-0".to_vec(),
+            Vec::new(), // Invalid key makes accidental signing observable as another error.
+            anchor.clone(),
+            0,
+        )
+        .unwrap();
+        finalizer.record_commit(1, 0);
+        finalizer.mark_applied(0, [7; 32], 0);
+        let mut calls = 0;
+        let error = finalizer
+            .build_ready_with_reservation(&[], 10, |header, coverage| {
+                calls += 1;
+                assert_eq!(header.height, 1);
+                assert_eq!(header.state_root, [7; 32]);
+                assert_eq!(header.previous, anchor.id().unwrap());
+                assert_eq!(coverage, 0);
+                Err(invalid("reservation unavailable"))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("reservation unavailable"));
+        assert_eq!(calls, 1);
+        assert_eq!(finalizer.last_built(), &anchor);
+        assert_eq!(finalizer.head(), &anchor);
+        assert_eq!(finalizer.built_headers(), 0);
+        assert!(finalizer.shares.is_empty());
+        assert!(finalizer.order_lens.is_empty());
+    }
+
+    #[test]
+    fn reservations_distinguish_empty_commits_and_match_signed_headers() {
+        let (set, keys) = fixture(4);
+        let anchor = genesis(b"reservation-success", [0; 32]);
+        let mut finalizer = Finalizer::new(
+            SetSchedule::single(set),
+            EpochSchedule::single(1),
+            anchor.chain_id.clone(),
+            b"val-0".to_vec(),
+            keys[0].clone(),
+            anchor.clone(),
+            0,
+        )
+        .unwrap();
+        finalizer.record_commit(1, 0);
+        finalizer.record_commit(2, 0);
+        finalizer.mark_applied(0, [7; 32], 0);
+        let mut reserved = Vec::new();
+        let build = finalizer
+            .build_ready_with_reservation(&[], 10, |header, coverage| {
+                reserved.push((header.clone(), coverage));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(reserved.len(), 2);
+        assert_eq!(build.shares.len(), 2);
+        for ((header, coverage), share) in reserved.iter().zip(&build.shares) {
+            assert_eq!(header, &share.header);
+            assert_eq!(*coverage, 0);
+        }
+        assert_eq!(reserved[0].0.previous, anchor.id().unwrap());
+        assert_eq!(reserved[1].0.previous, reserved[0].0.id().unwrap());
+        assert_ne!(reserved[0].0.id().unwrap(), reserved[1].0.id().unwrap());
+        assert_eq!(reserved[0].0.round, 1);
+        assert_eq!(reserved[1].0.round, 2);
     }
 
     #[test]
