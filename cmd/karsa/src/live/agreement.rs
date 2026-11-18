@@ -1960,7 +1960,19 @@ fn checked_key(
 }
 
 /// The legacy node must not run on an authenticated signing root (including staged generations).
+///
+/// A store that already holds a certified session is refused explicitly: running the
+/// legacy decision loop beside it would produce a second ordering history over the
+/// same disk. An empty or legacy store keeps the existing signing-root check.
 pub(super) fn disabled_guard(store: &Store) -> Result<(), String> {
+    if store
+        .has_authenticated_slot_agreement()
+        .map_err(|error| error.to_string())?
+    {
+        return Err(
+            "store holds a certified agreement session; legacy live startup refused".into(),
+        );
+    }
     store.slot_decision_locks().map(|_| ()).map_err(|e| {
         format!("live agreement adapter is disabled; legacy root signing check failed: {e}")
     })

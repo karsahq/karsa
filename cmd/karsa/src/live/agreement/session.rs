@@ -17,9 +17,10 @@
 //! What this does not establish: live transport, proposal/view authoring,
 //! slot application, execution publication, or authority replacement. Receiving
 //! a carrier still requires the caller to authenticate and deliver it, and a
-//! decided slot still requires an explicit `AdvanceSlot`. The legacy node must
-//! not run on this store afterwards: an authenticated signing root and the
-//! legacy root are mutually exclusive.
+//! decided slot still requires an explicit `AdvanceSlot`. The two histories are
+//! mutually exclusive on disk: a store that already carries a legacy genesis
+//! state or header is refused here, and the legacy startup guard refuses a store
+//! that already holds this session.
 
 use exec::State;
 use store::{AuthenticatedSlotAgreementBootstrap, SlotAgreementBootstrap, Store};
@@ -98,9 +99,9 @@ pub fn genesis_bootstrap(
 /// zero is the header epoch.
 ///
 /// # Errors
-/// Rejects an incompatible state root, epoch schedule, genesis bootstrap, an
-/// existing authenticated journal, and every error from building the finalizer
-/// or opening the journaled owner.
+/// Rejects an incompatible state root, epoch schedule or genesis bootstrap, a
+/// store that already holds a legacy chain, an existing authenticated journal,
+/// and every error from building the finalizer or opening the journaled owner.
 pub fn open_at_genesis(
     store: &Store,
     membership: &Membership,
@@ -109,6 +110,7 @@ pub fn open_at_genesis(
     genesis_state: State,
     epoch_schedule: EpochSchedule,
 ) -> Result<JournaledFinalization, String> {
+    checked_store(store)?;
     let bootstrap = checked_bootstrap(membership, index, genesis, &genesis_state, epoch_schedule)?;
     let adapter = Adapter::begin(store, bootstrap, membership, index)?;
     let finalizer = anchored_finalizer(membership, index, genesis, epoch_schedule)?;
@@ -132,10 +134,32 @@ pub fn recover_at_genesis(
     genesis_state: State,
     epoch_schedule: EpochSchedule,
 ) -> Result<JournaledFinalization, String> {
+    checked_store(store)?;
     let bootstrap = checked_bootstrap(membership, index, genesis, &genesis_state, epoch_schedule)?;
     let adapter = Adapter::recover(store, bootstrap, membership, index)?;
     let finalizer = anchored_finalizer(membership, index, genesis, epoch_schedule)?;
     JournaledFinalization::open(adapter, genesis_state, finalizer)
+}
+
+/// A genesis session starts a new history, so the same store cannot already carry one.
+///
+/// The legacy live node writes a genesis state and header before it decides anything.
+/// Opening a certified session over that chain would put two orderings on one disk and
+/// make recovery depend on which one a caller happened to read. The session is refused
+/// instead. The store's authenticated-journal absence is checked by `Adapter::begin`.
+fn checked_store(store: &Store) -> Result<(), String> {
+    if store
+        .genesis_header()
+        .map_err(|error| error.to_string())?
+        .is_some()
+        || store
+            .genesis_state()
+            .map_err(|error| error.to_string())?
+            .is_some()
+    {
+        return Err("certified session refuses a store that already holds a legacy chain".into());
+    }
+    Ok(())
 }
 
 fn checked_bootstrap(
@@ -302,6 +326,57 @@ mod tests {
                 .agreement
                 .context,
             "recovery must not move the trusted checkpoint"
+        );
+    }
+
+    #[test]
+    fn a_certified_session_store_refuses_legacy_live_startup() {
+        let membership = chain::membership(4, None).unwrap();
+        let chain_id = b"karsa-agreement-session".to_vec();
+        let state = chain::genesis_state(&membership.accounts).unwrap();
+        let genesis = genesis(&chain_id, &membership, &state);
+        let schedule = validator::EpochSchedule::single(membership.set.epoch);
+        let dir = Dir::new();
+        let store = Store::open(&dir.0).unwrap();
+        assert!(!store.has_authenticated_slot_agreement().unwrap());
+        assert!(
+            super::super::disabled_guard(&store).is_ok(),
+            "a store without a session is a valid legacy start"
+        );
+
+        let session = open_at_genesis(&store, &membership, 0, &genesis, state, schedule).unwrap();
+        assert!(store.has_authenticated_slot_agreement().unwrap());
+        let refused = super::super::disabled_guard(&store).unwrap_err();
+        assert!(
+            refused.contains("certified agreement session"),
+            "the legacy loop must be refused by name: {refused}"
+        );
+        drop(session);
+    }
+
+    #[test]
+    fn a_session_refuses_a_store_that_already_holds_a_legacy_chain() {
+        let membership = chain::membership(4, None).unwrap();
+        let chain_id = b"karsa-agreement-session".to_vec();
+        let state = chain::genesis_state(&membership.accounts).unwrap();
+        let genesis = genesis(&chain_id, &membership, &state);
+        let schedule = validator::EpochSchedule::single(membership.set.epoch);
+        let dir = Dir::new();
+        let store = Store::open(&dir.0).unwrap();
+        store.put_genesis_state(&state.encode().unwrap()).unwrap();
+        store.put_genesis_header(&genesis).unwrap();
+        assert!(!store.has_authenticated_slot_agreement().unwrap());
+
+        let error = open_at_genesis(&store, &membership, 0, &genesis, state, schedule)
+            .err()
+            .expect("a legacy chain store cannot open a certified session");
+        assert!(
+            error.contains("legacy chain"),
+            "two histories must not share one store: {error}"
+        );
+        assert!(
+            !store.has_authenticated_slot_agreement().unwrap(),
+            "a refused start must not create an authenticated journal"
         );
     }
 

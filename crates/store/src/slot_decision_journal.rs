@@ -141,6 +141,24 @@ impl Store {
         authenticated_slot_agreement::exclude_legacy(&root)?;
         read(&root)
     }
+
+    /// Reports whether this store already holds an authenticated agreement session.
+    ///
+    /// This is a layout check for startup routing, not authentication, ownership or
+    /// freshness. A staged or foreign journal is reported as present; its owner still
+    /// has to recover it before any signing or ordering authority exists.
+    ///
+    /// # Errors
+    /// Rejects a non-regular pointer file and filesystem failures.
+    pub fn has_authenticated_slot_agreement(&self) -> Result<bool, StoreError> {
+        let root = self
+            .slot_decisions
+            .lock()
+            .expect("slot decision lock poisoned");
+        let path = root.join(authenticated_slot_agreement::FILE);
+        validate_pointer_file(&path)?;
+        Ok(path.try_exists()?)
+    }
 }
 
 #[cfg(test)]
