@@ -3,6 +3,7 @@
 use net::wire::Message;
 use validator::{SlotAgreementViewCandidate, SlotProposalEnvelope, Vertex};
 
+use super::super::CarrierPayload;
 use super::super::pacemaker;
 use super::JournaledFinalization;
 
@@ -175,6 +176,9 @@ impl JournaledFinalization {
     /// more than `f` distinct authenticated signers. The echo never invents a target, derives one
     /// from local view advancement, or signs a stale view; it only signs already-observed support
     /// once, and later retransmission belongs to the bounded control-retry cadence.
+    /// A retained POL additionally makes an elected proposer author the re-proposal for the
+    /// current view: one fresh plain proposal carrier first, then one exact view carrier bound to
+    /// the durable POL prefix. Neither step invents a decision or evidence.
     /// The only prospective round is one above the highest retained causal round, not
     /// a protocol-phase counter. Nil votes use their durable intent, not a fabricated carrier;
     /// an empty DAG authors no carrier but can still echo observed view support. Full durable cone
@@ -231,7 +235,118 @@ impl JournaledFinalization {
         if !authored.is_empty() {
             return Ok(authored);
         }
+        let elected = self.elect_view_local()?;
+        if !elected.is_empty() {
+            return Ok(elected);
+        }
         self.echo_view_local()
+    }
+
+    /// Authors at most one elected re-proposal step for the current durable view.
+    /// A fresh plain proposal comes first; the next call binds its completed carrier to the exact
+    /// retained POL prefix as the view carrier. The most recent local proposal for the selected
+    /// decision is reused; when causal readiness cannot reach it, the step waits instead of
+    /// signing another copy. The decision and evidence are copied from the authenticated
+    /// reproposal lineage, never constructed from local timers or DAG guesses.
+    /// Only the elected proposer acts, only after a prior POL exists, and never twice per view.
+    /// Initial view-0 proposal construction remains explicit.
+    fn elect_view_local(&mut self) -> Result<Vec<Message>, String> {
+        self.check_health()?;
+        if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
+            return Err("local view election exceeds 4096 durable events".into());
+        }
+        let output = self.adapter.driver.output().map_err(|e| e.to_string())?;
+        let Some(transition) = output.transition.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if transition.decision.is_some() {
+            return Ok(Vec::new());
+        }
+        let view = transition.view;
+        let Some(reproposal) = output.reproposal.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let entries = reproposal.lineage().entries.as_slice();
+        let Some(prior) = entries.last() else {
+            return Ok(Vec::new());
+        };
+        if prior.pol.is_none() || prior.view >= view {
+            return Ok(Vec::new());
+        }
+        let decision = prior.proposal.decision.clone();
+        let elected =
+            validator::slot_agreement_view_proposer(&self.adapter.set, decision.round, view)
+                .map_err(|e| e.to_string())?;
+        if elected != self.adapter.validator_id.as_slice() {
+            return Ok(Vec::new());
+        }
+        let publications = self.adapter.completed_carriers()?;
+        if publications.iter().any(|carrier| {
+            matches!(
+                carrier.envelope.payload(),
+                CarrierPayload::View(lineage)
+                    if lineage.entries.last().is_some_and(|entry| {
+                        entry.view == view && entry.proposal.decision == decision
+                    })
+            )
+        }) {
+            return Ok(Vec::new());
+        }
+        let proposal_carrier =
+            publications
+                .iter()
+                .rev()
+                .find_map(|carrier| match carrier.envelope.payload() {
+                    CarrierPayload::Proposal(proposal)
+                        if proposal == &prior.proposal
+                            && carrier.vertex.author == self.adapter.validator_id =>
+                    {
+                        Some(carrier.envelope.carrier().clone())
+                    }
+                    _ => None,
+                });
+        let local = self
+            .authoring
+            .as_mut()
+            .ok_or("local authoring is not configured")?;
+        let round = local
+            .node
+            .dag()
+            .highest_round()
+            .map(|highest| highest.checked_add(1).ok_or("local causal round exhausted"))
+            .transpose()?;
+        let Some(round) = round else {
+            return Ok(Vec::new());
+        };
+        local.node.set_round(round);
+        let authored = match proposal_carrier {
+            None => self
+                .adapter
+                .author_proposal(&prior.proposal, &mut local.node)?,
+            Some(carrier) => {
+                let candidate = validator::SlotAgreementViewCandidate::new(
+                    entries.to_vec(),
+                    prior.proposal.clone(),
+                    carrier,
+                    view,
+                    &self.adapter.set,
+                )
+                .map_err(|e| e.to_string())?;
+                self.adapter.author_view(&candidate, &mut local.node)?
+            }
+        };
+        let result = match authored {
+            Some(carrier) => self
+                .adapter
+                .export_carrier(
+                    &carrier.vertex.id().map_err(|e| e.to_string())?,
+                    local.node.dag(),
+                )
+                .map(|message| vec![message]),
+            None => Ok(Vec::new()),
+        };
+        self.check_health()?;
+        result
     }
 
     /// Echoes at most one exact future view target already supported by more than `f`

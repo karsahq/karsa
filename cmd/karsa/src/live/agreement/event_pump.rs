@@ -12,9 +12,9 @@ use super::{JournaledFinalization, Membership};
 /// Local authority, deliberately separate from decoded network messages.
 pub enum LocalEvent {
     /// Import bounded trusted causal availability and select one durable nil or positive phase.
-    /// When no carrier obligation is authorable, one exact future view target with `f+1`
-    /// authenticated support may be echoed. Network carrier receipt never supplies this
-    /// availability or applies a slot.
+    /// When no carrier obligation is authorable, an elected re-proposal from a retained POL or
+    /// one exact `f+1`-supported future view echo may follow. Network carrier receipt never
+    /// supplies this availability or applies a slot.
     Drive(Vec<validator::Vertex>),
     /// Explicit trusted phase driving with independently authenticated causal availability.
     Author(Box<super::local_authoring::AuthoringRequest>),
@@ -116,17 +116,18 @@ impl LocalSchedule {
 impl EventPump {
     /// Opts this isolated owner into volatile, fixed-delay local maintenance.
     /// Requires pinned authoring. Each wake ticks once and attempts one nil or positive durable
-    /// action, or echoes one exact `f+1`-supported future view target when no carrier is authored,
-    /// or retries one discovered publication. Echoing never invents a target and adds no causal
-    /// requirement.
+    /// action, an elected re-proposal step from a retained POL, or echoes one exact
+    /// `f+1`-supported future view target, or retries one discovered publication. Re-proposal
+    /// copies an authenticated POL's decision/evidence and never invents one; echo never invents
+    /// a target. Neither adds a causal import requirement of its own.
     /// Discovery reads at most one 64-ID page per wake under the 4096-event replay cap;
     /// only its first ID is attempted; completion or error advances the offset, while
     /// a not-yet-due retry retains it. Empty pages wrap on the
     /// next wake. Historical/unavailable publications report errors but do not pin the cursor.
     /// Idle wakes alternate control-first and carrier-only retry turns. Control retries
     /// include completed nil votes and already-authorized view requests/certificates.
-    /// No proposal election, invented future-view target, causal import or slot application
-    /// is scheduled. Recovery requires opting in again, including authoring setup.
+    /// No initial proposal construction, invented decision/evidence, causal import or slot
+    /// application is scheduled. Recovery requires opting in again, including authoring setup.
     /// # Errors
     /// Rejects missing authoring, replacement schedules and intervals outside 10ms..=1 day.
     pub fn enable_scheduling(&mut self, interval: std::time::Duration) -> Result<(), String> {

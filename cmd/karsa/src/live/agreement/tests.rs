@@ -6978,6 +6978,301 @@ fn received_plain_proposal_is_neutral_durable_and_view_votes_after_recovery() {
     assert_eq!(recovered.pending().len(), 1);
 }
 
+fn reproposal_lineage(
+    m: &chain::Membership,
+    chain_id: &[u8],
+    vertices: &mut Vec<Vertex>,
+    context: SlotDecisionTip,
+    entry: SlotAgreementProofEntry,
+) -> (
+    SlotAgreementViewLineage,
+    validator::SlotAgreementPolCandidate,
+) {
+    use validator::slot_agreement::{AgreementPhase, AgreementQc, AgreementValue, AgreementVote};
+    let vote = AgreementVote {
+        context,
+        view: entry.view,
+        phase: AgreementPhase::Prevote,
+        value: AgreementValue::Decision(entry.proposal.decision.clone()),
+    };
+    let bytes = vote.signing_payload(&m.set).unwrap();
+    let mut signatures: Vec<_> = (0..m.set.quorum_size())
+        .map(|index| ValidatorSignature {
+            validator_id: m.consensus[index].id.clone(),
+            key_id: m.set.validators[index].keys[0].key_id.clone(),
+            signature: Ed25519Scheme
+                .sign(&m.consensus[index].private_key, &bytes)
+                .unwrap(),
+        })
+        .collect();
+    signatures.sort_by(|a, b| a.validator_id.cmp(&b.validator_id));
+    let certificate = AgreementQc { vote, signatures };
+    let round = entry.view_carrier.round;
+    let references: Vec<_> = vertices
+        .iter()
+        .filter(|vertex| vertex.round == round)
+        .map(|vertex| vertex.id().unwrap())
+        .collect();
+    let mut witnesses = Vec::new();
+    for signature in &certificate.signatures {
+        let index = m
+            .consensus
+            .iter()
+            .position(|identity| identity.id == signature.validator_id)
+            .unwrap();
+        let payload = SlotAgreementVotePayload {
+            vote: certificate.vote.clone(),
+            signature: signature.clone(),
+            prerequisite: entry.view_carrier.clone(),
+        };
+        let vertex = signed_for_chain(
+            m,
+            index,
+            round + 1,
+            references.clone(),
+            payload.digest(&m.set).unwrap(),
+            chain_id,
+        );
+        vertices.push(vertex.clone());
+        witnesses.push(validator::SlotAgreementVoteWitness {
+            payload,
+            carrier: vertex.id().unwrap(),
+        });
+    }
+    let lineage = SlotAgreementViewLineage {
+        entries: vec![entry],
+    };
+    let candidate = lineage
+        .pol_candidate_digest(certificate.clone(), witnesses.clone(), &m.set)
+        .unwrap();
+    let pol_references: Vec<_> = witnesses
+        .iter()
+        .map(|witness| witness.carrier.clone())
+        .collect();
+    let pol = signed_for_chain(
+        m,
+        0,
+        round + 2,
+        pol_references,
+        candidate.digest(),
+        chain_id,
+    );
+    let pol_carrier = pol.id().unwrap();
+    vertices.push(pol);
+    let bound = candidate.clone().bind_carrier(pol_carrier);
+    (bound, candidate)
+}
+
+#[test]
+fn elected_reproposal_authors_plain_then_exact_view_without_inventing_evidence() {
+    use net::wire::Message;
+    use std::time::Duration;
+    use validator::slot_agreement::AgreementView;
+    let (m, bootstrap, request) = fixture();
+    let AuthenticatedSlotAgreementRequest::Propose {
+        lineage,
+        mut vertices,
+    } = request
+    else {
+        unreachable!("fixture proposes")
+    };
+    let entry = lineage.entries[0].clone();
+    let proposal = entry.proposal.clone();
+    let (reproposal, pol_candidate) = reproposal_lineage(
+        &m,
+        b"live-adapter-tests",
+        &mut vertices,
+        bootstrap.agreement.context.clone(),
+        entry,
+    );
+    let elected_id =
+        validator::slot_agreement_view_proposer(&m.set, proposal.decision.round, AgreementView(1))
+            .unwrap();
+    let elected = m
+        .consensus
+        .iter()
+        .position(|identity| identity.id == elected_id)
+        .unwrap();
+    let non_elected = (0..m.consensus.len())
+        .find(|index| *index != elected)
+        .unwrap();
+    let pol_carrier = reproposal.entries[0].pol.as_ref().unwrap().carrier.clone();
+    let evidence = PendingIntent::Pol {
+        candidate: pol_candidate.clone(),
+        digest: pol_candidate.digest(),
+    }
+    .into_envelope(pol_carrier, &m.set)
+    .unwrap();
+    let wait = Duration::from_secs(1);
+    let policy = pacemaker::Policy::new(wait, wait, wait).unwrap();
+    let round_ids = |source: &[Vertex], round: u64| {
+        let mut ids: Vec<_> = source
+            .iter()
+            .filter(|vertex| vertex.round == round)
+            .map(|vertex| vertex.id().unwrap())
+            .collect();
+        ids.sort_by(|a, b| (a.round, &a.author, a.digest).cmp(&(b.round, &b.author, b.digest)));
+        ids
+    };
+
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut b = bootstrap.clone();
+    b.agreement.local_validator = m.consensus[elected].id.clone();
+    let mut adapter = Adapter::begin(&store, b.clone(), &m, elected).unwrap();
+    adapter
+        .receive_envelope(evidence.clone(), vertices.clone())
+        .unwrap();
+    let output_before_advance = adapter.driver.output().unwrap();
+    assert_eq!(
+        output_before_advance.reproposal.as_ref().unwrap().lineage(),
+        &reproposal
+    );
+    adapter
+        .apply(AuthenticatedSlotAgreementRequest::AdvanceView {
+            from: AgreementView(0),
+        })
+        .unwrap();
+    assert_eq!(adapter.timer_snapshot().unwrap().view, AgreementView(1));
+    let genesis = chain::genesis_state(&m.accounts).unwrap();
+    let chain = b.agreement.context.chain_id().to_vec();
+    let anchor = validator::Header::genesis(
+        chain.clone(),
+        m.set.epoch,
+        genesis.state_root(),
+        *b.agreement.context.order_root(),
+    );
+    let finalizer = validator::Finalizer::new(
+        validator::SetSchedule::single(m.set.clone()),
+        validator::EpochSchedule::single(m.set.epoch),
+        chain,
+        m.consensus[elected].id.clone(),
+        m.consensus[elected].private_key.clone(),
+        anchor,
+        0,
+    )
+    .unwrap();
+    let mut owner = JournaledFinalization::open(adapter, genesis, finalizer).unwrap();
+    owner
+        .enable_authoring(authoring_node_index(&m, &vertices, elected), policy, wait)
+        .unwrap();
+    let references = round_ids(&vertices, 5);
+    let mut sixth = Vec::new();
+    for author in [1, 2, 3] {
+        sixth.push(signed(&m, author, 6, references.clone(), [42; 32]));
+    }
+    let authored_proposal = owner.drive_local(sixth.clone()).unwrap();
+    assert_eq!(authored_proposal.len(), 1);
+    let Message::AgreementCarrier { envelope, .. } = &authored_proposal[0] else {
+        panic!("expected elected plain proposal")
+    };
+    let proposal_envelope = CarrierEnvelope::decode(envelope, &m.set).unwrap();
+    assert!(matches!(
+        proposal_envelope.payload(),
+        CarrierPayload::Proposal(actual) if *actual == proposal
+    ));
+    assert_eq!(proposal_envelope.carrier().round, 7);
+    assert_eq!(proposal_envelope.carrier().author, m.consensus[elected].id);
+    let proposal_carrier = proposal_envelope.carrier().clone();
+    let mut available = vertices.clone();
+    available.extend(sixth);
+    let references = round_ids(&available, 6);
+    let mut seventh = Vec::new();
+    for author in (0..m.consensus.len()).filter(|author| *author != elected) {
+        seventh.push(signed(&m, author, 7, references.clone(), [42; 32]));
+    }
+    let authored_view = owner.drive_local(seventh).unwrap();
+    assert_eq!(authored_view.len(), 1);
+    let Message::AgreementCarrier { envelope, .. } = &authored_view[0] else {
+        panic!("expected elected view carrier")
+    };
+    let view_envelope = CarrierEnvelope::decode(envelope, &m.set).unwrap();
+    let CarrierPayload::View(view_lineage) = view_envelope.payload() else {
+        panic!("expected view payload")
+    };
+    let selected = view_lineage.entries.last().unwrap();
+    assert_eq!(selected.view, AgreementView(1));
+    assert_eq!(selected.proposal_carrier, proposal_carrier);
+    assert_eq!(
+        &view_lineage.entries[..view_lineage.entries.len() - 1],
+        reproposal.entries.as_slice(),
+        "view must bind the exact retained POL prefix"
+    );
+    assert_eq!(view_envelope.carrier().round, 8);
+    assert_eq!(view_envelope.carrier().author, m.consensus[elected].id);
+    assert!(
+        owner.drive_local(Vec::new()).unwrap().is_empty(),
+        "a completed view election is not reauthored"
+    );
+    drop(owner);
+    let mut recovered = Adapter::recover(&store, b, &m, elected).unwrap();
+    let recovered_output = recovered.driver.output().unwrap();
+    assert_eq!(
+        recovered_output.reproposal.as_ref().unwrap().lineage(),
+        &reproposal
+    );
+    assert_eq!(recovered_output.transition.unwrap().view, AgreementView(1));
+    assert_eq!(recovered.completed_carriers().unwrap().len(), 2);
+
+    // The same durable state on a non-elected validator must author nothing.
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut b = bootstrap.clone();
+    b.agreement.local_validator = m.consensus[non_elected].id.clone();
+    let mut adapter = Adapter::begin(&store, b.clone(), &m, non_elected).unwrap();
+    adapter
+        .receive_envelope(evidence, vertices.clone())
+        .unwrap();
+    adapter
+        .apply(AuthenticatedSlotAgreementRequest::AdvanceView {
+            from: AgreementView(0),
+        })
+        .unwrap();
+    assert_eq!(adapter.timer_snapshot().unwrap().view, AgreementView(1));
+    let genesis = chain::genesis_state(&m.accounts).unwrap();
+    let chain = b.agreement.context.chain_id().to_vec();
+    let anchor = validator::Header::genesis(
+        chain.clone(),
+        m.set.epoch,
+        genesis.state_root(),
+        *b.agreement.context.order_root(),
+    );
+    let finalizer = validator::Finalizer::new(
+        validator::SetSchedule::single(m.set.clone()),
+        validator::EpochSchedule::single(m.set.epoch),
+        chain,
+        m.consensus[non_elected].id.clone(),
+        m.consensus[non_elected].private_key.clone(),
+        anchor,
+        0,
+    )
+    .unwrap();
+    let mut owner = JournaledFinalization::open(adapter, genesis, finalizer).unwrap();
+    owner
+        .enable_authoring(
+            authoring_node_index(&m, &vertices, non_elected),
+            policy,
+            wait,
+        )
+        .unwrap();
+    let wal = dir.0.join("authenticated-slot-agreement");
+    let before = std::fs::read(&wal).unwrap();
+    let references = round_ids(&vertices, 5);
+    let mut sixth = Vec::new();
+    for author in [1, 2, 3] {
+        sixth.push(signed(&m, author, 6, references.clone(), [42; 32]));
+    }
+    assert!(
+        owner.drive_local(sixth).unwrap().is_empty(),
+        "a non-elected proposer must not author"
+    );
+    assert_eq!(
+        std::fs::read(&wal).unwrap(),
+        before,
+        "no signing without election"
+    );
+}
+
 fn open_event_pump_owner(
     store: &Store,
     bootstrap: &AuthenticatedSlotAgreementBootstrap,
