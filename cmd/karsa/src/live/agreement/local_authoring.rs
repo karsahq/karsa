@@ -257,8 +257,9 @@ impl JournaledFinalization {
     /// validation remains authoritative; a high incomplete frontier can stall rather than invent
     /// progression. Completed payloads are not reauthored, including after explicit owner
     /// recovery. Durable selection/reconstruction is capped at 4096 WAL events, not storage bytes.
-    /// Authors at most one durable phase, one initial direct-commit proposal, one elected
-    /// re-proposal, or one view echo; it does not tick, retry or apply a slot.
+    /// Authors at most one durable phase, one initial direct-commit proposal and its
+    /// elected view authorization, one elected re-proposal, or one view echo; it does
+    /// not tick, retry or apply a slot.
     /// # Errors
     /// Propagates bounded import, ownership, round overflow and durable authoring errors.
     pub fn drive_local(&mut self, vertices: Vec<Vertex>) -> Result<Vec<Message>, String> {
@@ -311,6 +312,10 @@ impl JournaledFinalization {
         let proposed = self.propose_initial_local()?;
         if !proposed.is_empty() {
             return Ok(proposed);
+        }
+        let bound = self.bind_initial_view_local()?;
+        if !bound.is_empty() {
+            return Ok(bound);
         }
         let elected = self.elect_view_local()?;
         if !elected.is_empty() {
@@ -441,6 +446,103 @@ impl JournaledFinalization {
             .ok_or("local authoring is not configured")?;
         local.node.set_round(carrier_round);
         let authored = self.adapter.author_proposal(&proposal, &mut local.node)?;
+        let result = match authored {
+            Some(carrier) => self
+                .adapter
+                .export_carrier(
+                    &carrier.vertex.id().map_err(|e| e.to_string())?,
+                    local.node.dag(),
+                )
+                .map(|message| vec![message]),
+            None => Ok(Vec::new()),
+        };
+        self.check_health()?;
+        result
+    }
+
+    /// Authorizes the elected view-0 step by binding the completed plain proposal.
+    ///
+    /// The candidate is copied from the durable proposal carrier, never rebuilt from
+    /// local state: the same envelope, the same carrier, the same decision and an empty
+    /// prefix (no prior POL). Only the elected proposer acts, only once per view, and
+    /// only after its own plain proposal is completed. Receipt of this carrier is what
+    /// authorizes peers' prevote intents; authoring it locally does not vote on its own.
+    /// # Errors
+    /// Rejects unhealthy owners, histories above 4096 events, missing authoring setup,
+    /// candidate construction failures and durable authoring failures.
+    fn bind_initial_view_local(&mut self) -> Result<Vec<Message>, String> {
+        self.check_health()?;
+        if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
+            return Err("local view authorization exceeds 4096 events".into());
+        }
+        let output = self.adapter.driver.output().map_err(|e| e.to_string())?;
+        let (view, decided) = match output.transition.as_ref() {
+            Some(transition) => (transition.view, transition.decision.is_some()),
+            None => (validator::slot_agreement::AgreementView(0), false),
+        };
+        if decided
+            || view != validator::slot_agreement::AgreementView(0)
+            || output.reproposal.is_some()
+        {
+            return Ok(Vec::new());
+        }
+        let tip = output.binding.tip().clone();
+        let round = tip.next_round();
+        let elected = validator::slot_agreement_view_proposer(&self.adapter.set, round, view)
+            .map_err(|e| e.to_string())?;
+        if elected != self.adapter.validator_id.as_slice() {
+            return Ok(Vec::new());
+        }
+        let completed = self.adapter.completed_carriers()?;
+        if completed.iter().any(|old| {
+            matches!(
+                old.envelope.payload(),
+                CarrierPayload::View(lineage)
+                    if lineage.entries.last().is_some_and(|entry| {
+                        entry.view == view && entry.proposal.decision.round == round
+                    })
+            )
+        }) {
+            return Ok(Vec::new());
+        }
+        let proposal = completed
+            .iter()
+            .rev()
+            .find_map(|old| match old.envelope.payload() {
+                CarrierPayload::Proposal(proposal)
+                    if old.vertex.author == self.adapter.validator_id
+                        && proposal.decision.round == round =>
+                {
+                    Some((proposal.clone(), old.envelope.carrier().clone()))
+                }
+                _ => None,
+            });
+        let Some((proposal, proposal_carrier)) = proposal else {
+            return Ok(Vec::new());
+        };
+        let candidate = validator::SlotAgreementViewCandidate::new(
+            Vec::new(),
+            proposal,
+            proposal_carrier,
+            view,
+            &self.adapter.set,
+        )
+        .map_err(|e| e.to_string())?;
+        let local = self
+            .authoring
+            .as_mut()
+            .ok_or("local authoring is not configured")?;
+        let Some(round) = local
+            .node
+            .dag()
+            .highest_round()
+            .map(|highest| highest.checked_add(1).ok_or("local causal round exhausted"))
+            .transpose()?
+        else {
+            return Ok(Vec::new());
+        };
+        local.node.set_round(round);
+        let authored = self.adapter.author_view(&candidate, &mut local.node)?;
         let result = match authored {
             Some(carrier) => self
                 .adapter

@@ -12,9 +12,10 @@ use super::{JournaledFinalization, Membership};
 /// Local authority, deliberately separate from decoded network messages.
 pub enum LocalEvent {
     /// Import bounded trusted causal availability and select one durable nil or positive phase.
-    /// When no carrier obligation is authorable, an elected re-proposal from a retained POL or
-    /// one exact `f+1`-supported future view echo may follow. Network carrier receipt never
-    /// supplies this availability or applies a slot.
+    /// When no carrier obligation is authorable, the elected proposer may author its initial
+    /// direct-commit proposal and then bind it into the view-0 authorization, or an elected
+    /// re-proposal from a retained POL, or one exact `f+1`-supported future view echo may follow.
+    /// Network carrier receipt never supplies this availability or applies a slot.
     Drive(Vec<validator::Vertex>),
     /// Explicit trusted phase driving with independently authenticated causal availability.
     Author(Box<super::local_authoring::AuthoringRequest>),
@@ -116,18 +117,19 @@ impl LocalSchedule {
 impl EventPump {
     /// Opts this isolated owner into volatile, fixed-delay local maintenance.
     /// Requires pinned authoring. Each wake ticks once and attempts one nil or positive durable
-    /// action, an elected re-proposal step from a retained POL, or echoes one exact
-    /// `f+1`-supported future view target, or retries one discovered publication. Re-proposal
-    /// copies an authenticated POL's decision/evidence and never invents one; echo never invents
-    /// a target. Neither adds a causal import requirement of its own.
+    /// action, an initial direct-commit proposal with its elected view-0 binding, an elected
+    /// re-proposal step from a retained POL, or echoes one exact `f+1`-supported future view
+    /// target, or retries one discovered publication. The proposal/view steps use only local
+    /// retained causality and durable evidence; they never invent a decision or evidence.
+    /// Neither adds a causal import requirement of its own.
     /// Discovery reads at most one 64-ID page per wake under the 4096-event replay cap;
     /// only its first ID is attempted; completion or error advances the offset, while
     /// a not-yet-due retry retains it. Empty pages wrap on the
     /// next wake. Historical/unavailable publications report errors but do not pin the cursor.
     /// Idle wakes alternate control-first and carrier-only retry turns. Control retries
     /// include completed nil votes and already-authorized view requests/certificates.
-    /// No initial proposal construction, invented decision/evidence, causal import or slot
-    /// application is scheduled. Recovery requires opting in again, including authoring setup.
+    /// No invented decision/evidence, causal import or slot application is scheduled.
+    /// Recovery requires opting in again, including authoring setup.
     /// # Errors
     /// Rejects missing authoring, replacement schedules and intervals outside 10ms..=1 day.
     pub fn enable_scheduling(&mut self, interval: std::time::Duration) -> Result<(), String> {
