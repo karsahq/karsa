@@ -20,7 +20,7 @@
 //! header's epoch still builds the header, so its chain stays readable, but it
 //! does not sign.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crypto::scheme::Ed25519Scheme;
 use crypto::{CryptoError, CryptoErrorKind};
@@ -799,10 +799,70 @@ impl Finalizer {
                 // by height alone keeps that duplicate and shifts every later
                 // header away from its peers' heights; a decision's canonical
                 // identity is its round, so keep only later rounds and renumber
-                // them from the adopted head.
+                // them from the adopted head. Headers already built above the head
+                // are orphaned for the same reason, so their decisions are rebuilt
+                // from their recorded round and coverage instead of being signed
+                // again on the wrong chain.
+                let mut rebuilt = Vec::new();
+                let built: Vec<([u8; 32], Header)> = self
+                    .shares
+                    .iter()
+                    .filter(|(id, set)| {
+                        set.header.height > height && self.order_lens.contains_key(*id)
+                    })
+                    .map(|(id, set)| (*id, set.header.clone()))
+                    .collect();
+                // Headers this node built directly on the adopted head are
+                // already canonical. Their collected peer shares must survive, so
+                // these are rebuilt identically instead of being discarded; only
+                // chains that fork from an older head are dropped or re-created.
+                let mut by_previous: HashMap<[u8; 32], Vec<([u8; 32], Header)>> = HashMap::new();
+                for (id, built_header) in &built {
+                    by_previous
+                        .entry(built_header.previous)
+                        .or_default()
+                        .push((*id, built_header.clone()));
+                }
+                let mut connected: HashSet<[u8; 32]> = HashSet::new();
+                let mut frontier = vec![header.id()?];
+                while let Some(previous) = frontier.pop() {
+                    for (id, _) in by_previous.get(&previous).into_iter().flatten() {
+                        if connected.insert(*id) {
+                            frontier.push(*id);
+                        }
+                    }
+                }
+                for (id, orphan) in built {
+                    let canonical_child = connected.contains(&id);
+                    let order_len = self.order_lens.get(&id).copied().unwrap_or(0);
+                    if !canonical_child {
+                        self.shares.remove(&id);
+                        self.order_lens.remove(&id);
+                    }
+                    if !canonical_child && orphan.round <= header.round {
+                        continue;
+                    }
+                    rebuilt.push(Pending {
+                        round: orphan.round,
+                        order_len,
+                        height: 0,
+                        state_root: Some(orphan.state_root),
+                        applied: orphan.applied,
+                    });
+                }
                 self.last_built = header.clone();
                 self.last_built_order = 0;
                 self.pending.retain(|pending| pending.round > header.round);
+                rebuilt.extend(self.pending.drain(..));
+                rebuilt.sort_by_key(|pending| pending.round);
+                let mut queue: VecDeque<Pending> = VecDeque::with_capacity(rebuilt.len());
+                for pending in rebuilt {
+                    if queue.back().is_some_and(|last| last.round == pending.round) {
+                        continue;
+                    }
+                    queue.push_back(pending);
+                }
+                self.pending = queue;
                 self.next_height = height.saturating_add(1);
                 for pending in &mut self.pending {
                     pending.height = self.next_height;
@@ -1286,6 +1346,68 @@ mod tests {
             1,
             "the decision already covered by the adopted head is dropped"
         );
+        let own = &next.shares[0];
+        assert_eq!(own.header.height, 2);
+        assert_eq!(own.header.round, 3);
+        assert_eq!(own.header.previous, peer.id().unwrap());
+    }
+
+    #[test]
+    fn an_adopted_head_rebuilds_ahead_of_its_orphan_chain() {
+        let (set, keys) = fixture(4);
+        let sets = SetSchedule::single(set.clone());
+        let schedule = EpochSchedule::single(1);
+        let chain_id = b"karsa-orphan".to_vec();
+        let anchor = genesis(&chain_id, [0u8; 32]);
+
+        let mut follower = Finalizer::new(
+            sets,
+            schedule,
+            chain_id.clone(),
+            b"val-0".to_vec(),
+            keys[0].clone(),
+            anchor.clone(),
+            0,
+        )
+        .unwrap();
+        // Three local decisions are built before the peer's canonical height 1
+        // arrives. It decides round 2, so the local round-2 header is covered
+        // while the round-3 decision is still a future slot.
+        follower.record_commit(1, 0);
+        follower.record_commit(2, 0);
+        follower.record_commit(3, 0);
+        follower.mark_applied(0, [7u8; 32], 0);
+        let local = follower.build_ready(&[], 10).unwrap();
+        assert_eq!(local.shares.len(), 3);
+
+        let peer = Header {
+            chain_id: chain_id.clone(),
+            epoch: 1,
+            height: 1,
+            round: 2,
+            state_root: [7u8; 32],
+            dag_root: commit_root(&[]),
+            previous: anchor.id().unwrap(),
+            applied: 0,
+        };
+        let payload = signing_payload(&peer).unwrap();
+        for (signer, key) in keys.iter().enumerate().skip(1) {
+            follower
+                .receive_share(Share {
+                    header: peer.clone(),
+                    signer,
+                    signature: Ed25519Scheme.sign(key, &payload).unwrap(),
+                    at: 20 + signer as u64,
+                })
+                .unwrap();
+        }
+        assert_eq!(follower.head().height, 1);
+        assert_eq!(follower.head().round, 2);
+
+        // The covered round-2 header is dropped, and the round-3 header is
+        // rebuilt at the next canonical height on the adopted head.
+        let next = follower.build_ready(&[], 30).unwrap();
+        assert_eq!(next.shares.len(), 1);
         let own = &next.shares[0];
         assert_eq!(own.header.height, 2);
         assert_eq!(own.header.round, 3);
