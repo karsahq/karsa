@@ -385,20 +385,11 @@ impl Pacemaker {
         }
 
         // A fenced leader is failed by a quorum, so no honest quorum can vote
-        // for it at or after the fence. This runs after the direct and indirect
-        // rules: a commit always wins, and a fence only decides a round that is
-        // otherwise stuck.
+        // for it at or after the fence. This must preempt the anchor: an anchor
+        // can still name a vertex the fence proves no honest quorum supports,
+        // and committing it here would emit a slot the fence rejected.
         if dag.skip_fenced_leader(round)? {
             self.skips.fence_leader = self.skips.fence_leader.saturating_add(1);
-            self.cursor = round + 1;
-            return Ok(Advance::Skip);
-        }
-        // A live leader can still be blocked by one failed voter. With at most
-        // `f` held votes, even a late vote from every fenced validator cannot
-        // reach the `2f + 1` quorum, so the skip is safe under the fence's
-        // declaration.
-        if dag.skip_with_fence(round)? {
-            self.skips.fence_voter = self.skips.fence_voter.saturating_add(1);
             self.cursor = round + 1;
             return Ok(Advance::Skip);
         }
@@ -408,7 +399,8 @@ impl Pacemaker {
         // round whose status is still unknown: a higher anchor can contain a
         // leader the lower one does not, so choosing it early would make the
         // commit order depend on when data arrived rather than on the DAG.
-        if let Some(anchor) = self.stable_anchor(dag, round)? {
+        let anchor = self.stable_anchor(dag, round)?;
+        if let Some(anchor) = anchor.as_ref() {
             // A round-skip certificate is negative evidence: it proves that no
             // vote quorum can form, but it can arrive after another node has
             // already committed the same leader through its anchor. Overriding
@@ -419,12 +411,12 @@ impl Pacemaker {
             // `try_indirect_decide` commits the leader's history as a side
             // effect, so the two ways this node could be wrong are ruled out
             // first: a walk it cannot finish (nothing is proved), and a skip
-            // that could still win (a non-vote quorum may exist, and a skip must
-            // not race a commit).
+            // that could still win (a non-vote quorum may still arrive, and a
+            // skip must not race a commit).
             let reach = match dag.leader(round) {
                 Some(leader) => {
                     let leader_id = leader.id()?;
-                    match dag.is_ancestor(&leader_id, &anchor) {
+                    match dag.is_ancestor(&leader_id, anchor) {
                         Ok(true) => Reach::Yes,
                         Ok(false) => Reach::No,
                         // A partial walk proves nothing. Deciding anyway is how the
@@ -441,8 +433,16 @@ impl Pacemaker {
 
             let decision = match reach {
                 Reach::Unknown => None,
-                Reach::Yes if dag.held_voters(round)? <= dag.set().max_faulty() => None,
-                _ => Some(dag.try_indirect_decide(round, &anchor)?),
+                // The bound counts what can still arrive: held non-votes plus
+                // every missing voter that is not fenced. A fenced vote cannot
+                // be inserted, so it never keeps the slot open on its own.
+                // The coarse `held_voters <= f` bound this replaced treated
+                // every fenced vote as a possible skip, and then the fence
+                // rule skipped the slot before the anchor could commit it:
+                // the same DAG emitted one order when the certificate arrived
+                // before the tick and another when it arrived after.
+                Reach::Yes if dag.can_still_skip_directly(round)? => None,
+                _ => Some(dag.try_indirect_decide(round, anchor)?),
             };
 
             if let Some(decision) = decision {
@@ -460,7 +460,7 @@ impl Pacemaker {
                         // Reaching here means the leader is absent: the indirect
                         // rule bails out before checking reachability when the
                         // node does not hold the leader's vertex.
-                        if self.skip_absent_leader(dag, &anchor)? {
+                        if self.skip_absent_leader(dag, anchor)? {
                             self.skips.absent = self.skips.absent.saturating_add(1);
                             self.cursor = round + 1;
                             return Ok(Advance::Skip);
@@ -468,6 +468,21 @@ impl Pacemaker {
                     }
                 }
             }
+        }
+
+        // A live leader can still be blocked by one failed voter. With at most
+        // `f` held votes, even a late vote from every fenced validator cannot
+        // reach the quorum, so the skip is safe under the fence's declaration.
+        // This is the fallback only: when an anchor can decide the slot, the
+        // anchor is the outcome. A fence bounds a direct quorum, not the
+        // indirect commitment path, so letting it decide first makes the
+        // emitted order depend on certificate arrival. While the anchor's walk
+        // is incomplete the node waits instead: a fence is negative evidence,
+        // and the anchor may still name the leader.
+        if anchor.is_none() && dag.skip_with_fence(round)? {
+            self.skips.fence_voter = self.skips.fence_voter.saturating_add(1);
+            self.cursor = round + 1;
+            return Ok(Advance::Skip);
         }
 
         // The cursor is stuck. Note an anchored round ahead so the stall counter
@@ -995,17 +1010,23 @@ mod tests {
                     fixture.dag.inspect_indirect_decide(1, &anchor).unwrap(),
                     Decision::Commit(history) if history.contains(&leader)
                 ));
+                // The only missing voter is fenced, so the direct rule can never
+                // observe a non-vote quorum; the anchor commit is canonical and
+                // must win over the fence skip. This is the delivery-order case:
+                // the same DAG committed here when the fence arrived after the
+                // tick, so it must commit when the fence arrives before it.
+                assert!(!fixture.dag.can_still_skip_directly(1).unwrap());
                 assert!(matches!(
                     pacemaker.tick_one(&mut fixture.dag).unwrap(),
                     Step::Advanced {
                         from: 1,
                         cursor: 2,
-                        commits: 0,
-                        skips: 1,
+                        commits: 1,
+                        skips: 0,
                         ..
                     }
                 ));
-                assert!(!fixture.dag.order().contains(&leader));
+                assert!(fixture.dag.order().contains(&leader));
             }
             pacemaker.tick(&mut fixture.dag).unwrap();
             // Round 4 elects the fenced val-0, so draining also skips that slot.

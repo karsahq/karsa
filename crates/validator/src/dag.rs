@@ -1286,6 +1286,13 @@ impl Dag {
         let Some(leader) = self.leader(round) else {
             return Ok(None);
         };
+        // A fenced author's vertex is not an anchor. Nodes that hold the vertex
+        // from before the fence and nodes that never received it must agree that
+        // this round cannot anchor, or one would decide an earlier slot through
+        // a history the other cannot see.
+        if self.is_fenced(&leader.author, round) {
+            return Ok(None);
+        }
         let leader_id = leader.id()?;
         let candidates: Vec<Vertex> = self
             .round_vertices(round + 1)
@@ -2871,7 +2878,16 @@ impl Dag {
             let Some(vertex) = self.vertices.get(&(current.round, current.author.clone())) else {
                 return Some(current);
             };
-            stack.extend(vertex.references.iter().cloned());
+            // A fenced reference is not causal evidence: insertion rejects a
+            // fenced author's vertex, so no held peer can serve it and repair
+            // would wait for a vertex this node will never accept.
+            stack.extend(
+                vertex
+                    .references
+                    .iter()
+                    .filter(|reference| !self.is_fenced(&reference.author, reference.round))
+                    .cloned(),
+            );
         }
         None
     }
@@ -2969,6 +2985,50 @@ impl Dag {
         Ok(possible >= voter_set.quorum_size())
     }
 
+    /// Returns whether the direct rule could still decide to skip `round` if
+    /// every vertex it has not received turns out to be a non-vote.
+    ///
+    /// This is the mirror of [`Dag::can_still_anchor`]. A held non-vote already
+    /// counts, a missing non-fenced voter may still arrive as one, and a fenced
+    /// validator can never add a vertex. The pacemaker uses this to decide
+    /// whether an anchor commit may proceed: a skip must not race a commit, but
+    /// waiting for non-votes that cannot arrive is what let a fence certificate's
+    /// arrival time change the emitted order.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`tally_votes`].
+    pub fn can_still_skip_directly(&self, round: u64) -> Result<bool, CryptoError> {
+        let Some(leader) = self.leader(round) else {
+            // A missing leader is decided by the indirect rule's absence proof,
+            // never by observed non-votes.
+            return Ok(false);
+        };
+        let leader_id = leader.id()?;
+
+        let candidates: Vec<Vertex> = self
+            .round_vertices(round + 1)
+            .into_iter()
+            .cloned()
+            .collect();
+        let voter_set = self.set_for_round(round + 1);
+        let voters = tally_votes(voter_set, &leader_id, &candidates, &self.schedule)?;
+        let held: HashSet<&[u8]> = candidates
+            .iter()
+            .map(|vertex| vertex.author.as_slice())
+            .collect();
+        let possible = voter_set
+            .validators
+            .iter()
+            .filter(|record| {
+                !self.is_fenced(&record.validator_id, round + 1)
+                    && !(held.contains(record.validator_id.as_slice())
+                        && voters.contains(&record.validator_id))
+            })
+            .count();
+        Ok(possible >= voter_set.quorum_size())
+    }
+
     /// Collects `id` and its ancestors that are not yet committed, in a
     /// deterministic order.
     fn collect_uncommitted_history(&self, id: &VertexId) -> Result<Vec<VertexId>, CryptoError> {
@@ -3012,8 +3072,18 @@ impl Dag {
                     "agreement target history work budget exhausted",
                 ));
             }
-            collected.extend(vertex.references.iter().cloned());
-            stack.extend(vertex.references.iter().cloned());
+            // A fence erases the fenced author's causality from this round on.
+            // Two nodes that differ only in whether they hold that vertex must
+            // collect the same history, and a fenced vertex can never be
+            // committed (apply_fence refuses a committed one).
+            let references: Vec<VertexId> = vertex
+                .references
+                .iter()
+                .filter(|reference| !self.is_fenced(&reference.author, reference.round))
+                .cloned()
+                .collect();
+            collected.extend(references.iter().cloned());
+            stack.extend(references);
             collected.push(current);
         }
 
@@ -3172,6 +3242,9 @@ impl Dag {
         round: u64,
         author: &[u8],
     ) -> Result<bool, CryptoError> {
+        if self.is_fenced(&anchor.author, anchor.round) {
+            return Ok(false);
+        }
         let mut seen: HashSet<VertexId> = HashSet::new();
         let mut stack = vec![anchor.clone()];
         while let Some(current) = stack.pop() {
@@ -3188,7 +3261,13 @@ impl Dag {
                 .vertices
                 .get(&(current.round, current.author.clone()))
                 .ok_or_else(|| missing(&current))?;
-            stack.extend(vertex.references.iter().cloned());
+            stack.extend(
+                vertex
+                    .references
+                    .iter()
+                    .filter(|reference| !self.is_fenced(&reference.author, reference.round))
+                    .cloned(),
+            );
         }
         Ok(false)
     }
@@ -3205,6 +3284,14 @@ impl Dag {
         ancestor: &VertexId,
         descendant: &VertexId,
     ) -> Result<bool, CryptoError> {
+        // A fenced vertex is not part of the valid causal graph from its fence
+        // round on. Treating it as reachable would make the answer depend on
+        // whether the fenced vertex happened to arrive before the certificate.
+        if self.is_fenced(&ancestor.author, ancestor.round)
+            || self.is_fenced(&descendant.author, descendant.round)
+        {
+            return Ok(false);
+        }
         let mut seen: HashSet<VertexId> = HashSet::new();
         let mut stack = vec![descendant.clone()];
         while let Some(current) = stack.pop() {
@@ -3221,7 +3308,13 @@ impl Dag {
                 .vertices
                 .get(&(current.round, current.author.clone()))
                 .ok_or_else(|| missing(&current))?;
-            stack.extend(vertex.references.iter().cloned());
+            stack.extend(
+                vertex
+                    .references
+                    .iter()
+                    .filter(|reference| !self.is_fenced(&reference.author, reference.round))
+                    .cloned(),
+            );
         }
         Ok(false)
     }
@@ -5954,6 +6047,87 @@ mod tests {
         // name it; the fence says the author is failed from this round, so the
         // round can never anchor and a higher anchor must be used.
         assert!(!fixture.dag.can_still_anchor(LEADER_ROUND).unwrap());
+    }
+
+    #[test]
+    fn a_fenced_vertex_is_not_causal_history() {
+        // Round 1 is led by val-1. val-0 votes at round 2 before the fence
+        // exists, and the honest suffix references that vote. Once the fence is
+        // applied, the vertex is outside the valid causal graph: a node that
+        // holds it and a node that never received it must decide identically.
+        let mut fixture = bootstrapped(4);
+        let round1 = fixture.ids(1);
+        let leader = round1[1].clone();
+        for author in 0..fixture.count() {
+            let references = if author == 0 || author == 3 {
+                vec![leader.clone(), round1[0].clone(), round1[2].clone()]
+            } else {
+                vec![round1[0].clone(), round1[2].clone(), round1[3].clone()]
+            };
+            let vote = vertex(&fixture, author, 2, references);
+            fixture.dag.insert(vote).unwrap();
+        }
+        let fenced = fixture.dag.get(2, b"val-0").unwrap().id().unwrap();
+        let certificate = fence_certificate(&fixture, 2, b"val-0");
+        fixture
+            .dag
+            .apply_fence(b"karsa-dag-1", &certificate)
+            .unwrap();
+
+        // The fenced author can no longer author, but honest round-3 vertices
+        // still reference its pre-fence vote. Two of the three references are
+        // honest votes/trails, so the quorum is met without that voter.
+        let round2 = fixture.ids(2);
+        let refs = vec![fenced.clone(), round2[2].clone(), round2[3].clone()];
+        for author in 1..fixture.count() {
+            let vote = vertex(&fixture, author, 3, refs.clone());
+            fixture.dag.insert(vote).unwrap();
+        }
+        for round in 4..=6 {
+            let references = fixture.ids(round - 1);
+            for author in 1..fixture.count() {
+                let vote = vertex(&fixture, author, round, references.clone());
+                fixture.dag.insert(vote).unwrap();
+            }
+        }
+        let round3 = fixture.ids(3);
+        let anchor = fixture.dag.is_anchored(5).unwrap().unwrap();
+
+        let before = fixture.dag.inspect_indirect_decide(3, &anchor).unwrap();
+        let Decision::Commit(history) = &before else {
+            panic!("the round-3 leader is reachable from the anchor: {before:?}");
+        };
+        let leader3 = fixture.dag.leader(3).unwrap().id().unwrap();
+        assert!(history.contains(&leader3));
+        assert!(round3.contains(&leader3));
+        assert!(
+            !history.contains(&fenced),
+            "a fenced vertex is not part of the committed history"
+        );
+        assert!(!fixture.dag.is_ancestor(&fenced, &anchor).unwrap());
+        assert!(
+            !fixture
+                .dag
+                .history_contains_author(&anchor, 2, b"val-0")
+                .unwrap()
+        );
+
+        // Dropping the fenced vertex, as a node that never received it would,
+        // must not create a missing reference: the walk skips it either way.
+        fixture
+            .dag
+            .vertices
+            .remove(&(fenced.round, fenced.author.clone()));
+        assert_eq!(
+            fixture.dag.inspect_indirect_decide(3, &anchor).unwrap(),
+            before
+        );
+        assert!(fixture.dag.is_ancestor(&leader, &anchor).unwrap());
+        assert_eq!(
+            fixture.dag.missing_history(3),
+            None,
+            "repair must not request a vertex the fence made invalid"
+        );
     }
 
     fn transition_keys(count: usize) -> Vec<Vec<u8>> {
