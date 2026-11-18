@@ -791,13 +791,23 @@ impl Finalizer {
                 // head. Continuing to build on it would produce headers whose
                 // `previous` names an orphan, and no field ever moves back to the
                 // canonical chain. Reset the builder to the new head and drop
-                // pending heights the head has passed. Heights already assigned
-                // above the head keep their numbers: `record_commit` may have
-                // queued several of them before this advance.
+                // pending decisions the head already covers.
+                //
+                // A height is only a local label. A node that ran ahead of the
+                // certified head can have queued a pending decision for the very
+                // round the adopted header decides, under the next height. Dropping
+                // by height alone keeps that duplicate and shifts every later
+                // header away from its peers' heights; a decision's canonical
+                // identity is its round, so keep only later rounds and renumber
+                // them from the adopted head.
                 self.last_built = header.clone();
                 self.last_built_order = 0;
-                self.next_height = self.next_height.max(height.saturating_add(1));
-                self.pending.retain(|pending| pending.height > height);
+                self.pending.retain(|pending| pending.round > header.round);
+                self.next_height = height.saturating_add(1);
+                for pending in &mut self.pending {
+                    pending.height = self.next_height;
+                    self.next_height = self.next_height.saturating_add(1);
+                }
             }
             certified.push(Certified {
                 header,
@@ -1206,6 +1216,79 @@ mod tests {
         let next = follower.build_ready(&order, 30).unwrap();
         let own = next.shares.first().expect("the follower signs its header");
         assert_eq!(own.header.height, 2);
+        assert_eq!(own.header.previous, peer.id().unwrap());
+    }
+
+    #[test]
+    fn an_adopted_head_drops_a_duplicate_pending_decision() {
+        let (set, keys) = fixture(4);
+        let sets = SetSchedule::single(set.clone());
+        let schedule = EpochSchedule::single(1);
+        let chain_id = b"karsa-rebase".to_vec();
+        let anchor = genesis(&chain_id, [0u8; 32]);
+
+        let mut follower = Finalizer::new(
+            sets,
+            schedule,
+            chain_id.clone(),
+            b"val-0".to_vec(),
+            keys[0].clone(),
+            anchor.clone(),
+            0,
+        )
+        .unwrap();
+        // This node commits round 1 locally and queues round 2 before it sees
+        // the peer's canonical head.
+        follower.record_commit(1, 0);
+        follower.mark_applied(0, [7u8; 32], 0);
+        let local = follower.build_ready(&[], 10).unwrap();
+        assert_eq!(local.shares[0].header.height, 1);
+        follower.record_commit(2, 0);
+
+        // The peer head at height 1 already decides round 2. It is certified by
+        // a quorum that this node did not sign.
+        let peer = Header {
+            chain_id: chain_id.clone(),
+            epoch: 1,
+            height: 1,
+            round: 2,
+            state_root: [7u8; 32],
+            dag_root: commit_root(&[]),
+            previous: anchor.id().unwrap(),
+            applied: 0,
+        };
+        let payload = signing_payload(&peer).unwrap();
+        for (signer, key) in keys.iter().enumerate().skip(1) {
+            follower
+                .receive_share(Share {
+                    header: peer.clone(),
+                    signer,
+                    signature: Ed25519Scheme.sign(key, &payload).unwrap(),
+                    at: 20 + signer as u64,
+                })
+                .unwrap();
+        }
+        assert_eq!(follower.head().height, 1);
+        assert_eq!(follower.head().round, 2);
+        assert_eq!(
+            follower.next_height(),
+            2,
+            "heights restart directly above the adopted head"
+        );
+
+        // The next local decision is round 3. Its header must be height 2 on the
+        // adopted head; the duplicate round-2 pending must not be rebuilt first.
+        follower.record_commit(3, 0);
+        follower.mark_applied(0, [7u8; 32], 0);
+        let next = follower.build_ready(&[], 30).unwrap();
+        assert_eq!(
+            next.shares.len(),
+            1,
+            "the decision already covered by the adopted head is dropped"
+        );
+        let own = &next.shares[0];
+        assert_eq!(own.header.height, 2);
+        assert_eq!(own.header.round, 3);
         assert_eq!(own.header.previous, peer.id().unwrap());
     }
 
