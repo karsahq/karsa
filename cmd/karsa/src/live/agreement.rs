@@ -1978,6 +1978,7 @@ pub use execution::CertifiedExecution;
 pub use finalization::CertifiedFinalization;
 pub use journaled_finalization::JournaledFinalization;
 pub mod pacemaker;
+pub mod session;
 pub use envelope::{CarrierEnvelope, CarrierPayload, MAX_ENVELOPE_BYTES};
 pub use ordering::OrderingConsumer;
 
