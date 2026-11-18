@@ -171,13 +171,17 @@ impl JournaledFinalization {
     }
 
     /// Imports trusted availability and attempts one durable nil or positive-phase obligation.
+    /// When no carrier obligation is authorable, echoes the largest exact future view target with
+    /// more than `f` distinct authenticated signers. The echo never invents a target, derives one
+    /// from local view advancement, or signs a stale view; it only signs already-observed support
+    /// once, and later retransmission belongs to the bounded control-retry cadence.
     /// The only prospective round is one above the highest retained causal round, not
     /// a protocol-phase counter. Nil votes use their durable intent, not a fabricated carrier;
-    /// an empty DAG waits only for positive phases. Full durable cone validation remains
-    /// authoritative; a high incomplete frontier can stall rather than invent progression.
-    /// Completed payloads are not reauthored, including after explicit owner recovery.
-    /// Durable selection/reconstruction is capped at 4096 WAL events, not storage bytes.
-    /// Does not tick, retry, authorize future-view requests, elect proposals/views or apply slots.
+    /// an empty DAG authors no carrier but can still echo observed view support. Full durable cone
+    /// validation remains authoritative; a high incomplete frontier can stall rather than invent
+    /// progression. Completed payloads are not reauthored, including after explicit owner
+    /// recovery. Durable selection/reconstruction is capped at 4096 WAL events, not storage bytes.
+    /// Does not tick, retry, elect proposals/views or apply slots.
     /// # Errors
     /// Propagates bounded import, ownership, round overflow and durable authoring errors.
     pub fn drive_local(&mut self, vertices: Vec<Vertex>) -> Result<Vec<Message>, String> {
@@ -214,13 +218,45 @@ impl JournaledFinalization {
             .authoring
             .as_ref()
             .ok_or("local authoring is not configured")?;
-        let Some(highest) = local.node.dag().highest_round() else {
-            return Ok(Vec::new());
+        let round = local
+            .node
+            .dag()
+            .highest_round()
+            .map(|highest| highest.checked_add(1).ok_or("local causal round exhausted"))
+            .transpose()?;
+        let authored = match round {
+            Some(round) => self.author_local_action(round, AuthoringAction::Durable)?,
+            None => Vec::new(),
         };
-        let round = highest
-            .checked_add(1)
-            .ok_or("local causal round exhausted")?;
-        self.author_local_action(round, AuthoringAction::Durable)
+        if !authored.is_empty() {
+            return Ok(authored);
+        }
+        self.echo_view_local()
+    }
+
+    /// Echoes at most one exact future view target already supported by more than `f`
+    /// distinct authenticated signers. Support comes only from authenticated receipt or
+    /// durable local publications; local timers, decisions and causal state create no target.
+    /// Only a newly authored publication is returned; an already completed echo is left to the
+    /// bounded control-retry cadence so automatic driving cannot starve carrier retries.
+    fn echo_view_local(&mut self) -> Result<Vec<Message>, String> {
+        self.check_health()?;
+        if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
+            return Err("local view echo exceeds 4096 durable events".into());
+        }
+        let before = self.adapter.driver.sequence();
+        let echoed = self.adapter.echo_view_request();
+        let result = match echoed {
+            Ok(Some(request)) if self.adapter.driver.sequence() != before => request
+                .encode(&self.adapter.set)
+                .map(Message::AgreementViewRequest)
+                .map(|message| vec![message])
+                .map_err(|e| e.to_string()),
+            Ok(_) => Ok(Vec::new()),
+            Err(error) => Err(error),
+        };
+        self.check_health()?;
+        result
     }
 
     fn import_local(&mut self, vertices: Vec<Vertex>) -> Result<(), String> {

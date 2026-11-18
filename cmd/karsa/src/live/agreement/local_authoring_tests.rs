@@ -868,3 +868,160 @@ fn owned_publication_discovery_recovers_lost_output_and_reopen_without_signing()
         "discovery checks stale ownership"
     );
 }
+
+#[test]
+fn owned_drive_echoes_exact_future_support_without_inventing_targets() {
+    use net::wire::Message;
+    use std::time::Duration;
+    let (m, bootstrap, _) = fixture();
+    let wait = Duration::from_secs(1);
+    let policy = super::pacemaker::Policy::new(wait, wait, wait).unwrap();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut b = bootstrap.clone();
+    b.agreement.local_validator = m.consensus[3].id.clone();
+    let mut owner = open_event_pump_owner_index(&store, &b, &m, 3);
+    owner
+        .enable_authoring(authoring_node_index(&m, &[], 3), policy, wait)
+        .unwrap();
+    let wal = dir.0.join("authenticated-slot-agreement");
+    let before = std::fs::read(&wal).unwrap();
+    assert!(
+        owner.drive_local(Vec::new()).unwrap().is_empty(),
+        "no view support is invented"
+    );
+    assert_eq!(
+        std::fs::read(&wal).unwrap(),
+        before,
+        "no signing without support"
+    );
+
+    owner
+        .receive_agreement_message(Message::AgreementViewRequest(
+            signed_view_request(&m, &b, 0, 7).encode(&m.set).unwrap(),
+        ))
+        .unwrap();
+    assert!(
+        owner.drive_local(Vec::new()).unwrap().is_empty(),
+        "f support is below the echo threshold"
+    );
+    assert_eq!(
+        std::fs::read(&wal).unwrap(),
+        before,
+        "sub-threshold receipt creates no obligation"
+    );
+
+    owner
+        .receive_agreement_message(Message::AgreementViewRequest(
+            signed_view_request(&m, &b, 1, 8).encode(&m.set).unwrap(),
+        ))
+        .unwrap();
+    assert!(
+        owner.drive_local(Vec::new()).unwrap().is_empty(),
+        "one support per mixed target does not authorize an echo"
+    );
+    assert_eq!(std::fs::read(&wal).unwrap(), before);
+
+    owner
+        .receive_agreement_message(Message::AgreementViewRequest(
+            signed_view_request(&m, &b, 2, 7).encode(&m.set).unwrap(),
+        ))
+        .unwrap();
+    let echo = owner.drive_local(Vec::new()).unwrap();
+    assert_eq!(echo.len(), 1);
+    let Message::AgreementViewRequest(bytes) = &echo[0] else {
+        panic!("expected view request publication")
+    };
+    let request = validator::SlotAgreementViewRequest::decode(bytes, &m.set).unwrap();
+    request.verify(&b.agreement.context, &m.set).unwrap();
+    assert_eq!(request.target_view(), AgreementView(7));
+    assert_eq!(request.signature().validator_id, m.consensus[3].id);
+    net::wire::frame(&echo[0], 0).unwrap();
+    let completed = std::fs::read(&wal).unwrap();
+    assert_ne!(
+        completed, before,
+        "echo durably reserves and completes support"
+    );
+    assert!(
+        owner.drive_local(Vec::new()).unwrap().is_empty(),
+        "entered target is no longer future; echo does not repeat"
+    );
+    assert_eq!(
+        std::fs::read(&wal).unwrap(),
+        completed,
+        "no duplicate signing"
+    );
+    drop(owner);
+    let recovered = Adapter::recover(&store, b, &m, 3).unwrap();
+    assert_eq!(recovered.completed_view_requests().unwrap(), vec![request]);
+    assert_eq!(
+        recovered.driver.output().unwrap().transition.unwrap().view,
+        AgreementView(7),
+        "local support completed a quorum for the echoed target"
+    );
+    assert_eq!(std::fs::read(&wal).unwrap(), completed);
+}
+
+#[test]
+fn owned_drive_prefers_a_durable_carrier_over_view_echo() {
+    use net::wire::Message;
+    use std::time::Duration;
+    let (m, bootstrap, request) = fixture();
+    let AuthenticatedSlotAgreementRequest::Propose { vertices, .. } = &request else {
+        unreachable!("fixture proposes")
+    };
+    let vertices = vertices.clone();
+    let wait = Duration::from_secs(1);
+    let policy = super::pacemaker::Policy::new(wait, wait, wait).unwrap();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let genesis = chain::genesis_state(&m.accounts).unwrap();
+    let chain_id = bootstrap.agreement.context.chain_id().to_vec();
+    let anchor = validator::Header::genesis(
+        chain_id.clone(),
+        m.set.epoch,
+        genesis.state_root(),
+        *bootstrap.agreement.context.order_root(),
+    );
+    let finalizer = validator::Finalizer::new(
+        validator::SetSchedule::single(m.set.clone()),
+        validator::EpochSchedule::single(m.set.epoch),
+        chain_id,
+        m.consensus[0].id.clone(),
+        m.consensus[0].private_key.clone(),
+        anchor,
+        0,
+    )
+    .unwrap();
+    let mut adapter = Adapter::begin(&store, bootstrap.clone(), &m, 0).unwrap();
+    adapter.apply(request).unwrap();
+    let mut owner = JournaledFinalization::open(adapter, genesis, finalizer).unwrap();
+    owner
+        .enable_authoring(authoring_node_index(&m, &[], 0), policy, wait)
+        .unwrap();
+    for signer in [1, 2] {
+        owner
+            .receive_agreement_message(Message::AgreementViewRequest(
+                signed_view_request(&m, &bootstrap, signer, 9)
+                    .encode(&m.set)
+                    .unwrap(),
+            ))
+            .unwrap();
+    }
+    let authored = owner.drive_local(vertices).unwrap();
+    assert_eq!(authored.len(), 1);
+    assert!(
+        matches!(authored[0], Message::AgreementCarrier { .. }),
+        "positive durable obligation precedes view echo"
+    );
+    let echo = owner.drive_local(Vec::new()).unwrap();
+    assert_eq!(echo.len(), 1);
+    let Message::AgreementViewRequest(bytes) = &echo[0] else {
+        panic!("expected view echo once the carrier is complete")
+    };
+    let echoed = validator::SlotAgreementViewRequest::decode(bytes, &m.set).unwrap();
+    assert_eq!(echoed.target_view(), AgreementView(9));
+    drop(owner);
+    let recovered = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
+    assert_eq!(recovered.completed_view_requests().unwrap(), vec![echoed]);
+}
