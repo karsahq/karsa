@@ -598,6 +598,7 @@ mod tests {
     use crate::fence::{Fence, FenceCertificate};
     use crate::schedule::{NO_EXPIRY, ValidatorKey, ValidatorRecord, ValidatorSet};
     use crate::vertex::Vertex;
+    use crate::{EpochSchedule, Finalizer, Header, SetSchedule, commit_root};
     use crypto::registry::ALG_ED25519;
     use crypto::scheme::Ed25519Scheme;
 
@@ -920,63 +921,123 @@ mod tests {
         );
     }
 
+    /// Builds the fence-arrival regression DAG and the honest certificate over it.
+    ///
+    /// Two voters for the round-1 leader, two non-voters, and `f = 1` is the
+    /// smallest shape where the direct rule cannot decide but a higher anchor
+    /// can. The certificate signs only validators that never referenced the
+    /// fenced author at or after its fence round, so it is valid whether it is
+    /// applied before or after the round-1 decision.
+    fn fence_arrival_fixture() -> (Fixture, VertexId, VertexId, FenceCertificate, Vec<Vertex>) {
+        let mut fixture = chain(1, &[]);
+        let round1 = fixture.ids(1);
+        let leader = round1[1].clone();
+        // Match the arrival regression: two votes, two non-votes, f = 1.
+        for author in 0..COUNT {
+            let references = if author == 0 || author == 3 {
+                vec![round1[0].clone(), leader.clone(), round1[2].clone()]
+            } else {
+                vec![round1[0].clone(), round1[2].clone(), round1[3].clone()]
+            };
+            let vote = vertex(&fixture, author, 2, references);
+            fixture.dag.insert(vote).unwrap();
+        }
+        let honest_votes: Vec<_> = fixture
+            .ids(2)
+            .into_iter()
+            .filter(|id| id.author != b"val-0")
+            .collect();
+        fixture.insert_round(3, &honest_votes, &[0]).unwrap();
+        let round3 = fixture.ids(3);
+        fixture.insert_round(4, &round3, &[0]).unwrap();
+        let anchor = fixture.dag.is_anchored(3).unwrap().unwrap();
+        assert!(fixture.dag.is_ancestor(&leader, &anchor).unwrap());
+        assert_eq!(fixture.dag.held_voters(1).unwrap(), 2);
+        let suffix: Vec<_> = (3..=4)
+            .flat_map(|round| (1..COUNT).map(move |author| (round, format!("val-{author}"))))
+            .map(|(round, author)| fixture.dag.get(round, author.as_bytes()).unwrap().clone())
+            .collect();
+
+        let fence = Fence::new(b"karsa-pacemaker-1".to_vec(), 2, b"val-0".to_vec());
+        let payload = fence.signing_payload().unwrap();
+        let mut signer_bitmap = vec![0u8; bitmap_len(COUNT)];
+        let mut signatures = Vec::new();
+        for index in 1..COUNT {
+            // Signers never referenced val-0 at/after the proposed fence,
+            // including in the suffix authored before certificate delivery.
+            for round in 0..=4 {
+                let author = format!("val-{index}");
+                let authored = fixture.dag.get(round, author.as_bytes()).unwrap();
+                assert!(
+                    authored.references.iter().all(|id| {
+                        id.author != fence.validator_id || id.round < fence.from_round
+                    })
+                );
+            }
+            set_bit(&mut signer_bitmap, index);
+            signatures.push(Ed25519Scheme.sign(&fixture.keys[index], &payload).unwrap());
+        }
+        let certificate = FenceCertificate {
+            fence,
+            signer_bitmap,
+            signatures,
+        };
+        certificate
+            .verify(b"karsa-pacemaker-1", fixture.dag.set())
+            .unwrap();
+        (fixture, leader, anchor, certificate, suffix)
+    }
+
+    /// A finalizer anchored at the same genesis header the live node would use.
+    fn header_finalizer(fixture: &Fixture) -> Finalizer {
+        let anchor = Header::genesis(
+            b"karsa-pacemaker-1".to_vec(),
+            EPOCH,
+            [0; 32],
+            commit_root(&[]),
+        );
+        Finalizer::new(
+            SetSchedule::single(fixture.dag.set().clone()),
+            EpochSchedule::single(EPOCH),
+            anchor.chain_id.clone(),
+            b"val-0".to_vec(),
+            fixture.keys[0].clone(),
+            anchor,
+            0,
+        )
+        .unwrap()
+    }
+
+    /// Takes one decision and allocates a header only for a commit boundary.
+    ///
+    /// This is the live loop's exact feed: `tick_one` exposes one boundary,
+    /// and `record_commit` is called only when that boundary committed. A skip
+    /// advances the cursor without consuming a height.
+    fn decide_and_build(
+        fixture: &mut Fixture,
+        pacemaker: &mut Pacemaker,
+        finalizer: &mut Finalizer,
+        headers: &mut Vec<Header>,
+    ) -> Step {
+        let step = pacemaker.tick_one(&mut fixture.dag).unwrap();
+        if let Step::Advanced {
+            from, commits: 1, ..
+        } = step
+        {
+            let _ = finalizer.record_commit(from, fixture.dag.order_len());
+        }
+        finalizer.mark_applied(fixture.dag.order_len(), [0; 32], 0);
+        let build = finalizer
+            .build_ready_with_prefix(fixture.dag.prefix(), fixture.dag.order(), 0)
+            .unwrap();
+        headers.extend(build.shares.into_iter().map(|share| share.header));
+        step
+    }
+
     #[test]
     fn fence_delivery_after_an_indirect_commit_preserves_order_and_root() {
         fn run(decide_before_fence: bool) -> (Vec<VertexId>, [u8; 32], Vec<Vertex>) {
-            let mut fixture = chain(1, &[]);
-            let round1 = fixture.ids(1);
-            let leader = round1[1].clone();
-            // Match the arrival regression: two votes, two non-votes, f = 1.
-            for author in 0..COUNT {
-                let references = if author == 0 || author == 3 {
-                    vec![round1[0].clone(), leader.clone(), round1[2].clone()]
-                } else {
-                    vec![round1[0].clone(), round1[2].clone(), round1[3].clone()]
-                };
-                let vote = vertex(&fixture, author, 2, references);
-                fixture.dag.insert(vote).unwrap();
-            }
-            let honest_votes: Vec<_> = fixture
-                .ids(2)
-                .into_iter()
-                .filter(|id| id.author != b"val-0")
-                .collect();
-            fixture.insert_round(3, &honest_votes, &[0]).unwrap();
-            let round3 = fixture.ids(3);
-            fixture.insert_round(4, &round3, &[0]).unwrap();
-            let anchor = fixture.dag.is_anchored(3).unwrap().unwrap();
-            assert!(fixture.dag.is_ancestor(&leader, &anchor).unwrap());
-            assert_eq!(fixture.dag.held_voters(1).unwrap(), 2);
-            let suffix: Vec<_> = (3..=4)
-                .flat_map(|round| (1..COUNT).map(move |author| (round, format!("val-{author}"))))
-                .map(|(round, author)| fixture.dag.get(round, author.as_bytes()).unwrap().clone())
-                .collect();
-
-            let fence = Fence::new(b"karsa-pacemaker-1".to_vec(), 2, b"val-0".to_vec());
-            let payload = fence.signing_payload().unwrap();
-            let mut signer_bitmap = vec![0u8; bitmap_len(COUNT)];
-            let mut signatures = Vec::new();
-            for index in 1..COUNT {
-                // Signers never referenced val-0 at/after the proposed fence,
-                // including in the suffix authored before certificate delivery.
-                for round in 0..=4 {
-                    let author = format!("val-{index}");
-                    let authored = fixture.dag.get(round, author.as_bytes()).unwrap();
-                    assert!(authored.references.iter().all(|id| {
-                        id.author != fence.validator_id || id.round < fence.from_round
-                    }));
-                }
-                set_bit(&mut signer_bitmap, index);
-                signatures.push(Ed25519Scheme.sign(&fixture.keys[index], &payload).unwrap());
-            }
-            let certificate = FenceCertificate {
-                fence,
-                signer_bitmap,
-                signatures,
-            };
-            certificate
-                .verify(b"karsa-pacemaker-1", fixture.dag.set())
-                .unwrap();
+            let (mut fixture, leader, anchor, certificate, suffix) = fence_arrival_fixture();
             let mut pacemaker = pacemaker(1);
             if decide_before_fence {
                 assert!(matches!(
@@ -1056,6 +1117,95 @@ mod tests {
             first_difference.map(|index| &early_order[index]),
             first_difference.map(|index| &late_order[index])
         );
+    }
+
+    #[test]
+    fn fence_delivery_after_an_indirect_commit_preserves_header_heights() {
+        // The same delivery variation at the header boundary: a height is
+        // allocated per commit decision, so the header sequence must be a
+        // function of the decision sequence rather than of which tick the
+        // fence certificate landed in.
+        fn run(decide_before_fence: bool) -> (Vec<VertexId>, Vec<Header>, u64, usize) {
+            let (mut fixture, leader, anchor, certificate, _) = fence_arrival_fixture();
+            let mut pacemaker = pacemaker(1);
+            let mut finalizer = header_finalizer(&fixture);
+            let mut headers = Vec::new();
+            if decide_before_fence {
+                assert!(matches!(
+                    decide_and_build(&mut fixture, &mut pacemaker, &mut finalizer, &mut headers),
+                    Step::Advanced {
+                        from: 1,
+                        cursor: 2,
+                        commits: 1,
+                        skips: 0,
+                        ..
+                    }
+                ));
+            }
+            fixture
+                .dag
+                .apply_fence(b"karsa-pacemaker-1", &certificate)
+                .unwrap();
+            if !decide_before_fence {
+                assert_eq!(fixture.dag.held_voters(1).unwrap(), 1);
+                assert_eq!(fixture.dag.inspect_commit(1).unwrap(), Decision::Undecided);
+                assert!(!fixture.dag.can_still_skip_directly(1).unwrap());
+                assert!(matches!(
+                    fixture.dag.inspect_indirect_decide(1, &anchor).unwrap(),
+                    Decision::Commit(history) if history.contains(&leader)
+                ));
+            }
+            for _ in 0..64 {
+                if !matches!(
+                    decide_and_build(&mut fixture, &mut pacemaker, &mut finalizer, &mut headers),
+                    Step::Advanced { .. }
+                ) {
+                    break;
+                }
+            }
+            assert_eq!(pacemaker.cursor(), 5);
+            assert!(fixture.dag.order().contains(&leader));
+            // Round 4 elects the fenced val-0, so no height may cover it.
+            assert!(
+                headers.iter().all(|header| header.round != 4),
+                "a skipped slot must not allocate a header height"
+            );
+            let heights: Vec<u64> = headers.iter().map(|header| header.height).collect();
+            assert_eq!(
+                heights,
+                (1..=u64::try_from(headers.len()).unwrap()).collect::<Vec<_>>(),
+                "commit decisions allocate contiguous heights from one"
+            );
+            assert_eq!(
+                u64::try_from(headers.len()).unwrap(),
+                finalizer.next_height() - 1
+            );
+            assert_eq!(headers.len(), finalizer.built_headers());
+            // The last header covers the whole committed order, so its dag
+            // root must be the root of that exact decision sequence.
+            assert_eq!(finalizer.last_built_order(), fixture.dag.order_len());
+            assert_eq!(
+                headers.last().map(|header| header.dag_root),
+                Some(fixture.dag.commit_root())
+            );
+            (
+                fixture.dag.order().to_vec(),
+                headers,
+                finalizer.next_height(),
+                finalizer.last_built_order(),
+            )
+        }
+
+        let (early_order, early_headers, early_next, early_coverage) = run(true);
+        let (late_order, late_headers, late_next, late_coverage) = run(false);
+        assert_eq!(early_order, late_order);
+        assert_eq!(
+            early_headers, late_headers,
+            "fence delivery across an indirect commit must preserve the header sequence"
+        );
+        assert_eq!(early_next, late_next);
+        assert_eq!(early_coverage, late_coverage);
+        assert!(!early_headers.is_empty());
     }
 
     #[test]
