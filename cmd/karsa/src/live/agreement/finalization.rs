@@ -162,8 +162,16 @@ impl CertifiedFinalization {
                 break;
             }
             if boundary.is_commit() {
-                self.finalizer
-                    .record_commit(boundary.round(), boundary.order_len());
+                let Some(_height) = self
+                    .finalizer
+                    .record_commit(boundary.round(), boundary.order_len())
+                else {
+                    // Certified applications are the canonical decision sequence;
+                    // one that the header chain already covers means the snapshot
+                    // and the finalizer diverged.
+                    self.failed = true;
+                    return Err("certified commit boundary does not extend the header chain".into());
+                };
                 self.finalizer.mark_applied(
                     boundary.order_len(),
                     self.execution.state().state_root(),

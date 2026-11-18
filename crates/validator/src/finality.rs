@@ -346,7 +346,23 @@ impl Finalizer {
     ///
     /// `order_len` is the committed order length after this commit. The caller
     /// records one header per decision, in decision order.
-    pub fn record_commit(&mut self, round: u64, order_len: usize) -> u64 {
+    ///
+    /// Returns `None` when `round` is not beyond the slot this builder already
+    /// extends. A node that lags the committee keeps its own DAG cursor, so it
+    /// can decide a round whose header a quorum already certified and this
+    /// builder adopted. Allocating a second height for that covered decision
+    /// shifts every later local header one height away from its peers, and no
+    /// combination of shares can then reach a quorum. Height is a function of
+    /// the decision sequence, not of how late a node observed it.
+    pub fn record_commit(&mut self, round: u64, order_len: usize) -> Option<u64> {
+        let covered = round <= self.last_built.round
+            || self
+                .pending
+                .back()
+                .is_some_and(|pending| pending.round >= round);
+        if covered {
+            return None;
+        }
         let height = self.next_height;
         self.next_height = self.next_height.saturating_add(1);
         self.pending.push_back(Pending {
@@ -356,7 +372,7 @@ impl Finalizer {
             state_root: None,
             applied: 0,
         });
-        height
+        Some(height)
     }
 
     /// Captures the state at a committed prefix.
@@ -995,7 +1011,7 @@ mod tests {
             0,
         )
         .unwrap();
-        finalizer.record_commit(1, 0);
+        let _ = finalizer.record_commit(1, 0);
         finalizer.mark_applied(0, [7; 32], 0);
         let build = finalizer
             .build_ready_with_canonical_share(
@@ -1041,7 +1057,7 @@ mod tests {
             0,
         )
         .unwrap();
-        finalizer.record_commit(1, 0);
+        let _ = finalizer.record_commit(1, 0);
         finalizer.mark_applied(0, [7; 32], 0);
         let mut calls = 0;
         let error = finalizer
@@ -1077,8 +1093,8 @@ mod tests {
             0,
         )
         .unwrap();
-        finalizer.record_commit(1, 0);
-        finalizer.record_commit(2, 0);
+        let _ = finalizer.record_commit(1, 0);
+        let _ = finalizer.record_commit(2, 0);
         finalizer.mark_applied(0, [7; 32], 0);
         let mut reserved = Vec::new();
         let build = finalizer
@@ -1118,7 +1134,7 @@ mod tests {
         )
         .unwrap();
 
-        finalizer.record_commit(1, 1);
+        let _ = finalizer.record_commit(1, 1);
         finalizer.mark_applied(1, [7u8; 32], 1);
         let order = vec![order_entry(1, b"val-0")];
         let build = finalizer.build_ready(&order, 10).unwrap();
@@ -1164,8 +1180,8 @@ mod tests {
         )
         .unwrap();
 
-        finalizer.record_commit(1, 1);
-        finalizer.record_commit(2, 2);
+        let _ = finalizer.record_commit(1, 1);
+        let _ = finalizer.record_commit(2, 2);
         finalizer.mark_applied(1, [7u8; 32], 1);
         finalizer.mark_applied(2, [9u8; 32], 2);
         let order = vec![order_entry(1, b"val-0"), order_entry(2, b"val-1")];
@@ -1241,7 +1257,7 @@ mod tests {
             0,
         )
         .unwrap();
-        leader.record_commit(1, 1);
+        let _ = leader.record_commit(1, 1);
         leader.mark_applied(1, [7u8; 32], 1);
         let order = vec![order_entry(1, b"val-0")];
         let built = leader.build_ready(&order, 10).unwrap();
@@ -1270,12 +1286,102 @@ mod tests {
         }
         assert_eq!(follower.head().height, 1, "the peer chain is certified");
 
-        // Its next commit must extend that head, not rebuild height 1 behind it.
-        follower.record_commit(1, 1);
-        follower.mark_applied(1, [7u8; 32], 1);
-        let next = follower.build_ready(&order, 30).unwrap();
+        // This node's own DAG still has round 1 undecided, so it reports the
+        // same slot the certified head already covers. Rebuilding it would put
+        // the next local header one height above its peers' chain.
+        assert!(
+            follower.record_commit(1, 1).is_none(),
+            "a covered round does not allocate a second height"
+        );
+        assert!(
+            follower.build_ready(&order, 30).unwrap().shares.is_empty(),
+            "the covered decision produces no local header"
+        );
+        assert_eq!(follower.next_height(), 2);
+
+        // Its next decision is a later round, so it extends the certified head.
+        let order = vec![order_entry(1, b"val-0"), order_entry(2, b"val-1")];
+        assert_eq!(follower.record_commit(2, 2), Some(2));
+        follower.mark_applied(2, [9u8; 32], 2);
+        let next = follower.build_ready(&order, 40).unwrap();
         let own = next.shares.first().expect("the follower signs its header");
         assert_eq!(own.header.height, 2);
+        assert_eq!(own.header.round, 2);
+        assert_eq!(own.header.previous, peer.id().unwrap());
+    }
+
+    #[test]
+    fn a_lagging_builder_ignores_every_round_the_adopted_head_covers() {
+        let (set, keys) = fixture(4);
+        let sets = SetSchedule::single(set.clone());
+        let schedule = EpochSchedule::single(1);
+        let chain_id = b"karsa-covered".to_vec();
+        let anchor = genesis(&chain_id, [0u8; 32]);
+
+        let mut follower = Finalizer::new(
+            sets,
+            schedule,
+            chain_id.clone(),
+            b"val-0".to_vec(),
+            keys[0].clone(),
+            anchor.clone(),
+            0,
+        )
+        .unwrap();
+
+        // The committee certified round 5 at height 1 while this node's DAG was
+        // still at round 1. Decision rounds are the slot identity; the node's
+        // later local decisions for slots 1 through 5 are already covered.
+        let peer = Header {
+            chain_id: chain_id.clone(),
+            epoch: 1,
+            height: 1,
+            round: 5,
+            state_root: [7u8; 32],
+            dag_root: commit_root(&[]),
+            previous: anchor.id().unwrap(),
+            applied: 0,
+        };
+        let payload = signing_payload(&peer).unwrap();
+        for (signer, key) in keys.iter().enumerate().skip(1) {
+            follower
+                .receive_share(Share {
+                    header: peer.clone(),
+                    signer,
+                    signature: Ed25519Scheme.sign(key, &payload).unwrap(),
+                    at: 20 + signer as u64,
+                })
+                .unwrap();
+        }
+        assert_eq!(follower.head().height, 1);
+
+        for round in 1..=5 {
+            assert_eq!(
+                follower.record_commit(round, 0),
+                None,
+                "round {round} is already covered by the certified head"
+            );
+        }
+        assert_eq!(
+            follower.build_ready(&[], 10).unwrap().shares.len(),
+            0,
+            "covered decisions build no local header"
+        );
+
+        // The first decision past the head is the canonical height 2, even
+        // though this node observed four extra decisions before it.
+        assert_eq!(follower.record_commit(6, 0), Some(2));
+        assert_eq!(
+            follower.record_commit(6, 0),
+            None,
+            "a repeated decision does not allocate a second height"
+        );
+        follower.mark_applied(0, [7u8; 32], 0);
+        let build = follower.build_ready(&[], 20).unwrap();
+        assert_eq!(build.shares.len(), 1);
+        let own = &build.shares[0];
+        assert_eq!(own.header.height, 2);
+        assert_eq!(own.header.round, 6);
         assert_eq!(own.header.previous, peer.id().unwrap());
     }
 
@@ -1299,11 +1405,11 @@ mod tests {
         .unwrap();
         // This node commits round 1 locally and queues round 2 before it sees
         // the peer's canonical head.
-        follower.record_commit(1, 0);
+        let _ = follower.record_commit(1, 0);
         follower.mark_applied(0, [7u8; 32], 0);
         let local = follower.build_ready(&[], 10).unwrap();
         assert_eq!(local.shares[0].header.height, 1);
-        follower.record_commit(2, 0);
+        let _ = follower.record_commit(2, 0);
 
         // The peer head at height 1 already decides round 2. It is certified by
         // a quorum that this node did not sign.
@@ -1338,7 +1444,7 @@ mod tests {
 
         // The next local decision is round 3. Its header must be height 2 on the
         // adopted head; the duplicate round-2 pending must not be rebuilt first.
-        follower.record_commit(3, 0);
+        let _ = follower.record_commit(3, 0);
         follower.mark_applied(0, [7u8; 32], 0);
         let next = follower.build_ready(&[], 30).unwrap();
         assert_eq!(
@@ -1373,9 +1479,9 @@ mod tests {
         // Three local decisions are built before the peer's canonical height 1
         // arrives. It decides round 2, so the local round-2 header is covered
         // while the round-3 decision is still a future slot.
-        follower.record_commit(1, 0);
-        follower.record_commit(2, 0);
-        follower.record_commit(3, 0);
+        let _ = follower.record_commit(1, 0);
+        let _ = follower.record_commit(2, 0);
+        let _ = follower.record_commit(3, 0);
         follower.mark_applied(0, [7u8; 32], 0);
         let local = follower.build_ready(&[], 10).unwrap();
         assert_eq!(local.shares.len(), 3);
@@ -1431,7 +1537,7 @@ mod tests {
             0,
         )
         .unwrap();
-        finalizer.record_commit(1, 1);
+        let _ = finalizer.record_commit(1, 1);
         finalizer.mark_applied(1, [7u8; 32], 1);
         let order = vec![order_entry(1, b"val-0")];
         let header = finalizer.build_ready(&order, 10).unwrap().shares[0]
@@ -1497,7 +1603,7 @@ mod tests {
             0,
         )
         .unwrap();
-        finalizer.record_commit(1, 2);
+        let _ = finalizer.record_commit(1, 2);
         finalizer.mark_applied(2, [7u8; 32], 2);
         let error = finalizer.build_ready(&[], 10).unwrap_err();
         assert!(error.to_string().contains("covers"), "{error}");

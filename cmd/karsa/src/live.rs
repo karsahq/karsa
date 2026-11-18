@@ -5096,7 +5096,12 @@ async fn node_task(
                             if commits > 0
                                 && let Some(finalizer) = finalizer.as_mut()
                             {
-                                finalizer.record_commit(from, node.dag().order_len());
+                                // A node behind the committee keeps its own DAG
+                                // cursor, so it may decide a round whose header
+                                // a quorum already certified. That slot has a
+                                // height; recording it again would shift every
+                                // later local header away from its peers.
+                                let _ = finalizer.record_commit(from, node.dag().order_len());
                             }
                             if anchors > 0 {
                                 break;

@@ -2444,7 +2444,12 @@ fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen
         };
         if i == 0 {
             let mut speculative = make_finalizer(anchor.clone());
-            speculative.record_commit(99, recovered.order().len());
+            assert!(
+                speculative
+                    .record_commit(99, recovered.order().len())
+                    .is_some(),
+                "the speculative decision allocates a header"
+            );
             assert!(
                 CertifiedFinalization::begin(recovered.clone(), genesis.clone(), speculative)
                     .is_err(),
