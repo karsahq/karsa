@@ -240,9 +240,9 @@ fn a_four_process_devnet_keeps_moving_after_one_validator_dies() {
     }
 
     // Advancing heights is not enough: every survivor must also agree on the
-    // committed content. A node that re-decided a late slot or classified a
-    // fence differently can keep building local headers while the committee
-    // certifies a different order, or none at all.
+    // committed content and on the certified head itself. A node that re-decided
+    // a late slot or classified a fence differently can keep building local
+    // headers while the committee certifies a different order, or no new height.
     let settled = wait_for(Duration::from_secs(10), || {
         let mut committed = Vec::with_capacity(VALIDATORS - 1);
         for index in 1..VALIDATORS {
@@ -251,6 +251,8 @@ fn a_four_process_devnet_keeps_moving_after_one_validator_dies() {
             committed.push((
                 status["committed_entries"].as_u64()?,
                 status["order_root"].as_str()?.to_string(),
+                status["head_height"].as_u64()?,
+                status["head_dag_root"].as_str()?.to_string(),
             ));
         }
         committed
@@ -259,7 +261,7 @@ fn a_four_process_devnet_keeps_moving_after_one_validator_dies() {
             .then_some(())
     });
     if settled.is_none() {
-        devnet.fail("the survivors disagree on the committed order after validator 0 died");
+        devnet.fail("the survivors disagree on the committed chain after validator 0 died");
     }
 
     for index in 1..VALIDATORS {

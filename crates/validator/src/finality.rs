@@ -506,6 +506,16 @@ impl Finalizer {
                     prefix.len()
                 )));
             }
+            // A child must at least cover everything the header below it covers.
+            // A reheated pending decision whose local order had not yet caught up
+            // with the certified head would otherwise build a "next" header rooted
+            // in an earlier prefix, forking the chain while still signing.
+            if pending.order_len < self.last_built_order {
+                return Err(invalid(format!(
+                    "header {} covers {} commits, below its parent's {}",
+                    pending.height, pending.order_len, self.last_built_order
+                )));
+            }
             let Some(dag_root) = prefix.root_at(order, pending.order_len - prefix.len()) else {
                 return Err(invalid(format!(
                     "header {} cannot be rooted at commit {}",
@@ -724,12 +734,16 @@ impl Finalizer {
     ///
     /// The store persisted the certified chain, not every built header. The next
     /// header therefore extends the certified head, and a commit that was built
-    /// but not certified before the restart is covered by that next header. The
-    /// order length at the head is not persisted: the live node does not serve a
-    /// snapshot from it yet, and a tail snapshot will carry it explicitly.
+    /// but not certified before the restart is covered by that next header.
+    /// Coverage this finalizer already learned for the head is retained; an
+    /// unknown coverage stays zero, and the first new header establishes it.
     pub fn resume_from_head(&mut self) {
         self.last_built = self.chain.head().clone();
-        self.last_built_order = 0;
+        self.last_built_order = self
+            .certified_orders
+            .get(&self.last_built.height)
+            .copied()
+            .unwrap_or(0);
         self.next_height = self.last_built.height.saturating_add(1);
     }
 
@@ -867,7 +881,7 @@ impl Finalizer {
                     });
                 }
                 self.last_built = header.clone();
-                self.last_built_order = 0;
+                self.last_built_order = self.certified_orders.get(&height).copied().unwrap_or(0);
                 self.pending.retain(|pending| pending.round > header.round);
                 rebuilt.extend(self.pending.drain(..));
                 rebuilt.sort_by_key(|pending| pending.round);
@@ -1607,5 +1621,94 @@ mod tests {
         finalizer.mark_applied(2, [7u8; 32], 2);
         let error = finalizer.build_ready(&[], 10).unwrap_err();
         assert!(error.to_string().contains("covers"), "{error}");
+    }
+
+    #[test]
+    fn a_header_cannot_cover_less_than_the_header_below_it() {
+        let (set, keys) = fixture(4);
+        let sets = SetSchedule::single(set.clone());
+        let schedule = EpochSchedule::single(1);
+        let chain_id = b"karsa-test-1".to_vec();
+        let anchor = genesis(&chain_id, [0u8; 32]);
+        let mut finalizer = Finalizer::new(
+            sets,
+            schedule,
+            chain_id,
+            b"val-0".to_vec(),
+            keys[0].clone(),
+            anchor,
+            0,
+        )
+        .unwrap();
+        let _ = finalizer.record_commit(1, 2);
+        finalizer.mark_applied(2, [7u8; 32], 2);
+        let order = vec![order_entry(1, b"val-0"), order_entry(2, b"val-1")];
+        let built = finalizer.build_ready(&order, 10).unwrap();
+        assert_eq!(built.shares.len(), 1);
+        assert_eq!(finalizer.last_built_order(), 2);
+
+        // A local decision can be recorded while its order is still behind the
+        // certified head. Building it as the next header would root the chain in
+        // an earlier prefix than its parent, so it must fail closed.
+        let _ = finalizer.record_commit(2, 1);
+        finalizer.mark_applied(1, [9u8; 32], 1);
+        let error = finalizer.build_ready(&order, 20).unwrap_err();
+        assert!(error.to_string().contains("below its parent"), "{error}");
+    }
+
+    #[test]
+    fn resuming_keeps_the_known_coverage_of_the_certified_head() {
+        let (set, keys) = fixture(4);
+        let sets = SetSchedule::single(set.clone());
+        let schedule = EpochSchedule::single(1);
+        let chain_id = b"karsa-resume".to_vec();
+        let anchor = genesis(&chain_id, [0u8; 32]);
+        let mut finalizer = Finalizer::new(
+            sets,
+            schedule,
+            chain_id.clone(),
+            b"val-0".to_vec(),
+            keys[0].clone(),
+            anchor.clone(),
+            0,
+        )
+        .unwrap();
+
+        let header = Header {
+            chain_id: chain_id.clone(),
+            epoch: 1,
+            height: 1,
+            round: 1,
+            state_root: [7u8; 32],
+            dag_root: commit_root(&[]),
+            previous: anchor.id().unwrap(),
+            applied: 0,
+        };
+        let payload = signing_payload(&header).unwrap();
+        let mut bitmap = vec![0u8; bitmap_len(set.validators.len())];
+        let mut signatures = Vec::new();
+        for (index, key) in keys.iter().enumerate().take(set.quorum_size()) {
+            set_bit(&mut bitmap, index);
+            signatures.push(Ed25519Scheme.sign(key, &payload).unwrap());
+        }
+        let certificate = Certificate {
+            chain_id: chain_id.clone(),
+            epoch: 1,
+            round: 1,
+            vertex_id: header.id().unwrap().to_vec(),
+            validator_set_id: VALIDATOR_SET_ID.to_vec(),
+            signer_bitmap: bitmap,
+            signatures,
+        };
+        finalizer.adopt_anchor(header, &certificate, 3).unwrap();
+        assert_eq!(finalizer.last_built_order(), 3);
+
+        finalizer.resume_from_head();
+        assert_eq!(
+            finalizer.last_built_order(),
+            3,
+            "known head coverage survives the restart boundary"
+        );
+        assert_eq!(finalizer.next_height(), 2);
     }
 }
