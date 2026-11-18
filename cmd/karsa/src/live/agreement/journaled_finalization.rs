@@ -186,7 +186,23 @@ impl JournaledFinalization {
             .adapter
             .apply(store::AuthenticatedSlotAgreementRequest::AdvanceSlot);
         self.refresh()?;
-        result
+        result?;
+        // The owned causal Node must continue from the prefix the durable binding now
+        // covers, not from whatever it held when the slot was still undecided.
+        self.sync_local_order()
+    }
+
+    fn sync_local_order(&mut self) -> Result<(), String> {
+        if self.authoring.is_none() {
+            return Ok(());
+        }
+        let snapshot = self.adapter.ordering_snapshot().inspect_err(|_| {
+            self.failed = true;
+        })?;
+        if let Some(local) = self.authoring.as_mut() {
+            local.node.seed_order(snapshot.order().to_vec());
+        }
+        Ok(())
     }
 
     /// Read-only execution and finalizer diagnostics; mutation cannot bypass reservation.

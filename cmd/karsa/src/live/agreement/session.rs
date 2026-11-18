@@ -381,6 +381,43 @@ mod tests {
     }
 
     #[test]
+    fn enabling_authoring_seeds_the_owned_order_from_the_certified_prefix() {
+        let membership = chain::membership(4, None).unwrap();
+        let chain_id = b"karsa-agreement-session".to_vec();
+        let state = chain::genesis_state(&membership.accounts).unwrap();
+        let genesis = genesis(&chain_id, &membership, &state);
+        let schedule = validator::EpochSchedule::single(membership.set.epoch);
+        let dir = Dir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let mut session =
+            open_at_genesis(&store, &membership, 0, &genesis, state, schedule).unwrap();
+        assert!(session.local_causal_coverage().is_none());
+        let node = net::Node::with_chain_id(
+            membership.set.clone(),
+            membership.consensus[0].id.clone(),
+            membership.consensus[0].private_key.clone(),
+            chain_id,
+        );
+        session
+            .enable_authoring(
+                node,
+                super::super::pacemaker::Policy::new(
+                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_millis(100),
+                )
+                .unwrap(),
+                std::time::Duration::from_millis(50),
+            )
+            .unwrap();
+        assert_eq!(
+            session.local_causal_coverage(),
+            Some((0, Vec::new())),
+            "a genesis session seeds an empty applied prefix"
+        );
+    }
+
+    #[test]
     fn a_genesis_session_rejects_untrusted_starting_points() {
         let membership = chain::membership(4, None).unwrap();
         let chain_id = b"karsa-agreement-session".to_vec();

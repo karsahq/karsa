@@ -663,6 +663,17 @@ fn owned_event_pump_authors_protocol_over_tcp_then_explicitly_applies() {
                         .vertices()
                         .is_empty()
                 );
+                let order = owner
+                    .finalization()
+                    .execution()
+                    .snapshot()
+                    .order()
+                    .to_vec();
+                assert_eq!(
+                    owner.local_causal_coverage(),
+                    Some((order.len(), order)),
+                    "the owned causal order follows the applied certified prefix"
+                );
             }
         })
         .await

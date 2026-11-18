@@ -166,7 +166,7 @@ enum SelectedAction {
 }
 
 pub(super) struct LocalAuthoring {
-    node: net::Node,
+    pub(super) node: net::Node,
     remaining_imports: usize,
 }
 
@@ -181,6 +181,8 @@ impl JournaledFinalization {
 
     /// Pins one causal Node for this owner's lifetime. No mutable handle is returned.
     /// Recovery requires a fresh explicit setup; timers and retry cadence are volatile.
+    /// The Node's committed order is seeded from the owner's applied certified prefix, so
+    /// its causal history starts where the durable ordering does.
     /// # Errors
     /// Rejects unhealthy owners, replacement Nodes, mismatched identity and invalid cadence.
     pub fn enable_authoring(
@@ -194,6 +196,9 @@ impl JournaledFinalization {
             return Err("local authoring is already pinned".into());
         }
         self.adapter.local_authoring_output(&node)?;
+        let snapshot = self.adapter.ordering_snapshot()?;
+        let mut node = node;
+        node.seed_order(snapshot.order().to_vec());
         self.adapter
             .configure_carrier_retransmission(retry_interval)?;
         self.adapter.configure_retransmission(retry_interval)?;
@@ -203,6 +208,18 @@ impl JournaledFinalization {
             remaining_imports: 4096,
         });
         Ok(())
+    }
+
+    /// The owned causal Node's committed order and total coverage, for diagnostics only.
+    /// `None` when local authoring is not configured. This is a clone of the prefix the
+    /// Node was last seeded with, not a mutable handle or a second ordering authority.
+    pub fn local_causal_coverage(&self) -> Option<(usize, Vec<VertexId>)> {
+        self.authoring.as_ref().map(|local| {
+            (
+                local.node.dag().order_len(),
+                local.node.dag().order().to_vec(),
+            )
+        })
     }
 
     /// Authors at most one current durable obligation and exports its authenticated cone.
@@ -312,8 +329,9 @@ impl JournaledFinalization {
     /// is authored at the first unoccupied local round, whose references must
     /// cover the selected voters. Nothing is signed unless the exact proposal
     /// validates against the pinned binding. The owned DAG's committed order is
-    /// reseeded from the certified snapshot first, so the proposal's before/after
-    /// frontier is the one the durable binding will check.
+    /// the applied certified prefix: the owner seeds it when authoring is enabled
+    /// and after every certified application, so the before/after frontier is the
+    /// one the durable binding will check.
     /// # Errors
     /// Rejects unhealthy owners, histories above 4096 events, arithmetic
     /// exhaustion, and durable authoring failures.
@@ -340,13 +358,11 @@ impl JournaledFinalization {
         if elected != self.adapter.validator_id.as_slice() {
             return Ok(Vec::new());
         }
-        let snapshot = self.adapter.ordering_snapshot()?;
         let proposal = {
             let local = self
                 .authoring
                 .as_mut()
                 .ok_or("local authoring is not configured")?;
-            local.node.seed_order(snapshot.order().to_vec());
             let dag = local.node.dag();
             let Some(highest) = dag.highest_round() else {
                 return Ok(Vec::new());
