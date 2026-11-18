@@ -4150,10 +4150,53 @@ async fn node_task(
                                 if let Some(rpc) = &rpc {
                                     let mut core = rpc.lock().expect("rpc lock poisoned");
                                     core.note_order_from(node.dag().prefix(), node.dag().order());
-                                    core.note_certified(
-                                        &certified.header,
-                                        finalizer.certified_order(certified.header.height),
-                                    );
+                                    let known = finalizer.certified_order(certified.header.height);
+                                    let awaits = core.awaits_finality_coverage();
+                                    core.note_certified(&certified.header, known);
+                                    drop(core);
+                                    // A pending transaction cannot finalize while the
+                                    // adopted peer head has unknown coverage. Derive it
+                                    // once the order is local; the failed-scan cache
+                                    // bounds retries to the retained order length.
+                                    if awaits
+                                        && known.is_none()
+                                        && let Some(coverage) = certified_coverage(
+                                            &node,
+                                            &*finalizer,
+                                            &certified.header,
+                                            coverage_lower,
+                                            &mut coverage_scan,
+                                        )
+                                    {
+                                        finalizer
+                                            .note_certified_order(certified.header.height, coverage);
+                                        coverage_lower = coverage_lower.max(coverage);
+                                        if last_provable.as_ref().is_none_or(|(current, _)| {
+                                            current.height <= certified.header.height
+                                        }) {
+                                            last_provable = Some((
+                                                certified.header.clone(),
+                                                certified.certificate.clone(),
+                                            ));
+                                            let height = last_provable
+                                                .as_ref()
+                                                .map_or(0, |(header, _)| header.height);
+                                            if height != provable_height {
+                                                provable_height = height;
+                                                provable_since = Instant::now();
+                                            }
+                                        }
+                                        let mut core =
+                                            rpc.lock().expect("rpc lock poisoned");
+                                        core.note_order_from(
+                                            node.dag().prefix(),
+                                            node.dag().order(),
+                                        );
+                                        core.note_certified(
+                                            &certified.header,
+                                            Some(coverage),
+                                        );
+                                    }
                                 }
                                 // A peer header is written only once the committed
                                 // prefix its `dag_root` names is local. Writing it

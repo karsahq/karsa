@@ -833,6 +833,13 @@ impl RpcCore {
             .collect();
     }
 
+    /// Whether executed transactions are waiting for a certified coverage length.
+    /// A peer-certified head without coverage leaves `/tx` at `executed`; callers use this
+    /// to derive the head's coverage lazily instead of waiting for a checkpoint request.
+    pub(crate) fn awaits_finality_coverage(&self) -> bool {
+        !self.pending_finality.is_empty()
+    }
+
     /// Records a certified header and finalizes every executed batch its commit
     /// prefix covers.
     ///
