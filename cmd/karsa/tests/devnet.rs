@@ -236,7 +236,14 @@ fn a_four_process_devnet_keeps_moving_after_one_validator_dies() {
         Some(())
     });
     if advanced.is_none() {
-        devnet.fail("the survivors stopped certifying after validator 0 died");
+        let mut detail = String::new();
+        for index in 1..VALIDATORS {
+            let port = rpc_base + u16::try_from(index).expect("four ports fit a u16");
+            detail.push_str(&format!("node {index}: {:?}\n", request(port, "/status")));
+        }
+        devnet.fail(&format!(
+            "the survivors stopped certifying after validator 0 died\n{detail}"
+        ));
     }
 
     // Advancing heights is not enough: every survivor must also agree on the

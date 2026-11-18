@@ -74,6 +74,15 @@ const WANT_RETRY: Duration = Duration::from_millis(250);
 const WANT_SLOT_AFTER: Duration = Duration::from_millis(200);
 /// Attempts before a want is abandoned and counted.
 const WANT_TRIES: u8 = 8;
+/// How long a node waits for the previous round's leader before authoring a non-vote.
+///
+/// A vertex that does not reference the leader cannot vote for it. The reference
+/// rule only needs a quorum of previous-round authors, so without this wait a node
+/// routinely signs a non-vote against a leader that is merely still in flight.
+/// With four validators and a quorum of three, one crashed node leaves no room for
+/// a premature non-vote. The wait is bounded: a leader that really is absent must
+/// still receive non-votes, or the skip rules can never observe its absence.
+const LEADER_VOTE_GRACE: Duration = Duration::from_millis(50);
 /// Control frames a peer may have queued: wants and their answers.
 const CONTROL_QUEUE: usize = 256;
 /// Share frames kept so a reconnected peer can recover a signature that was in
@@ -864,6 +873,50 @@ async fn broadcast_payload(links: &[Link], bytes: &[u8]) {
             let _ = link.data.try_send(bytes.to_vec());
         }
     }
+}
+
+/// Queues a certificate share on the data plane, awaiting a slot on a live link.
+///
+/// A share is produced once per height and has no reference-based repair: a lost
+/// frame wedges that peer's finality at the missing height and every height above
+/// it. It therefore must not be dropped while the peer can still read, unlike a
+/// vertex whose loss is visible to the want sweep. A link with no live socket keeps
+/// the reconnect replay as its recovery path.
+async fn broadcast_share(links: &[Link], bytes: &[u8]) {
+    for link in links {
+        if link.up.load(Ordering::Relaxed) {
+            let _ = link.data.send(bytes.to_vec()).await;
+        } else {
+            let _ = link.data.try_send(bytes.to_vec());
+        }
+    }
+}
+
+/// Whether authoring `round` must wait for the leader of the previous round.
+///
+/// A vertex that does not reference the leader is a non-vote for that slot. The
+/// reference rule only needs a quorum of previous-round authors, so a node can
+/// author a valid vertex that silently votes against a leader still in flight.
+/// Waiting is bounded by [`LEADER_VOTE_GRACE`]; after that a non-vote is the
+/// evidence a direct skip needs, not a premature signature.
+fn waits_for_previous_leader(
+    round: u64,
+    dag: &validator::Dag,
+    since: &mut Option<(u64, Instant)>,
+    now: Instant,
+) -> bool {
+    if round <= 1 || dag.leader(round - 1).is_some() {
+        *since = None;
+        return false;
+    }
+    let started = match since {
+        Some((waiting, started)) if *waiting == round => *started,
+        _ => {
+            *since = Some((round, now));
+            now
+        }
+    };
+    now.saturating_duration_since(started) < LEADER_VOTE_GRACE
 }
 
 /// One outstanding repair request.
@@ -3944,6 +3997,9 @@ async fn node_task(
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut authoring_stopped = *stop_authoring.borrow();
+    // The round this node is waiting on for its previous leader, and when the
+    // wait started. Volatile: a restart simply waits again.
+    let mut leader_wait: Option<(u64, Instant)> = None;
     let mut replayed = false;
     let mut reported_silent: BTreeSet<Vec<u8>> = BTreeSet::new();
 
@@ -4915,11 +4971,14 @@ async fn node_task(
                 let within_lead = config.rpc_port == 0
                     || !config.round_skip
                     || node.round() <= node.cursor().saturating_add(lead);
+                let round = node.round();
+                let waiting_for_leader =
+                    waits_for_previous_leader(round, node.dag(), &mut leader_wait, Instant::now());
                 if !authoring_stopped
                     && within_lead
-                    && (config.rpc_port > 0 || node.round() <= config.rounds)
+                    && !waiting_for_leader
+                    && (config.rpc_port > 0 || round <= config.rounds)
                 {
-                    let round = node.round();
                     let slot = usize::try_from(round).unwrap_or(usize::MAX);
                     let mut sign = Duration::ZERO;
                     // A locally built certificate waits for a vertex to bind it.
@@ -5310,7 +5369,7 @@ async fn node_task(
                         let bytes = wire::frame(&Message::Share(share), now())
                             .map_err(|error| error.to_string())?;
                         remember_share(&recent_shares, &bytes);
-                        broadcast(&outbound, false, &bytes, &mut dropped);
+                        broadcast_share(&outbound, &bytes).await;
                     }
                     for certified in build.certified {
                         if last_certified
@@ -7851,6 +7910,75 @@ mod tests {
             missing_leader_trigger(&node, 0, &floors).is_none(),
             "a peer with no floor may still serve the leader"
         );
+    }
+
+    #[test]
+    fn authoring_waits_for_the_previous_leader_but_not_forever() {
+        use validator::{Dag, Vertex};
+
+        fn signed_vertex(
+            membership: &chain::Membership,
+            chain_id: &[u8],
+            author: usize,
+            round: u64,
+            references: Vec<VertexId>,
+        ) -> Vertex {
+            let mut vertex = Vertex {
+                chain_id: chain_id.to_vec(),
+                epoch: membership.set.epoch,
+                round,
+                author: membership.consensus[author].id.clone(),
+                payload_hash: [0u8; 32],
+                references,
+                signature: Vec::new(),
+            };
+            let payload = vertex.signing_payload().unwrap();
+            vertex.signature = Ed25519Scheme
+                .sign(&membership.consensus[author].private_key, &payload)
+                .unwrap();
+            vertex
+        }
+
+        let membership = chain::membership(4, None).expect("a demo committee");
+        let chain_id = b"karsa-leader-grace".to_vec();
+        let mut dag = Dag::new(membership.set.clone());
+        let genesis: Vec<Vertex> = (0..4)
+            .map(|author| signed_vertex(&membership, &chain_id, author, 0, Vec::new()))
+            .collect();
+        for vertex in &genesis {
+            dag.insert(vertex.clone()).unwrap();
+        }
+        let genesis_ids: Vec<VertexId> =
+            genesis.iter().map(|vertex| vertex.id().unwrap()).collect();
+
+        let start = Instant::now();
+        let mut since = None;
+        assert!(!waits_for_previous_leader(1, &dag, &mut since, start));
+        assert!(
+            waits_for_previous_leader(2, &dag, &mut since, start),
+            "round 2 cannot author before its leader is held"
+        );
+        assert!(waits_for_previous_leader(
+            2,
+            &dag,
+            &mut since,
+            start + Duration::from_millis(49)
+        ));
+        assert!(
+            !waits_for_previous_leader(2, &dag, &mut since, start + LEADER_VOTE_GRACE),
+            "an absent leader must still receive non-votes after the grace"
+        );
+
+        // Once the round-1 leader is held, authoring proceeds immediately.
+        let leader = signed_vertex(&membership, &chain_id, 1, 1, genesis_ids[..3].to_vec());
+        dag.insert(leader).unwrap();
+        assert!(!waits_for_previous_leader(
+            2,
+            &dag,
+            &mut since,
+            start + LEADER_VOTE_GRACE
+        ));
+        assert!(since.is_none());
     }
 
     #[tokio::test]
