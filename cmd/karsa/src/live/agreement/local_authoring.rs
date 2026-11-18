@@ -1,7 +1,10 @@
 //! Bounded trusted local driving, isolated from production agreement scheduling.
 
 use net::wire::Message;
-use validator::{SlotAgreementViewCandidate, SlotProposalEnvelope, Vertex};
+use validator::{
+    Decision, SlotAgreementViewCandidate, SlotDecision, SlotOutcome, SlotProposalEnvelope,
+    SlotProposalEvidence, Vertex, VertexId,
+};
 
 use super::super::CarrierPayload;
 use super::super::pacemaker;
@@ -75,6 +78,58 @@ fn canonical_vertex_len(vertex: &Vertex) -> Result<usize, String> {
         }
     }
     Ok(size)
+}
+
+/// Everything the carrier at `round` will reference, transitively.
+///
+/// A prospective carrier references every held vertex of `round - 1`, and
+/// `Node` requires those references' full retained cone to cover the authored
+/// prerequisites (the selected voters and binding carrier). Selecting voters
+/// that are outside this cone would make the proposal unready forever, so the
+/// proposal builder filters by this exact walk. Budgets mirror the validator's
+/// phase walk: exceeding them yields `None` (wait) rather than a signature.
+fn prospective_cone(
+    dag: &validator::Dag,
+    round: u64,
+) -> Result<Option<std::collections::HashSet<VertexId>>, String> {
+    if round == 0 {
+        return Ok(None);
+    }
+    let previous = round - 1;
+    let mut cone = std::collections::HashSet::new();
+    let mut stack = Vec::new();
+    for record in &dag.set_for_round(previous).validators {
+        let Some(vertex) = dag.get(previous, &record.validator_id) else {
+            continue;
+        };
+        let id = vertex.id().map_err(|e| e.to_string())?;
+        cone.insert(id.clone());
+        stack.push(id);
+    }
+    let mut nodes = 0usize;
+    let mut edges = 0usize;
+    while let Some(id) = stack.pop() {
+        nodes = nodes.saturating_add(1);
+        if nodes > validator::SLOT_AGREEMENT_PHASE_WORK_BUDGET {
+            return Ok(None);
+        }
+        let Some(vertex) = dag.get(id.round, &id.author) else {
+            return Ok(None);
+        };
+        edges = edges.saturating_add(vertex.references.len());
+        if edges > 65536 {
+            return Ok(None);
+        }
+        for reference in &vertex.references {
+            if reference.round >= id.round {
+                return Ok(None);
+            }
+            if cone.insert(reference.clone()) {
+                stack.push(reference.clone());
+            }
+        }
+    }
+    Ok(Some(cone))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,7 +240,8 @@ impl JournaledFinalization {
     /// validation remains authoritative; a high incomplete frontier can stall rather than invent
     /// progression. Completed payloads are not reauthored, including after explicit owner
     /// recovery. Durable selection/reconstruction is capped at 4096 WAL events, not storage bytes.
-    /// Does not tick, retry, elect proposals/views or apply slots.
+    /// Authors at most one durable phase, one initial direct-commit proposal, one elected
+    /// re-proposal, or one view echo; it does not tick, retry or apply a slot.
     /// # Errors
     /// Propagates bounded import, ownership, round overflow and durable authoring errors.
     pub fn drive_local(&mut self, vertices: Vec<Vertex>) -> Result<Vec<Message>, String> {
@@ -235,11 +291,152 @@ impl JournaledFinalization {
         if !authored.is_empty() {
             return Ok(authored);
         }
+        let proposed = self.propose_initial_local()?;
+        if !proposed.is_empty() {
+            return Ok(proposed);
+        }
         let elected = self.elect_view_local()?;
         if !elected.is_empty() {
             return Ok(elected);
         }
         self.echo_view_local()
+    }
+
+    /// Authors the initial view-0 proposal when this validator is elected and the
+    /// direct commit rule has already decided the slot.
+    ///
+    /// The proposal is constructed from the owned causal DAG, never from a timer:
+    /// the leader, its exact history, and a canonical quorum of held voters come
+    /// from `inspect_commit`. Only the direct positive rule is supported here;
+    /// conservative or indirect initial evidence remains explicit. The carrier
+    /// is authored at the first unoccupied local round, whose references must
+    /// cover the selected voters. Nothing is signed unless the exact proposal
+    /// validates against the pinned binding. The owned DAG's committed order is
+    /// reseeded from the certified snapshot first, so the proposal's before/after
+    /// frontier is the one the durable binding will check.
+    /// # Errors
+    /// Rejects unhealthy owners, histories above 4096 events, arithmetic
+    /// exhaustion, and durable authoring failures.
+    fn propose_initial_local(&mut self) -> Result<Vec<Message>, String> {
+        self.check_health()?;
+        if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
+            return Err("local proposal selection exceeds 4096 events".into());
+        }
+        let output = self.adapter.driver.output().map_err(|e| e.to_string())?;
+        let (view, decided) = match output.transition.as_ref() {
+            Some(transition) => (transition.view, transition.decision.is_some()),
+            None => (validator::slot_agreement::AgreementView(0), false),
+        };
+        if decided
+            || view != validator::slot_agreement::AgreementView(0)
+            || output.reproposal.is_some()
+        {
+            return Ok(Vec::new());
+        }
+        let tip = output.binding.tip().clone();
+        let round = tip.next_round();
+        let elected = validator::slot_agreement_view_proposer(&self.adapter.set, round, view)
+            .map_err(|e| e.to_string())?;
+        if elected != self.adapter.validator_id.as_slice() {
+            return Ok(Vec::new());
+        }
+        let snapshot = self.adapter.ordering_snapshot()?;
+        let proposal = {
+            let local = self
+                .authoring
+                .as_mut()
+                .ok_or("local authoring is not configured")?;
+            local.node.seed_order(snapshot.order().to_vec());
+            let dag = local.node.dag();
+            let Some(highest) = dag.highest_round() else {
+                return Ok(Vec::new());
+            };
+            let voting_round = round.saturating_add(1);
+            if highest < voting_round {
+                return Ok(Vec::new());
+            }
+            let carrier_round = highest
+                .checked_add(1)
+                .ok_or("local causal round exhausted")?;
+            let Decision::Commit(history) = dag.inspect_commit(round).map_err(|e| e.to_string())?
+            else {
+                return Ok(Vec::new());
+            };
+            let Some(leader) = dag.leader(round) else {
+                return Ok(Vec::new());
+            };
+            let leader_id = leader.id().map_err(|e| e.to_string())?;
+            let Some(cone) = prospective_cone(dag, carrier_round)? else {
+                return Ok(Vec::new());
+            };
+            let quorum = dag.set_for_round(round).quorum_size();
+            let mut voters: Vec<VertexId> = dag
+                .set_for_round(voting_round)
+                .validators
+                .iter()
+                .filter_map(|record| dag.get(voting_round, &record.validator_id))
+                .filter(|vertex| vertex.references.contains(&leader_id))
+                .filter_map(|vertex| vertex.id().ok())
+                .filter(|id| cone.contains(id))
+                .collect();
+            voters.sort_by(|a, b| {
+                (a.round, &a.author, a.digest).cmp(&(b.round, &b.author, b.digest))
+            });
+            if voters.len() < quorum {
+                return Ok(Vec::new());
+            }
+            voters.truncate(quorum);
+            let mut frontier = dag.prefix().clone();
+            frontier.extend(dag.order());
+            frontier.extend(&history);
+            let decision = SlotDecision {
+                chain_id: tip.chain_id().to_vec(),
+                validator_set_id: *tip.set_id(),
+                epoch: tip.epoch(),
+                round,
+                previous: *tip.previous_id(),
+                before_len: tip.order_len(),
+                before_root: *tip.order_root(),
+                after_len: u64::try_from(frontier.len()).map_err(|_| "order length exceeds u64")?,
+                after_root: frontier.root(),
+                outcome: SlotOutcome::Commit { leader: leader_id },
+            };
+            (
+                carrier_round,
+                SlotProposalEnvelope {
+                    decision,
+                    evidence: SlotProposalEvidence::Direct { voters },
+                },
+            )
+        };
+        let (carrier_round, proposal) = proposal;
+        let completed = self.adapter.completed_carriers()?;
+        if completed.iter().any(|carrier| {
+            matches!(
+                carrier.envelope.payload(),
+                CarrierPayload::Proposal(old) if old.decision == proposal.decision
+            )
+        }) {
+            return Ok(Vec::new());
+        }
+        let local = self
+            .authoring
+            .as_mut()
+            .ok_or("local authoring is not configured")?;
+        local.node.set_round(carrier_round);
+        let authored = self.adapter.author_proposal(&proposal, &mut local.node)?;
+        let result = match authored {
+            Some(carrier) => self
+                .adapter
+                .export_carrier(
+                    &carrier.vertex.id().map_err(|e| e.to_string())?,
+                    local.node.dag(),
+                )
+                .map(|message| vec![message]),
+            None => Ok(Vec::new()),
+        };
+        self.check_health()?;
+        result
     }
 
     /// Authors at most one elected re-proposal step for the current durable view.
@@ -249,7 +446,8 @@ impl JournaledFinalization {
     /// signing another copy. The decision and evidence are copied from the authenticated
     /// reproposal lineage, never constructed from local timers or DAG guesses.
     /// Only the elected proposer acts, only after a prior POL exists, and never twice per view.
-    /// Initial view-0 proposal construction remains explicit.
+    /// Initial view-0 proposals come from the direct commit rule in
+    /// [`Self::propose_initial_local`]; conservative or indirect initial evidence remains explicit.
     fn elect_view_local(&mut self) -> Result<Vec<Message>, String> {
         self.check_health()?;
         if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {

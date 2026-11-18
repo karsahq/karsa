@@ -3,8 +3,8 @@ use crate::chain;
 use std::sync::atomic::{AtomicU64, Ordering};
 use validator::slot_agreement::AgreementView;
 use validator::{
-    Dag, SlotAgreementProofEntry, SlotAgreementViewLineage, SlotDecision, SlotDecisionTip,
-    SlotOutcome, SlotProposal, Vertex,
+    Dag, Decision, SlotAgreementProofEntry, SlotAgreementViewLineage, SlotDecision,
+    SlotDecisionTip, SlotOutcome, SlotProposal, SlotProposalEvidence, Vertex,
 };
 
 #[test]
@@ -4655,6 +4655,131 @@ fn authoring_node_index(m: &Membership, vertices: &[Vertex], index: usize) -> ne
     }
     node.set_round(5);
     node
+}
+
+#[test]
+fn the_elected_proposer_authors_the_initial_direct_proposal() {
+    let m = chain::membership(4, None).unwrap();
+    let chain_id = b"karsa-initial-proposal";
+    let state = chain::genesis_state(&m.accounts).unwrap();
+    let genesis = validator::Header::genesis(
+        chain_id.to_vec(),
+        m.set.epoch,
+        state.state_root(),
+        validator::commit_root(&[]),
+    );
+    let view = AgreementView(0);
+    let proposer = validator::slot_agreement_view_proposer(&m.set, 1, view).unwrap();
+    let index = m
+        .consensus
+        .iter()
+        .position(|identity| identity.id == proposer)
+        .unwrap();
+
+    // Rounds 0..=3 with every round referencing the whole previous round: round 2
+    // is a direct vote quorum for the round-1 leader, so the direct rule decides.
+    let mut dag = Dag::new(m.set.clone());
+    dag.set_chain_id(chain_id.to_vec());
+    let mut vertices = Vec::new();
+    let mut previous = Vec::new();
+    for round in 0..=3u64 {
+        let mut ids = Vec::new();
+        for author in 0..4 {
+            let payload = [u8::try_from(author + 1).unwrap(); 32];
+            let vertex = signed_for_chain(&m, author, round, previous.clone(), payload, chain_id);
+            ids.push(dag.insert(vertex.clone()).unwrap());
+            vertices.push(vertex);
+        }
+        ids.sort_by(|a, b| (a.round, &a.author, a.digest).cmp(&(b.round, &b.author, b.digest)));
+        previous = ids;
+    }
+    let leader = dag.leader(1).unwrap().id().unwrap();
+    assert!(matches!(
+        dag.inspect_commit(1).unwrap(),
+        Decision::Commit(history) if history.contains(&leader)
+    ));
+
+    let mut node = net::Node::with_chain_id(
+        m.set.clone(),
+        proposer.to_vec(),
+        m.consensus[index].private_key.clone(),
+        chain_id.to_vec(),
+    );
+    for vertex in &vertices {
+        node.receive(vertex.clone()).unwrap();
+    }
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = session::open_at_genesis(
+        &store,
+        &m,
+        index,
+        &genesis,
+        state,
+        validator::EpochSchedule::single(m.set.epoch),
+    )
+    .unwrap();
+    owner
+        .enable_authoring(
+            node,
+            pacemaker::Policy::new(
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(100),
+            )
+            .unwrap(),
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+
+    let messages = owner.drive_local(Vec::new()).unwrap();
+    assert_eq!(
+        messages.len(),
+        1,
+        "the elected proposer authors one initial proposal"
+    );
+    let net::wire::Message::AgreementCarrier {
+        envelope,
+        vertices: cone,
+    } = &messages[0]
+    else {
+        panic!("the initial publication must be a carrier");
+    };
+    let envelope = CarrierEnvelope::decode(envelope, &m.set).unwrap();
+    let CarrierPayload::Proposal(proposal) = envelope.payload() else {
+        panic!("the initial carrier must be a proposal");
+    };
+    assert_eq!(proposal.decision.round, 1);
+    assert_eq!(proposal.decision.previous, genesis.id().unwrap());
+    assert!(matches!(
+        proposal.decision.outcome,
+        SlotOutcome::Commit { leader: ref id } if *id == leader
+    ));
+    let SlotProposalEvidence::Direct { voters } = &proposal.evidence else {
+        panic!("a direct commit must carry direct evidence");
+    };
+    assert_eq!(voters.len(), m.set.quorum_size());
+
+    // The signed proposal must validate against an independent copy of the same
+    // causal DAG under the durable binding, not merely against its own authoring.
+    for vertex in cone {
+        dag.insert(vertex.clone()).unwrap();
+    }
+    let binding = owner
+        .finalization()
+        .execution()
+        .snapshot()
+        .binding()
+        .clone();
+    let decision = dag
+        .inspect_slot_proposal_envelope(proposal, envelope.carrier(), binding.tip())
+        .unwrap();
+    assert!(matches!(decision, Decision::Commit(_)));
+
+    assert!(
+        owner.drive_local(Vec::new()).unwrap().is_empty(),
+        "a completed local proposal is not reauthored"
+    );
 }
 
 #[test]
