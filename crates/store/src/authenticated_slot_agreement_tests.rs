@@ -104,6 +104,60 @@ fn an_exact_repeated_view_receipt_replays_as_a_durable_no_op() {
 }
 
 #[test]
+fn a_retransmitted_view_authorization_with_a_new_cone_is_a_durable_no_op() {
+    let (f, lineage, bootstrap) = fixture(true);
+    let dir = TempDir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = store
+        .begin_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    let first = owner
+        .apply(
+            1,
+            AuthenticatedSlotAgreementRequest::Propose {
+                lineage: lineage.clone(),
+                vertices: f.vertices,
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            first.vote,
+            Some(ref vote) if vote.phase == AgreementPhase::Prevote
+        ),
+        "a view authorization emits the local prevote"
+    );
+    let outbox = format!("{:?}", owner.signing_outbox().unwrap());
+    // A retransmission of the same authorized view can carry a different availability cone,
+    // so the encoded receipt differs and byte-exact dedupe does not apply. The local prevote
+    // was already emitted for exactly this inspected decision, so replay must journal the
+    // receipt without emitting a second vote.
+    let repeated = owner
+        .apply(
+            2,
+            AuthenticatedSlotAgreementRequest::Propose {
+                lineage,
+                vertices: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert!(
+        repeated.vote.is_none(),
+        "a retransmitted view authorization emits no second prevote"
+    );
+    assert_eq!(owner.sequence(), 2);
+    assert_eq!(format!("{:?}", owner.signing_outbox().unwrap()), outbox);
+    drop(owner);
+    drop(store);
+    let store = Store::open(&dir.0).unwrap();
+    let recovered = store
+        .recover_authenticated_slot_agreement(bootstrap)
+        .unwrap();
+    assert_eq!(recovered.sequence(), 2);
+    assert_eq!(format!("{:?}", recovered.signing_outbox().unwrap()), outbox);
+}
+
+#[test]
 fn execution_checkpoint_stays_with_signing_root_across_generation_activation() {
     let (_, _, bootstrap) = fixture(true);
     let dir = TempDir::new();

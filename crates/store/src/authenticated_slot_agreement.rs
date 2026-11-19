@@ -1752,6 +1752,30 @@ fn replay(
                 (AgreementInput::AdvanceView { from: *from }, None)
             }
         };
+        // A retransmitted view authorization can carry a different availability cone than the
+        // receipt that first authorized this view, so the byte-exact observation dedupe above
+        // cannot catch it. The first receipt already emitted this view's prevote for the same
+        // inspected decision; replay must record that receipt without emitting a second vote,
+        // while a conflicting re-proposal still fails.
+        if let AgreementInput::Propose {
+            view,
+            decision: proposed,
+            ..
+        } = &input
+        {
+            if *view == reducer.view()
+                && reducer
+                    .voted_value(AgreementPhase::Prevote)
+                    .is_some_and(|value| *value == AgreementValue::Decision(proposed.clone()))
+            {
+                result = Some(AgreementTransitionResult {
+                    vote: None,
+                    view: reducer.view(),
+                    decision: reducer.decision().cloned(),
+                });
+                continue;
+            }
+        }
         result = Some(
             reducer
                 .prepare(input, |actual| {

@@ -5682,9 +5682,11 @@ fn received_envelope_valid_for_other_chain_is_rejected_without_durable_change() 
     assert_eq!(adapter.driver.sequence(), sequence);
     assert_eq!(format!("{:?}", adapter.signing_history()), history);
     assert_eq!(format!("{:?}", adapter.pending()), pending);
+    // A validly signed receipt from a foreign chain is dropped, not journaled. Receipts are
+    // advisory peer evidence: refusal keeps the owner usable instead of demanding recovery.
     assert_eq!(
         adapter.readiness(),
-        Readiness::RecoveryRequiredHistoricalIntentsUnavailable
+        Readiness::DisabledMissingCausalReadinessAndTransport
     );
     recover_envelope_adapter(&mut adapter, &store, &bootstrap, &m, 0);
     assert_eq!(exposed_receipt_state(&store, &bootstrap), state);
@@ -5740,7 +5742,7 @@ fn exposed_receipt_state(store: &Store, bootstrap: &AuthenticatedSlotAgreementBo
 }
 
 #[test]
-fn received_envelope_reauthenticates_carrier_before_wal_and_requires_recovery() {
+fn received_envelope_reauthenticates_carrier_before_wal_without_owner_failure() {
     let (m, bootstrap, request) = fixture();
     let dir = Dir::new();
     let store = Store::open(&dir.0).unwrap();
@@ -5782,9 +5784,10 @@ fn received_envelope_reauthenticates_carrier_before_wal_and_requires_recovery() 
     assert_eq!(adapter.driver.sequence(), sequence);
     assert_eq!(format!("{:?}", adapter.signing_history()), history);
     assert_eq!(format!("{:?}", adapter.pending()), pending);
+    // Reauthentication runs before the WAL and a refused receipt leaves the owner usable.
     assert_eq!(
         adapter.readiness(),
-        Readiness::RecoveryRequiredHistoricalIntentsUnavailable
+        Readiness::DisabledMissingCausalReadinessAndTransport
     );
     let decoded = CarrierEnvelope::decode(&envelope.encode(&m.set).unwrap(), &m.set).unwrap();
     assert!(adapter.receive_envelope(decoded, vec![]).is_err());
@@ -9377,7 +9380,10 @@ fn pacemaker_future_nil_does_not_synchronize_a_slow_adapter() {
     let sequence = slow.driver.sequence();
     assert!(slow.receive_nil_vote(future).is_err());
     assert_eq!(slow.driver.sequence(), sequence);
-    assert!(slow.tick(now).is_err());
+    // The valid future-view receipt is dropped, not journaled and not treated as an owner
+    // failure: the slow adapter must not synchronize to the fast one and must stay tickable.
+    assert_eq!(slow.timer_snapshot().unwrap().view, AgreementView(0));
+    assert_eq!(slow.tick(now).unwrap(), None);
     let mut slow = Adapter::recover(&slow_store, slow_bootstrap, &m, 1).unwrap();
     assert_eq!(slow.timer_snapshot().unwrap().view, AgreementView(0));
     slow.configure_pacemaker(policy);

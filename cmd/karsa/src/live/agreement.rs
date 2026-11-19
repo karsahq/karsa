@@ -1203,7 +1203,7 @@ impl Adapter {
         {
             return Ok(());
         }
-        self.apply(AuthenticatedSlotAgreementRequest::EnterRequestedView { requests })
+        self.apply_observation(AuthenticatedSlotAgreementRequest::EnterRequestedView { requests })
     }
 
     /// Collects bounded volatile latest-per-signer support; only a full entry is journaled.
@@ -1260,7 +1260,9 @@ impl Adapter {
             .collect();
         if requests.len() >= self.set.quorum_size() {
             requests.sort_by(|a, b| a.signature().validator_id.cmp(&b.signature().validator_id));
-            self.apply(AuthenticatedSlotAgreementRequest::EnterRequestedView { requests })?;
+            self.apply_observation(AuthenticatedSlotAgreementRequest::EnterRequestedView {
+                requests,
+            })?;
         }
         Ok(())
     }
@@ -1363,14 +1365,15 @@ impl Adapter {
     }
 
     /// Receives carrier-free nil evidence through the authenticated durable request path.
-    /// This neither advances the view nor applies a decision.
+    /// This neither advances the view nor applies a decision. A receipt the owner can no
+    /// longer apply is dropped without poisoning the owner.
     /// # Errors
-    /// Invalid evidence or driver failures require recovery before further operations.
+    /// Rejects malformed evidence; stale ownership still surfaces on the next read.
     pub fn receive_nil_vote(
         &mut self,
         message: validator::SlotAgreementNilVote,
     ) -> Result<(), String> {
-        self.apply(AuthenticatedSlotAgreementRequest::ObserveNilVote { message })
+        self.apply_observation(AuthenticatedSlotAgreementRequest::ObserveNilVote { message })
     }
 
     fn complete_carrier(
@@ -1676,15 +1679,16 @@ impl Adapter {
     /// Receives untrusted owned evidence through the existing authenticated WAL path.
     /// Envelope construction, caller-set decoding and external inspection grant no authority:
     /// the session reauthenticates with its pinned binding and supplied/retained signed DAG.
+    /// A receipt the owner can no longer apply is dropped without poisoning the owner.
     /// This does not activate transport, carrier authoring or decision application.
     /// # Errors
-    /// Returns existing apply errors and requires recovery after any driver/output failure.
+    /// Returns existing apply errors; driver/output failures still require recovery.
     pub fn receive_envelope(
         &mut self,
         envelope: CarrierEnvelope,
         vertices: Vec<validator::Vertex>,
     ) -> Result<(), String> {
-        self.apply(envelope.into_request(vertices).map_err(|e| e.to_string())?)
+        self.apply_observation(envelope.into_request(vertices).map_err(|e| e.to_string())?)
     }
 
     /// Accepts only authenticated requests and reconstructs the durable signing outbox.
@@ -1702,6 +1706,39 @@ impl Adapter {
         self.consume_durable_result(result, None)
     }
 
+    /// Applies one authenticated remote receipt without treating a rejection as owner failure.
+    ///
+    /// A peer may retransmit evidence this owner can no longer apply: a stale view, an
+    /// already-consumed slot, or a repeated observation whose local vote already exists.
+    /// Such a receipt is dropped and reported, not journaled and not poisoned; the owner
+    /// stays usable. A genuine durable or ownership failure still surfaces on the next
+    /// read or health check, which fails closed and stops the run.
+    fn apply_observation(
+        &mut self,
+        request: AuthenticatedSlotAgreementRequest,
+    ) -> Result<(), String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before message receipt".into());
+        }
+        let sequence = self
+            .driver
+            .sequence()
+            .checked_add(1)
+            .ok_or("agreement sequence exhausted")?;
+        match self.driver.apply(sequence, request) {
+            Ok(output) => self.accept_durable_output(output),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Reconstructs every durable signing obligation after an accepted request.
+    /// Any failure here, including encoding or key mismatch, blocks further signing.
+    fn accept_durable_output(&mut self, output: SlotAgreementDriverOutput) -> Result<(), String> {
+        self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+        let history = self.driver.signing_outbox().map_err(|e| e.to_string())?;
+        self.reconstruct_history(output, history)
+    }
+
     fn consume_durable_result(
         &mut self,
         result: Result<SlotAgreementDriverOutput, StoreError>,
@@ -1714,10 +1751,7 @@ impl Adapter {
                 return Err(error.to_string());
             }
         };
-        // A post-durability encoding/signing failure must also block continued operation.
-        self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
-        let history = self.driver.signing_outbox().map_err(|e| e.to_string())?;
-        self.reconstruct_history(output, history)
+        self.accept_durable_output(output)
     }
 
     fn reconstruct_history(

@@ -363,6 +363,19 @@ impl SlotAgreement {
         self.decision.as_ref()
     }
 
+    /// Value of the local vote already emitted in this view for `phase`, if any.
+    ///
+    /// Votes reset when the view advances or an enter-view certificate is applied, so
+    /// this only answers for the current view. It exposes no vote history and grants
+    /// no permission to re-emit: [`Self::propose`] and [`Self::timeout`] still reject
+    /// a repeated vote.
+    pub fn voted_value(&self, phase: AgreementPhase) -> Option<&AgreementValue> {
+        match phase {
+            AgreementPhase::Prevote => self.prevote.as_ref(),
+            AgreementPhase::Precommit => self.precommit.as_ref(),
+        }
+    }
+
     fn active(&self) -> Result<(), CryptoError> {
         if self.decision.is_some() {
             return Err(invalid("agreement already decided"));
