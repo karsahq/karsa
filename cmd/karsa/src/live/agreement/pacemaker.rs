@@ -42,9 +42,15 @@ pub enum Action {
         phase: AgreementPhase,
     },
     /// Local one-view step after publication grace, not remote evidence or a nil certificate.
+    /// The certificate view-change policy turns this into [`Self::RequestView`] instead.
     AdvanceView {
         /// Exact current view.
         from: AgreementView,
+    },
+    /// A signed advisory request for the next view; entry still needs a quorum certificate.
+    RequestView {
+        /// Strictly future target view authored by this node.
+        target: AgreementView,
     },
 }
 

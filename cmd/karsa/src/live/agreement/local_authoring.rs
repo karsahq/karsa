@@ -251,6 +251,13 @@ impl JournaledFinalization {
         Ok(())
     }
 
+    /// Requires quorum-certificate entry for every timeout-driven view change.
+    /// A live set then signs one advisory next-view request instead of drifting apart
+    /// on independent local timers. Explicit offline flows keep the local step.
+    pub fn require_certificate_view_change(&mut self) {
+        self.adapter.require_certificate_view_change();
+    }
+
     /// Pins one causal Node for this owner's lifetime. No mutable handle is returned.
     /// Recovery requires a fresh explicit setup; timers and retry cadence are volatile.
     /// The Node's committed order is seeded from the owner's applied certified prefix, so
@@ -1137,16 +1144,25 @@ impl JournaledFinalization {
         result
     }
 
-    /// Applies at most one pacemaker action, without signing, publishing or applying a slot.
-    /// Nil obligations are published by `drive_local`; ticks themselves never sign.
+    /// Applies at most one pacemaker action and returns one newly authored view request.
+    /// Nil obligations are published by `drive_local`; ticks never sign a vote.
+    /// Under the certificate policy an elapsed grace signs one next-view advisory request
+    /// and leaves local view entry to the quorum certificate path.
     /// # Errors
     /// Rejects absent setup, backwards time, arithmetic exhaustion and unhealthy owners.
-    pub fn tick_local(&mut self, now: std::time::Instant) -> Result<(), String> {
+    pub fn tick_local(&mut self, now: std::time::Instant) -> Result<Vec<Message>, String> {
         self.check_health()?;
         if self.authoring.is_none() {
             return Err("local authoring is not configured".into());
         }
-        let result = self.adapter.tick(now).map(|_| ());
+        let result = match self.adapter.tick(now) {
+            Ok(Some(pacemaker::Action::RequestView { target })) => self
+                .adapter
+                .view_request_message(target)
+                .map(|message| message.into_iter().collect()),
+            Ok(_) => Ok(Vec::new()),
+            Err(error) => Err(error),
+        };
         self.check_health()?;
         result
     }

@@ -176,7 +176,12 @@ impl EventPump {
         if self.schedule.is_none() {
             return Err("local pump scheduling is disabled".into());
         }
-        self.owner.tick_local(now)?;
+        let ticked = self.owner.tick_local(now)?;
+        if !ticked.is_empty() {
+            // A newly authored view request is this turn's publication; the durable
+            // retry cadence owns every later copy.
+            return Ok(ticked);
+        }
         let authored = self.owner.drive_local(Vec::new())?;
         if !authored.is_empty() {
             return Ok(authored);
@@ -334,7 +339,10 @@ impl EventPump {
                     })
                 }
                 Input::Local(Some(LocalEvent::Tick(now))) => {
-                    self.owner.tick_local(now).map(|()| Build::default())
+                    self.owner.tick_local(now).map(|messages| {
+                        carriers = messages;
+                        Build::default()
+                    })
                 }
                 Input::Local(Some(LocalEvent::Retry { now, carriers: ids })) => {
                     self.owner.retry_local(now, &ids).map(|messages| {

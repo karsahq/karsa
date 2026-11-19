@@ -12,6 +12,9 @@
 //!   authored vertex, and precommits bind their prerequisite by exact vertex ID, so
 //!   competing carriers would make every precommit bind a different prerequisite;
 //! - agreement frames route through the same authenticated receipt path peers use;
+//! - a grace deadline signs one advisory next-view request; the local view advances only
+//!   when a quorum certificate enters it, so independent timers cannot drift the set
+//!   into incompatible views;
 //! - a decided slot is applied from the durable transition, then executed and built into
 //!   a header whose shares are dispatched over the existing writer queues;
 //! - no data-plane payload, RPC, snapshot, epoch transition, pruning or restart
@@ -60,9 +63,10 @@ const TICK: Duration = Duration::from_millis(50);
 const SCHEDULE: Duration = Duration::from_millis(50);
 /// Publication retry cadence; a lost carrier is recovered from its durable ID.
 const RETRY: Duration = Duration::from_millis(100);
-/// Phase waits are deliberately long: the positive direct path runs first, and a
-/// missing leader still produces nil evidence without racing that path in one run.
-const PHASE_WAIT: Duration = Duration::from_secs(10);
+/// Phase waits bound one view attempt. The positive direct path runs first; a missing
+/// leader still produces nil evidence and a next-view request, and the bounded session
+/// must be able to recycle a stalled view inside its lifetime.
+const PHASE_WAIT: Duration = Duration::from_secs(3);
 /// Vertices imported by one trusted causal turn.
 const MAX_IMPORTS_PER_TURN: usize = 64;
 /// Pending peer vertices retained between turns; the owner re-checks each one.
@@ -360,6 +364,9 @@ async fn certified_node_task(
     );
     let policy = pacemaker::Policy::new(PHASE_WAIT, PHASE_WAIT, PHASE_WAIT)?;
     owner.enable_authoring(authoring, policy, RETRY)?;
+    // A live set must not drift into different views on independent timers: a grace
+    // deadline signs one advisory next-view request, and only a quorum certificate enters.
+    owner.require_certificate_view_change();
     let (mut pump, mut channels) = EventPump::new(
         owner,
         committee.clone(),

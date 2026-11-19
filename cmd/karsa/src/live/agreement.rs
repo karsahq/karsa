@@ -128,6 +128,16 @@ pub struct Adapter {
     carrier_retransmission: Option<Retransmission>,
     // Partial remote support is never journaled and is lost on recovery.
     view_requests: Vec<validator::SlotAgreementViewRequest>,
+    // Timeout-driven view changes either apply a local step or require a quorum certificate.
+    view_change: ViewChange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewChange {
+    /// Apply the one-view local step directly; explicit/offline flows and unit tests.
+    LocalAdvance,
+    /// Sign a next-view request and wait for a quorum certificate before entering.
+    Certificate,
 }
 
 // Volatile scheduling only: never retain durable messages or export authority here.
@@ -596,11 +606,13 @@ impl Adapter {
         self.pacemaker = Some(pacemaker::Pacemaker::new(policy));
     }
 
-    /// Rechecks durable state and applies at most one timed action; never signs or sends.
+    /// Rechecks durable state and applies at most one timed action.
     /// Nil obligations must subsequently use `author_nil_vote`. No delayed action is accepted.
     /// Observing any durable precommit starts a fresh, bounded publication grace. Its deadline
     /// is not remote evidence: no publication, acknowledgement, or pending control work gates
     /// local advancement. The driver still enforces durable votes and preserves locks.
+    /// Under the certificate policy an elapsed grace signs at most one next-view advisory
+    /// request; it never advances the local view, which only a quorum certificate enters.
     /// # Errors
     /// Snapshot failures require recovery; backwards time and arithmetic exhaustion are rejected.
     pub fn tick(&mut self, now: std::time::Instant) -> Result<Option<pacemaker::Action>, String> {
@@ -618,17 +630,103 @@ impl Adapter {
             .as_mut()
             .expect("configured pacemaker")
             .plan(&snapshot, now)?;
-        if let Some(action) = action {
-            self.apply(match action {
-                pacemaker::Action::Timeout { view, phase } => {
-                    AuthenticatedSlotAgreementRequest::Timeout { view, phase }
+        let Some(action) = action else {
+            return Ok(None);
+        };
+        match action {
+            pacemaker::Action::Timeout { view, phase } => {
+                self.apply(AuthenticatedSlotAgreementRequest::Timeout { view, phase })?;
+                Ok(Some(action))
+            }
+            pacemaker::Action::AdvanceView { from } => match self.view_change {
+                ViewChange::LocalAdvance => {
+                    self.apply(AuthenticatedSlotAgreementRequest::AdvanceView { from })?;
+                    Ok(Some(action))
                 }
-                pacemaker::Action::AdvanceView { from } => {
-                    AuthenticatedSlotAgreementRequest::AdvanceView { from }
-                }
-            })?;
+                ViewChange::Certificate => self.request_next_view(from),
+            },
+            pacemaker::Action::RequestView { target } => self.request_next_view_rearmed(target),
         }
-        Ok(action)
+    }
+
+    /// Authors and self-observes one next-view advisory request at most once.
+    /// Entry remains a separate quorum certificate; this returns `None` after publication.
+    fn request_next_view(
+        &mut self,
+        from: validator::slot_agreement::AgreementView,
+    ) -> Result<Option<pacemaker::Action>, String> {
+        let target = validator::slot_agreement::AgreementView(
+            from.0.checked_add(1).ok_or("agreement view exhausted")?,
+        );
+        self.request_next_view_rearmed(target)
+    }
+
+    fn request_next_view_rearmed(
+        &mut self,
+        target: validator::slot_agreement::AgreementView,
+    ) -> Result<Option<pacemaker::Action>, String> {
+        let output = self.driver.output().map_err(|error| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            error.to_string()
+        })?;
+        let current = output
+            .transition
+            .as_ref()
+            .map_or(validator::slot_agreement::AgreementView(0), |t| t.view);
+        if output
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.decision.is_some())
+            || target <= current
+        {
+            return Ok(None);
+        }
+        let tip = output.binding.tip().clone();
+        let published = self
+            .driver
+            .view_request_reservations()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .any(|reservation| {
+                reservation.agreement.context == tip
+                    && reservation.target_view == target
+                    && reservation.message.is_some()
+            });
+        if published {
+            return Ok(None);
+        }
+        let request = self.author_view_request(target)?;
+        self.receive_view_request(request)?;
+        Ok(Some(pacemaker::Action::RequestView { target }))
+    }
+
+    /// Encodes the exact durable publication for one already-authored view target.
+    /// # Errors
+    /// Rejects stale ownership, missing publications and encoding failures.
+    pub fn view_request_message(
+        &self,
+        target: validator::slot_agreement::AgreementView,
+    ) -> Result<Option<net::wire::Message>, String> {
+        let output = self.driver.output().map_err(|e| e.to_string())?;
+        let tip = output.binding.tip();
+        let Some(request) = self
+            .completed_view_requests()?
+            .into_iter()
+            .find(|request| request.context() == tip && request.target_view() == target)
+        else {
+            return Ok(None);
+        };
+        request
+            .encode(&self.set)
+            .map(net::wire::Message::AgreementViewRequest)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Requires a quorum certificate for every timeout-driven view entry.
+    /// The local grace deadline then signs one advisory request instead of advancing alone.
+    pub fn require_certificate_view_change(&mut self) {
+        self.view_change = ViewChange::Certificate;
     }
 
     fn timer_snapshot(&self) -> Result<pacemaker::Snapshot, String> {
@@ -1565,6 +1663,7 @@ impl Adapter {
             retransmission: None,
             carrier_retransmission: None,
             view_requests: Vec::new(),
+            view_change: ViewChange::LocalAdvance,
             readiness: Readiness::DisabledMissingCausalReadinessAndTransport,
         })
     }
@@ -1596,6 +1695,7 @@ impl Adapter {
             retransmission: None,
             carrier_retransmission: None,
             view_requests: Vec::new(),
+            view_change: ViewChange::LocalAdvance,
             readiness: Readiness::RecoveryRequiredHistoricalIntentsUnavailable,
         };
         let output = adapter.driver.output();

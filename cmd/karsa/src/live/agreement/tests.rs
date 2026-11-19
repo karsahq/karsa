@@ -4783,7 +4783,7 @@ fn the_elected_proposer_authors_the_initial_direct_proposal() {
 }
 
 #[test]
-fn a_timeout_view_without_a_pol_still_gets_a_plain_proposal_and_view() {
+fn a_certificate_view_without_a_pol_still_gets_a_plain_proposal_and_view() {
     use std::time::{Duration, Instant};
 
     let m = chain::membership(4, None).unwrap();
@@ -4849,16 +4849,40 @@ fn a_timeout_view_without_a_pol_still_gets_a_plain_proposal_and_view() {
             Duration::from_millis(50),
         )
         .unwrap();
+    owner.require_certificate_view_change();
 
-    // Two phase timeouts and the publication grace advance the durable view with no
-    // POL ever released. Without the current-view plain path no validator can propose.
+    // Two phase timeouts and the publication grace produce one signed next-view request
+    // and no local view step. The durable view can only change by quorum certificate.
     let t0 = Instant::now();
     owner.tick_local(t0).unwrap();
     let mut now = t0;
+    let mut request_messages = Vec::new();
     for _ in 0..3 {
         now += Duration::from_millis(20);
-        owner.tick_local(now).unwrap();
-        owner.tick_local(now).unwrap();
+        request_messages.extend(owner.tick_local(now).unwrap());
+        request_messages.extend(owner.tick_local(now).unwrap());
+    }
+    assert_eq!(
+        request_messages.len(),
+        1,
+        "the grace deadline authors one view request, not a local advance"
+    );
+    let net::wire::Message::AgreementViewRequest(bytes) = &request_messages[0] else {
+        panic!("the grace deadline must publish a view request");
+    };
+    let request = validator::SlotAgreementViewRequest::decode(bytes, &m.set).unwrap();
+    assert_eq!(request.target_view(), view);
+
+    // The local request is self-observed. Two peer signers complete the four-validator
+    // quorum, and the certificate enters the view without any local timer step.
+    let bootstrap = session::genesis_bootstrap(&m, index, chain_id, &genesis).unwrap();
+    for signer in (0..4).filter(|signer| *signer != index).take(2) {
+        let remote = signed_view_request(&m, &bootstrap, signer, view.0);
+        owner
+            .receive_agreement_message(net::wire::Message::AgreementViewRequest(
+                remote.encode(&m.set).unwrap(),
+            ))
+            .unwrap();
     }
 
     let messages = owner.drive_local(Vec::new()).unwrap();
