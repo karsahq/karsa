@@ -56,7 +56,7 @@ pub enum AgreementInput {
 }
 
 /// Observations released only after applying a prepared volatile transition.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgreementTransitionResult {
     /// Optional unsigned vote emitted by this transition.
     pub vote: Option<AgreementVote>,

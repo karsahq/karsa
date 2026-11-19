@@ -128,9 +128,23 @@ impl AuthenticatedSlotAgreement {
 
     pub(super) fn check_checkpoint_owner(&self, root: &Path) -> Result<(), StoreError> {
         exclusions(root)?;
+        if self.uncertain {
+            return Err(invalid("stale or uncertain execution checkpoint owner"));
+        }
+        // Callers already hold the root lock, so this cannot use `with_replay`; it
+        // revalidates the same cache key directly instead.
+        let cache = self.cache.lock().expect("replay cache lock poisoned");
+        if let Some(cached) = cache.as_ref() {
+            if cached.sequence == self.sequence
+                && cached.tip == self.tip
+                && journal_bytes(root)? == Some(cached.bytes)
+            {
+                return Ok(());
+            }
+        }
+        drop(cache);
         let journal = read(root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
-        if self.uncertain
-            || journal.header != self.header
+        if journal.header != self.header
             || journal.events.len() as u64 != self.sequence
             || journal.tip != self.tip
         {

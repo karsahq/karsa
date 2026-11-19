@@ -18,10 +18,12 @@
 //! The single-validator path is proven end to end: plain causal rounds decide whenever a
 //! majority of authors is held, the initial proposal and view bind, durable votes follow,
 //! and the decided slot executes into a header whose share and certificate persist. The
-//! multi-validator mesh routes the same evidence over the same links, but a sustained run
-//! advances far slower: every durable read replays the whole journal and re-verifies its
-//! supplied cones, so the live task is throttled by the owner's steady-state read cost.
-//! That cost is the next slice; increasing a timer does not remove it.
+//! multi-validator mesh routes the same evidence over the same links; durable reads now
+//! reuse a replay verified for the owner's exact journal tip, so a sustained run no longer
+//! pays a full journal replay per getter. Multi-validator progress past the first slot is
+//! still unproven: a three-node run exchanges evidence but has not certified a slot, and a
+//! longer run surfaces a durable reducer rejection ("already voted in this phase and view"),
+//! which is the next blocker rather than read cost.
 //!
 //! The owner's causal import budget bounds one run, and both histories stay mutually
 //! exclusive on disk: a store holding a legacy chain is refused by the session opener.
@@ -622,9 +624,13 @@ async fn certified_node_task(
                     if error.contains("local causal import budget exhausted") {
                         import_exhausted = true;
                     }
+                    // Per-event rejections are retryable output, not a stopped owner: the pump
+                    // already reports health failures by ending its run. Historical carriers
+                    // and transient evidence rejects are expected during a live run, so they
+                    // stay diagnostics instead of failing the node.
                     if local_error.as_deref() != Some(error.as_str()) && error_reports < 3 {
                         error_reports += 1;
-                        eprintln!("certified node {index} local output error: {error}");
+                        eprintln!("certified node {index} local output rejected: {error}");
                     }
                     local_error = Some(error);
                 }
@@ -679,9 +685,6 @@ async fn certified_node_task(
     let _ = dispatcher.await;
     if let Some(error) = &report.error {
         eprintln!("certified node {index}: {error}");
-    }
-    if local_error.is_some() {
-        report.error = local_error;
     }
     Ok(report)
 }

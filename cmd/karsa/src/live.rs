@@ -8775,9 +8775,9 @@ mod tests {
             genesis_state.state_root(),
             commit_root(&[]),
         );
-        // One validator proves the full live path; a multi-validator mesh routes the
-        // same evidence but is not gated here while the owner's full-journal replay
-        // throttles it below slot cadence.
+        // One validator proves the full live path. The owner now serves durable reads
+        // from its verified replay instead of replaying the journal per getter, but a
+        // multi-validator mesh is still not gated here until its progress is measured.
         for index in 0..1 {
             let store = Store::open(dir.0.join(format!("val-{index}"))).unwrap();
             assert!(

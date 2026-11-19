@@ -900,6 +900,8 @@ pub struct AgreementViewRequestReservation {
 #[derive(Default)]
 struct ViewRequests {
     reservations: Vec<AgreementViewRequestReservation>,
+    // Latest durable entry certificate for the current slot; cleared by AdvanceSlot.
+    certificate: Option<Vec<validator::SlotAgreementViewRequest>>,
 }
 
 // Explicit local authorizations are separate from remotely supplied observations.
@@ -1186,6 +1188,7 @@ fn replay(
             }
             AuthenticatedSlotAgreementRequest::EnterRequestedView { requests } => {
                 reducer.enter_requested_view(requests)?;
+                view_requests.certificate = Some(requests.clone());
                 result = Some(AgreementTransitionResult {
                     vote: None,
                     view: reducer.view(),
@@ -1509,6 +1512,8 @@ fn replay(
             buckets.clear();
             nil_buckets.clear();
             reproposal = None;
+            // A slot application consumes the entered-view certificate with the slot.
+            view_requests.certificate = None;
             result = Some(AgreementTransitionResult {
                 vote: None,
                 view: reducer.view(),
@@ -1856,14 +1861,49 @@ pub(super) fn validate(root: &Path) -> Result<(), StoreError> {
     }
     Ok(())
 }
+/// Verified replay retained for this owner, keyed by the durable hash-chain tip and
+/// the journal's byte length. Entries are only produced by a full read and replay;
+/// a cached entry is used only while both keys still describe the on-disk journal.
+struct ReplayCache {
+    bytes: u64,
+    sequence: u64,
+    tip: [u8; 32],
+    state: ReplayState,
+}
+
+impl std::fmt::Debug for ReplayCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplayCache")
+            .field("bytes", &self.bytes)
+            .field("sequence", &self.sequence)
+            .field("tip", &self.tip)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Journal file length, or `None` when the file does not exist.
+fn journal_bytes(root: &Path) -> Result<Option<u64>, StoreError> {
+    validate_pointer_file(&root.join(FILE))?;
+    match fs::metadata(root.join(FILE)) {
+        Ok(metadata) => Ok(Some(metadata.len())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Exclusive durable session handle; uncertain I/O requires recovery.
 #[derive(Debug)]
 pub struct AuthenticatedSlotAgreement {
     store: Store,
     header: Vec<u8>,
+    checkpoint_binding: SlotAgreementBinding,
     sequence: u64,
     tip: [u8; 32],
     uncertain: bool,
+    // The journal is append-only and exclusively written by live owners, so a byte-length
+    // change is the only way a sibling can advance it. Any other difference is rejected by
+    // the read that reloads this cache.
+    cache: Mutex<Option<ReplayCache>>,
     #[cfg(feature = "test-support")]
     share_publication_fault: Option<(header_shares::SharePublicationStage, usize)>,
 }
@@ -1877,7 +1917,11 @@ impl Store {
         bootstrap: AuthenticatedSlotAgreementBootstrap,
     ) -> Result<AuthenticatedSlotAgreement, StoreError> {
         let header = bootstrap.encode()?;
-        replay(&bootstrap, &[])?;
+        let state = replay(&bootstrap, &[])?;
+        let checkpoint_binding = SlotAgreementBinding::from_checkpoint(
+            bootstrap.agreement.context.clone(),
+            bootstrap.predecessor.clone(),
+        )?;
         let root = self
             .slot_decisions
             .lock()
@@ -1887,14 +1931,23 @@ impl Store {
             .write(true)
             .create_new(true)
             .open(root.join(FILE))?;
-        file.write_all(&frame(&[0; 32], 0, &header))?;
+        let first = frame(&[0; 32], 0, &header);
+        file.write_all(&first)?;
         sync(&file, &root)?;
+        let tip = digest(&[0; 32], 0, &header);
         Ok(AuthenticatedSlotAgreement {
             store: self.clone(),
-            tip: digest(&[0; 32], 0, &header),
             header,
+            checkpoint_binding,
             sequence: 0,
+            tip,
             uncertain: false,
+            cache: Mutex::new(Some(ReplayCache {
+                bytes: first.len() as u64,
+                sequence: 0,
+                tip,
+                state,
+            })),
             #[cfg(feature = "test-support")]
             share_publication_fault: None,
         })
@@ -1917,14 +1970,27 @@ impl Store {
         if journal.header != header {
             return Err(invalid("authenticated checkpoint mismatch"));
         }
-        replay(&bootstrap, &journal.events)?;
+        let state = replay(&bootstrap, &journal.events)?;
+        let checkpoint_binding = SlotAgreementBinding::from_checkpoint(
+            bootstrap.agreement.context.clone(),
+            bootstrap.predecessor.clone(),
+        )?;
         sync(&File::open(root.join(FILE))?, &root)?;
+        let sequence = journal.events.len() as u64;
+        let tip = journal.tip;
         Ok(AuthenticatedSlotAgreement {
             store: self.clone(),
             header,
-            sequence: journal.events.len() as u64,
-            tip: journal.tip,
+            checkpoint_binding,
+            sequence,
+            tip,
             uncertain: false,
+            cache: Mutex::new(Some(ReplayCache {
+                bytes: journal.bytes,
+                sequence,
+                tip,
+                state,
+            })),
             #[cfg(feature = "test-support")]
             share_publication_fault: None,
         })
@@ -1946,27 +2012,13 @@ impl AuthenticatedSlotAgreement {
     /// statements. History is bounded by the WAL's 4096 requests and 64 MiB capacity;
     /// capacity exhaustion rejects new requests rather than evicting signing obligations.
     /// Recovery repeats fsync before constructing an owner that can expose this output.
+    /// Each call still rechecks this owner against the durable journal; a verified replay is
+    /// reused until the journal's byte length or this owner's tip changes.
     ///
     /// # Errors
     /// Rejects uncertain or stale owners, corrupt journals and invalid historical evidence.
     pub fn signing_outbox(&self) -> Result<Vec<AgreementSigningIntent>, StoreError> {
-        if self.uncertain {
-            return Err(invalid("uncertain authenticated write requires recovery"));
-        }
-        let root = self
-            .store
-            .slot_decisions
-            .lock()
-            .expect("slot decision lock poisoned");
-        exclusions(&root)?;
-        let journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
-        if journal.header != self.header
-            || journal.events.len() as u64 != self.sequence
-            || journal.tip != self.tip
-        {
-            return Err(invalid("stale authenticated owner"));
-        }
-        Ok(replay(&journal.bootstrap, &journal.events)?.5)
+        self.with_replay(|state| Ok(state.5.clone()))
     }
 
     /// Returns all durable pre-sign reservations in original WAL order.
@@ -1974,23 +2026,7 @@ impl AuthenticatedSlotAgreement {
     /// # Errors
     /// Rejects uncertain or stale owners and invalid durable evidence.
     pub fn reserved_carriers(&self) -> Result<Vec<AgreementReservedCarrier>, StoreError> {
-        if self.uncertain {
-            return Err(invalid("uncertain authenticated write requires recovery"));
-        }
-        let root = self
-            .store
-            .slot_decisions
-            .lock()
-            .expect("slot decision lock poisoned");
-        exclusions(&root)?;
-        let journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
-        if journal.header != self.header
-            || journal.events.len() as u64 != self.sequence
-            || journal.tip != self.tip
-        {
-            return Err(invalid("stale authenticated owner"));
-        }
-        Ok(replay(&journal.bootstrap, &journal.events)?.7)
+        self.with_replay(|state| Ok(state.7.clone()))
     }
 
     /// Returns all durable signed publications in completion WAL order.
@@ -1998,23 +2034,7 @@ impl AuthenticatedSlotAgreement {
     /// # Errors
     /// Rejects uncertain or stale owners and invalid durable evidence.
     pub fn completed_carriers(&self) -> Result<Vec<AgreementCompletedCarrier>, StoreError> {
-        if self.uncertain {
-            return Err(invalid("uncertain authenticated write requires recovery"));
-        }
-        let root = self
-            .store
-            .slot_decisions
-            .lock()
-            .expect("slot decision lock poisoned");
-        exclusions(&root)?;
-        let journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
-        if journal.header != self.header
-            || journal.events.len() as u64 != self.sequence
-            || journal.tip != self.tip
-        {
-            return Err(invalid("stale authenticated owner"));
-        }
-        Ok(replay(&journal.bootstrap, &journal.events)?.8)
+        self.with_replay(|state| Ok(state.8.clone()))
     }
 
     /// Returns all durable signed nil publications in completion WAL order.
@@ -2022,43 +2042,7 @@ impl AuthenticatedSlotAgreement {
     /// # Errors
     /// Rejects uncertain or stale owners and invalid durable evidence.
     pub fn completed_nil_votes(&self) -> Result<Vec<AgreementCompletedNilVote>, StoreError> {
-        if self.uncertain {
-            return Err(invalid("uncertain authenticated write requires recovery"));
-        }
-        let root = self
-            .store
-            .slot_decisions
-            .lock()
-            .expect("slot decision lock poisoned");
-        exclusions(&root)?;
-        let journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
-        if journal.header != self.header
-            || journal.events.len() as u64 != self.sequence
-            || journal.tip != self.tip
-        {
-            return Err(invalid("stale authenticated owner"));
-        }
-        Ok(replay(&journal.bootstrap, &journal.events)?.9)
-    }
-
-    fn view_requests(&self) -> Result<ViewRequests, StoreError> {
-        if self.uncertain {
-            return Err(invalid("uncertain authenticated write requires recovery"));
-        }
-        let root = self
-            .store
-            .slot_decisions
-            .lock()
-            .expect("slot decision lock poisoned");
-        exclusions(&root)?;
-        let journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
-        if journal.header != self.header
-            || journal.events.len() as u64 != self.sequence
-            || journal.tip != self.tip
-        {
-            return Err(invalid("stale authenticated owner"));
-        }
-        Ok(replay(&journal.bootstrap, &journal.events)?.10)
+        self.with_replay(|state| Ok(state.9.clone()))
     }
 
     /// Returns durable authorizations and their exact signed completions, including history.
@@ -2067,7 +2051,7 @@ impl AuthenticatedSlotAgreement {
     pub fn view_request_reservations(
         &self,
     ) -> Result<Vec<AgreementViewRequestReservation>, StoreError> {
-        Ok(self.view_requests()?.reservations)
+        self.with_replay(|state| Ok(state.10.reservations.clone()))
     }
 
     /// Exports the latest durable entry certificate for the current slot, not volatile support.
@@ -2077,34 +2061,7 @@ impl AuthenticatedSlotAgreement {
     pub fn entered_view_certificate(
         &self,
     ) -> Result<Option<Vec<validator::SlotAgreementViewRequest>>, StoreError> {
-        if self.uncertain {
-            return Err(invalid("uncertain authenticated write requires recovery"));
-        }
-        let root = self
-            .store
-            .slot_decisions
-            .lock()
-            .expect("slot decision lock poisoned");
-        exclusions(&root)?;
-        let journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
-        if journal.header != self.header
-            || journal.events.len() as u64 != self.sequence
-            || journal.tip != self.tip
-        {
-            return Err(invalid("stale authenticated owner"));
-        }
-        replay(&journal.bootstrap, &journal.events)?;
-        let mut certificate = None;
-        for event in &journal.events {
-            match event {
-                AuthenticatedSlotAgreementRequest::AdvanceSlot => certificate = None,
-                AuthenticatedSlotAgreementRequest::EnterRequestedView { requests } => {
-                    certificate = Some(requests.clone());
-                }
-                _ => {}
-            }
-        }
-        Ok(certificate)
+        self.with_replay(|state| Ok(state.10.certificate.clone()))
     }
 
     /// Reauthenticates durable evidence and returns frozen candidates without mutable state access.
@@ -2120,7 +2077,17 @@ impl AuthenticatedSlotAgreement {
         Ok(self.driver_snapshot()?.3)
     }
 
-    fn replay_owned(&self) -> Result<ReplayState, StoreError> {
+    /// Runs a read against the store state verified for this owner's exact durable tip.
+    ///
+    /// The cache stores the state produced by a full journal read and replay, together with
+    /// that read's exact byte length and hash-chain tip. It is reused only while all three
+    /// still describe this owner and the on-disk journal; the journal is append-only and
+    /// exclusively written, so a length difference is the only legitimate advance and
+    /// forces the full read that revalidates (or rejects) the owner.
+    fn with_replay<R>(
+        &self,
+        f: impl FnOnce(&ReplayState) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
         if self.uncertain {
             return Err(invalid("uncertain authenticated write requires recovery"));
         }
@@ -2130,6 +2097,15 @@ impl AuthenticatedSlotAgreement {
             .lock()
             .expect("slot decision lock poisoned");
         exclusions(&root)?;
+        let mut cache = self.cache.lock().expect("replay cache lock poisoned");
+        if let Some(cached) = cache.as_ref() {
+            if cached.sequence == self.sequence
+                && cached.tip == self.tip
+                && journal_bytes(&root)? == Some(cached.bytes)
+            {
+                return f(&cached.state);
+            }
+        }
         let journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
         if journal.header != self.header
             || journal.events.len() as u64 != self.sequence
@@ -2137,46 +2113,59 @@ impl AuthenticatedSlotAgreement {
         {
             return Err(invalid("stale authenticated owner"));
         }
-        replay(&journal.bootstrap, &journal.events)
+        let state = replay(&journal.bootstrap, &journal.events)?;
+        *cache = Some(ReplayCache {
+            bytes: journal.bytes,
+            sequence: self.sequence,
+            tip: self.tip,
+            state,
+        });
+        let Some(cached) = cache.as_ref() else {
+            unreachable!("cache installed")
+        };
+        f(&cached.state)
     }
 
     pub(super) fn driver_snapshot(&self) -> Result<DriverSnapshot, StoreError> {
-        let (transition, candidates, active, binding, reproposal, _, authorable, _, _, _, _, _, _) =
-            self.replay_owned()?;
-        Ok((
-            active, transition, candidates, reproposal, binding, authorable,
-        ))
+        self.with_replay(|state| {
+            Ok((
+                state.2.clone(),
+                state.0.clone(),
+                state.1.clone(),
+                state.4.clone(),
+                state.3.clone(),
+                state.6.clone(),
+            ))
+        })
     }
 
-    /// Reauthenticates the WAL and exports the last applied certified ordering.
-    /// The binding, IDs and signed vertices come from one freshness-checked replay.
+    /// Exports the last applied certified ordering from one freshness-checked replay.
+    /// The binding, IDs and signed vertices always come from the same verified state.
     /// This read does not apply a decided slot, sign, append, or execute transactions.
-    /// Like other durable getters it replays the bounded full WAL, not a hot-loop cache.
+    /// Repeated reads reuse that verified state until the durable journal advances.
     /// # Errors
     /// Rejects stale or uncertain owners, corrupt evidence, and missing ordered vertices.
     pub fn ordering_snapshot(&self) -> Result<AgreementOrderingSnapshot, StoreError> {
-        let (_, _, _, binding, _, _, _, _, _, _, _, dag, applications) = self.replay_owned()?;
-        let bootstrap = AuthenticatedSlotAgreementBootstrap::decode(&self.header)?;
-        let checkpoint_binding = SlotAgreementBinding::from_checkpoint(
-            bootstrap.agreement.context,
-            bootstrap.predecessor,
-        )?;
-        let order = dag.dag().order().to_vec();
-        let vertices = order
-            .iter()
-            .map(|id| {
-                dag.dag()
-                    .get(id.round, &id.author)
-                    .cloned()
-                    .ok_or_else(|| invalid("applied ordering vertex missing"))
+        self.with_replay(|state| {
+            let order = state.11.dag().order().to_vec();
+            let vertices = order
+                .iter()
+                .map(|id| {
+                    state
+                        .11
+                        .dag()
+                        .get(id.round, &id.author)
+                        .cloned()
+                        .ok_or_else(|| invalid("applied ordering vertex missing"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(AgreementOrderingSnapshot {
+                checkpoint_binding: self.checkpoint_binding.clone(),
+                applications: state.12.clone(),
+                binding: state.3.clone(),
+                order,
+                vertices,
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(AgreementOrderingSnapshot {
-            checkpoint_binding,
-            applications,
-            binding,
-            order,
-            vertices,
         })
     }
 
@@ -2193,23 +2182,7 @@ impl AuthenticatedSlotAgreement {
     /// # Errors
     /// Rejects uncertain or stale owners and invalid durable evidence.
     pub fn binding(&self) -> Result<SlotAgreementBinding, StoreError> {
-        if self.uncertain {
-            return Err(invalid("uncertain authenticated write requires recovery"));
-        }
-        let root = self
-            .store
-            .slot_decisions
-            .lock()
-            .expect("slot decision lock poisoned");
-        exclusions(&root)?;
-        let journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
-        if journal.header != self.header
-            || journal.events.len() as u64 != self.sequence
-            || journal.tip != self.tip
-        {
-            return Err(invalid("stale authenticated owner"));
-        }
-        Ok(replay(&journal.bootstrap, &journal.events)?.3)
+        self.with_replay(|state| Ok(state.3.clone()))
     }
 
     /// Number of durably installed requests.
@@ -2278,9 +2251,14 @@ impl AuthenticatedSlotAgreement {
         } else {
             &journal.events
         };
-        let result = replay(&journal.bootstrap, replay_events)?
+        let replayed = replay(&journal.bootstrap, replay_events)?;
+        let result = replayed
             .0
+            .clone()
             .ok_or_else(|| invalid("no authenticated transition"))?;
+        // A prefix replay describes state before later durable events, so it cannot replace
+        // the owner's cache; only a replay of the whole journal can.
+        let cacheable = replay_events.len() == journal.events.len();
         self.uncertain = true;
         let mut file = OpenOptions::new().append(true).open(root.join(FILE))?;
         if !retry {
@@ -2291,6 +2269,14 @@ impl AuthenticatedSlotAgreement {
         if !retry {
             self.sequence = sequence;
             self.tip = digest(&self.tip, sequence, &body);
+        }
+        if cacheable {
+            *self.cache.lock().expect("replay cache lock poisoned") = Some(ReplayCache {
+                bytes: journal.bytes + if retry { 0 } else { bytes.len() as u64 },
+                sequence: self.sequence,
+                tip: self.tip,
+                state: replayed,
+            });
         }
         Ok(result)
     }

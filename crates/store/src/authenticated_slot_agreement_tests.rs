@@ -907,6 +907,80 @@ fn authenticated_stale_checkpoint_bounds_and_torn_write_fail_closed() {
 }
 
 #[test]
+fn verified_replay_cache_revalidates_ownership_and_refreshes_on_append() {
+    let (_, _, bootstrap) = fixture(false);
+    let dir = TempDir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = store
+        .begin_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    let mut sibling = store
+        .recover_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    let timeout = AuthenticatedSlotAgreementRequest::Timeout {
+        view: AgreementView(0),
+        phase: AgreementPhase::Prevote,
+    };
+
+    // The first read verifies the journal and retains that replay; repeated reads must
+    // return exactly the same durable state instead of a fresh unverified snapshot.
+    let cached = owner.ordering_snapshot().unwrap();
+    assert!(cached.order().is_empty());
+    assert!(cached.applications().is_empty());
+    assert!(owner.signing_outbox().unwrap().is_empty());
+    assert_eq!(owner.binding().unwrap().tip(), cached.binding().tip());
+
+    // A sibling recovery that does not append leaves bytes and tip unchanged, so the
+    // verified cache stays valid rather than failing closed for unrelated activity.
+    let refreshed = store
+        .recover_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    assert!(owner.ordering_snapshot().is_ok());
+    drop(refreshed);
+
+    // A sibling append changes the journal's byte length. The cached owner must not
+    // serve its verified prefix as if it were current; every read and writer fails closed.
+    sibling.apply(1, timeout.clone()).unwrap();
+    assert_eq!(sibling.sequence(), 1);
+    assert_eq!(sibling.signing_outbox().unwrap().len(), 1);
+    assert_eq!(owner.sequence(), 0);
+    assert!(owner.ordering_snapshot().is_err());
+    assert!(owner.signing_outbox().is_err());
+    assert!(owner.completed_carriers().is_err());
+    assert!(owner.entered_view_certificate().is_err());
+    assert!(owner.view_request_reservations().is_err());
+    assert!(owner.binding().is_err());
+    assert!(owner.header_intents().is_err());
+    assert!(owner.execution_checkpoint().is_err());
+    assert!(owner.apply(1, timeout).is_err());
+
+    // A local append replaces the cache with the replay of the new full journal, so the
+    // advancing owner can keep reading without reloading on every getter.
+    let mut advancing = store
+        .recover_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    advancing
+        .apply(
+            2,
+            AuthenticatedSlotAgreementRequest::AdvanceView {
+                from: AgreementView(0),
+            },
+        )
+        .unwrap();
+    assert_eq!(advancing.sequence(), 2);
+    assert_eq!(advancing.signing_outbox().unwrap().len(), 1);
+    assert!(advancing.ordering_snapshot().is_ok());
+
+    // Recovery re-authenticates the whole journal and seeds the new owner's cache.
+    let recovered = store
+        .recover_authenticated_slot_agreement(bootstrap)
+        .unwrap();
+    assert_eq!(recovered.sequence(), 2);
+    assert_eq!(recovered.signing_outbox().unwrap().len(), 1);
+    assert!(recovered.ordering_snapshot().unwrap().order().is_empty());
+}
+
+#[test]
 fn authenticated_dual_journal_rejects_raw_apply_and_open() {
     use validator::slot_agreement::AgreementInput;
     let (f, lineage, bootstrap) = fixture(true);

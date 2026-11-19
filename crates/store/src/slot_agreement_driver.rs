@@ -98,8 +98,9 @@ impl SlotAgreementDriver {
         self.session.entered_view_certificate()
     }
 
-    /// Exports the applied certified prefix and signed vertices from one durable replay.
-    /// Deciding evidence alone does not extend this prefix; `AdvanceSlot` must be durable.
+    /// Exports the applied certified prefix and signed vertices from the owner's
+    /// verified durable state. Deciding evidence alone does not extend this prefix;
+    /// `AdvanceSlot` must be durable.
     /// # Errors
     /// Rejects stale or uncertain sessions, corrupt evidence, and missing ordered vertices.
     pub fn ordering_snapshot(&self) -> Result<crate::AgreementOrderingSnapshot, StoreError> {
@@ -187,7 +188,11 @@ impl SlotAgreementDriver {
         self.output()
     }
 
-    /// Reconstructs output without trusting cached evidence or mutable external context.
+    /// Rebuilds immutable output from the owner's verified durable state.
+    ///
+    /// Durable reads reuse the replay verified for the owner's exact journal tip; a
+    /// reported sequence and transition always describe that same durable state.
+    /// Output is still a snapshot, not a queue: repeated reads can repeat output.
     ///
     /// # Errors
     /// Rejects stale or uncertain owners, corrupt evidence, and invalid candidates.
