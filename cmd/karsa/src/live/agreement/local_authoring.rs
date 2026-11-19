@@ -237,10 +237,14 @@ impl JournaledFinalization {
     /// Bounds, foreign chains, signature failures and known conflicting statements reject
     /// the whole request before import or budget mutation. Other Node insertion failures
     /// may retain an authenticated prefix and consume budget; imports are not transactional.
-    /// Signing never precedes reservation.
+    /// Signing never precedes reservation. Every signed publication is delivered back
+    /// through the same authenticated receipt path peers use, so the author observes the
+    /// exact evidence it published instead of waiting for a peer to echo it.
     pub fn author_local(&mut self, request: AuthoringRequest) -> Result<Vec<Message>, String> {
-        self.import_local(request.vertices)?;
-        self.author_local_action(request.round, request.action)
+        let authored = self
+            .import_local(request.vertices)
+            .and_then(|()| self.author_local_action(request.round, request.action));
+        self.deliver_own_publications(authored)
     }
 
     /// Imports trusted availability and attempts one durable nil or positive-phase obligation.
@@ -259,10 +263,17 @@ impl JournaledFinalization {
     /// recovery. Durable selection/reconstruction is capped at 4096 WAL events, not storage bytes.
     /// Authors at most one durable phase, one initial direct-commit proposal and its
     /// elected view authorization, one elected re-proposal, or one view echo; it does
-    /// not tick, retry or apply a slot.
+    /// not tick, retry or apply a slot. A signed publication is delivered back through
+    /// the same authenticated receipt path peers use, so the author observes it locally.
     /// # Errors
     /// Propagates bounded import, ownership, round overflow and durable authoring errors.
     pub fn drive_local(&mut self, vertices: Vec<Vertex>) -> Result<Vec<Message>, String> {
+        let authored = self.drive_local_turn(vertices);
+        self.deliver_own_publications(authored)
+    }
+
+    /// One local turn: at most one authored publication, without local receipt.
+    fn drive_local_turn(&mut self, vertices: Vec<Vertex>) -> Result<Vec<Message>, String> {
         self.import_local(vertices)?;
         if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
             return Err("local durable selection exceeds 4096 events".into());
@@ -322,6 +333,31 @@ impl JournaledFinalization {
             return Ok(elected);
         }
         self.echo_view_local()
+    }
+
+    /// Delivers signed local publications to this owner as a peer's receipt would.
+    ///
+    /// The durable driver records a completed carrier as a publication, not as a reducer
+    /// input, so without this the author would never observe the proposal, view
+    /// authorization, vote or aggregate it just signed. Delivery re-authenticates the
+    /// exact wire message against the pinned binding and retained causal evidence: it
+    /// grants no voting authority and applies no slot. Control publications (view
+    /// requests) are already self-observed where they are authorized, so they are not
+    /// sent through this path again.
+    fn deliver_own_publications(
+        &mut self,
+        authored: Result<Vec<Message>, String>,
+    ) -> Result<Vec<Message>, String> {
+        let messages = authored?;
+        for message in &messages {
+            if matches!(
+                message,
+                Message::AgreementCarrier { .. } | Message::AgreementNilVote(_)
+            ) {
+                self.receive_agreement_message(message.clone())?;
+            }
+        }
+        Ok(messages)
     }
 
     /// Authors the initial view-0 proposal when this validator is elected and the

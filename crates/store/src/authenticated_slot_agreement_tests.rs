@@ -60,6 +60,50 @@ pub(super) fn fixture(
     (f, lineage, bootstrap)
 }
 #[test]
+fn an_exact_repeated_view_receipt_replays_as_a_durable_no_op() {
+    let (f, lineage, bootstrap) = fixture(true);
+    let dir = TempDir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = store
+        .begin_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    let request = AuthenticatedSlotAgreementRequest::Propose {
+        lineage,
+        vertices: f.vertices,
+    };
+    let first = owner.apply(1, request.clone()).unwrap();
+    assert!(
+        matches!(
+            first.vote,
+            Some(ref vote) if vote.phase == AgreementPhase::Prevote
+        ),
+        "a view authorization emits the local prevote"
+    );
+    let sequence = owner.sequence();
+    assert_eq!(sequence, 1);
+    let outbox = format!("{:?}", owner.signing_outbox().unwrap());
+    // A self-delivered publication may also be echoed by a peer, and a carrier retransmission
+    // repeats evidence the peer already holds. The repeated receipt is journaled but must
+    // replay as a no-op instead of emitting the prevote a second time.
+    let repeated = owner.apply(sequence + 1, request).unwrap();
+    assert!(repeated.vote.is_none(), "a repeated receipt emits no vote");
+    assert_eq!(owner.sequence(), sequence + 1);
+    assert_eq!(
+        format!("{:?}", owner.signing_outbox().unwrap()),
+        outbox,
+        "state is unchanged"
+    );
+    drop(owner);
+    drop(store);
+    let store = Store::open(&dir.0).unwrap();
+    let recovered = store
+        .recover_authenticated_slot_agreement(bootstrap)
+        .unwrap();
+    assert_eq!(recovered.sequence(), sequence + 1);
+    assert_eq!(format!("{:?}", recovered.signing_outbox().unwrap()), outbox);
+}
+
+#[test]
 fn execution_checkpoint_stays_with_signing_root_across_generation_activation() {
     let (_, _, bootstrap) = fixture(true);
     let dir = TempDir::new();

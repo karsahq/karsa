@@ -247,6 +247,7 @@ fn competing_indirect_and_conservative_skip_across_views_durable_lock_and_common
     );
 
     // Honest 2/2 decision/nil split, not proposer equivocation. Skip has authorization only in view 1.
+    let repeated_availability = f.vertices.clone();
     let mut outputs = vec![];
     for (id, driver) in drivers.iter_mut().enumerate() {
         outputs.push(apply(
@@ -254,7 +255,7 @@ fn competing_indirect_and_conservative_skip_across_views_durable_lock_and_common
             if id < 2 {
                 AuthenticatedSlotAgreementRequest::Propose {
                     lineage: commit.clone(),
-                    vertices: f.vertices.clone(),
+                    vertices: repeated_availability.clone(),
                 }
             } else {
                 AuthenticatedSlotAgreementRequest::Timeout {
@@ -281,11 +282,22 @@ fn competing_indirect_and_conservative_skip_across_views_durable_lock_and_common
             sequence + 1,
             AuthenticatedSlotAgreementRequest::Propose {
                 lineage: commit.clone(),
-                vertices: f.vertices.clone(),
+                vertices: repeated_availability.clone(),
             },
         );
-        assert!(again.is_err(), "a second same-phase vote must be rejected");
-        assert_eq!(drivers[id].sequence(), sequence);
+        if id < 2 {
+            // This driver already journaled this exact view authorization and availability;
+            // a repeated authenticated receipt is a no-op instead of a second vote.
+            let repeated = again.unwrap().transition.unwrap();
+            assert!(repeated.vote.is_none());
+            assert_eq!(drivers[id].sequence(), sequence + 1);
+        } else {
+            assert!(
+                again.is_err(),
+                "a proposal received after a timeout cannot replace the nil prevote"
+            );
+            assert_eq!(drivers[id].sequence(), sequence);
+        }
         if id < 2 {
             let (v, w) = witness(
                 &f,

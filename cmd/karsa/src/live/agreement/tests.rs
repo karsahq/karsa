@@ -2338,8 +2338,8 @@ fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen
             history,
             "duplicate QC creates no signing obligation {i}"
         );
-        // Ingress allocates a new sequence even for duplicate evidence; only an
-        // exact session retry at the original sequence avoids a WAL append.
+        // Ingress allocates a new sequence even for duplicate evidence; replay treats the
+        // exact repeat as a receipt-only no-op so it cannot re-emit the local prevote.
         assert_eq!(adapter.driver.sequence(), sequence + 1);
         let wal = std::fs::read(dirs[i].0.join("authenticated-slot-agreement")).unwrap();
         assert!(
@@ -4985,6 +4985,191 @@ fn the_elected_proposer_binds_the_initial_view_and_a_peer_votes() {
         payload.vote.value,
         validator::slot_agreement::AgreementValue::Decision(_)
     ));
+}
+
+#[test]
+fn the_elected_proposer_observes_its_own_view_and_authors_its_vote() {
+    let m = chain::membership(4, None).unwrap();
+    let chain_id = b"karsa-initial-self-observation";
+    let state = chain::genesis_state(&m.accounts).unwrap();
+    let genesis = validator::Header::genesis(
+        chain_id.to_vec(),
+        m.set.epoch,
+        state.state_root(),
+        validator::commit_root(&[]),
+    );
+    let view = AgreementView(0);
+    let proposer = validator::slot_agreement_view_proposer(&m.set, 1, view).unwrap();
+    let index = m
+        .consensus
+        .iter()
+        .position(|identity| identity.id == proposer)
+        .unwrap();
+
+    let mut dag = Dag::new(m.set.clone());
+    dag.set_chain_id(chain_id.to_vec());
+    let mut vertices = Vec::new();
+    let mut previous = Vec::new();
+    for round in 0..=2u64 {
+        let mut ids = Vec::new();
+        for author in 0..4 {
+            let payload = [u8::try_from(author + 1).unwrap(); 32];
+            let vertex = signed_for_chain(&m, author, round, previous.clone(), payload, chain_id);
+            ids.push(dag.insert(vertex.clone()).unwrap());
+            vertices.push(vertex);
+        }
+        ids.sort_by(|a, b| (a.round, &a.author, a.digest).cmp(&(b.round, &b.author, b.digest)));
+        previous = ids;
+    }
+    let round_two = previous.clone();
+    let leader = dag.leader(1).unwrap().id().unwrap();
+    assert!(matches!(
+        dag.inspect_commit(1).unwrap(),
+        Decision::Commit(history) if history.contains(&leader)
+    ));
+
+    let mut node = net::Node::with_chain_id(
+        m.set.clone(),
+        m.consensus[index].id.clone(),
+        m.consensus[index].private_key.clone(),
+        chain_id.to_vec(),
+    );
+    for vertex in &vertices {
+        node.receive(vertex.clone()).unwrap();
+    }
+    let policy = pacemaker::Policy::new(
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(100),
+    )
+    .unwrap();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = session::open_at_genesis(
+        &store,
+        &m,
+        index,
+        &genesis,
+        state,
+        validator::EpochSchedule::single(m.set.epoch),
+    )
+    .unwrap();
+    owner
+        .enable_authoring(node, policy, std::time::Duration::from_millis(50))
+        .unwrap();
+
+    // The proposal is signed, published and then received by its own author.
+    let proposal_message = owner.drive_local(Vec::new()).unwrap();
+    assert_eq!(proposal_message.len(), 1);
+    let net::wire::Message::AgreementCarrier {
+        envelope: proposal_bytes,
+        ..
+    } = &proposal_message[0]
+    else {
+        panic!("the initial publication must be a proposal carrier");
+    };
+    let proposal_envelope = CarrierEnvelope::decode(proposal_bytes, &m.set).unwrap();
+    let proposal_carrier = proposal_envelope.carrier().clone();
+
+    let mut round_three = Vec::new();
+    let mut placeholders = Vec::new();
+    for author in 0..4 {
+        if author == index {
+            continue;
+        }
+        let vertex = signed_for_chain(
+            &m,
+            author,
+            3,
+            round_two.clone(),
+            [u8::try_from(author + 20).unwrap(); 32],
+            chain_id,
+        );
+        round_three.push(vertex.id().unwrap());
+        placeholders.push(vertex);
+    }
+    round_three.push(proposal_carrier.clone());
+    round_three.sort_by(|a, b| (a.round, &a.author, a.digest).cmp(&(b.round, &b.author, b.digest)));
+    let view_message = owner.drive_local(placeholders).unwrap();
+    assert_eq!(view_message.len(), 1, "the elected proposer binds one view");
+    let net::wire::Message::AgreementCarrier {
+        envelope: view_bytes,
+        ..
+    } = &view_message[0]
+    else {
+        panic!("the view authorization must be a carrier");
+    };
+    let view_envelope = CarrierEnvelope::decode(view_bytes, &m.set).unwrap();
+    let view_carrier = view_envelope.carrier().clone();
+
+    // Receipt of its own view authorization is what gives the author a prevote
+    // intent, but the carrier still needs a quorum of round-4 causal authors.
+    assert!(
+        owner.drive_local(Vec::new()).unwrap().is_empty(),
+        "a prevote intent without causal readiness must wait"
+    );
+
+    let mut round_four = vec![view_carrier.clone()];
+    let mut availability = Vec::new();
+    for author in 0..4 {
+        if author == index {
+            continue;
+        }
+        let vertex = signed_for_chain(
+            &m,
+            author,
+            4,
+            round_three.clone(),
+            [u8::try_from(author + 30).unwrap(); 32],
+            chain_id,
+        );
+        round_four.push(vertex.id().unwrap());
+        availability.push(vertex);
+    }
+    round_four.sort_by(|a, b| (a.round, &a.author, a.digest).cmp(&(b.round, &b.author, b.digest)));
+
+    let vote_message = owner.drive_local(availability).unwrap();
+    assert_eq!(
+        vote_message.len(),
+        1,
+        "self-observation must let the proposer author its own prevote"
+    );
+    let net::wire::Message::AgreementCarrier {
+        envelope: vote_bytes,
+        vertices: vote_cone,
+    } = &vote_message[0]
+    else {
+        panic!("the proposer vote must be a carrier");
+    };
+    let vote_envelope = CarrierEnvelope::decode(vote_bytes, &m.set).unwrap();
+    let CarrierPayload::Vote { payload, lineage } = vote_envelope.payload() else {
+        panic!("the proposer publication must be a vote");
+    };
+    assert_eq!(
+        payload.vote.phase,
+        validator::slot_agreement::AgreementPhase::Prevote
+    );
+    assert!(matches!(
+        payload.vote.value,
+        validator::slot_agreement::AgreementValue::Decision(_)
+    ));
+    assert_eq!(
+        lineage.entries.last().unwrap().view_carrier,
+        view_carrier,
+        "the prevote must name the view authorization it observed"
+    );
+    let carrier = vote_envelope.carrier();
+    assert_eq!(carrier.author.as_slice(), proposer);
+    let mut held: Vec<_> = vote_cone
+        .iter()
+        .filter(|vertex| vertex.round == 4)
+        .filter_map(|vertex| vertex.id().ok())
+        .collect();
+    held.sort_by(|a, b| (a.round, &a.author, a.digest).cmp(&(b.round, &b.author, b.digest)));
+    assert_eq!(
+        held, round_four,
+        "the vote carrier must reference the held round-4 quorum"
+    );
 }
 
 #[test]

@@ -694,10 +694,13 @@ fn owned_publication_discovery_recovers_lost_output_and_reopen_without_signing()
     let store = Store::open(&dir.0).unwrap();
     let mut owner = open_event_pump_owner(&store, &bootstrap, &m);
     let anchor = owner.finalization().finalizer().head().clone();
+    // This test is about publication discovery and retry cadence, not timeouts. The
+    // phase waits keep the pacemaker from authoring a nil vote mid-run and changing
+    // the phase the final stale-owner probe depends on.
     let policy = super::pacemaker::Policy::new(
-        Duration::from_secs(1),
-        Duration::from_secs(1),
-        Duration::from_secs(1),
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
     )
     .unwrap();
     owner

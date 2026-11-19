@@ -1039,6 +1039,28 @@ fn authorable_votes(
         .collect()
 }
 
+/// Canonical identity of one authenticated observation, including its availability.
+/// Only a byte-identical receipt is a repeat: extra dependency vertices are independent
+/// input that can conflict with a local reservation or fail retention, so a request that
+/// merely resembles an earlier statement must still be replayed and validated.
+fn observation_key(
+    request: &AuthenticatedSlotAgreementRequest,
+    set: &validator::ValidatorSet,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    match request {
+        AuthenticatedSlotAgreementRequest::ObserveProposal { .. }
+        | AuthenticatedSlotAgreementRequest::Propose { .. }
+        | AuthenticatedSlotAgreementRequest::ObserveVote { .. }
+        | AuthenticatedSlotAgreementRequest::ObservePrevote { .. }
+        | AuthenticatedSlotAgreementRequest::ObservePrecommit { .. }
+        | AuthenticatedSlotAgreementRequest::ObserveNilVote { .. }
+        | AuthenticatedSlotAgreementRequest::EnterRequestedView { .. } => {
+            Ok(Some(request.encode(set)?))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn replay(
     b: &AuthenticatedSlotAgreementBootstrap,
     events: &[AuthenticatedSlotAgreementRequest],
@@ -1066,7 +1088,23 @@ fn replay(
     let mut nil_buckets: BTreeMap<Vec<u8>, NilVoteBucket> = BTreeMap::new();
     let mut view_requests = ViewRequests::default();
     let mut applications = Vec::new();
+    let mut observations: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
     for (index, event) in events.iter().enumerate() {
+        if let Some(key) = observation_key(event, &b.agreement.set)? {
+            if !observations.insert(key) {
+                // The same authenticated observation can arrive twice: a local publication
+                // may be self-delivered and then echoed by a peer, and a carrier retransmission
+                // repeats evidence a peer already holds. Replaying it again would repeat a
+                // one-shot reducer step (a view authorization emits the local prevote), so the
+                // receipt is a durable no-op that emits no new vote.
+                result = Some(AgreementTransitionResult {
+                    vote: None,
+                    view: reducer.view(),
+                    decision: reducer.decision().cloned(),
+                });
+                continue;
+            }
+        }
         let incoming = match event {
             AuthenticatedSlotAgreementRequest::ObserveProposal { vertices, .. }
             | AuthenticatedSlotAgreementRequest::ReserveCarrier { vertices, .. }
