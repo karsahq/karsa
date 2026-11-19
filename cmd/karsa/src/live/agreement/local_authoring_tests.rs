@@ -1146,3 +1146,80 @@ fn advance_decided_slot_is_a_no_op_before_a_durable_decision() {
     assert_eq!(owner.finalization().execution().applied(), 0);
     assert!(owner.finalization().execution().consumed_order().is_empty());
 }
+
+#[test]
+fn owned_event_pump_authors_a_caller_batch_without_early_publication() {
+    use super::event_pump::{EventPump, LocalEvent};
+    use std::time::Duration;
+    let (m, bootstrap, _) = fixture();
+    let wait = Duration::from_secs(1);
+    let policy = super::pacemaker::Policy::new(wait, wait, wait).unwrap();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = open_event_pump_owner(&store, &bootstrap, &m);
+    owner
+        .enable_authoring(
+            net::Node::with_chain_id(
+                m.set.clone(),
+                m.consensus[0].id.clone(),
+                m.consensus[0].private_key.clone(),
+                b"live-adapter-tests".to_vec(),
+            ),
+            policy,
+            wait,
+        )
+        .unwrap();
+    let accounts = chain::accounts(4).unwrap();
+    let batch = chain::demo_batch(b"live-adapter-tests", &accounts, 0, 0, 1).unwrap();
+    let hash = batch.digest().unwrap();
+    let (pump, mut channels) = EventPump::new(
+        owner,
+        m.clone(),
+        Default::default(),
+        1.try_into().unwrap(),
+        16,
+        1024 * 1024,
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(pump.run(stop_rx));
+        channels
+            .local
+            .send(LocalEvent::AuthorCausalBatch {
+                vertices: Vec::new(),
+                batch: batch.clone(),
+            })
+            .await
+            .unwrap();
+        let output = channels.output.recv().await.unwrap();
+        assert!(output.error.is_none(), "{:?}", output.error);
+        assert!(output.build.shares.is_empty() && output.build.certified.is_empty());
+        let vertex = output
+            .carriers
+            .iter()
+            .find_map(|message| match message {
+                net::wire::Message::Vertex(vertex) => Some(vertex.clone()),
+                _ => None,
+            })
+            .expect("the authored causal vertex is published");
+        assert_eq!(vertex.round, 0, "the first available round is zero");
+        assert_eq!(
+            vertex.payload_hash, hash,
+            "the vertex names the trusted local batch"
+        );
+        assert!(
+            output
+                .carriers
+                .iter()
+                .all(|message| !matches!(message, net::wire::Message::Payload(_))),
+            "the bytes wait for applied certified ordering instead of a guaranteed rejection"
+        );
+        stop.send(true).unwrap();
+        let (_, result) = task.await.unwrap();
+        result.unwrap();
+    });
+}

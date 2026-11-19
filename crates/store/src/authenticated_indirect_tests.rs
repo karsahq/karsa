@@ -363,6 +363,114 @@ fn authenticated_indirect_proposal_votes_finalization_advance_and_wal_recovery()
 }
 
 #[test]
+fn incremental_and_one_shot_evidence_derive_the_same_certified_ordering() {
+    use validator::SlotAgreementViewLineage;
+    let (f, proof, carrier) = fixture();
+    let mut lineage = SlotAgreementViewLineage {
+        entries: proof.entries.clone(),
+    };
+    lineage.entries[0].pol = None;
+    let context = f.binding.tip().clone();
+    let dirs = (0..2).map(|_| TempDir::new()).collect::<Vec<_>>();
+    let stores = dirs
+        .iter()
+        .map(|dir| Store::open(&dir.0).unwrap())
+        .collect::<Vec<_>>();
+    let bootstraps = (0..2)
+        .map(|id| AuthenticatedSlotAgreementBootstrap {
+            agreement: SlotAgreementBootstrap {
+                context: context.clone(),
+                set: f.set.clone(),
+                local_validator: f.set.validators[id].validator_id.clone(),
+            },
+            predecessor: None,
+            order: vec![],
+            vertices: vec![],
+        })
+        .collect::<Vec<_>>();
+    // The same evidence arrives as three dependent receipts: proposal, then the new
+    // view's POL, then the complete final proof.
+    let mut incremental = stores[0]
+        .begin_authenticated_slot_agreement(bootstraps[0].clone())
+        .unwrap();
+    incremental
+        .apply(
+            1,
+            AuthenticatedSlotAgreementRequest::Propose {
+                lineage: lineage.clone(),
+                vertices: f
+                    .vertices
+                    .iter()
+                    .filter(|v| v.round <= 6)
+                    .cloned()
+                    .collect(),
+            },
+        )
+        .unwrap();
+    incremental
+        .apply(
+            2,
+            AuthenticatedSlotAgreementRequest::ObservePrevote {
+                lineage: SlotAgreementViewLineage {
+                    entries: proof.entries.clone(),
+                },
+                vertices: f
+                    .vertices
+                    .iter()
+                    .filter(|v| v.round <= 8)
+                    .cloned()
+                    .collect(),
+            },
+        )
+        .unwrap();
+    incremental
+        .apply(
+            3,
+            AuthenticatedSlotAgreementRequest::ObservePrecommit {
+                proof: proof.clone(),
+                carrier: carrier.clone(),
+                vertices: f.vertices.clone(),
+            },
+        )
+        .unwrap();
+    incremental.advance_slot(4).unwrap();
+    let stepwise = incremental.ordering_snapshot().unwrap();
+
+    // A peer that never retained the intermediate proposal or POL receives the same
+    // evidence as one complete proof. The authenticated decision is the ordering
+    // authority, so delivery granularity cannot change the emitted identity.
+    let mut one_shot = stores[1]
+        .begin_authenticated_slot_agreement(bootstraps[1].clone())
+        .unwrap();
+    one_shot
+        .apply(
+            1,
+            AuthenticatedSlotAgreementRequest::ObservePrecommit {
+                proof,
+                carrier,
+                vertices: f.vertices.clone(),
+            },
+        )
+        .unwrap();
+    one_shot.advance_slot(2).unwrap();
+    let complete = one_shot.ordering_snapshot().unwrap();
+    assert_eq!(complete.order(), stepwise.order());
+    assert_eq!(complete.applications(), stepwise.applications());
+    assert_eq!(complete.binding(), stepwise.binding());
+    assert_eq!(complete.vertices(), stepwise.vertices());
+    assert_eq!(
+        validator::commit_root(complete.order()),
+        validator::commit_root(stepwise.order())
+    );
+    assert_eq!(
+        complete.binding().tip().order_root(),
+        stepwise.binding().tip().order_root()
+    );
+    // Journal length describes delivery, not authority: the two disagree by design.
+    assert_ne!(incremental.sequence(), one_shot.sequence());
+}
+
+#[test]
 fn indirect_application_target_only_root_and_retained_vertex_restart_replay() {
     let (f, proof, carrier) = fixture();
     let dir = TempDir::new();

@@ -160,6 +160,28 @@ impl CertifiedExecution {
     pub fn consumed_order(&self) -> &[VertexId] {
         self.consumer.consumed_order()
     }
+    /// Applied certified slot boundaries, including skips. Diagnostics only.
+    pub fn applied_slots(&self) -> usize {
+        self.consumer.snapshot().applications().len()
+    }
+    /// Root of the applied certified order; comparing it across nodes is a diagnostic.
+    pub fn order_root(&self) -> [u8; 32] {
+        *self.consumer.snapshot().binding().tip().order_root()
+    }
+    /// First certified vertex whose payload is still missing, if execution is blocked.
+    /// The last flag reports whether the retained vertex's digest still equals the
+    /// certified order ID's digest at that index.
+    pub fn blocked(&self) -> Option<(u64, Vec<u8>, [u8; 32], bool)> {
+        let snapshot = self.consumer.snapshot();
+        let index = self.consumer.consumed_order().len();
+        let id = snapshot.order().get(index)?;
+        let vertex = &snapshot.vertices()[index];
+        let id_matches = vertex
+            .id()
+            .map(|actual| actual.digest == id.digest)
+            .unwrap_or(false);
+        Some((id.round, id.author.clone(), vertex.payload_hash, id_matches))
+    }
     /// Volatile rejection diagnostics accumulated since begin or restore.
     pub fn rejected(&self) -> &BTreeMap<&'static str, usize> {
         &self.rejected

@@ -42,6 +42,19 @@ pub enum LocalEvent {
         /// Local data-plane payload digest; zero names no batch.
         payload_hash: [u8; 32],
     },
+    /// Authors one causal availability vertex naming a caller-supplied local batch.
+    ///
+    /// The batch is trusted local data-plane input, not network input. It is checked
+    /// for control classification and ordered-index bounds, retained locally, and only
+    /// then named by the authored vertex. Local batches that applied certified ordering
+    /// requires are retransmitted on scheduled wakes so peers can admit them after they
+    /// apply the same slot. This is still not an agreement publication.
+    AuthorCausalBatch {
+        /// Bounded trusted causal availability, imported before selecting the round.
+        vertices: Vec<validator::Vertex>,
+        /// Exact local batch the authored vertex names.
+        batch: Batch,
+    },
     /// Applies the durable decided slot if one exists, then attempts execution from
     /// journaled ordering. An undecided slot is an ordinary no-op, not an error.
     AdvanceDecidedSlot {
@@ -62,7 +75,8 @@ pub enum LocalEvent {
 
 /// One attempted response per processed event; volatile and without publication authority.
 pub struct PumpOutput {
-    /// At most one authenticated durable carrier or control publication per local turn.
+    /// Authenticated durable carriers and control publications, plus bounded retransmission
+    /// of locally authored payloads; never proof of delivery.
     pub carriers: Vec<Message>,
     /// Volatile shares and certificates; grants no pruning or store-publication authority.
     pub build: Build,
@@ -183,6 +197,8 @@ pub struct EventPump {
     payload_bytes: usize,
     max_payload_bytes: usize,
     max_batches: usize,
+    /// Hashes of callers' trusted local batches, the only ones retransmitted.
+    local_batches: BTreeSet<[u8; 32]>,
     build_at: Option<u64>,
     schedule: Option<LocalSchedule>,
     frames: mpsc::Receiver<Frame>,
@@ -193,11 +209,28 @@ pub struct EventPump {
 
 /// Caps caller selection and duplicate-check work per scheduled carrier poll.
 const CARRIER_PAGE_IDS: usize = 64;
+/// Authenticated non-batch payload digests retained as trusted controls.
+/// One per distinct agreement carrier; bounded like the journal's event cap.
+const MAX_CONTROLS: usize = 4096;
+/// Payload retransmissions attempted right after the applied order grows.
+/// Only locally authored batches that the new order names are selected, so the
+/// burst is bounded by the order itself, not by history.
+const PAYLOAD_BURST: usize = 2;
+/// Drip cadence between payload retransmissions: no acknowledgement exists, so a
+/// peer that applies later still receives the bytes, just less often.
+const PAYLOAD_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 struct LocalSchedule {
     interval: std::time::Duration,
     next: tokio::time::Instant,
     publication_offset: usize,
+    payload_offset: usize,
+    /// Applied order length observed at the last payload growth check.
+    payload_growth: usize,
+    /// Retransmissions left in the current burst.
+    payload_burst: usize,
+    /// Earliest next volatile payload retransmission.
+    payload_next: std::time::Instant,
     retry_controls: bool,
 }
 
@@ -224,6 +257,9 @@ impl EventPump {
     /// target, or retries one discovered publication. The proposal/view steps use only local
     /// retained causality and durable evidence; they never invent a decision or evidence.
     /// Neither adds a causal import requirement of its own.
+    /// Every wake also retransmits one caller-supplied local batch whose digest an applied
+    /// certified order names, so peers can admit payload they rejected before that slot.
+    /// That retransmission is volatile and has no acknowledgement or delivery promise.
     /// Discovery reads at most one 64-ID page per wake under the 4096-event replay cap;
     /// only the first still-current ID is attempted, and IDs whose slot or view has passed
     /// are skipped without a retransmission (they stay durable for explicit export).
@@ -250,6 +286,10 @@ impl EventPump {
             interval,
             next: tokio::time::Instant::now() + interval,
             publication_offset: 0,
+            payload_offset: 0,
+            payload_growth: 0,
+            payload_burst: 0,
+            payload_next: std::time::Instant::now() + interval,
             retry_controls: true,
         });
         Ok(())
@@ -259,6 +299,15 @@ impl EventPump {
         &mut self,
         now: std::time::Instant,
     ) -> Result<Vec<Message>, String> {
+        let mut messages = self.maintain(now)?;
+        while let Some(payload) = self.required_payload_retry(now) {
+            messages.push(payload);
+        }
+        Ok(messages)
+    }
+
+    /// Runs the existing one-action-per-wake maintenance without payload retransmission.
+    fn maintain(&mut self, now: std::time::Instant) -> Result<Vec<Message>, String> {
         if self.schedule.is_none() {
             return Err("local pump scheduling is disabled".into());
         }
@@ -329,6 +378,139 @@ impl EventPump {
         result
     }
 
+    /// Retransmits one locally authored batch that applied certified ordering names.
+    ///
+    /// Selection is exact: only caller-supplied local batches, and only those whose digest
+    /// appears in a vertex of the applied certified order. A new applied order starts a
+    /// small burst; afterward the same rotation drips, because there is no acknowledgement
+    /// and a peer that applies later still needs the bytes. Nothing here invents a delivery
+    /// promise or eviction policy.
+    fn required_payload_retry(&mut self, now: std::time::Instant) -> Option<Message> {
+        let applied = self
+            .owner
+            .finalization()
+            .execution()
+            .snapshot()
+            .order()
+            .len();
+        let schedule = self.schedule.as_mut()?;
+        if applied > schedule.payload_growth {
+            schedule.payload_growth = applied;
+            schedule.payload_burst = PAYLOAD_BURST;
+            schedule.payload_next = now;
+        }
+        if now < schedule.payload_next {
+            return None;
+        }
+        if schedule.payload_burst == 0 {
+            schedule.payload_burst = 1;
+        }
+        // Execution names the exact payload it is stalled on. A local author must prefer
+        // that digest over the drip rotation: a peer cannot make progress without it.
+        let blocked = self
+            .owner
+            .finalization()
+            .execution()
+            .blocked()
+            .map(|(_, _, payload, _)| payload);
+        let verbatim = blocked
+            .filter(|hash| self.local_batches.contains(hash))
+            .and_then(|hash| self.batches.get(&hash).cloned());
+        if let Some(batch) = verbatim {
+            schedule.payload_burst = schedule.payload_burst.saturating_sub(1);
+            if schedule.payload_burst == 0 {
+                schedule.payload_next = now + PAYLOAD_RETRY;
+            }
+            return Some(Message::Payload(batch));
+        }
+        let required = {
+            let snapshot = self.owner.finalization().execution().snapshot();
+            snapshot
+                .vertices()
+                .iter()
+                .map(|vertex| vertex.payload_hash)
+                .collect::<BTreeSet<_>>()
+        };
+        let offset = schedule.payload_offset;
+        let (hash, next) = next_required_payload(&self.local_batches, &required, offset)?;
+        schedule.payload_offset = next;
+        schedule.payload_burst -= 1;
+        if schedule.payload_burst == 0 {
+            schedule.payload_next = now + PAYLOAD_RETRY;
+        }
+        let batch = self.batches.get(&hash).cloned();
+        batch.map(Message::Payload)
+    }
+
+    /// Records agreement payload digests as trusted non-batch controls.
+    ///
+    /// Only an exact decoded carrier binding is classified: the envelope digest is what the
+    /// carrier vertex signs as its payload hash, it commits to agreement evidence, and a
+    /// batch digest cannot collide with it. Classification is deliberately independent of
+    /// the owner's request verdict: a refused stale or duplicate carrier still names a
+    /// vertex whose payload is not a batch, and leaving it unclassified would stall
+    /// execution on bytes no author will ever send. Returns whether a new digest was
+    /// installed.
+    fn record_agreement_controls(&mut self, messages: &[Message]) -> bool {
+        use super::envelope::CarrierEnvelope;
+        let mut added = false;
+        for message in messages {
+            let Message::AgreementCarrier { envelope, .. } = message else {
+                continue;
+            };
+            let Ok(envelope) = CarrierEnvelope::decode(envelope, &self.membership.set) else {
+                continue;
+            };
+            if self.controls.len() >= MAX_CONTROLS {
+                break;
+            }
+            if self.controls.insert(envelope.payload_digest()) {
+                added = true;
+            }
+        }
+        added
+    }
+
+    /// Retains a trusted caller-supplied batch and names it in one authored causal vertex.
+    ///
+    /// The batch is not network input, so admission does not wait for applied certified
+    /// ordering; the same bounds and control classification still apply. Peer admission is
+    /// the network path's decision and may reject the payload until that vertex is applied.
+    fn author_causal_batch(
+        &mut self,
+        vertices: Vec<validator::Vertex>,
+        batch: Batch,
+    ) -> Result<Vec<Message>, String> {
+        let bytes = batch.encode().map_err(|error| error.to_string())?;
+        let hash = batch.digest().map_err(|error| error.to_string())?;
+        if hash == [0; 32] || self.controls.contains(&hash) {
+            return Err("payload conflicts with trusted control classification".into());
+        }
+        let size = match self.batches.get(&hash) {
+            Some(_) => self.payload_bytes,
+            None => {
+                let size = self
+                    .payload_bytes
+                    .checked_add(bytes.len())
+                    .ok_or("payload index size overflow")?;
+                if self.batches.len() >= self.max_batches || size > self.max_payload_bytes {
+                    return Err("event pump payload index full".into());
+                }
+                size
+            }
+        };
+        let messages = self.owner.author_causal_local(vertices, hash)?;
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.batches.entry(hash) {
+            entry.insert(batch);
+            self.payload_bytes = size;
+        }
+        self.local_batches.insert(hash);
+        // The naming vertex travels now; the bytes wait for applied certified ordering,
+        // because a peer cannot admit a payload before it applies the slot that names it.
+        // Scheduled retransmission is what actually delivers it.
+        Ok(messages)
+    }
+
     /// All channel capacities are identical and nonzero. Payload limits cover batch count
     /// and the sum of retained batches' canonical encoded lengths, not total memory usage
     /// (decoded allocations, channel contents, encoding temporaries and journals are extra).
@@ -355,6 +537,7 @@ impl EventPump {
                 payload_bytes: 0,
                 max_payload_bytes,
                 max_batches,
+                local_batches: BTreeSet::new(),
                 build_at: None,
                 schedule: None,
                 frames,
@@ -488,6 +671,12 @@ impl EventPump {
                         carriers = messages;
                         Build::default()
                     }),
+                Input::Local(Some(LocalEvent::AuthorCausalBatch { vertices, batch })) => {
+                    self.author_causal_batch(vertices, batch).map(|messages| {
+                        carriers = messages;
+                        Build::default()
+                    })
+                }
                 Input::Local(Some(LocalEvent::AdvanceDecidedSlot { at })) => {
                     match self.owner.advance_decided_slot() {
                         Ok(true) => self.build(at),
@@ -512,14 +701,19 @@ impl EventPump {
             };
             self.stats.record(kind, started.elapsed());
             let (output, fatal) = match result {
-                Ok(build) => (
-                    PumpOutput {
-                        carriers,
-                        build,
-                        error: None,
-                    },
-                    None,
-                ),
+                Ok(build) => {
+                    // Locally authored carriers are authenticated by the owner itself; their
+                    // exact payload digests are agreement evidence, never batches.
+                    self.record_agreement_controls(&carriers);
+                    (
+                        PumpOutput {
+                            carriers,
+                            build,
+                            error: None,
+                        },
+                        None,
+                    )
+                }
                 Err(error) => {
                     let fatal = self.owner.check_health().err();
                     (
@@ -563,7 +757,15 @@ impl EventPump {
                     .iter()
                     .any(|vertex| vertex.payload_hash == hash)
                 {
-                    return Err("payload is not required by applied certified ordering; retransmit after certified application".into());
+                    return Err(format!(
+                        "payload is not required by applied certified ordering; retransmit after certified application (order {})",
+                        self.owner
+                            .finalization()
+                            .execution()
+                            .snapshot()
+                            .order()
+                            .len()
+                    ));
                 }
                 if !self.batches.contains_key(&hash) {
                     let size = self
@@ -591,17 +793,84 @@ impl EventPump {
             | Message::AgreementNilVote(_)
             | Message::AgreementViewRequest(_)
             | Message::AgreementViewCertificate(_)) => {
-                self.owner.receive_agreement_message(message)?;
-                Ok(Build::default())
+                // Classify before the owner judges the request: an authenticated-format
+                // carrier names a digest that cannot be a batch, and a refused stale or
+                // duplicate request must not leave execution blocked on that vertex.
+                let added = self.record_agreement_controls(std::slice::from_ref(&message));
+                let received = self.owner.receive_agreement_message(message.clone());
+                let built = if added {
+                    self.build_at
+                        .map_or(Ok(Build::default()), |at| self.build(at))
+                } else {
+                    Ok(Build::default())
+                };
+                received?;
+                built
             }
             _ => Err("message is not isolated agreement input".into()),
         }
     }
 }
 
+/// Selects the next caller-supplied local batch an applied certified order names.
+///
+/// Returns the digest and the rotation cursor after it. At most one full rotation is
+/// scanned, so a wake's selection work is bounded by the retained local payload count.
+fn next_required_payload(
+    local: &BTreeSet<[u8; 32]>,
+    required: &BTreeSet<[u8; 32]>,
+    offset: usize,
+) -> Option<([u8; 32], usize)> {
+    if local.is_empty() {
+        return None;
+    }
+    let hashes: Vec<[u8; 32]> = local.iter().copied().collect();
+    let len = hashes.len();
+    let start = offset % len;
+    for step in 0..len {
+        let selected = (start + step) % len;
+        if required.contains(&hashes[selected]) {
+            return Some((hashes[selected], (selected + 1) % len));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_payload_rotation_selects_only_required_hashes() {
+        let local: BTreeSet<[u8; 32]> = [[1; 32], [2; 32], [3; 32]].into_iter().collect();
+        let none: BTreeSet<[u8; 32]> = BTreeSet::new();
+        assert_eq!(next_required_payload(&local, &none, 0), None);
+        assert_eq!(
+            next_required_payload(&BTreeSet::new(), &local, 0),
+            None,
+            "retransmission is only for caller-supplied local batches"
+        );
+        let required: BTreeSet<[u8; 32]> = [[2; 32], [3; 32]].into_iter().collect();
+        assert_eq!(
+            next_required_payload(&local, &required, 0),
+            Some(([2; 32], 2)),
+            "the rotation skips a local batch the applied order does not name"
+        );
+        assert_eq!(
+            next_required_payload(&local, &required, 1),
+            Some(([2; 32], 2))
+        );
+        assert_eq!(
+            next_required_payload(&local, &required, 2),
+            Some(([3; 32], 0))
+        );
+        let only_last: BTreeSet<[u8; 32]> = [[3; 32]].into_iter().collect();
+        assert_eq!(
+            next_required_payload(&local, &only_last, 0),
+            Some(([3; 32], 0)),
+            "a scan is bounded to one full rotation"
+        );
+    }
 
     #[test]
     fn delayed_schedule_defers_without_catch_up_or_cursor_reset() {
@@ -611,6 +880,10 @@ mod tests {
             interval,
             next: start + interval,
             publication_offset: 63,
+            payload_offset: 7,
+            payload_growth: 0,
+            payload_burst: 0,
+            payload_next: std::time::Instant::now(),
             retry_controls: true,
         };
         let after_backpressure = start + interval * 100;

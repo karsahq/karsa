@@ -17,9 +17,12 @@
 //!   into incompatible views;
 //! - a decided slot is applied from the durable transition, then executed and built into
 //!   a header whose shares are dispatched over the existing writer queues;
-//! - no data-plane payload, RPC, snapshot, epoch transition, pruning or restart
-//!   acknowledgement is wired here. Payload hashes stay zero, so applied slots order
-//!   vertices without executing transactions.
+//! - with `--execute`, each node authors bounded local demo batches and names them in its
+//!   plain causal vertices. The pump retains those bytes, broadcasts them with the naming
+//!   vertex, and retries them once applied certified ordering requires them, so peers admit
+//!   the payload after they apply the same slot. Without `--execute`, payload hashes stay
+//!   zero and applied slots order vertices without executing transactions;
+//! - no RPC, snapshot, epoch transition, pruning or delivery acknowledgement is wired here.
 //!
 //! The single-validator path is proven end to end: plain causal rounds decide whenever a
 //! majority of authors is held, the initial proposal and view bind, durable votes follow,
@@ -27,8 +30,10 @@
 //! multi-validator mesh routes the same evidence over the same links: durable reads reuse a
 //! verified replay, refused peer receipts are dropped instead of poisoning the owner, and a
 //! single elected publisher owns the shared POL carrier. A bounded three-validator test
-//! certifies the first slots on every node; payloads stay zero, so slots order without
-//! executing transactions. Multi-slot progress is not free at this size: the causal DAG
+//! certifies the first slots on every node. Without `--execute`, payloads stay zero and
+//! slots order without executing transactions; with `--execute`, nodes author bounded demo
+//! batches and exchange them after certified application, so headers carry real state roots.
+//! Multi-slot progress is not free at this size: the causal DAG
 //! requires a quorum of the previous round's authors, and a three-validator set has no
 //! spare author, so every node has to fill every round before the next one is reference
 //! ready. The test therefore proves the first decisions, not sustained slot throughput.
@@ -83,6 +88,11 @@ const MAX_PENDING_SHARES: usize = 1024;
 const MAX_SHARES_PER_TURN: usize = 16;
 /// Inbound frames retained when the pump ingress queue is transiently full.
 const MAX_PENDING_FRAMES: usize = 64;
+/// Batches one `--execute` node retains: its own authored payloads plus admitted peers'.
+/// Bounds the offline lifetime; exhaustion rejects input instead of evicting required data.
+const MAX_SESSION_BATCHES: usize = 512;
+/// Encoded bytes of retained batches. Demo batches are small; this is a hard stop.
+const MAX_SESSION_PAYLOAD_BYTES: usize = 4 << 20;
 
 /// What one certified node observed before it stopped.
 struct Report {
@@ -96,6 +106,9 @@ struct Report {
     bytes_out: u64,
     applied_tx: u64,
     consumed: usize,
+    applications: usize,
+    order_root: [u8; 32],
+    blocked: Option<(u64, usize, [u8; 32], bool)>,
     certified: usize,
     progress: AgreementProgress,
     head_height: u64,
@@ -432,8 +445,11 @@ fn print_costs(prefix: &str, report: &Report) {
         report.local_full
     );
     println!(
-        "{prefix}journal:    {} events, {} folds {} ({} resumed over {}), {} read/decode, {} duplicate receipts skipped",
+        "{prefix}journal:    {} events, {} applied slots, {} consumed vertices, root {:02x?}, {} folds {} ({} resumed over {}), {} read/decode, {} duplicate receipts skipped",
         report.progress.sequence,
+        report.applications,
+        report.consumed,
+        &report.order_root[..8],
         report.progress.replays,
         super::millis(report.progress.replay_nanos),
         report.progress.resumed_replays,
@@ -443,6 +459,12 @@ fn print_costs(prefix: &str, report: &Report) {
     );
     for (reason, count) in &report.rejections {
         println!("{prefix}rejected:   {count}x {reason}");
+    }
+    if let Some((round, author, payload, id_matches)) = &report.blocked {
+        println!(
+            "{prefix}blocked:    round {round} author val-{author} payload {:02x?} id-match {id_matches}",
+            &payload[..8]
+        );
     }
 }
 
@@ -509,13 +531,24 @@ async fn certified_node_task(
     // A live set must not drift into different views on independent timers: a grace
     // deadline signs one advisory next-view request, and only a quorum certificate enters.
     owner.require_certificate_view_change();
+    // A one-account genesis cannot author a transfer batch, and a run without `--execute`
+    // keeps the order-only zero-payload path.
+    let authored_payloads = config.execute && committee.accounts.len() >= 2;
     let (mut pump, mut channels) = EventPump::new(
         owner,
         committee.clone(),
         BTreeSet::new(),
         NonZeroUsize::new(config.queue.max(1)).ok_or("certified pump capacity must be nonzero")?,
-        0,
-        0,
+        if authored_payloads {
+            MAX_SESSION_BATCHES
+        } else {
+            0
+        },
+        if authored_payloads {
+            MAX_SESSION_PAYLOAD_BYTES
+        } else {
+            0
+        },
     );
     pump.enable_scheduling(SCHEDULE)?;
     let pump_stats = Arc::clone(&channels.stats);
@@ -684,6 +717,7 @@ async fn certified_node_task(
     let mut local_full = 0u64;
     let mut local_accepted = 0u64;
     let mut ticks = 0u64;
+    let mut batch_round: u64 = 0;
     let mut rejections: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
 
@@ -755,12 +789,44 @@ async fn certified_node_task(
                 // because each turn is one or the other and imports arrive between them.
                 if author_turn {
                     author_turn = false;
-                    let event = LocalEvent::AuthorCausal {
-                        payload_hash: [0u8; 32],
-                        vertices: Vec::new(),
+                    // With --execute the vertex names a real local demo batch. The pump
+                    // retains it, publishes it with the vertex, and retries it once applied
+                    // certified ordering requires the bytes; peers admit it after they
+                    // apply the same slot. Batch authoring failure falls back to a zero
+                    // payload rather than stopping the node.
+                    let event = if authored_payloads {
+                        match chain::demo_batch(
+                            &chain_id,
+                            &committee.accounts,
+                            index,
+                            batch_round,
+                            1,
+                        ) {
+                            Ok(batch) => LocalEvent::AuthorCausalBatch {
+                                vertices: Vec::new(),
+                                batch,
+                            },
+                            Err(error) => {
+                                *rejections
+                                    .entry(format!("batch authoring failed: {error}"))
+                                    .or_insert(0) += 1;
+                                LocalEvent::AuthorCausal {
+                                    payload_hash: [0u8; 32],
+                                    vertices: Vec::new(),
+                                }
+                            }
+                        }
+                    } else {
+                        LocalEvent::AuthorCausal {
+                            payload_hash: [0u8; 32],
+                            vertices: Vec::new(),
+                        }
                     };
                     match channels.local.try_send(event) {
-                        Ok(()) => local_accepted = local_accepted.saturating_add(1),
+                        Ok(()) => {
+                            local_accepted = local_accepted.saturating_add(1);
+                            batch_round = batch_round.saturating_add(1);
+                        }
                         Err(mpsc::error::TrySendError::Closed(_)) => break,
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             local_full = local_full.saturating_add(1);
@@ -860,6 +926,9 @@ async fn certified_node_task(
         bytes_out: bytes_out.load(Ordering::Relaxed),
         applied_tx: 0,
         consumed: 0,
+        applications: 0,
+        order_root: [0; 32],
+        blocked: None,
         certified: 0,
         progress: AgreementProgress::default(),
         head_height: 0,
@@ -883,6 +952,19 @@ async fn certified_node_task(
                     report.head_round = finalizer.head().round;
                     report.applied_tx = owner.finalization().execution().applied();
                     report.consumed = owner.finalization().execution().consumed_order().len();
+                    report.applications = owner.finalization().execution().applied_slots();
+                    report.order_root = owner.finalization().execution().order_root();
+                    report.blocked = owner.finalization().execution().blocked().map(
+                        |(round, author, payload, id_matches)| {
+                            let author = committee
+                                .set
+                                .validators
+                                .iter()
+                                .position(|record| record.validator_id == author)
+                                .unwrap_or(usize::MAX);
+                            (round, author, payload, id_matches)
+                        },
+                    );
                 }
                 Err(error) => report.error = Some(error),
             }
