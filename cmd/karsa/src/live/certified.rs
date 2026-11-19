@@ -51,6 +51,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use validator::{EpochSchedule, Header, Share, Vertex, commit_root};
 
+use super::agreement::AgreementProgress;
 use super::agreement::event_pump::{EventPump, LocalEvent};
 use super::agreement::output_dispatcher::{self, SharePeer};
 use super::agreement::{pacemaker, session};
@@ -63,10 +64,13 @@ const TICK: Duration = Duration::from_millis(50);
 const SCHEDULE: Duration = Duration::from_millis(50);
 /// Publication retry cadence; a lost carrier is recovered from its durable ID.
 const RETRY: Duration = Duration::from_millis(100);
-/// Phase waits bound one view attempt. The positive direct path runs first; a missing
-/// leader still produces nil evidence and a next-view request, and the bounded session
-/// must be able to recycle a stalled view inside its lifetime.
-const PHASE_WAIT: Duration = Duration::from_secs(3);
+/// Phase waits bound one view attempt. The positive direct path runs first. A 3-validator
+/// set needs every author's causal vertex and vote, so a deadline shorter than one full
+/// causal round turns a slow import into a nil vote; one nil vote then rules out the
+/// positive quorum for the whole view and the set spends its lifetime recycling views.
+/// The wait keeps that round affordable while still letting a genuinely dead leader reach
+/// a certificate view change inside a bounded run.
+const PHASE_WAIT: Duration = Duration::from_secs(6);
 /// Vertices imported by one trusted causal turn.
 const MAX_IMPORTS_PER_TURN: usize = 64;
 /// Pending peer vertices retained between turns; the owner re-checks each one.
@@ -91,6 +95,7 @@ struct Report {
     applied_tx: u64,
     consumed: usize,
     certified: usize,
+    progress: AgreementProgress,
     head_height: u64,
     head_round: u64,
     error: Option<String>,
@@ -213,12 +218,20 @@ async fn run_mesh(
 
     println!();
     println!(
-        "  {:<7} {:>8} {:>9} {:>9} {:>8} {:>8} {:>9} {:>7}",
-        "node", "authored", "imported", "received", "dropped", "rejected", "certified", "head"
+        "  {:<7} {:>8} {:>9} {:>9} {:>8} {:>8} {:>9} {:>7} {:>9}",
+        "node",
+        "authored",
+        "imported",
+        "received",
+        "dropped",
+        "rejected",
+        "certified",
+        "head",
+        "view/cert"
     );
     for report in &reports {
         println!(
-            "  {:<7} {:>8} {:>9} {:>9} {:>8} {:>8} {:>9} {:>7}",
+            "  {:<7} {:>8} {:>9} {:>9} {:>8} {:>8} {:>9} {:>7} {:>9}",
             format!("val-{}", report.index),
             report.authored,
             report.imported,
@@ -226,7 +239,35 @@ async fn run_mesh(
             report.dropped,
             report.rejected,
             report.certified,
-            format!("{}/{}", report.head_height, report.head_round)
+            format!("{}/{}", report.head_height, report.head_round),
+            format!(
+                "{}/{}",
+                report.progress.view,
+                report
+                    .progress
+                    .certificate
+                    .map_or_else(|| String::from("-"), |target| target.to_string())
+            )
+        );
+    }
+    for report in &reports {
+        let p = &report.progress;
+        println!(
+            "  val-{} view {}: proposal {}, view carriers {}, votes {}, POLs {}, finals {}, nil {}/{}, intents {}, authorable {}, candidates {}, decided {}, POL {}",
+            report.index,
+            p.view,
+            p.proposal,
+            p.view_carriers,
+            p.vote_carriers,
+            p.pols,
+            p.finals,
+            p.nil_prevotes,
+            p.nil_precommits,
+            p.intents,
+            p.authorable,
+            p.candidates,
+            p.decided,
+            p.reproposal
         );
     }
     for failure in &failures {
@@ -289,6 +330,32 @@ fn print_report(report: &Report) {
         report.head_round,
         report.applied_tx,
         report.consumed
+    );
+    println!(
+        "  agreement:  durable view {}, entered certificate {}",
+        report.progress.view,
+        report
+            .progress
+            .certificate
+            .map_or_else(|| String::from("none"), |target| target.to_string())
+    );
+    println!(
+        "  current:    proposal {}, view carriers {}, votes {}, POLs {}, finals {}, nil votes {}/{}",
+        report.progress.proposal,
+        report.progress.view_carriers,
+        report.progress.vote_carriers,
+        report.progress.pols,
+        report.progress.finals,
+        report.progress.nil_prevotes,
+        report.progress.nil_precommits
+    );
+    println!(
+        "  durable:    intents {}, authorable {}, candidates {}, decided {}, POL {}",
+        report.progress.intents,
+        report.progress.authorable,
+        report.progress.candidates,
+        report.progress.decided,
+        report.progress.reproposal
     );
     println!(
         "  causal:     {} authored, {} imported, {} frames received, {} rejected, {} dropped",
@@ -536,6 +603,7 @@ async fn certified_node_task(
     let mut inbound_open = true;
     let mut dispatch_open = true;
     let mut advance_after = 0u64;
+    let mut author_turn = true;
 
     loop {
         if *shutdown.borrow() {
@@ -575,16 +643,13 @@ async fn certified_node_task(
                 }
             }
             _ = ticker.tick(), if inbound_open || dispatch_open => {
-                let batch: Vec<Vertex> = if import_exhausted {
-                    Vec::new()
-                } else {
-                    let take = pending.len().min(MAX_IMPORTS_PER_TURN);
-                    pending.drain(..take).collect()
-                };
-                if batch.is_empty() {
-                    // Alternate import turns with authored turns: the proposal rules
-                    // must see the imported DAG before this node extends its frontier,
-                    // or the proposer is permanently one round ahead of its peers.
+                // Strict turn alternation, not "author only when nothing is pending": a live
+                // mesh keeps imports arriving continuously, so waiting for an empty batch
+                // would let this node import every turn and never extend its own frontier.
+                // The proposal rules still see the imported DAG before this node authors,
+                // because each turn is one or the other and imports arrive between them.
+                if author_turn {
+                    author_turn = false;
                     let event = LocalEvent::AuthorCausal {
                         payload_hash: [0u8; 32],
                         vertices: Vec::new(),
@@ -595,17 +660,26 @@ async fn certified_node_task(
                         Err(_) => {}
                     }
                 } else {
-                    let count = batch.len();
-                    match channels.local.try_send(LocalEvent::Drive(batch)) {
-                        Ok(()) => imported = imported.saturating_add(count),
-                        Err(mpsc::error::TrySendError::Full(LocalEvent::Drive(vertices))) => {
-                            // Keep the availability for the next turn; the pump is busy,
-                            // not unhealthy, and dropping signed vertices would just force
-                            // a peer to resend them.
-                            requeue_vertices(&mut pending, vertices);
+                    author_turn = true;
+                    let batch: Vec<Vertex> = if import_exhausted {
+                        Vec::new()
+                    } else {
+                        let take = pending.len().min(MAX_IMPORTS_PER_TURN);
+                        pending.drain(..take).collect()
+                    };
+                    if !batch.is_empty() {
+                        let count = batch.len();
+                        match channels.local.try_send(LocalEvent::Drive(batch)) {
+                            Ok(()) => imported = imported.saturating_add(count),
+                            Err(mpsc::error::TrySendError::Full(LocalEvent::Drive(vertices))) => {
+                                // Keep the availability for the next turn; the pump is busy,
+                                // not unhealthy, and dropping signed vertices would just force
+                                // a peer to resend them.
+                                requeue_vertices(&mut pending, vertices);
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                            Err(_) => {}
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => break,
-                        Err(_) => {}
                     }
                 }
                 // A decided-slot check replays the durable journal, so it runs far less
@@ -674,6 +748,7 @@ async fn certified_node_task(
         applied_tx: 0,
         consumed: 0,
         certified: 0,
+        progress: AgreementProgress::default(),
         head_height: 0,
         head_round: 0,
         error: None,
@@ -681,16 +756,29 @@ async fn certified_node_task(
     drop(channels.local);
     drop(channels.frames);
     match pump_task.await {
-        Ok((owner, Ok(()))) => {
-            let finalizer = owner.finalization().finalizer();
-            report.certified = finalizer.certified_ids().len();
-            report.head_height = finalizer.head().height;
-            report.head_round = finalizer.head().round;
-            report.applied_tx = owner.finalization().execution().applied();
-            report.consumed = owner.finalization().execution().consumed_order().len();
-        }
-        Ok((_, Err(error))) => {
-            report.error = Some(error);
+        Ok((owner, result)) => {
+            match result {
+                Ok(()) => {
+                    let finalizer = owner.finalization().finalizer();
+                    report.certified = finalizer.certified_ids().len();
+                    report.head_height = finalizer.head().height;
+                    report.head_round = finalizer.head().round;
+                    report.applied_tx = owner.finalization().execution().applied();
+                    report.consumed = owner.finalization().execution().consumed_order().len();
+                }
+                Err(error) => report.error = Some(error),
+            }
+            // One durable read per node after the pump ends: the final view, certificate
+            // and current-view carrier counts distinguish view divergence from a stalled
+            // proposal, vote, aggregate or causal quorum.
+            match owner.progress_diagnostics() {
+                Ok(progress) => report.progress = progress,
+                Err(error) => {
+                    if report.error.is_none() {
+                        report.error = Some(error);
+                    }
+                }
+            }
         }
         Err(error) => report.error = Some(format!("certified pump stopped: {error}")),
     }

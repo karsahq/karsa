@@ -6,8 +6,8 @@ use validator::{
     SlotProposalEvidence, Vertex, VertexId,
 };
 
-use super::super::CarrierPayload;
 use super::super::pacemaker;
+use super::super::{AgreementProgress, CarrierPayload};
 use super::JournaledFinalization;
 
 /// One caller-selected protocol phase. Votes and aggregates come only from durable state.
@@ -256,6 +256,15 @@ impl JournaledFinalization {
     /// on independent local timers. Explicit offline flows keep the local step.
     pub fn require_certificate_view_change(&mut self) {
         self.adapter.require_certificate_view_change();
+    }
+
+    /// Collects end-of-run durable counters for the current slot and view.
+    /// Replays the durable journal; grants no ordering, voting or entry authority.
+    /// # Errors
+    /// Rejects owners poisoned by durable history failures and uncertain evidence.
+    pub fn progress_diagnostics(&self) -> Result<AgreementProgress, String> {
+        self.ensure_usable()?;
+        self.adapter.progress_diagnostics()
     }
 
     /// Pins one causal Node for this owner's lifetime. No mutable handle is returned.

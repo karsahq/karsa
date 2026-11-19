@@ -132,6 +132,42 @@ pub struct Adapter {
     view_change: ViewChange,
 }
 
+/// End-of-run durable counters for the current slot and view.
+///
+/// Diagnostics only: this grants no ordering, execution, voting or view-entry authority,
+/// and it is not a throughput or liveness promise.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgreementProgress {
+    /// Durable current view.
+    pub view: u64,
+    /// Target view of the latest entered certificate, if one is durable.
+    pub certificate: Option<u64>,
+    /// A decision is durable for the current slot.
+    pub decided: bool,
+    /// A retained POL is available for the current slot.
+    pub reproposal: bool,
+    /// A completed proposal carrier matches the current slot's next round.
+    pub proposal: bool,
+    /// Completed elected-view carriers in the current view.
+    pub view_carriers: usize,
+    /// Completed non-nil vote carriers in the current view.
+    pub vote_carriers: usize,
+    /// Completed POL carriers in the current view.
+    pub pols: usize,
+    /// Completed final carriers in the current view.
+    pub finals: usize,
+    /// Completed nil prevote publications in the current view.
+    pub nil_prevotes: usize,
+    /// Completed nil precommit publications in the current view.
+    pub nil_precommits: usize,
+    /// Durable signing intents in the current view, published or not.
+    pub intents: usize,
+    /// Reducer-authorable obligations in the current view.
+    pub authorable: usize,
+    /// Frozen carrier candidates for the current slot.
+    pub candidates: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewChange {
     /// Apply the one-view local step directly; explicit/offline flows and unit tests.
@@ -727,6 +763,103 @@ impl Adapter {
     /// The local grace deadline then signs one advisory request instead of advancing alone.
     pub fn require_certificate_view_change(&mut self) {
         self.view_change = ViewChange::Certificate;
+    }
+
+    /// Collects end-of-run durable counters for the current slot and view.
+    /// Replays the durable journal; grants no ordering, execution, voting or entry authority.
+    /// # Errors
+    /// Rejects stale/recovery-required owners and invalid durable evidence.
+    pub fn progress_diagnostics(&self) -> Result<AgreementProgress, String> {
+        use validator::slot_agreement::{AgreementPhase, AgreementView};
+
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before progress diagnostics".into());
+        }
+        let output = self.driver.output().map_err(|error| error.to_string())?;
+        let view = output
+            .transition
+            .as_ref()
+            .map_or(AgreementView(0), |t| t.view);
+        let tip = output.binding.tip().clone();
+        let round = tip.next_round();
+        let certificate = self
+            .driver
+            .entered_view_certificate()
+            .map_err(|error| error.to_string())?
+            .and_then(|requests| requests.iter().map(|request| request.target_view().0).max());
+        let mut progress = AgreementProgress {
+            view: view.0,
+            certificate,
+            decided: output
+                .transition
+                .as_ref()
+                .is_some_and(|transition| transition.decision.is_some()),
+            reproposal: output.reproposal.is_some(),
+            authorable: output.authorable_vote_ids.len(),
+            candidates: output.candidates.len(),
+            ..AgreementProgress::default()
+        };
+        for completed in self
+            .driver
+            .completed_carriers()
+            .map_err(|error| error.to_string())?
+        {
+            match &completed.reservation.evidence {
+                store::AgreementCarrierEvidence::Proposal { proposal }
+                    if proposal.decision.round == round =>
+                {
+                    progress.proposal = true;
+                }
+                store::AgreementCarrierEvidence::View { lineage }
+                    if lineage
+                        .entries
+                        .last()
+                        .is_some_and(|entry| entry.view == view) =>
+                {
+                    progress.view_carriers += 1;
+                }
+                store::AgreementCarrierEvidence::Vote { payload, .. }
+                    if payload.vote.context == tip && payload.vote.view == view =>
+                {
+                    progress.vote_carriers += 1;
+                }
+                store::AgreementCarrierEvidence::Pol { lineage }
+                    if lineage
+                        .entries
+                        .last()
+                        .is_some_and(|entry| entry.view == view) =>
+                {
+                    progress.pols += 1;
+                }
+                store::AgreementCarrierEvidence::Final { proof }
+                    if proof.entries.last().is_some_and(|entry| entry.view == view) =>
+                {
+                    progress.finals += 1;
+                }
+                _ => {}
+            }
+        }
+        for completed in self
+            .driver
+            .completed_nil_votes()
+            .map_err(|error| error.to_string())?
+        {
+            let vote = completed.message.vote();
+            if vote.context == tip && vote.view == view {
+                match vote.phase {
+                    AgreementPhase::Prevote => progress.nil_prevotes += 1,
+                    AgreementPhase::Precommit => progress.nil_precommits += 1,
+                }
+            }
+        }
+        progress.intents = self
+            .driver
+            .signing_outbox()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .filter(|intent| intent.vote.context == tip && intent.vote.view == view)
+            .count();
+        Ok(progress)
     }
 
     fn timer_snapshot(&self) -> Result<pacemaker::Snapshot, String> {
