@@ -81,6 +81,8 @@ const MAX_SEEN_VERTICES: usize = 8192;
 const MAX_PENDING_SHARES: usize = 1024;
 /// Peer shares re-injected by one turn.
 const MAX_SHARES_PER_TURN: usize = 16;
+/// Inbound frames retained when the pump ingress queue is transiently full.
+const MAX_PENDING_FRAMES: usize = 64;
 
 /// What one certified node observed before it stopped.
 struct Report {
@@ -620,6 +622,7 @@ async fn certified_node_task(
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut pending: Vec<Vertex> = Vec::new();
+    let mut pending_frames: VecDeque<wire::Frame> = VecDeque::new();
     let mut seen: BTreeSet<(u64, Vec<u8>, [u8; 32])> = BTreeSet::new();
     let mut pending_shares: VecDeque<Share> = VecDeque::new();
     let mut built_height: u64 = 0;
@@ -669,11 +672,33 @@ async fn certified_node_task(
                     Message::Floor { .. } => continue,
                     _ => {}
                 }
-                if channels.frames.try_send(frame).is_err() {
-                    dropped = dropped.saturating_add(1);
+                match channels.frames.try_send(frame) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(frame)) => {
+                        // A dropped certificate or vote never reaches the reducer, and the peer
+                        // has no way to know. Keep a bounded local retry backlog instead of
+                        // counting it as lost; the next ticks retry one frame each.
+                        if pending_frames.len() < MAX_PENDING_FRAMES {
+                            pending_frames.push_back(frame);
+                        } else {
+                            dropped = dropped.saturating_add(1);
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
             _ = ticker.tick(), if inbound_open || dispatch_open => {
+                // Retry one frame the pump could not accept yet. The backlog is bounded and
+                // the pump's own queue stays the only backpressure boundary.
+                if let Some(frame) = pending_frames.pop_front() {
+                    match channels.frames.try_send(frame) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(frame)) => {
+                            pending_frames.push_front(frame);
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    }
+                }
                 // Strict turn alternation, not "author only when nothing is pending": a live
                 // mesh keeps imports arriving continuously, so waiting for an empty batch
                 // would let this node import every turn and never extend its own frontier.

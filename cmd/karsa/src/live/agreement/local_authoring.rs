@@ -163,6 +163,7 @@ fn first_reference_ready_round(dag: &validator::Dag, id: &[u8], min: u64) -> Opt
     None
 }
 
+/// Explains the first round in the authoring scan that is not reference-ready.
 /// Earliest local round this node has not authored.
 ///
 /// Carriers and plain causal vertices share one authoring slot per round. A node that
@@ -177,6 +178,39 @@ fn next_local_round(dag: &validator::Dag, id: &[u8]) -> u64 {
     (0..=frontier)
         .find(|round| dag.get(*round, id).is_none())
         .unwrap_or(frontier)
+}
+
+/// Explains the first round in the authoring scan that is not reference-ready.
+/// Diagnostics only; mirrors [`first_reference_ready_round`] without selecting a round.
+fn reference_ready_blocker(dag: &validator::Dag, id: &[u8], min: u64) -> String {
+    let highest = dag.highest_round().unwrap_or(0);
+    let frontier = highest.saturating_add(2).max(min);
+    let own_hole = next_local_round(dag, id);
+    for round in min..=frontier {
+        if dag.get(round, id).is_some() {
+            continue;
+        }
+        if round == 0 {
+            return format!("round 0 is authorable (own hole {own_hole}, highest {highest})");
+        }
+        let set = dag.set_for_round(round);
+        let held = set
+            .validators
+            .iter()
+            .filter(|record| dag.get(round - 1, &record.validator_id).is_some())
+            .count();
+        if held >= set.quorum_size() {
+            return format!(
+                "round {round} is reference-ready (own hole {own_hole}, highest {highest})"
+            );
+        }
+        return format!(
+            "round {round} needs {held}/{} authors of round {} (own hole {own_hole}, highest {highest})",
+            set.quorum_size(),
+            round - 1
+        );
+    }
+    format!("no unoccupied round in {min}..={frontier} (own hole {own_hole}, highest {highest})")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -891,8 +925,10 @@ impl JournaledFinalization {
             local.node.id(),
             highest.saturating_add(1).max(reproposal_min_round),
         ) else {
-            self.last_view_error = Some(format!(
-                "no reference-ready carrier round at or above {reproposal_min_round} (highest {highest})"
+            self.last_view_error = Some(reference_ready_blocker(
+                local.node.dag(),
+                local.node.id(),
+                highest.saturating_add(1).max(reproposal_min_round),
             ));
             return Ok(Vec::new());
         };
