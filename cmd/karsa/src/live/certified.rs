@@ -253,9 +253,10 @@ async fn run_mesh(
     for report in &reports {
         let p = &report.progress;
         println!(
-            "  val-{} view {}: proposal {}, view carriers {}, votes {}, POLs {}, finals {}, nil {}/{}, intents {}, authorable {}, candidates {}, decided {}, POL {}",
+            "  val-{} view {} round {}: proposal {}, view carriers {}, votes {}, POLs {}, finals {}, nil {}/{}, intents {}, authorable {}/{} prevote/precommit, {} nil ({} unready), candidates {}, decided {}, POL {}, local round {}",
             report.index,
             p.view,
+            p.next_round,
             p.proposal,
             p.view_carriers,
             p.vote_carriers,
@@ -264,10 +265,14 @@ async fn run_mesh(
             p.nil_prevotes,
             p.nil_precommits,
             p.intents,
-            p.authorable,
+            p.authorable_prevotes,
+            p.authorable_precommits,
+            p.authorable_nil,
+            p.authorable_unready,
             p.candidates,
             p.decided,
-            p.reproposal
+            p.reproposal,
+            p.local_round
         );
     }
     for failure in &failures {
@@ -356,6 +361,23 @@ fn print_report(report: &Report) {
         report.progress.candidates,
         report.progress.decided,
         report.progress.reproposal
+    );
+    println!(
+        "  causal:     next round {}, local round {}, authorable {}/{} prevote/precommit, {} nil, {} unready, first {} self {}",
+        report.progress.next_round,
+        report.progress.local_round,
+        report.progress.authorable_prevotes,
+        report.progress.authorable_precommits,
+        report.progress.authorable_nil,
+        report.progress.authorable_unready,
+        report
+            .progress
+            .first_unready_round
+            .map_or_else(|| String::from("-"), |round| round.to_string()),
+        report
+            .progress
+            .first_unready_self
+            .map_or_else(|| String::from("-"), |local| local.to_string())
     );
     println!(
         "  causal:     {} authored, {} imported, {} frames received, {} rejected, {} dropped",

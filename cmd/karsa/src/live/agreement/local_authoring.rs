@@ -264,7 +264,60 @@ impl JournaledFinalization {
     /// Rejects owners poisoned by durable history failures and uncertain evidence.
     pub fn progress_diagnostics(&self) -> Result<AgreementProgress, String> {
         self.ensure_usable()?;
-        self.adapter.progress_diagnostics()
+        let mut progress = self.adapter.progress_diagnostics()?;
+        let Some(local) = self.authoring.as_ref() else {
+            return Ok(progress);
+        };
+        let output = self
+            .adapter
+            .driver
+            .output()
+            .map_err(|error| error.to_string())?;
+        let history = self
+            .adapter
+            .driver
+            .signing_outbox()
+            .map_err(|error| error.to_string())?;
+        let dag = local.node.dag();
+        progress.local_round = dag.highest_round().unwrap_or(0);
+        // An authorable obligation whose exact prerequisite carrier is missing cannot be
+        // signed this turn: the prospective cone would reject it. These counters separate
+        // "waiting for causal availability" from "reducer has no obligation yet".
+        for id in &output.authorable_vote_ids {
+            let Some(intent) = history.iter().find(|intent| intent.id == *id) else {
+                continue;
+            };
+            match &intent.prerequisite {
+                store::AgreementSigningPrerequisite::Carrier(carrier) => {
+                    match intent.vote.phase {
+                        validator::slot_agreement::AgreementPhase::Prevote => {
+                            progress.authorable_prevotes += 1;
+                        }
+                        validator::slot_agreement::AgreementPhase::Precommit => {
+                            progress.authorable_precommits += 1;
+                        }
+                    }
+                    let held = dag
+                        .get(carrier.round, &carrier.author)
+                        .and_then(|vertex| vertex.id().ok())
+                        .is_some_and(|held| held == *carrier);
+                    if !held {
+                        progress.authorable_unready += 1;
+                        if progress.first_unready_round.is_none() {
+                            progress.first_unready_round = Some(carrier.round);
+                            progress.first_unready_self =
+                                Some(carrier.author == self.adapter.validator_id);
+                        }
+                    }
+                }
+                store::AgreementSigningPrerequisite::UnsupportedNil => {
+                    // Nil obligations publish through the separate signed-nil path and
+                    // never need a carrier, so they are not causally blocked.
+                    progress.authorable_nil += 1;
+                }
+            }
+        }
+        Ok(progress)
     }
 
     /// Pins one causal Node for this owner's lifetime. No mutable handle is returned.

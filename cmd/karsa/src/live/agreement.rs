@@ -164,8 +164,24 @@ pub struct AgreementProgress {
     pub intents: usize,
     /// Reducer-authorable obligations in the current view.
     pub authorable: usize,
+    /// Authorable prevote obligations in the current view.
+    pub authorable_prevotes: usize,
+    /// Authorable precommit obligations in the current view.
+    pub authorable_precommits: usize,
+    /// Authorable nil obligations with no carrier representation; published separately.
+    pub authorable_nil: usize,
     /// Frozen carrier candidates for the current slot.
     pub candidates: usize,
+    /// Next slot decision round, fixed by the durable tip.
+    pub next_round: u64,
+    /// Authorable obligations whose exact prerequisite carrier the owned Node does not hold.
+    pub authorable_unready: usize,
+    /// Round of the first unready prerequisite carrier.
+    pub first_unready_round: Option<u64>,
+    /// Whether the first unready prerequisite carrier was authored locally.
+    pub first_unready_self: Option<bool>,
+    /// Highest causal round retained by the owned Node; zero when empty or absent.
+    pub local_round: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -782,6 +798,12 @@ impl Adapter {
             .map_or(AgreementView(0), |t| t.view);
         let tip = output.binding.tip().clone();
         let round = tip.next_round();
+        let current = |decision: &validator::SlotDecision| {
+            decision.round == round
+                && decision.previous == *tip.previous_id()
+                && decision.before_len == tip.order_len()
+                && decision.before_root == *tip.order_root()
+        };
         let certificate = self
             .driver
             .entered_view_certificate()
@@ -797,6 +819,7 @@ impl Adapter {
             reproposal: output.reproposal.is_some(),
             authorable: output.authorable_vote_ids.len(),
             candidates: output.candidates.len(),
+            next_round: round,
             ..AgreementProgress::default()
         };
         for completed in self
@@ -806,15 +829,14 @@ impl Adapter {
         {
             match &completed.reservation.evidence {
                 store::AgreementCarrierEvidence::Proposal { proposal }
-                    if proposal.decision.round == round =>
+                    if current(&proposal.decision) =>
                 {
                     progress.proposal = true;
                 }
                 store::AgreementCarrierEvidence::View { lineage }
-                    if lineage
-                        .entries
-                        .last()
-                        .is_some_and(|entry| entry.view == view) =>
+                    if lineage.entries.last().is_some_and(|entry| {
+                        entry.view == view && current(&entry.proposal.decision)
+                    }) =>
                 {
                     progress.view_carriers += 1;
                 }
@@ -824,15 +846,16 @@ impl Adapter {
                     progress.vote_carriers += 1;
                 }
                 store::AgreementCarrierEvidence::Pol { lineage }
-                    if lineage
-                        .entries
-                        .last()
-                        .is_some_and(|entry| entry.view == view) =>
+                    if lineage.entries.last().is_some_and(|entry| {
+                        entry.view == view && current(&entry.proposal.decision)
+                    }) =>
                 {
                     progress.pols += 1;
                 }
                 store::AgreementCarrierEvidence::Final { proof }
-                    if proof.entries.last().is_some_and(|entry| entry.view == view) =>
+                    if proof.entries.last().is_some_and(|entry| {
+                        entry.view == view && current(&entry.proposal.decision)
+                    }) =>
                 {
                     progress.finals += 1;
                 }
