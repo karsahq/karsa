@@ -104,6 +104,7 @@ struct Report {
     local_full: u64,
     local_accepted: u64,
     ticks: u64,
+    rejections: Vec<(String, usize)>,
     error: Option<String>,
 }
 
@@ -431,14 +432,18 @@ fn print_costs(prefix: &str, report: &Report) {
         report.local_full
     );
     println!(
-        "{prefix}journal:    {} events, {} folds {} ({} resumed over {}), {} read/decode",
+        "{prefix}journal:    {} events, {} folds {} ({} resumed over {}), {} read/decode, {} duplicate receipts skipped",
         report.progress.sequence,
         report.progress.replays,
         super::millis(report.progress.replay_nanos),
         report.progress.resumed_replays,
         super::millis(report.progress.resumed_replay_nanos),
-        super::millis(report.progress.replay_read_nanos)
+        super::millis(report.progress.replay_read_nanos),
+        report.progress.duplicate_receipts
     );
+    for (reason, count) in &report.rejections {
+        println!("{prefix}rejected:   {count}x {reason}");
+    }
 }
 
 /// One validator's bounded certified session over the shared peer mesh.
@@ -679,6 +684,8 @@ async fn certified_node_task(
     let mut local_full = 0u64;
     let mut local_accepted = 0u64;
     let mut ticks = 0u64;
+    let mut rejections: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
 
     loop {
         if *shutdown.borrow() {
@@ -814,6 +821,7 @@ async fn certified_node_task(
                     if error.contains("local causal import budget exhausted") {
                         import_exhausted = true;
                     }
+                    *rejections.entry(error.clone()).or_insert(0) += 1;
                     // Per-event rejections are retryable output, not a stopped owner: the pump
                     // already reports health failures by ending its run. Historical carriers
                     // and transient evidence rejects are expected during a live run, so they
@@ -860,6 +868,7 @@ async fn certified_node_task(
         local_full,
         local_accepted,
         ticks,
+        rejections: rejections.into_iter().collect(),
         error: None,
     };
     drop(channels.local);

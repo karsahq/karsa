@@ -132,6 +132,8 @@ pub struct Adapter {
     view_change: ViewChange,
     // Latest aggregate carrier whose prospective cone was unavailable, diagnostics only.
     last_aggregate_error: Option<String>,
+    // Peer receipts skipped because the exact observation is already a durable no-op.
+    duplicate_receipts: u64,
 }
 
 /// End-of-run durable counters for the current slot and view.
@@ -204,6 +206,8 @@ pub struct AgreementProgress {
     pub resumed_replays: u64,
     /// Cumulative nanoseconds spent in resumed (incremental) folds.
     pub resumed_replay_nanos: u64,
+    /// Peer receipts skipped because the exact observation was already a durable no-op.
+    pub duplicate_receipts: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -848,6 +852,7 @@ impl Adapter {
                 .unwrap_or(false),
             ..AgreementProgress::default()
         };
+        progress.duplicate_receipts = self.duplicate_receipts;
         progress.sequence = self.driver.sequence();
         (
             progress.replays,
@@ -1886,6 +1891,7 @@ impl Adapter {
             view_requests: Vec::new(),
             view_change: ViewChange::LocalAdvance,
             last_aggregate_error: None,
+            duplicate_receipts: 0,
             readiness: Readiness::DisabledMissingCausalReadinessAndTransport,
         })
     }
@@ -1919,6 +1925,7 @@ impl Adapter {
             view_requests: Vec::new(),
             view_change: ViewChange::LocalAdvance,
             last_aggregate_error: None,
+            duplicate_receipts: 0,
             readiness: Readiness::RecoveryRequiredHistoricalIntentsUnavailable,
         };
         let output = adapter.driver.output();
@@ -2042,6 +2049,19 @@ impl Adapter {
     ) -> Result<(), String> {
         if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
             return Err("agreement owner requires recovery before message receipt".into());
+        }
+        // A repeated authenticated observation replays as a durable no-op. Skipping the
+        // append is equivalent and keeps the bounded journal for evidence that changes state.
+        let retained = self
+            .driver
+            .observation_retained(&request)
+            .map_err(|error| {
+                self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+                error.to_string()
+            })?;
+        if retained {
+            self.duplicate_receipts = self.duplicate_receipts.saturating_add(1);
+            return Ok(());
         }
         let sequence = self
             .driver

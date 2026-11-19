@@ -373,10 +373,12 @@ enum Command {
         /// Needs `--store`, no archives, and no data-plane payload yet: the session
         /// orders plain causal vertices and produces certified headers without executing
         /// transactions. A single validator proves the local path through a certified
-        /// header; a multi-validator mesh exchanges the same evidence but advances much
-        /// slower because the durable owner replays its whole journal on every read.
-        /// A legacy store is refused; the two histories never share one directory. This
-        /// bounded wiring is not a production authority claim.
+        /// header; a multi-validator mesh exchanges the same evidence and advances with
+        /// the causal quorum, not with a legacy commit loop. Duplicate peer receipts are
+        /// skipped and durable appends fold only the new event over a verified replay, so
+        /// the journal and its replay cost stay proportional to new evidence. A legacy
+        /// store is refused; the two histories never share one directory. This bounded
+        /// wiring is not a production authority claim.
         #[arg(long)]
         agreement_session: bool,
     },

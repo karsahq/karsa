@@ -2338,19 +2338,19 @@ fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen
             history,
             "duplicate QC creates no signing obligation {i}"
         );
-        // Ingress allocates a new sequence even for duplicate evidence; replay treats the
-        // exact repeat as a receipt-only no-op so it cannot re-emit the local prevote.
-        assert_eq!(adapter.driver.sequence(), sequence + 1);
+        // A repeated receipt is skipped before the append: replay would treat it as the same
+        // receipt-only no-op, so writing it again would only grow the bounded journal.
+        assert_eq!(adapter.driver.sequence(), sequence);
         let wal = std::fs::read(dirs[i].0.join("authenticated-slot-agreement")).unwrap();
-        assert!(
-            wal.len() > snapshots[i].1.len() && wal.starts_with(&snapshots[i].1),
-            "duplicate receipt extends the existing journal {i}"
+        assert_eq!(
+            wal, snapshots[i].1,
+            "duplicate receipt does not extend the journal {i}"
         );
         drop(adapter);
         drop(store);
         let store = Store::open(&dirs[i].0).unwrap();
         let mut adapter = Adapter::recover(&store, bootstraps[i].clone(), &m, i).unwrap();
-        assert_eq!(adapter.driver.sequence(), sequence + 1);
+        assert_eq!(adapter.driver.sequence(), sequence);
         assert_eq!(
             format!("{:?}", adapter.driver.output().unwrap()),
             snapshots[i].0,
