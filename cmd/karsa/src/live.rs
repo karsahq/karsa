@@ -8775,9 +8775,8 @@ mod tests {
             genesis_state.state_root(),
             commit_root(&[]),
         );
-        // One validator proves the full live path. The owner now serves durable reads
-        // from its verified replay instead of replaying the journal per getter, but a
-        // multi-validator mesh is still not gated here until its progress is measured.
+        // One validator proves the full live path end to end here; the bounded
+        // three-validator mesh test covers multi-validator certification separately.
         for index in 0..1 {
             let store = Store::open(dir.0.join(format!("val-{index}"))).unwrap();
             assert!(
@@ -8810,6 +8809,64 @@ mod tests {
             assert!(
                 intents[0].header().id().is_ok(),
                 "node {index} reserved an unencodable certified header"
+            );
+        }
+    }
+
+    #[test]
+    fn a_three_validator_certified_session_mesh_certifies_a_slot() {
+        let _mesh = mesh_test_lock();
+        let dir = TestDir::new("certified-mesh");
+        let mut config = mesh_config(&dir, a_free_port_base(3), 0, 0);
+        config.validators = 3;
+        config.timeout = Duration::from_secs(30);
+        config.execute = false;
+        config.agreement_session = true;
+        let result = run(config);
+        assert!(
+            result.is_ok(),
+            "the three-validator certified mesh failed: {result:?}"
+        );
+
+        let committee = chain::membership(3, None).unwrap();
+        let chain_id = chain::demo_chain_id();
+        let genesis_state = credited_genesis(&committee.accounts).unwrap();
+        let genesis = Header::genesis(
+            chain_id.clone(),
+            committee.set.epoch,
+            genesis_state.state_root(),
+            commit_root(&[]),
+        );
+        for index in 0..3 {
+            let store = Store::open(dir.0.join(format!("val-{index}"))).unwrap();
+            assert!(
+                store.has_authenticated_slot_agreement().unwrap(),
+                "mesh node {index} opened no certified session"
+            );
+            let bootstrap =
+                agreement::session::genesis_bootstrap(&committee, index, &chain_id, &genesis)
+                    .unwrap();
+            let session = store
+                .recover_authenticated_slot_agreement(bootstrap)
+                .unwrap();
+            let applications = session.ordering_snapshot().unwrap().applications().len();
+            assert!(
+                applications >= 2,
+                "mesh node {index} applied {applications} certified slot(s)"
+            );
+            let driver = store::SlotAgreementDriver::new(session);
+            assert!(
+                !driver.header_intents().unwrap().is_empty(),
+                "mesh node {index} reserved no certified header intent"
+            );
+            assert_eq!(
+                driver
+                    .header_shares()
+                    .unwrap()
+                    .first()
+                    .map(|share| share.header.height),
+                Some(1),
+                "mesh node {index} did not publish its first header share"
             );
         }
     }

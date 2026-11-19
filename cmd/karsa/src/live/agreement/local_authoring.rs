@@ -906,18 +906,40 @@ impl JournaledFinalization {
             if let Some(intent) = vote {
                 SelectedAction::Durable(DurableAction::Vote(intent.id))
             } else {
-                let candidates = output
-                    .candidates
-                    .into_iter()
-                    .map(|candidate| match candidate {
-                        store::SlotAgreementCarrierCandidate::PendingPol(candidate) => {
-                            Ok(DurableAction::Pol(candidate.digest()))
-                        }
-                        store::SlotAgreementCarrierCandidate::PendingFinalProof(proof) => proof
-                            .digest(&self.adapter.set)
-                            .map(DurableAction::Final)
-                            .map_err(|e| e.to_string()),
-                    });
+                // The precommit vote binds its prerequisite POL carrier by exact vertex ID, and
+                // a precommit quorum therefore needs one shared POL carrier. Every node can
+                // assemble the same POL candidate, but a carrier is a locally authored vertex,
+                // so competing carriers would make every precommit bind a different prerequisite
+                // and no quorum could ever form. The elected view proposer publishes that carrier;
+                // the other validators wait and bind their precommits to the one they observe.
+                let candidates =
+                    output
+                        .candidates
+                        .into_iter()
+                        .filter_map(|candidate| match candidate {
+                            store::SlotAgreementCarrierCandidate::PendingPol(candidate) => {
+                                let Some(entry) = candidate.lineage().entries.last() else {
+                                    return Some(Err("POL candidate lacks a lineage entry".into()));
+                                };
+                                match validator::slot_agreement_view_proposer(
+                                    &self.adapter.set,
+                                    entry.proposal.decision.round,
+                                    entry.view,
+                                ) {
+                                    Ok(elected) if elected == self.adapter.validator_id => {
+                                        Some(Ok(DurableAction::Pol(candidate.digest())))
+                                    }
+                                    Ok(_) => None,
+                                    Err(error) => Some(Err(error.to_string())),
+                                }
+                            }
+                            store::SlotAgreementCarrierCandidate::PendingFinalProof(proof) => Some(
+                                proof
+                                    .digest(&self.adapter.set)
+                                    .map(DurableAction::Final)
+                                    .map_err(|e| e.to_string()),
+                            ),
+                        });
                 let Some(action) = select_uncompleted_aggregate(candidates, &completed)? else {
                     return Ok(Vec::new());
                 };

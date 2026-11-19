@@ -8,6 +8,9 @@
 //! - every node opens or recovers a certified session from the same trusted genesis;
 //! - plain causal vertices feed the owned availability DAG, which is the only thing the
 //!   certified proposal and vote rules read;
+//! - only the elected view proposer authors the POL carrier: a carrier is a locally
+//!   authored vertex, and precommits bind their prerequisite by exact vertex ID, so
+//!   competing carriers would make every precommit bind a different prerequisite;
 //! - agreement frames route through the same authenticated receipt path peers use;
 //! - a decided slot is applied from the durable transition, then executed and built into
 //!   a header whose shares are dispatched over the existing writer queues;
@@ -18,12 +21,11 @@
 //! The single-validator path is proven end to end: plain causal rounds decide whenever a
 //! majority of authors is held, the initial proposal and view bind, durable votes follow,
 //! and the decided slot executes into a header whose share and certificate persist. The
-//! multi-validator mesh routes the same evidence over the same links; durable reads now
-//! reuse a replay verified for the owner's exact journal tip, so a sustained run no longer
-//! pays a full journal replay per getter. Multi-validator progress past the first slot is
-//! still unproven: a three-node run exchanges evidence but has not certified a slot, and a
-//! longer run surfaces a durable reducer rejection ("already voted in this phase and view"),
-//! which is the next blocker rather than read cost.
+//! multi-validator mesh routes the same evidence over the same links: durable reads reuse a
+//! verified replay, refused peer receipts are dropped instead of poisoning the owner, and a
+//! single elected publisher owns the shared POL carrier. A bounded three-validator test
+//! certifies the first slots on every node; payloads stay zero, so slots order without
+//! executing transactions.
 //!
 //! The owner's causal import budget bounds one run, and both histories stay mutually
 //! exclusive on disk: a store holding a legacy chain is refused by the session opener.

@@ -489,23 +489,45 @@ fn owned_event_pump_authors_protocol_over_tcp_then_explicitly_applies() {
                 }
                 available.extend(votes);
                 if round == 5 {
-                    let pol =
-                        driver_author(0, 6, &available, AuthoringAction::Pol, &mut channels, &m)
-                            .await;
-                    let wal = dirs[0].0.join("authenticated-slot-agreement");
+                    // The elected view proposer is the only POL carrier publisher: precommits
+                    // bind that carrier by exact vertex ID, so a second publisher would make
+                    // every precommit bind a different prerequisite.
+                    let pol = driver_author(
+                        proposer,
+                        6,
+                        &available,
+                        AuthoringAction::Pol,
+                        &mut channels,
+                        &m,
+                    )
+                    .await;
+                    let wal = dirs[proposer].0.join("authenticated-slot-agreement");
                     let before = std::fs::read(&wal).unwrap();
-                    channels[0].local.send(LocalEvent::Drive(Vec::new())).await.unwrap();
-                    let repeated = channels[0].output.recv().await.unwrap();
+                    channels[proposer]
+                        .local
+                        .send(LocalEvent::Drive(Vec::new()))
+                        .await
+                        .unwrap();
+                    let repeated = channels[proposer].output.recv().await.unwrap();
                     assert!(repeated.error.is_none(), "{:?}", repeated.error);
                     assert!(repeated.carriers.is_empty());
                     assert_eq!(std::fs::read(&wal).unwrap(), before, "completed POL does not reserve again");
+                    // The other validators learn the shared POL carrier over the peer links, not
+                    // from this node's local replay; let those receipts reach their durable state
+                    // before the precommits that bind that carrier are authorized.
+                    tokio::time::sleep(Duration::from_millis(250)).await;
                     let refs: Vec<_> = available
                         .iter()
                         .filter(|v| v.round == 5)
                         .map(|v| v.id().unwrap())
                         .collect();
                     available.push(pol);
-                    for i in 1..3 {
+                    for i in 0..3 {
+                        // The elected proposer already occupies its round-6 slot with the POL
+                        // carrier; a synthetic vertex there would conflict with it.
+                        if i == proposer {
+                            continue;
+                        }
                         available.push(signed(&m, i, 6, refs.clone(), [6; 32]));
                     }
                 }
