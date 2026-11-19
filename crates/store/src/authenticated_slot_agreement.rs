@@ -1137,21 +1137,44 @@ fn replay(
     b: &AuthenticatedSlotAgreementBootstrap,
     events: &[AuthenticatedSlotAgreementRequest],
 ) -> Result<ReplayCursor, StoreError> {
-    replay_from(b, None, events)
+    replay_from(b, None, 0, events)
 }
 
-/// Folds the journal from a verified prefix, which must be a byte-exact prefix of `events`.
+/// Folds `tail` over a fresh or verified cursor that ends at absolute event index `start`.
 /// A resumed cursor never skips authentication of its own events: it already authenticated
 /// them, and only the retained tail is folded here.
 fn replay_from(
     b: &AuthenticatedSlotAgreementBootstrap,
     resume: Option<ReplayCursor>,
-    events: &[AuthenticatedSlotAgreementRequest],
+    start: usize,
+    tail: &[AuthenticatedSlotAgreementRequest],
 ) -> Result<ReplayCursor, StoreError> {
-    let start = resume.as_ref().map_or(0, |cursor| cursor.consumed);
-    if start > events.len() {
-        return Err(invalid("replay cursor is past the retained journal"));
+    let cursor = match resume {
+        Some(cursor) => cursor,
+        None => {
+            if start != 0 {
+                return Err(invalid("replay fold starts past an empty prefix"));
+            }
+            ReplayCursor::fresh(b)?
+        }
+    };
+    fold(cursor, start, tail)
+}
+
+/// Folds `tail` over `cursor`, which must have consumed exactly the `start` events before it.
+/// The cursor's active set is the pinned set, so fresh and resumed folds authenticate
+/// observations identically.
+fn fold(
+    cursor: ReplayCursor,
+    start: usize,
+    tail: &[AuthenticatedSlotAgreementRequest],
+) -> Result<ReplayCursor, StoreError> {
+    if cursor.consumed != start {
+        return Err(invalid("replay cursor does not end at the fold start"));
     }
+    let end = start
+        .checked_add(tail.len())
+        .ok_or_else(|| invalid("replay fold range overflow"))?;
     let ReplayCursor {
         mut binding,
         mut vertices,
@@ -1173,13 +1196,10 @@ fn replay_from(
         mut applications,
         mut observations,
         consumed: _,
-    } = match resume {
-        Some(cursor) => cursor,
-        None => ReplayCursor::fresh(b)?,
-    };
-    for (offset, event) in events[start..].iter().enumerate() {
+    } = cursor;
+    for (offset, event) in tail.iter().enumerate() {
         let index = start + offset;
-        if let Some(key) = observation_key(event, &b.agreement.set)? {
+        if let Some(key) = observation_key(event, &active.set)? {
             if !observations.insert(key) {
                 // The same authenticated observation can arrive twice: a local publication
                 // may be self-delivered and then echoed by a peer, and a carrier retransmission
@@ -1635,7 +1655,7 @@ fn replay_from(
                     .pol = None;
             }
             let mut key = Encoder::new();
-            key.put_bytes(&witness.payload.vote.signing_payload(&b.agreement.set)?)?;
+            key.put_bytes(&witness.payload.vote.signing_payload(&active.set)?)?;
             put_id(&mut key, &witness.payload.prerequisite)?;
             let key = key.finish();
             if !buckets.contains_key(&key) && buckets.len() + nil_buckets.len() >= MAX_EVENTS {
@@ -1643,7 +1663,7 @@ fn replay_from(
             }
             let bucket = buckets.entry(key).or_default();
             if let Some(old) = &bucket.lineage {
-                if old.encode(&b.agreement.set)? != retained_lineage.encode(&b.agreement.set)? {
+                if old.encode(&active.set)? != retained_lineage.encode(&active.set)? {
                     return Err(invalid("conflicting individual vote lineage"));
                 }
             }
@@ -1654,8 +1674,7 @@ fn replay_from(
                 }
             } else {
                 witness_count += 1;
-                evidence_bytes =
-                    evidence_bytes.saturating_add(event.encode(&b.agreement.set)?.len());
+                evidence_bytes = evidence_bytes.saturating_add(event.encode(&active.set)?.len());
                 if witness_count > MAX_EVENTS || evidence_bytes > MAX_BYTES as usize {
                     return Err(invalid("retained vote evidence bound exceeded"));
                 }
@@ -1670,10 +1689,7 @@ fn replay_from(
                             .map(|w| w.payload.signature.clone())
                             .collect(),
                     };
-                    if certificate
-                        .verify(&active.context, &b.agreement.set)
-                        .is_ok()
-                    {
+                    if certificate.verify(&active.context, &active.set).is_ok() {
                         let candidate = AgreementQuorumCandidate {
                             lineage: bucket
                                 .lineage
@@ -1684,7 +1700,7 @@ fn replay_from(
                         };
                         // Replay runs before opening the WAL for append. A quorum that
                         // cannot be exported must never become a frozen durable bucket.
-                        candidate.validate_envelope(&b.agreement.set)?;
+                        candidate.validate_envelope(&active.set)?;
                         bucket.candidate = Some(candidate);
                     }
                 }
@@ -1967,7 +1983,7 @@ fn replay_from(
         view_requests,
         applications,
         observations,
-        consumed: events.len(),
+        consumed: end,
     };
     Ok(cursor)
 }
@@ -1986,6 +2002,9 @@ struct ReplayCache {
     sequence: u64,
     tip: [u8; 32],
     cursor: ReplayCursor,
+    /// Canonical encoding of the last durable request. Retry detection without a journal
+    /// read relies on it; it is bounded by `MAX_BODY` like every journal event.
+    last: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for ReplayCache {
@@ -2041,7 +2060,7 @@ impl Store {
         bootstrap: AuthenticatedSlotAgreementBootstrap,
     ) -> Result<AuthenticatedSlotAgreement, StoreError> {
         let header = bootstrap.encode()?;
-        let cursor = replay_from(&bootstrap, None, &[])?;
+        let cursor = replay_from(&bootstrap, None, 0, &[])?;
         let checkpoint_binding = SlotAgreementBinding::from_checkpoint(
             bootstrap.agreement.context.clone(),
             bootstrap.predecessor.clone(),
@@ -2076,6 +2095,7 @@ impl Store {
                 sequence: 0,
                 tip,
                 cursor,
+                last: None,
             })),
             #[cfg(feature = "test-support")]
             share_publication_fault: None,
@@ -2099,7 +2119,12 @@ impl Store {
         if journal.header != header {
             return Err(invalid("authenticated checkpoint mismatch"));
         }
-        let cursor = replay_from(&bootstrap, None, &journal.events)?;
+        let cursor = replay_from(&bootstrap, None, 0, &journal.events)?;
+        let last = journal
+            .events
+            .last()
+            .map(|event| event.encode(&bootstrap.agreement.set))
+            .transpose()?;
         let checkpoint_binding = SlotAgreementBinding::from_checkpoint(
             bootstrap.agreement.context.clone(),
             bootstrap.predecessor.clone(),
@@ -2124,6 +2149,7 @@ impl Store {
                 sequence,
                 tip,
                 cursor,
+                last,
             })),
             #[cfg(feature = "test-support")]
             share_publication_fault: None,
@@ -2140,6 +2166,24 @@ type DriverSnapshot = (
 );
 
 impl AuthenticatedSlotAgreement {
+    /// Returns whether this exact observation is already retained as a durable no-op.
+    ///
+    /// A repeated authenticated observation replays as a no-op so it never repeats a one-shot
+    /// reducer step. Callers may skip the append entirely instead of journaling that no-op again;
+    /// this reads the same retained key the replay uses. Non-observation requests always return
+    /// `false`. Diagnostic-free and grants no ordering authority.
+    /// # Errors
+    /// Rejects uncertain or stale owners and invalid durable evidence.
+    pub fn observation_retained(
+        &self,
+        request: &AuthenticatedSlotAgreementRequest,
+    ) -> Result<bool, StoreError> {
+        self.with_replay(|state| match observation_key(request, &state.active.set)? {
+            Some(key) => Ok(state.observations.contains(&key)),
+            None => Ok(false),
+        })
+    }
+
     /// Returns every durable signing intent in emission order, including unsupported nil votes.
     ///
     /// No acknowledgements or queue removal exist: repeated reads intentionally resend exact
@@ -2250,13 +2294,19 @@ impl AuthenticatedSlotAgreement {
         }
         let read_nanos = started.elapsed();
         let started = std::time::Instant::now();
-        let cursor = replay_from(&journal.bootstrap, None, &journal.events)?;
+        let cursor = replay_from(&journal.bootstrap, None, 0, &journal.events)?;
         self.record_replay(false, read_nanos, started.elapsed());
+        let last = journal
+            .events
+            .last()
+            .map(|event| event.encode(&journal.bootstrap.agreement.set))
+            .transpose()?;
         *cache = Some(ReplayCache {
             bytes: journal.bytes,
             sequence: self.sequence,
             tip: self.tip,
             cursor,
+            last,
         });
         let Some(cached) = cache.as_ref() else {
             unreachable!("cache installed")
@@ -2360,11 +2410,14 @@ impl AuthenticatedSlotAgreement {
     }
     /// Persists the full canonical request before releasing a vote or session decision.
     ///
-    /// A request is authenticated against the whole retained history: the on-disk prefix is
-    /// folded again when the verified cache does not describe this owner's exact tip, and only
-    /// the new event is folded when it does. The cached prefix is trusted exactly as cache
-    /// reads already trust it (this owner's sequence and hash-chain tip), so an append never
-    /// accepts evidence the full fold would reject and never skips durability barriers.
+    /// A request is authenticated against the retained history. An append uses the verified
+    /// cache when it still describes this owner's exact sequence, hash-chain tip and on-disk
+    /// byte length: the new event is folded over that cache instead of re-reading the journal.
+    /// Same-length in-place corruption of an earlier frame is therefore not re-detected here
+    /// (cache reads already accept it the same way), but it still fails every full fold and
+    /// every recovery, and any length change forces a full re-read before an append. Duplicate
+    /// and prefix retries keep their exact transition and do not write; a rejected fold drops
+    /// the cache and writes nothing.
     ///
     /// # Errors
     /// Rejects stale owners, inexact retries, invalid evidence, bounds and uncertain I/O.
@@ -2391,82 +2444,128 @@ impl AuthenticatedSlotAgreement {
             .lock()
             .expect("slot decision lock poisoned");
         exclusions(&root)?;
+        // Reads and appends share one trust boundary: a verified cache describes this owner's
+        // exact sequence and hash-chain tip, and the journal's byte length is unchanged. A
+        // same-length rewrite is not re-read here, exactly as cache reads do not re-read it.
+        let disk_bytes = journal_bytes(&root)?;
         let started_read = std::time::Instant::now();
-        let mut journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
-        if journal.header != self.header
-            || journal.events.len() as u64 != self.sequence
-            || journal.tip != self.tip
-        {
-            return Err(invalid("stale authenticated owner"));
-        }
-        let body = request.encode(&journal.bootstrap.agreement.set)?;
-        let reservation_retry = matches!(
+        let mut cache = self.cache.lock().expect("replay cache lock poisoned");
+        let verified_prefix = cache.as_ref().is_some_and(|cached| {
+            cached.sequence == self.sequence
+                && cached.tip == self.tip
+                && disk_bytes == Some(cached.bytes)
+        });
+        let body;
+        let retry;
+        let bytes;
+        let prefix_capable = matches!(
             request,
             AuthenticatedSlotAgreementRequest::ReserveCarrier { .. }
                 | AuthenticatedSlotAgreementRequest::CompleteCarrier { .. }
                 | AuthenticatedSlotAgreementRequest::CompleteNilVote { .. }
                 | AuthenticatedSlotAgreementRequest::ReserveViewRequest { .. }
                 | AuthenticatedSlotAgreementRequest::CompleteViewRequest { .. }
-        ) && sequence > 0
-            && journal.events.get((sequence - 1) as usize) == Some(&request);
-        let retry = reservation_retry
-            || (sequence == self.sequence && journal.events.last() == Some(&request));
-        if !retry && sequence != self.sequence + 1 {
-            return Err(invalid("incorrect authenticated sequence or retry"));
-        }
-        let bytes = frame(&self.tip, sequence, &body);
-        if !retry {
-            if journal.events.len() >= MAX_EVENTS || journal.bytes + bytes.len() as u64 > MAX_BYTES
-            {
-                return Err(invalid("authenticated WAL capacity exhausted"));
-            }
-            journal.events.push(request);
-        }
-        let read_nanos = started_read.elapsed();
-        let started_replay = std::time::Instant::now();
-        let mut cache = self.cache.lock().expect("replay cache lock poisoned");
-        // The cache describes this owner's exact durable tip, so its prefix is byte-identical
-        // to the journal read above. A sibling advance or corrupt prefix changes either the
-        // sequence or the tip and forces a full fold.
-        let verified_prefix = cache
-            .as_ref()
-            .is_some_and(|cached| cached.sequence == self.sequence && cached.tip == self.tip);
+        );
         let mut staged: Option<ReplayCursor> = None;
         let mut prefix: Option<ReplayCursor> = None;
-        if retry && verified_prefix && !reservation_retry {
-            // A repeated request changed nothing durable; its recorded transition stands.
-        } else if reservation_retry {
-            // A retried reservation reports the prefix just before the later durable events,
-            // so it cannot be folded from the whole journal and is never cached.
-            let cursor = replay_from(
-                &journal.bootstrap,
-                None,
-                &journal.events[..sequence as usize],
-            )?;
-            self.record_replay(false, read_nanos, started_replay.elapsed());
-            prefix = Some(cursor);
-        } else if !verified_prefix {
-            // An unverified cache cannot be resumed: fold the retained journal from its
-            // bootstrap.
-            let cursor = replay_from(&journal.bootstrap, None, &journal.events)?;
-            self.record_replay(false, read_nanos, started_replay.elapsed());
-            staged = Some(cursor);
+        let mut install_base = 0u64;
+        let mut appended_bytes = 0u64;
+        // A retried reservation reports the transition of the prefix before it, which the
+        // cache cannot derive, so those retries read the journal instead of resuming.
+        if verified_prefix
+            && sequence >= self.sequence
+            && !(prefix_capable && sequence == self.sequence)
+        {
+            // The cached prefix is this owner's durable journal, so no read is needed to
+            // append: only the new request is authenticated and folded.
+            let cached = cache.as_ref().expect("verified cache entry is present");
+            if sequence > self.sequence + 1 {
+                return Err(invalid("incorrect authenticated sequence or retry"));
+            }
+            body = request.encode(&cached.cursor.active.set)?;
+            retry = sequence == self.sequence && cached.last.as_deref() == Some(body.as_slice());
+            if !retry && sequence != self.sequence + 1 {
+                return Err(invalid("incorrect authenticated sequence or retry"));
+            }
+            bytes = frame(&self.tip, sequence, &body);
+            if !retry {
+                if self.sequence >= MAX_EVENTS as u64
+                    || cached.bytes + bytes.len() as u64 > MAX_BYTES
+                {
+                    return Err(invalid("authenticated WAL capacity exhausted"));
+                }
+                let base_bytes = cached.bytes;
+                let cached = cache.take().expect("verified cache entry is present");
+                let read_nanos = started_read.elapsed();
+                let started_replay = std::time::Instant::now();
+                match fold(
+                    cached.cursor,
+                    self.sequence as usize,
+                    std::slice::from_ref(&request),
+                ) {
+                    Ok(cursor) => {
+                        self.record_replay(true, read_nanos, started_replay.elapsed());
+                        install_base = base_bytes;
+                        appended_bytes = bytes.len() as u64;
+                        staged = Some(cursor);
+                    }
+                    Err(error) => {
+                        // The fold consumed the cached cursor, and a rejected append means the
+                        // retained evidence no longer folds. Drop the cache so every later read
+                        // must re-authenticate or report the same failure; nothing was written.
+                        *cache = None;
+                        return Err(error);
+                    }
+                }
+            }
         } else {
-            // Only the appended request is new. Fold it over the cached verified prefix
-            // instead of re-authenticating every retained event on each durable append.
-            let cached = cache.take().expect("verified cache entry is present");
-            match replay_from(&journal.bootstrap, Some(cached.cursor), &journal.events) {
-                Ok(cursor) => {
-                    self.record_replay(true, read_nanos, started_replay.elapsed());
-                    staged = Some(cursor);
+            let mut journal = read(&root)?.ok_or_else(|| invalid("authenticated WAL missing"))?;
+            if journal.header != self.header
+                || journal.events.len() as u64 != self.sequence
+                || journal.tip != self.tip
+            {
+                return Err(invalid("stale authenticated owner"));
+            }
+            body = request.encode(&journal.bootstrap.agreement.set)?;
+            let reservation_retry = prefix_capable
+                && sequence > 0
+                && journal.events.get((sequence - 1) as usize) == Some(&request);
+            retry = reservation_retry
+                || (sequence == self.sequence && journal.events.last() == Some(&request));
+            if !retry && sequence != self.sequence + 1 {
+                return Err(invalid("incorrect authenticated sequence or retry"));
+            }
+            bytes = frame(&self.tip, sequence, &body);
+            if !retry {
+                if journal.events.len() >= MAX_EVENTS
+                    || journal.bytes + bytes.len() as u64 > MAX_BYTES
+                {
+                    return Err(invalid("authenticated WAL capacity exhausted"));
                 }
-                Err(error) => {
-                    // The fold consumed the cached cursor, and a rejected append means the
-                    // retained evidence no longer folds. Drop the cache so every later read
-                    // must re-authenticate or report the same failure; nothing was written.
-                    *cache = None;
-                    return Err(error);
-                }
+                journal.events.push(request);
+            }
+            let read_nanos = started_read.elapsed();
+            let started_replay = std::time::Instant::now();
+            if retry && verified_prefix && !reservation_retry {
+                // A repeated request changed nothing durable; its recorded transition stands.
+            } else if reservation_retry {
+                // A retried reservation reports the prefix just before the later durable events,
+                // so it cannot be folded from the whole journal and is never cached.
+                prefix = Some(replay_from(
+                    &journal.bootstrap,
+                    None,
+                    0,
+                    &journal.events[..sequence as usize],
+                )?);
+                self.record_replay(false, read_nanos, started_replay.elapsed());
+            } else {
+                // The cache does not describe this exact durable tip: fold the retained journal
+                // from its bootstrap before accepting anything new.
+                let cursor = replay_from(&journal.bootstrap, None, 0, &journal.events)?;
+                self.record_replay(false, read_nanos, started_replay.elapsed());
+                install_base = journal.bytes;
+                appended_bytes = if retry { 0 } else { bytes.len() as u64 };
+                staged = Some(cursor);
             }
         };
         let result = match (&prefix, &staged, cache.as_ref()) {
@@ -2489,10 +2588,11 @@ impl AuthenticatedSlotAgreement {
         }
         if let Some(cursor) = staged {
             *self.cache.lock().expect("replay cache lock poisoned") = Some(ReplayCache {
-                bytes: journal.bytes + if retry { 0 } else { bytes.len() as u64 },
+                bytes: install_base + appended_bytes,
                 sequence: self.sequence,
                 tip: self.tip,
                 cursor,
+                last: Some(body),
             });
         }
         Ok(result)

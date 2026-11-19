@@ -167,6 +167,19 @@ impl SlotAgreementDriver {
         self.session.reserve_header_share(anchor, share)
     }
 
+    /// Returns whether this exact observation is already a durable no-op.
+    ///
+    /// Callers may skip re-appending a duplicate peer receipt; the replay treats it as the
+    /// same no-op. This grants no ordering, signing or delivery authority.
+    /// # Errors
+    /// Rejects uncertain or stale owners and invalid durable evidence.
+    pub fn observation_retained(
+        &self,
+        request: &AuthenticatedSlotAgreementRequest,
+    ) -> Result<bool, StoreError> {
+        self.session.observation_retained(request)
+    }
+
     /// Returns the number of durable requests installed by this owner.
     pub fn sequence(&self) -> u64 {
         self.session.sequence()
