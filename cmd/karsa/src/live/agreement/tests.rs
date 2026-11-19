@@ -4783,6 +4783,143 @@ fn the_elected_proposer_authors_the_initial_direct_proposal() {
 }
 
 #[test]
+fn a_timeout_view_without_a_pol_still_gets_a_plain_proposal_and_view() {
+    use std::time::{Duration, Instant};
+
+    let m = chain::membership(4, None).unwrap();
+    let chain_id = b"karsa-plain-view-change";
+    let state = chain::genesis_state(&m.accounts).unwrap();
+    let genesis = validator::Header::genesis(
+        chain_id.to_vec(),
+        m.set.epoch,
+        state.state_root(),
+        validator::commit_root(&[]),
+    );
+    let view = AgreementView(1);
+    let proposer = validator::slot_agreement_view_proposer(&m.set, 1, view).unwrap();
+    let index = m
+        .consensus
+        .iter()
+        .position(|identity| identity.id == proposer)
+        .unwrap();
+
+    // Rounds 0..=3 with every round referencing the whole previous round: round 2
+    // is a direct vote quorum for the round-1 leader, so the direct rule decides.
+    let mut dag = Dag::new(m.set.clone());
+    dag.set_chain_id(chain_id.to_vec());
+    let mut vertices = Vec::new();
+    let mut previous = Vec::new();
+    for round in 0..=3u64 {
+        let mut ids = Vec::new();
+        for author in 0..4 {
+            let payload = [u8::try_from(author + 1).unwrap(); 32];
+            let vertex = signed_for_chain(&m, author, round, previous.clone(), payload, chain_id);
+            ids.push(dag.insert(vertex.clone()).unwrap());
+            vertices.push(vertex);
+        }
+        ids.sort_by(|a, b| (a.round, &a.author, a.digest).cmp(&(b.round, &b.author, b.digest)));
+        previous = ids;
+    }
+
+    let mut node = net::Node::with_chain_id(
+        m.set.clone(),
+        proposer.to_vec(),
+        m.consensus[index].private_key.clone(),
+        chain_id.to_vec(),
+    );
+    for vertex in &vertices {
+        node.receive(vertex.clone()).unwrap();
+    }
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = session::open_at_genesis(
+        &store,
+        &m,
+        index,
+        &genesis,
+        state,
+        validator::EpochSchedule::single(m.set.epoch),
+    )
+    .unwrap();
+    let wait = Duration::from_millis(10);
+    owner
+        .enable_authoring(
+            node,
+            pacemaker::Policy::new(wait, wait, wait).unwrap(),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+
+    // Two phase timeouts and the publication grace advance the durable view with no
+    // POL ever released. Without the current-view plain path no validator can propose.
+    let t0 = Instant::now();
+    owner.tick_local(t0).unwrap();
+    let mut now = t0;
+    for _ in 0..3 {
+        now += Duration::from_millis(20);
+        owner.tick_local(now).unwrap();
+        owner.tick_local(now).unwrap();
+    }
+
+    let messages = owner.drive_local(Vec::new()).unwrap();
+    assert_eq!(
+        messages.len(),
+        1,
+        "the elected proposer authors one plain proposal"
+    );
+    let net::wire::Message::AgreementCarrier { envelope, .. } = &messages[0] else {
+        panic!("the view-1 publication must be a carrier");
+    };
+    let envelope = CarrierEnvelope::decode(envelope, &m.set).unwrap();
+    let CarrierPayload::Proposal(proposal) = envelope.payload() else {
+        panic!("the view-1 plain carrier must be a proposal");
+    };
+    assert_eq!(proposal.decision.round, 1);
+    let proposal_carrier = envelope.carrier().clone();
+
+    // Peers author their own round-4 vertices, so the next round has a quorum of held
+    // authors and the elected view carrier is reference-ready.
+    let round_three = previous.clone();
+    let mut peer_round_four = Vec::new();
+    for author in (0..4).filter(|author| *author != index) {
+        peer_round_four.push(signed_for_chain(
+            &m,
+            author,
+            4,
+            round_three.clone(),
+            [9; 32],
+            chain_id,
+        ));
+    }
+    let messages = owner.drive_local(peer_round_four).unwrap();
+    assert_eq!(
+        messages.len(),
+        1,
+        "the elected proposer binds the plain view"
+    );
+    let net::wire::Message::AgreementCarrier { envelope, .. } = &messages[0] else {
+        panic!("the view-1 authorization must be a carrier");
+    };
+    let envelope = CarrierEnvelope::decode(envelope, &m.set).unwrap();
+    let CarrierPayload::View(lineage) = envelope.payload() else {
+        panic!("the second carrier must be the view authorization");
+    };
+    let selected = lineage
+        .entries
+        .last()
+        .expect("the view lineage is nonempty");
+    assert_eq!(selected.view, view);
+    assert_eq!(selected.proposal_carrier, proposal_carrier);
+    assert_eq!(lineage.entries.len(), 1, "no POL prefix was invented");
+    assert!(selected.pol.is_none());
+
+    assert!(
+        owner.drive_local(Vec::new()).unwrap().is_empty(),
+        "a completed plain view is not reauthored"
+    );
+}
+
+#[test]
 fn the_elected_proposer_binds_the_initial_view_and_a_peer_votes() {
     let m = chain::membership(4, None).unwrap();
     let chain_id = b"karsa-initial-view";

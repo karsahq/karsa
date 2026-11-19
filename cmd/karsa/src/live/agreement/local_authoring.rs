@@ -335,8 +335,9 @@ impl JournaledFinalization {
     /// validation remains authoritative; a high incomplete frontier can stall rather than invent
     /// progression. Completed payloads are not reauthored, including after explicit owner
     /// recovery. Durable selection/reconstruction is capped at 4096 WAL events, not storage bytes.
-    /// Authors at most one durable phase, one initial direct-commit proposal and its
-    /// elected view authorization, one elected re-proposal, or one view echo; it does
+    /// Authors at most one durable phase, one current-view direct-commit proposal and
+    /// its elected view authorization (with an empty POL prefix when the view has none),
+    /// one elected re-proposal, or one view echo; it does
     /// not tick, retry or apply a slot. A signed publication is delivered back through
     /// the same authenticated receipt path peers use, so the author observes it locally.
     /// # Errors
@@ -399,11 +400,11 @@ impl JournaledFinalization {
         if !authored.is_empty() {
             return Ok(authored);
         }
-        let proposed = self.propose_initial_local()?;
+        let proposed = self.propose_plain_local()?;
         if !proposed.is_empty() {
             return Ok(proposed);
         }
-        let bound = self.bind_initial_view_local()?;
+        let bound = self.bind_plain_view_local()?;
         if !bound.is_empty() {
             return Ok(bound);
         }
@@ -496,23 +497,17 @@ impl JournaledFinalization {
         Ok(messages)
     }
 
-    /// Authors the initial view-0 proposal when this validator is elected and the
+    /// Authors the current-view plain proposal when this validator is elected and the
     /// direct commit rule has already decided the slot.
     ///
-    /// The proposal is constructed from the owned causal DAG, never from a timer:
-    /// the leader, its exact history, and a canonical quorum of held voters come
-    /// from `inspect_commit`. Only the direct positive rule is supported here;
-    /// conservative or indirect initial evidence remains explicit. The carrier
-    /// is authored at the first unoccupied local round, whose references must
-    /// cover the selected voters. Nothing is signed unless the exact proposal
-    /// validates against the pinned binding. The owned DAG's committed order is
-    /// the applied certified prefix: the owner seeds it when authoring is enabled
-    /// and after every certified application, so the before/after frontier is the
-    /// one the durable binding will check.
+    /// A view whose lock has no released POL still needs a proposal: a timeout can move
+    /// the whole set to view 1 before any POL exists, and without this path no validator
+    /// would ever propose again. The plain proposal is valid in any current view; a view
+    /// with a retained POL is handled by [`Self::elect_view_local`] instead.
     /// # Errors
     /// Rejects unhealthy owners, histories above 4096 events, arithmetic
     /// exhaustion, and durable authoring failures.
-    fn propose_initial_local(&mut self) -> Result<Vec<Message>, String> {
+    fn propose_plain_local(&mut self) -> Result<Vec<Message>, String> {
         self.check_health()?;
         if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
             return Err("local proposal selection exceeds 4096 events".into());
@@ -522,10 +517,7 @@ impl JournaledFinalization {
             Some(transition) => (transition.view, transition.decision.is_some()),
             None => (validator::slot_agreement::AgreementView(0), false),
         };
-        if decided
-            || view != validator::slot_agreement::AgreementView(0)
-            || output.reproposal.is_some()
-        {
+        if decided || output.reproposal.is_some() {
             return Ok(Vec::new());
         }
         let tip = output.binding.tip().clone();
@@ -645,17 +637,19 @@ impl JournaledFinalization {
         result
     }
 
-    /// Authorizes the elected view-0 step by binding the completed plain proposal.
+    /// Authorizes the elected plain step by binding the completed proposal in the current view.
     ///
     /// The candidate is copied from the durable proposal carrier, never rebuilt from
     /// local state: the same envelope, the same carrier, the same decision and an empty
     /// prefix (no prior POL). Only the elected proposer acts, only once per view, and
     /// only after its own plain proposal is completed. Receipt of this carrier is what
     /// authorizes peers' prevote intents; authoring it locally does not vote on its own.
+    /// This is the view-change liveness pair to [`Self::propose_plain_local`]: a timeout
+    /// can enter a new view before any POL exists, so an empty prefix is still valid.
     /// # Errors
     /// Rejects unhealthy owners, histories above 4096 events, missing authoring setup,
     /// candidate construction failures and durable authoring failures.
-    fn bind_initial_view_local(&mut self) -> Result<Vec<Message>, String> {
+    fn bind_plain_view_local(&mut self) -> Result<Vec<Message>, String> {
         self.check_health()?;
         if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
             return Err("local view authorization exceeds 4096 events".into());
@@ -665,10 +659,7 @@ impl JournaledFinalization {
             Some(transition) => (transition.view, transition.decision.is_some()),
             None => (validator::slot_agreement::AgreementView(0), false),
         };
-        if decided
-            || view != validator::slot_agreement::AgreementView(0)
-            || output.reproposal.is_some()
-        {
+        if decided || output.reproposal.is_some() {
             return Ok(Vec::new());
         }
         let tip = output.binding.tip().clone();
@@ -749,8 +740,9 @@ impl JournaledFinalization {
     /// signing another copy. The decision and evidence are copied from the authenticated
     /// reproposal lineage, never constructed from local timers or DAG guesses.
     /// Only the elected proposer acts, only after a prior POL exists, and never twice per view.
-    /// Initial view-0 proposals come from the direct commit rule in
-    /// [`Self::propose_initial_local`]; conservative or indirect initial evidence remains explicit.
+    /// A view with no released POL uses the plain proposal pair
+    /// [`Self::propose_plain_local`] / [`Self::bind_plain_view_local`] instead; conservative
+    /// or indirect initial evidence remains explicit.
     fn elect_view_local(&mut self) -> Result<Vec<Message>, String> {
         self.check_health()?;
         if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
@@ -956,7 +948,22 @@ impl JournaledFinalization {
                         super::super::CarrierPayload::Vote { payload, .. } if payload.vote == intent.vote
                     ))
             });
-            if let Some(intent) = vote {
+            // A vote whose exact prerequisite carrier the owned Node has not retained
+            // cannot be authored this turn: the prospective cone requires that carrier.
+            // Prefer an aggregate this node is elected to publish before spending the turn
+            // on a guaranteed no-op, which would starve the aggregate forever.
+            let vote_ready = vote
+                .as_ref()
+                .is_some_and(|intent| match &intent.prerequisite {
+                    store::AgreementSigningPrerequisite::Carrier(carrier) => self
+                        .authoring
+                        .as_ref()
+                        .and_then(|local| local.node.dag().get(carrier.round, &carrier.author))
+                        .and_then(|vertex| vertex.id().ok())
+                        .is_some_and(|held| held == *carrier),
+                    store::AgreementSigningPrerequisite::UnsupportedNil => false,
+                });
+            let vote_action = vote.as_ref().map(|intent| {
                 // A vote carrier must follow its selected prerequisite carrier. Authoring it
                 // one round early is rejected by the prospective cone, so the action carries
                 // its exact minimum instead of trusting the caller's frontier scan.
@@ -964,14 +971,15 @@ impl JournaledFinalization {
                     store::AgreementSigningPrerequisite::Carrier(carrier) => {
                         carrier.round.saturating_add(1)
                     }
-                    store::AgreementSigningPrerequisite::UnsupportedNil => {
-                        return Ok(Vec::new());
-                    }
+                    store::AgreementSigningPrerequisite::UnsupportedNil => 0,
                 };
                 (
                     SelectedAction::Durable(DurableAction::Vote(intent.id)),
                     Some(minimum),
                 )
+            });
+            let selected = if vote_ready {
+                vote_action
             } else {
                 // The precommit vote binds its prerequisite POL carrier by exact vertex ID, and
                 // a precommit quorum therefore needs one shared POL carrier. Every node can
@@ -1011,12 +1019,19 @@ impl JournaledFinalization {
                                     .map_err(|e| e.to_string()),
                             ),
                         });
-                let Some((action, minimum)) = select_uncompleted_aggregate(candidates, &completed)?
-                else {
-                    return Ok(Vec::new());
-                };
-                (SelectedAction::Durable(action), Some(minimum))
-            }
+                match select_uncompleted_aggregate(candidates, &completed)? {
+                    Some((action, minimum)) => {
+                        Some((SelectedAction::Durable(action), Some(minimum)))
+                    }
+                    // Nothing this node may publish: keep the vote selected so the turn
+                    // waits for the carrier instead of authoring anything.
+                    None => vote_action,
+                }
+            };
+            let Some(selected) = selected else {
+                return Ok(Vec::new());
+            };
+            selected
         } else {
             (SelectedAction::Explicit(Box::new(action)), None)
         };
