@@ -1334,6 +1334,23 @@ impl JournaledFinalization {
         result
     }
 
+    /// Whether an exact completed publication still targets this owner's current slot and
+    /// view, so a retransmission could still be applied by a peer.
+    ///
+    /// A selection hint for durable retransmission, not export or send authorization: it
+    /// reads durable evidence only and never authenticates a cone or signs.
+    /// # Errors
+    /// Rejects unhealthy owners, histories beyond the replay cap and adapter selection errors.
+    pub fn publication_is_current(&mut self, id: &validator::VertexId) -> Result<bool, String> {
+        if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
+            return Err("publication selection exceeds 4096 durable events".into());
+        }
+        self.check_health()?;
+        let result = self.adapter.carrier_is_current(id);
+        self.check_health()?;
+        result
+    }
+
     /// Retries at most one of at most 64 explicitly selected durable local carriers.
     /// # Errors
     /// Rejects absent setup, invalid IDs, cadence violations and unavailable authenticated cones.

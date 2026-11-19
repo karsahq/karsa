@@ -1743,7 +1743,7 @@ impl Adapter {
     /// Retrieves exact durable signed publications, including historical slots.
     /// Never signs, consults a Node, or accepts caller-supplied evidence.
     /// # Errors
-    /// Stale owners, uncertain writes and reconstruction errors require recovery.
+    /// Stale owners, uncertain writes and invalid durable evidence require recovery.
     pub fn completed_carriers(&mut self) -> Result<Vec<AuthoredCarrier>, String> {
         if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
             return Err("agreement owner requires recovery before publication retrieval".into());
@@ -1791,6 +1791,36 @@ impl Adapter {
             self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
         }
         result
+    }
+
+    /// Whether an exact completed local publication was authored for this owner's current
+    /// slot, so export inspection could still accept it.
+    ///
+    /// A publication for an earlier slot never passes export inspection: its decision
+    /// context no longer matches the binding. Skipping it is therefore exact, not a
+    /// heuristic, and it stays durable for history. Evidence for an older *view* of the
+    /// current slot is kept, because a final proof from that view can still settle it.
+    /// This is a selection hint: it reads one durable context and grants no export,
+    /// signing or delivery authority.
+    /// # Errors
+    /// Rejects stale/recovery-required owners and invalid durable evidence.
+    pub fn carrier_is_current(&mut self, carrier: &validator::VertexId) -> Result<bool, String> {
+        if self.readiness == Readiness::RecoveryRequiredHistoricalIntentsUnavailable {
+            return Err("agreement owner requires recovery before carrier selection".into());
+        }
+        let output = self.driver.output().map_err(|error| {
+            self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+            error.to_string()
+        })?;
+        let tip = output.binding.tip();
+        let context = self
+            .driver
+            .completed_carrier_context(carrier)
+            .map_err(|error| {
+                self.readiness = Readiness::RecoveryRequiredHistoricalIntentsUnavailable;
+                error.to_string()
+            })?;
+        Ok(context.as_ref().is_some_and(|context| context == tip))
     }
 
     fn reserve_carrier(

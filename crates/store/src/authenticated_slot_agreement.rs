@@ -2166,6 +2166,26 @@ type DriverSnapshot = (
 );
 
 impl AuthenticatedSlotAgreement {
+    /// Returns the slot context one exact completed local publication was authored under.
+    ///
+    /// This is a retransmission selection hint: a publication authored for another slot
+    /// can no longer pass export inspection, so a scheduler may skip it without exporting.
+    /// It neither authenticates a cone nor authorizes a send.
+    /// # Errors
+    /// Rejects uncertain or stale owners and invalid durable evidence.
+    pub fn completed_carrier_context(
+        &self,
+        carrier: &VertexId,
+    ) -> Result<Option<validator::SlotDecisionTip>, StoreError> {
+        self.with_replay(|state| {
+            Ok(state
+                .completed
+                .iter()
+                .find(|completed| completed.reservation.id == *carrier)
+                .map(|completed| completed.reservation.agreement.context.clone()))
+        })
+    }
+
     /// Returns whether this exact observation is already retained as a durable no-op.
     ///
     /// A repeated authenticated observation replays as a no-op so it never repeats a one-shot

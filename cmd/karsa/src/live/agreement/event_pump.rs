@@ -191,6 +191,9 @@ pub struct EventPump {
     stats: Arc<PumpStats>,
 }
 
+/// Caps caller selection and duplicate-check work per scheduled carrier poll.
+const CARRIER_PAGE_IDS: usize = 64;
+
 struct LocalSchedule {
     interval: std::time::Duration,
     next: tokio::time::Instant,
@@ -222,9 +225,11 @@ impl EventPump {
     /// retained causality and durable evidence; they never invent a decision or evidence.
     /// Neither adds a causal import requirement of its own.
     /// Discovery reads at most one 64-ID page per wake under the 4096-event replay cap;
-    /// only its first ID is attempted; completion or error advances the offset, while
-    /// a not-yet-due retry retains it. Empty pages wrap on the
-    /// next wake. Historical/unavailable publications report errors but do not pin the cursor.
+    /// only the first still-current ID is attempted, and IDs whose slot or view has passed
+    /// are skipped without a retransmission (they stay durable for explicit export).
+    /// Completion or error advances the offset, while a not-yet-due retry retains it. Empty
+    /// pages wrap on the next wake. Historical/unavailable publications report errors but
+    /// do not pin the cursor.
     /// Idle wakes alternate control-first and carrier-only retry turns. Control retries
     /// include completed nil votes and already-authorized view requests/certificates.
     /// No invented decision/evidence, causal import or slot application is scheduled.
@@ -279,15 +284,48 @@ impl EventPump {
                 return Ok(messages);
             }
         }
-        let page = self
-            .owner
-            .completed_publications(schedule.publication_offset)?;
-        let Some(id) = page.first() else {
-            schedule.publication_offset = 0;
+        let offset = self
+            .schedule
+            .as_ref()
+            .ok_or("local pump scheduling is disabled")?
+            .publication_offset;
+        let page = self.owner.completed_publications(offset)?;
+        let page_len = page.len();
+        if page_len == 0 {
+            if let Some(schedule) = self.schedule.as_mut() {
+                schedule.publication_offset = 0;
+            }
+            return Ok(Vec::new());
+        }
+        // Retransmitting evidence for a slot or view this node has already left only trains
+        // peers to reject it. Skip those IDs; the publication stays durable and explicit
+        // export can still select it.
+        let mut skipped = 0usize;
+        let mut selected = None;
+        for id in &page {
+            if self.owner.publication_is_current(id)? {
+                selected = Some(id.clone());
+                break;
+            }
+            skipped += 1;
+        }
+        let Some(id) = selected else {
+            if let Some(schedule) = self.schedule.as_mut() {
+                schedule.publication_offset = if page_len < CARRIER_PAGE_IDS {
+                    0
+                } else {
+                    offset + page_len
+                };
+            }
             return Ok(Vec::new());
         };
-        let result = self.owner.retry_local(now, std::slice::from_ref(id));
-        schedule.finish_retry(&result);
+        if let Some(schedule) = self.schedule.as_mut() {
+            schedule.publication_offset = offset + skipped;
+        }
+        let result = self.owner.retry_local(now, std::slice::from_ref(&id));
+        if let Some(schedule) = self.schedule.as_mut() {
+            schedule.finish_retry(&result);
+        }
         result
     }
 

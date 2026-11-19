@@ -167,6 +167,19 @@ impl SlotAgreementDriver {
         self.session.reserve_header_share(anchor, share)
     }
 
+    /// Returns the slot context one exact completed local publication was authored under.
+    ///
+    /// Callers use it to skip retransmissions that could no longer pass export inspection;
+    /// it grants no export, send or delivery authority.
+    /// # Errors
+    /// Rejects uncertain or stale owners and invalid durable evidence.
+    pub fn completed_carrier_context(
+        &self,
+        carrier: &validator::VertexId,
+    ) -> Result<Option<validator::SlotDecisionTip>, StoreError> {
+        self.session.completed_carrier_context(carrier)
+    }
+
     /// Returns whether this exact observation is already a durable no-op.
     ///
     /// Callers may skip re-appending a duplicate peer receipt; the replay treats it as the

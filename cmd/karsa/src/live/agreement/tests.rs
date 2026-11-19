@@ -2171,6 +2171,13 @@ fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen
     let lost_final = adapters[0]
         .export_carrier(&final_proof.vertex.id().unwrap(), node.dag())
         .unwrap();
+    // The publication still belongs to the current slot, so scheduled retransmission
+    // may select it even from an older view.
+    assert!(
+        adapters[0]
+            .carrier_is_current(&final_proof.vertex.id().unwrap())
+            .unwrap()
+    );
     available.push(final_proof.vertex.clone());
 
     // While the QC publication is lost, retransmit dropped control requests to
@@ -2367,6 +2374,15 @@ fn isolated_tcp_carrier_retry_control_retransmission_and_decision_survive_reopen
         adapter
             .apply(AuthenticatedSlotAgreementRequest::AdvanceSlot)
             .unwrap();
+        // Once this slot is applied, a publication authored against it can no longer pass
+        // export inspection; the scheduler skips it instead of retrying a guaranteed
+        // failure, while the history stays durable.
+        assert!(
+            !adapter
+                .carrier_is_current(&final_proof.vertex.id().unwrap())
+                .unwrap(),
+            "applied slot {i} leaves its carriers non-current"
+        );
         let applied = adapter.ordering_snapshot().unwrap();
         assert!(
             !applied.order().is_empty(),
