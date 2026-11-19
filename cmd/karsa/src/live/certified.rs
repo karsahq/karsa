@@ -25,7 +25,10 @@
 //! verified replay, refused peer receipts are dropped instead of poisoning the owner, and a
 //! single elected publisher owns the shared POL carrier. A bounded three-validator test
 //! certifies the first slots on every node; payloads stay zero, so slots order without
-//! executing transactions.
+//! executing transactions. Multi-slot progress is not free at this size: the causal DAG
+//! requires a quorum of the previous round's authors, and a three-validator set has no
+//! spare author, so every node has to fill every round before the next one is reference
+//! ready. The test therefore proves the first decisions, not sustained slot throughput.
 //!
 //! The owner's causal import budget bounds one run, and both histories stay mutually
 //! exclusive on disk: a store holding a legacy chain is refused by the session opener.

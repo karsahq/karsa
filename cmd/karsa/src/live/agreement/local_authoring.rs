@@ -163,6 +163,22 @@ fn first_reference_ready_round(dag: &validator::Dag, id: &[u8], min: u64) -> Opt
     None
 }
 
+/// Earliest local round this node has not authored.
+///
+/// Carriers and plain causal vertices share one authoring slot per round. A node that
+/// jumps its carrier to the global frontier leaves holes below it, and those holes can
+/// only be filled once every author retained round `r - 1`; with a small set that is the
+/// same quorum the carrier needs, so skipping ahead is what creates the wait. Filling the
+/// earliest hole first keeps the local round sequence dense and the reference rule ready.
+fn next_local_round(dag: &validator::Dag, id: &[u8]) -> u64 {
+    let frontier = dag
+        .highest_round()
+        .map_or(0, |highest| highest.saturating_add(1));
+    (0..=frontier)
+        .find(|round| dag.get(*round, id).is_none())
+        .unwrap_or(frontier)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DurableAction {
     Vote([u8; 32]),
@@ -179,16 +195,41 @@ impl DurableAction {
 }
 
 fn select_uncompleted_aggregate(
-    candidates: impl IntoIterator<Item = Result<DurableAction, String>>,
+    candidates: impl IntoIterator<Item = Result<(DurableAction, u64), String>>,
     completed: &std::collections::BTreeSet<[u8; 32]>,
-) -> Result<Option<DurableAction>, String> {
+) -> Result<Option<(DurableAction, u64)>, String> {
     for candidate in candidates {
-        let candidate = candidate?;
-        if !completed.contains(&candidate.id()) {
-            return Ok(Some(candidate));
+        let (action, round) = candidate?;
+        if !completed.contains(&action.id()) {
+            return Ok(Some((action, round)));
         }
     }
     Ok(None)
+}
+
+/// First round a POL carrier can occupy: after the view carrier and every prevote witness.
+fn pol_authoring_minimum(candidate: &validator::SlotAgreementPolCandidate) -> u64 {
+    let mut minimum = 0;
+    if let Some(entry) = candidate.lineage().entries.last() {
+        minimum = minimum.max(entry.view_carrier.round.saturating_add(1));
+    }
+    let (_, votes) = candidate.evidence();
+    for witness in votes {
+        minimum = minimum.max(witness.carrier.round.saturating_add(1));
+    }
+    minimum
+}
+
+/// First round a final carrier can occupy: after the selected POL and every precommit witness.
+fn final_authoring_minimum(proof: &validator::SlotAgreementProof) -> u64 {
+    let mut minimum = 0;
+    if let Some(pol) = proof.entries.last().and_then(|entry| entry.pol.as_ref()) {
+        minimum = minimum.max(pol.carrier.round.saturating_add(1));
+    }
+    for witness in &proof.votes {
+        minimum = minimum.max(witness.carrier.round.saturating_add(1));
+    }
+    minimum
 }
 
 enum SelectedAction {
@@ -286,8 +327,10 @@ impl JournaledFinalization {
     /// A retained POL additionally makes an elected proposer author the re-proposal for the
     /// current view: one fresh plain proposal carrier first, then one exact view carrier bound to
     /// the durable POL prefix. Neither step invents a decision or evidence.
-    /// The only prospective round is one above the highest retained causal round, not
-    /// a protocol-phase counter. Nil votes use their durable intent, not a fabricated carrier;
+    /// The prospective round is the first reference-ready unoccupied round at or above the
+    /// frontier, raised to at least one round after the selected action's prerequisite
+    /// carrier (and after the previous decision carrier a proposal binds). It is not a
+    /// protocol-phase counter. Nil votes use their durable intent, not a fabricated carrier;
     /// an empty DAG authors no carrier but can still echo observed view support. Full durable cone
     /// validation remains authoritative; a high incomplete frontier can stall rather than invent
     /// progression. Completed payloads are not reauthored, including after explicit owner
@@ -413,15 +456,7 @@ impl JournaledFinalization {
         // Fill the earliest local gap, not merely the frontier: a node that learns peers'
         // round-zero vertices before its first turn must still author its own, or it waits
         // forever for a quorum it can no longer join.
-        let id = local.node.id().to_vec();
-        let frontier = local
-            .node
-            .dag()
-            .highest_round()
-            .map_or(0, |highest| highest.saturating_add(1));
-        let round = (0..=frontier)
-            .find(|round| local.node.dag().get(*round, &id).is_none())
-            .ok_or("local causal round space exhausted")?;
+        let round = next_local_round(local.node.dag(), local.node.id());
         // Re-setting the round is deliberate: the durable obligation path moves the
         // Node to a carrier round between turns, and the next free round is what the
         // reference rule accepts, not whatever the last carrier used.
@@ -513,9 +548,20 @@ impl JournaledFinalization {
             if highest < voting_round {
                 return Ok(Vec::new());
             }
-            let Some(carrier_round) =
-                first_reference_ready_round(dag, local.node.id(), highest.saturating_add(1))
-            else {
+            // The proposal carrier must follow the previous decision carrier it binds and
+            // the voting round one above this decision, so the scan starts at that exact
+            // minimum rather than at a protocol-phase counter.
+            let minimum = round.saturating_add(2).max(
+                output
+                    .binding
+                    .carrier()
+                    .map_or(0, |carrier| carrier.round.saturating_add(1)),
+            );
+            let Some(carrier_round) = first_reference_ready_round(
+                dag,
+                local.node.id(),
+                highest.saturating_add(1).max(minimum),
+            ) else {
                 return Ok(Vec::new());
             };
             let Decision::Commit(history) = dag.inspect_commit(round).map_err(|e| e.to_string())?
@@ -760,11 +806,18 @@ impl JournaledFinalization {
                     }
                     _ => None,
                 });
-        let reproposal_min_round = proposal_carrier
-            .as_ref()
-            .map_or(decision.round.saturating_add(1), |carrier| {
-                carrier.round.saturating_add(1)
-            });
+        let reproposal_min_round = match (&proposal_carrier, prior.pol.as_ref()) {
+            (Some(carrier), Some(pol)) => carrier.round.max(pol.carrier.round).saturating_add(1),
+            (Some(carrier), None) => carrier.round.saturating_add(1),
+            // A plain proposal needs a carrier after its voting round and after the
+            // previous decision carrier the proposal binds.
+            (None, _) => decision.round.saturating_add(2).max(
+                output
+                    .binding
+                    .carrier()
+                    .map_or(0, |carrier| carrier.round.saturating_add(1)),
+            ),
+        };
         let local = self
             .authoring
             .as_mut()
@@ -885,7 +938,7 @@ impl JournaledFinalization {
         action: AuthoringAction,
     ) -> Result<Vec<Message>, String> {
         self.check_health()?;
-        let action = if matches!(action, AuthoringAction::Durable) {
+        let (action, minimum) = if matches!(action, AuthoringAction::Durable) {
             if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
                 return Err("local durable selection exceeds 4096 events".into());
             }
@@ -904,7 +957,21 @@ impl JournaledFinalization {
                     ))
             });
             if let Some(intent) = vote {
-                SelectedAction::Durable(DurableAction::Vote(intent.id))
+                // A vote carrier must follow its selected prerequisite carrier. Authoring it
+                // one round early is rejected by the prospective cone, so the action carries
+                // its exact minimum instead of trusting the caller's frontier scan.
+                let minimum = match &intent.prerequisite {
+                    store::AgreementSigningPrerequisite::Carrier(carrier) => {
+                        carrier.round.saturating_add(1)
+                    }
+                    store::AgreementSigningPrerequisite::UnsupportedNil => {
+                        return Ok(Vec::new());
+                    }
+                };
+                (
+                    SelectedAction::Durable(DurableAction::Vote(intent.id)),
+                    Some(minimum),
+                )
             } else {
                 // The precommit vote binds its prerequisite POL carrier by exact vertex ID, and
                 // a precommit quorum therefore needs one shared POL carrier. Every node can
@@ -927,7 +994,8 @@ impl JournaledFinalization {
                                     entry.view,
                                 ) {
                                     Ok(elected) if elected == self.adapter.validator_id => {
-                                        Some(Ok(DurableAction::Pol(candidate.digest())))
+                                        let minimum = pol_authoring_minimum(&candidate);
+                                        Some(Ok((DurableAction::Pol(candidate.digest()), minimum)))
                                     }
                                     Ok(_) => None,
                                     Err(error) => Some(Err(error.to_string())),
@@ -936,22 +1004,42 @@ impl JournaledFinalization {
                             store::SlotAgreementCarrierCandidate::PendingFinalProof(proof) => Some(
                                 proof
                                     .digest(&self.adapter.set)
-                                    .map(DurableAction::Final)
+                                    .map(|digest| {
+                                        let minimum = final_authoring_minimum(&proof);
+                                        (DurableAction::Final(digest), minimum)
+                                    })
                                     .map_err(|e| e.to_string()),
                             ),
                         });
-                let Some(action) = select_uncompleted_aggregate(candidates, &completed)? else {
+                let Some((action, minimum)) = select_uncompleted_aggregate(candidates, &completed)?
+                else {
                     return Ok(Vec::new());
                 };
-                SelectedAction::Durable(action)
+                (SelectedAction::Durable(action), Some(minimum))
             }
         } else {
-            SelectedAction::Explicit(Box::new(action))
+            (SelectedAction::Explicit(Box::new(action)), None)
         };
         let local = self
             .authoring
             .as_mut()
             .ok_or("local authoring is not configured")?;
+        let round = match minimum {
+            Some(minimum) => {
+                // A carrier must follow its selected prerequisite, and the caller's frontier
+                // scan may sit below it. Raising the minimum keeps the prospective carrier
+                // valid without changing the reference-ready scan itself.
+                let Some(ready) = first_reference_ready_round(
+                    local.node.dag(),
+                    local.node.id(),
+                    round.max(minimum),
+                ) else {
+                    return Ok(Vec::new());
+                };
+                ready
+            }
+            None => round,
+        };
         local.node.set_round(round);
         let authored = match action {
             SelectedAction::Durable(DurableAction::Vote(id)) => {
@@ -1129,15 +1217,17 @@ mod tests {
             let second = constructor([2; 32]);
             let completed = std::collections::BTreeSet::from([first.id()]);
             let selected =
-                select_uncompleted_aggregate([Ok(first), Ok(second)], &completed).unwrap();
+                select_uncompleted_aggregate([Ok((first, 0)), Ok((second, 0))], &completed)
+                    .unwrap();
             assert_eq!(
                 selected,
-                Some(second),
+                Some((second, 0)),
                 "must dispatch the uncompleted candidate, not reselect the first of its kind"
             );
             let completed = std::collections::BTreeSet::from([first.id(), second.id()]);
             assert_eq!(
-                select_uncompleted_aggregate([Ok(first), Ok(second)], &completed).unwrap(),
+                select_uncompleted_aggregate([Ok((first, 0)), Ok((second, 0))], &completed)
+                    .unwrap(),
                 None
             );
         }
