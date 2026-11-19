@@ -253,7 +253,7 @@ async fn run_mesh(
     for report in &reports {
         let p = &report.progress;
         println!(
-            "  val-{} view {} round {}: proposal {}, view carriers {}, votes {}, POLs {}, finals {}, nil {}/{}, intents {}, authorable {}/{} prevote/precommit, {} nil ({} unready), candidates {}, decided {}, POL {}, local round {}",
+            "  val-{} view {} round {}: proposal {}, view carriers {}, votes {}, POLs {}, finals {}, nil {}/{}, intents {}, authorable {}/{} prevote/precommit, {} nil ({} unready), candidates {}, decided {}, POL {}, local round {}, aggregate {:?}",
             report.index,
             p.view,
             p.next_round,
@@ -272,7 +272,8 @@ async fn run_mesh(
             p.candidates,
             p.decided,
             p.reproposal,
-            p.local_round
+            p.local_round,
+            p.last_aggregate_error
         );
     }
     for failure in &failures {
@@ -379,6 +380,9 @@ fn print_report(report: &Report) {
             .first_unready_self
             .map_or_else(|| String::from("-"), |local| local.to_string())
     );
+    if let Some(error) = &report.progress.last_aggregate_error {
+        println!("  aggregate:  {error}");
+    }
     println!(
         "  causal:     {} authored, {} imported, {} frames received, {} rejected, {} dropped",
         report.authored, report.imported, report.received, report.rejected, report.dropped

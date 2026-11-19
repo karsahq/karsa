@@ -130,13 +130,15 @@ pub struct Adapter {
     view_requests: Vec<validator::SlotAgreementViewRequest>,
     // Timeout-driven view changes either apply a local step or require a quorum certificate.
     view_change: ViewChange,
+    // Latest aggregate carrier whose prospective cone was unavailable, diagnostics only.
+    last_aggregate_error: Option<String>,
 }
 
 /// End-of-run durable counters for the current slot and view.
 ///
 /// Diagnostics only: this grants no ordering, execution, voting or view-entry authority,
 /// and it is not a throughput or liveness promise.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgreementProgress {
     /// Durable current view.
     pub view: u64,
@@ -170,6 +172,8 @@ pub struct AgreementProgress {
     pub authorable_precommits: usize,
     /// Authorable nil obligations with no carrier representation; published separately.
     pub authorable_nil: usize,
+    /// Latest aggregate carrier that could not be prepared, if any.
+    pub last_aggregate_error: Option<String>,
     /// Frozen carrier candidates for the current slot.
     pub candidates: usize,
     /// Next slot decision round, fixed by the durable tip.
@@ -820,6 +824,7 @@ impl Adapter {
             authorable: output.authorable_vote_ids.len(),
             candidates: output.candidates.len(),
             next_round: round,
+            last_aggregate_error: self.last_aggregate_error.clone(),
             ..AgreementProgress::default()
         };
         for completed in self
@@ -1076,6 +1081,11 @@ impl Adapter {
         let Some(intent) = selected else {
             return Ok(None);
         };
+        self.last_aggregate_error = None;
+        let label = match kind {
+            AggregateKind::Pol => "POL",
+            AggregateKind::Final => "final",
+        };
         CarrierEnvelope::preflight_aggregate(node.id(), &intent, &self.set)
             .map_err(|e| e.to_string())?;
         let prepared = match &intent {
@@ -1087,8 +1097,34 @@ impl Adapter {
             }
             _ => unreachable!("selected only aggregate candidates"),
         };
-        let Ok(prepared) = prepared else {
-            return Ok(None);
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Silent unavailability is the difference between "retry and it will work"
+                // and "this aggregate can never be authored". Record the exact missing
+                // prerequisite carriers for the run diagnostics; liveness is unchanged.
+                let prerequisites = intent.prerequisite_carriers().unwrap_or_default();
+                let missing: Vec<_> = prerequisites
+                    .iter()
+                    .filter(|carrier| {
+                        node.dag()
+                            .get(carrier.round, &carrier.author)
+                            .and_then(|vertex| vertex.id().ok())
+                            .is_none_or(|held| held != **carrier)
+                    })
+                    .collect();
+                let rounds: Vec<u64> = missing
+                    .iter()
+                    .take(4)
+                    .map(|carrier| carrier.round)
+                    .collect();
+                self.last_aggregate_error = Some(format!(
+                    "{label} carrier unavailable ({error}): missing {}/{} prerequisites at rounds {rounds:?}",
+                    missing.len(),
+                    prerequisites.len()
+                ));
+                return Ok(None);
+            }
         };
         let unsigned = prepared.unsigned().clone();
         let evidence = match &intent {
@@ -1820,6 +1856,7 @@ impl Adapter {
             carrier_retransmission: None,
             view_requests: Vec::new(),
             view_change: ViewChange::LocalAdvance,
+            last_aggregate_error: None,
             readiness: Readiness::DisabledMissingCausalReadinessAndTransport,
         })
     }
@@ -1852,6 +1889,7 @@ impl Adapter {
             carrier_retransmission: None,
             view_requests: Vec::new(),
             view_change: ViewChange::LocalAdvance,
+            last_aggregate_error: None,
             readiness: Readiness::RecoveryRequiredHistoricalIntentsUnavailable,
         };
         let output = adapter.driver.output();
