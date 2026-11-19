@@ -368,6 +368,17 @@ enum Command {
         /// voters prove that the cursor's leader cannot reach a quorum.
         #[arg(long)]
         round_skip: bool,
+        /// Run the certified slot-agreement session instead of the legacy commit loop.
+        ///
+        /// Needs `--store`, no archives, and no data-plane payload yet: the session
+        /// orders plain causal vertices and produces certified headers without executing
+        /// transactions. A single validator proves the local path through a certified
+        /// header; a multi-validator mesh exchanges the same evidence but advances much
+        /// slower because the durable owner replays its whole journal on every read.
+        /// A legacy store is refused; the two histories never share one directory. This
+        /// bounded wiring is not a production authority claim.
+        #[arg(long)]
+        agreement_session: bool,
     },
     /// Sign a transfer with a committee account and submit it to a live RPC node.
     Send {
@@ -594,6 +605,7 @@ fn main() -> ExitCode {
             remove_validator_at_epoch,
             fence_silent,
             round_skip,
+            agreement_session,
         } => live::run(live::Config {
             validators,
             port_base,
@@ -626,6 +638,7 @@ fn main() -> ExitCode {
                 }),
             fence_silent,
             round_skip,
+            agreement_session,
         }),
         Command::Send {
             rpc,

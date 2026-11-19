@@ -165,6 +165,34 @@ impl JournaledFinalization {
         result
     }
 
+    /// Applies the durable decided slot when one exists, reporting whether it did.
+    ///
+    /// A live tick must not treat "the protocol has not decided yet" as an error, so this
+    /// looks at the authenticated transition first and leaves an undecided slot untouched.
+    /// Every actual application still goes through [`Self::advance_certified_slot`], so
+    /// ordering, execution and header authority do not gain a second path.
+    /// # Errors
+    /// Propagates the same owner, durable and application failures as
+    /// [`Self::advance_certified_slot`].
+    pub fn advance_decided_slot(&mut self) -> Result<bool, String> {
+        self.ensure_usable()?;
+        self.refresh()?;
+        // Avoid sending a known-invalid local request into Adapter's fail-closed apply path.
+        let output = self.adapter.driver.output().map_err(|error| {
+            self.failed = true;
+            error.to_string()
+        })?;
+        if !output
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.decision.is_some())
+        {
+            return Ok(false);
+        }
+        self.advance_certified_slot()?;
+        Ok(true)
+    }
+
     /// Explicitly applies the certified slot, leaving execution to [`Self::build_ready`].
     /// # Errors
     /// An undecided slot is retryable. Adapter or durable refresh failures close this owner.

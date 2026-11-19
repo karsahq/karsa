@@ -1039,3 +1039,88 @@ fn owned_drive_prefers_a_durable_carrier_over_view_echo() {
     let recovered = Adapter::recover(&store, bootstrap, &m, 0).unwrap();
     assert_eq!(recovered.completed_view_requests().unwrap(), vec![echoed]);
 }
+
+#[test]
+fn plain_causal_authoring_waits_for_a_round_quorum_and_advances_the_owned_dag() {
+    let (m, bootstrap, _) = fixture();
+    let wait = std::time::Duration::from_secs(1);
+    let policy = super::pacemaker::Policy::new(wait, wait, wait).unwrap();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = open_event_pump_owner(&store, &bootstrap, &m);
+    owner
+        .enable_authoring(
+            net::Node::with_chain_id(
+                m.set.clone(),
+                m.consensus[0].id.clone(),
+                m.consensus[0].private_key.clone(),
+                b"live-adapter-tests".to_vec(),
+            ),
+            policy,
+            wait,
+        )
+        .unwrap();
+
+    let first = owner.author_causal_local(Vec::new(), [9; 32]).unwrap();
+    let net::wire::Message::Vertex(vertex) = &first[0] else {
+        panic!("expected a plain causal vertex")
+    };
+    assert_eq!(vertex.round, 0, "the first available round is zero");
+    assert_eq!(vertex.payload_hash, [9; 32], "the payload digest is signed");
+    assert!(vertex.references.is_empty());
+    vertex.verify(&m.set, m.set.epoch).unwrap();
+    assert_eq!(
+        owner.local_causal_coverage().unwrap(),
+        (0, Vec::new()),
+        "authoring does not manufacture committed order"
+    );
+
+    // Only this node's own round-0 vertex is held, so round 1 has no voter quorum.
+    assert!(
+        owner.author_causal_local(Vec::new(), [9; 32]).unwrap().is_empty(),
+        "an unready round waits instead of signing"
+    );
+
+    let peers: Vec<_> = (1..4)
+        .map(|author| {
+            signed_for_chain(
+                &m,
+                author,
+                0,
+                Vec::new(),
+                [author as u8; 32],
+                b"live-adapter-tests",
+            )
+        })
+        .collect();
+    let second = owner.author_causal_local(peers, [9; 32]).unwrap();
+    let net::wire::Message::Vertex(vertex) = &second[0] else {
+        panic!("expected a plain causal vertex")
+    };
+    assert_eq!(vertex.round, 1);
+    assert_eq!(
+        vertex.references.len(),
+        4,
+        "round 1 references every held round-0 author"
+    );
+    vertex.verify(&m.set, m.set.epoch).unwrap();
+    assert_eq!(
+        owner.local_causal_coverage().unwrap(),
+        (0, Vec::new()),
+        "plain authoring never applies a slot"
+    );
+}
+
+#[test]
+fn advance_decided_slot_is_a_no_op_before_a_durable_decision() {
+    let (m, bootstrap, _) = fixture();
+    let dir = Dir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = open_event_pump_owner(&store, &bootstrap, &m);
+    assert!(
+        !owner.advance_decided_slot().unwrap(),
+        "an undecided slot is an ordinary tick, not an error"
+    );
+    assert_eq!(owner.finalization().execution().applied(), 0);
+    assert!(owner.finalization().execution().consumed_order().is_empty());
+}

@@ -132,6 +132,37 @@ fn prospective_cone(
     Ok(Some(cone))
 }
 
+/// First unoccupied local round at or above `min` whose previous round already meets
+/// the reference rule.
+///
+/// A live availability DAG can have a frontier round authored only by this node while
+/// peers still lag, so `highest + 1` may name a round that no majority of authors can
+/// be referenced from. Scanning from `min` keeps a carrier inside a ready round instead
+/// of signing a vertex the DAG would immediately reject.
+fn first_reference_ready_round(dag: &validator::Dag, id: &[u8], min: u64) -> Option<u64> {
+    let frontier = dag
+        .highest_round()
+        .map_or(min, |highest| highest.saturating_add(2));
+    for round in min..=frontier.max(min) {
+        if dag.get(round, id).is_some() {
+            continue;
+        }
+        if round == 0 {
+            return Some(0);
+        }
+        let set = dag.set_for_round(round);
+        let authors = set
+            .validators
+            .iter()
+            .filter(|record| dag.get(round - 1, &record.validator_id).is_some())
+            .count();
+        if authors >= set.quorum_size() {
+            return Some(round);
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DurableAction {
     Vote([u8; 32]),
@@ -307,12 +338,17 @@ impl JournaledFinalization {
             .authoring
             .as_ref()
             .ok_or("local authoring is not configured")?;
-        let round = local
-            .node
-            .dag()
-            .highest_round()
-            .map(|highest| highest.checked_add(1).ok_or("local causal round exhausted"))
-            .transpose()?;
+        // Author at a round the reference rule can actually satisfy. The frontier round
+        // itself is often authored only by this node, so `highest + 1` would reference a
+        // single author and every durable vote carrier would wait forever.
+        let round = match local.node.dag().highest_round() {
+            Some(highest) => first_reference_ready_round(
+                local.node.dag(),
+                local.node.id(),
+                highest.saturating_add(1),
+            ),
+            None => Some(0),
+        };
         let authored = match round {
             Some(round) => self.author_local_action(round, AuthoringAction::Durable)?,
             None => Vec::new(),
@@ -333,6 +369,71 @@ impl JournaledFinalization {
             return Ok(elected);
         }
         self.echo_view_local()
+    }
+
+    /// Authors one plain causal vertex for the owned availability mesh.
+    ///
+    /// The certified proposal and vote rules read a causal DAG, so a live node has to
+    /// produce the same kind of vertex the legacy loop produces before any agreement
+    /// evidence exists. This signs exactly that vertex: no proposal, view, vote or
+    /// aggregate, and no slot application. `payload_hash` is local data-plane input;
+    /// zero names no batch, and a digest names the batch the caller holds.
+    ///
+    /// The vertex is authored at the first unoccupied local round and only when the
+    /// references that round requires are already retained. An unavailable round
+    /// waits for the next turn; nothing is invented. The returned vertex is already
+    /// inserted into the owned causal DAG, so the caller publishes it once.
+    /// # Errors
+    /// Rejects absent authoring, bounded import failures, a pinned-context mismatch,
+    /// and signing or DAG insertion failures.
+    pub fn author_causal_local(
+        &mut self,
+        vertices: Vec<Vertex>,
+        payload_hash: [u8; 32],
+    ) -> Result<Vec<Message>, String> {
+        self.import_local(vertices)?;
+        let output = self.adapter.driver.output().map_err(|error| {
+            self.failed = true;
+            error.to_string()
+        })?;
+        let local = self
+            .authoring
+            .as_mut()
+            .ok_or("local authoring is not configured")?;
+        if !local.node.matches_authoring_context(
+            output.binding.tip(),
+            &self.adapter.set,
+            &self.adapter.validator_id,
+            &self.adapter.private_key,
+        ) {
+            return Err(
+                "Node differs from pinned agreement identity, chain, epoch, set or key".into(),
+            );
+        }
+        // Fill the earliest local gap, not merely the frontier: a node that learns peers'
+        // round-zero vertices before its first turn must still author its own, or it waits
+        // forever for a quorum it can no longer join.
+        let id = local.node.id().to_vec();
+        let frontier = local
+            .node
+            .dag()
+            .highest_round()
+            .map_or(0, |highest| highest.saturating_add(1));
+        let round = (0..=frontier)
+            .find(|round| local.node.dag().get(*round, &id).is_none())
+            .ok_or("local causal round space exhausted")?;
+        // Re-setting the round is deliberate: the durable obligation path moves the
+        // Node to a carrier round between turns, and the next free round is what the
+        // reference rule accepts, not whatever the last carrier used.
+        local.node.set_round(round);
+        let Some(vertex) = local
+            .node
+            .author_with(payload_hash)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![Message::Vertex(vertex)])
     }
 
     /// Delivers signed local publications to this owner as a peer's receipt would.
@@ -412,9 +513,11 @@ impl JournaledFinalization {
             if highest < voting_round {
                 return Ok(Vec::new());
             }
-            let carrier_round = highest
-                .checked_add(1)
-                .ok_or("local causal round exhausted")?;
+            let Some(carrier_round) =
+                first_reference_ready_round(dag, local.node.id(), highest.saturating_add(1))
+            else {
+                return Ok(Vec::new());
+            };
             let Decision::Commit(history) = dag.inspect_commit(round).map_err(|e| e.to_string())?
             else {
                 return Ok(Vec::new());
@@ -556,6 +659,7 @@ impl JournaledFinalization {
         let Some((proposal, proposal_carrier)) = proposal else {
             return Ok(Vec::new());
         };
+        let view_min_round = proposal_carrier.round.saturating_add(1);
         let candidate = validator::SlotAgreementViewCandidate::new(
             Vec::new(),
             proposal,
@@ -568,13 +672,12 @@ impl JournaledFinalization {
             .authoring
             .as_mut()
             .ok_or("local authoring is not configured")?;
-        let Some(round) = local
-            .node
-            .dag()
-            .highest_round()
-            .map(|highest| highest.checked_add(1).ok_or("local causal round exhausted"))
-            .transpose()?
-        else {
+        let highest = local.node.dag().highest_round().unwrap_or(0);
+        let Some(round) = first_reference_ready_round(
+            local.node.dag(),
+            local.node.id(),
+            highest.saturating_add(1).max(view_min_round),
+        ) else {
             return Ok(Vec::new());
         };
         local.node.set_round(round);
@@ -657,17 +760,21 @@ impl JournaledFinalization {
                     }
                     _ => None,
                 });
+        let reproposal_min_round = proposal_carrier
+            .as_ref()
+            .map_or(decision.round.saturating_add(1), |carrier| {
+                carrier.round.saturating_add(1)
+            });
         let local = self
             .authoring
             .as_mut()
             .ok_or("local authoring is not configured")?;
-        let round = local
-            .node
-            .dag()
-            .highest_round()
-            .map(|highest| highest.checked_add(1).ok_or("local causal round exhausted"))
-            .transpose()?;
-        let Some(round) = round else {
+        let highest = local.node.dag().highest_round().unwrap_or(0);
+        let Some(round) = first_reference_ready_round(
+            local.node.dag(),
+            local.node.id(),
+            highest.saturating_add(1).max(reproposal_min_round),
+        ) else {
             return Ok(Vec::new());
         };
         local.node.set_round(round);

@@ -32,6 +32,7 @@
 //! genesis hashes never get as far as exchanging a vertex.
 
 pub mod agreement;
+mod certified;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::error::Error;
@@ -390,6 +391,18 @@ pub struct Config {
     /// it is a liveness aid and is off by default while the dissemination path is
     /// still experimental.
     pub round_skip: bool,
+    /// Run the opt-in certified slot-agreement session instead of the legacy loop.
+    ///
+    /// The nodes still exchange plain causal vertices, but ordering, execution and
+    /// headers come from the durable certified session. This mode needs a fresh or
+    /// already-certified store: a store holding a legacy chain is refused, and both
+    /// histories never share one directory. A single validator proves the local path
+    /// through a certified header; a multi-validator mesh exchanges the same evidence
+    /// but advances much slower because the durable owner replays its whole journal on
+    /// every read. It has no data-plane payload, RPC, snapshot or epoch-transition
+    /// support yet, and its bounded owner lifetime is a single run, not a production
+    /// authority claim.
+    pub agreement_session: bool,
 }
 
 /// Wall time spent in the stages the live loop can name.
@@ -6777,7 +6790,10 @@ fn run_one_node(
 }
 
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
-    if config.validators < 2 {
+    if config.validators == 0 {
+        return Err("a live run needs at least one node".into());
+    }
+    if config.validators < 2 && !config.agreement_session {
         return Err("a live run needs at least two nodes".into());
     }
     let total = config.validators + config.archives;
@@ -6897,6 +6913,38 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         Some(home) => chain::chain_id(Some(home))?,
         None => chain::demo_chain_id(),
     };
+
+    if config.agreement_session {
+        if config.store.as_os_str().is_empty() {
+            return Err(
+                "--agreement-session needs --store: the certified session is durable".into(),
+            );
+        }
+        if config.archives > 0 {
+            return Err("--agreement-session runs validators only; --archives must be 0".into());
+        }
+        if config.txs > 0 {
+            return Err(
+                "--agreement-session has no data-plane payload yet; leave --txs at 0".into(),
+            );
+        }
+        if config.rpc_port > 0
+            || config.snapshot_port > 0
+            || config.sync_from_peers
+            || config.checkpoint_every > 0
+        {
+            return Err("--agreement-session does not wire RPC, snapshots or checkpoints".into());
+        }
+        if config.pre_sign || config.shard {
+            return Err("--agreement-session does not pre-sign or shard payloads".into());
+        }
+        if config.change.is_some() || config.fence_silent || config.round_skip {
+            return Err(
+                "--agreement-session does not support set changes, fences or round skips".into(),
+            );
+        }
+        return certified::run(config, committee, chain_id);
+    }
 
     let mut prebuilt: Vec<Vec<Option<Batch>>> = if config.pre_sign && config.txs > 0 {
         let rounds = usize::try_from(config.rounds)
@@ -8607,6 +8655,7 @@ mod tests {
             change: None,
             fence_silent: false,
             round_skip: false,
+            agreement_session: false,
         }
     }
 
@@ -8698,6 +8747,70 @@ mod tests {
             change: None,
             fence_silent: false,
             round_skip: false,
+            agreement_session: false,
+        }
+    }
+
+    #[test]
+    fn a_certified_session_node_certifies_a_local_slot() {
+        let _mesh = mesh_test_lock();
+        let dir = TestDir::new("certified-session");
+        let mut config = mesh_config(&dir, a_free_port_base(1), 0, 0);
+        config.validators = 1;
+        config.timeout = Duration::from_secs(30);
+        config.execute = false;
+        config.agreement_session = true;
+        let result = run(config);
+        assert!(
+            result.is_ok(),
+            "the certified session run failed: {result:?}"
+        );
+
+        let committee = chain::membership(1, None).unwrap();
+        let chain_id = chain::demo_chain_id();
+        let genesis_state = credited_genesis(&committee.accounts).unwrap();
+        let genesis = Header::genesis(
+            chain_id.clone(),
+            committee.set.epoch,
+            genesis_state.state_root(),
+            commit_root(&[]),
+        );
+        // One validator proves the full live path; a multi-validator mesh routes the
+        // same evidence but is not gated here while the owner's full-journal replay
+        // throttles it below slot cadence.
+        for index in 0..1 {
+            let store = Store::open(dir.0.join(format!("val-{index}"))).unwrap();
+            assert!(
+                store.has_authenticated_slot_agreement().unwrap(),
+                "node {index} opened no certified session"
+            );
+            let bootstrap =
+                agreement::session::genesis_bootstrap(&committee, index, &chain_id, &genesis)
+                    .unwrap();
+            let session = store
+                .recover_authenticated_slot_agreement(bootstrap)
+                .unwrap();
+            let applications = session.ordering_snapshot().unwrap().applications().len();
+            assert!(applications > 0, "node {index} applied no certified slot");
+            let driver = store::SlotAgreementDriver::new(session);
+            let intents = driver.header_intents().unwrap();
+            assert!(
+                !intents.is_empty(),
+                "node {index} reserved no certified header intent"
+            );
+            assert_eq!(
+                driver
+                    .header_shares()
+                    .unwrap()
+                    .first()
+                    .map(|share| share.header.height),
+                Some(1),
+                "node {index} did not publish its first header share"
+            );
+            assert!(
+                intents[0].header().id().is_ok(),
+                "node {index} reserved an unencodable certified header"
+            );
         }
     }
 

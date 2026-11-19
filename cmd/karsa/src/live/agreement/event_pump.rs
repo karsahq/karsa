@@ -28,6 +28,24 @@ pub enum LocalEvent {
         /// At most 64 selected completed local publications; not an unbounded resend queue.
         carriers: Vec<validator::VertexId>,
     },
+    /// Authors one plain causal availability vertex at the first ready round.
+    ///
+    /// Live nodes need a causal DAG before any agreement evidence can be proposed;
+    /// this produces the same kind of vertex the legacy loop produces. It is not an
+    /// agreement publication: it carries no proposal, vote, aggregate or decision and
+    /// authorizes none. The payload digest is local data-plane input, zero meaning no batch.
+    AuthorCausal {
+        /// Bounded trusted causal availability, imported before selecting the round.
+        vertices: Vec<validator::Vertex>,
+        /// Local data-plane payload digest; zero names no batch.
+        payload_hash: [u8; 32],
+    },
+    /// Applies the durable decided slot if one exists, then attempts execution from
+    /// journaled ordering. An undecided slot is an ordinary no-op, not an error.
+    AdvanceDecidedSlot {
+        /// Caller-trusted local authoring timestamp.
+        at: u64,
+    },
     /// Apply the decided slot, then attempt execution from journaled ordering.
     ApplyCertifiedSlot {
         /// Caller-trusted local authoring timestamp.
@@ -323,6 +341,23 @@ impl EventPump {
                         carriers = messages;
                         Build::default()
                     })
+                }
+                Input::Local(Some(LocalEvent::AuthorCausal {
+                    vertices,
+                    payload_hash,
+                })) => self
+                    .owner
+                    .author_causal_local(vertices, payload_hash)
+                    .map(|messages| {
+                        carriers = messages;
+                        Build::default()
+                    }),
+                Input::Local(Some(LocalEvent::AdvanceDecidedSlot { at })) => {
+                    match self.owner.advance_decided_slot() {
+                        Ok(true) => self.build(at),
+                        Ok(false) => Ok(Build::default()),
+                        Err(error) => Err(error),
+                    }
                 }
                 Input::Local(Some(LocalEvent::ApplyCertifiedSlot { at })) => self
                     .owner

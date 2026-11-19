@@ -443,6 +443,10 @@ impl Adapter {
         }
         let mut checked = validator::Dag::new(self.set.clone());
         checked.set_chain_id(publication.vertex.chain_id.clone());
+        // The inspection binding already carries the applied certified prefix, so the
+        // throwaway validation DAG must start from that same frontier; otherwise every
+        // carrier exported after one slot is rejected as a continuity mismatch.
+        checked.seed_prefix(available.prefix().clone(), available.order().to_vec());
         let mut vertices = Vec::with_capacity(cone.len());
         for (_, (id, vertex)) in cone {
             if vertex.chain_id != publication.vertex.chain_id {
