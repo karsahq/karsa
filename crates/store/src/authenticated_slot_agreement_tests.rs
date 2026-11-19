@@ -1035,6 +1035,140 @@ fn verified_replay_cache_revalidates_ownership_and_refreshes_on_append() {
 }
 
 #[test]
+fn incremental_append_fold_matches_full_recovery_at_every_step() {
+    // Each append folds only the new event over the cached verified prefix. A second owner
+    // that recovers from disk folds the whole journal instead: the two must never diverge.
+    let (f, lineage, bootstrap) = fixture(true);
+    let selected = &lineage.entries[0];
+    let dir = TempDir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = store
+        .begin_authenticated_slot_agreement(bootstrap.clone())
+        .unwrap();
+    let proposal = AuthenticatedSlotAgreementRequest::ObserveProposal {
+        proposal: selected.proposal.clone(),
+        carrier: selected.proposal_carrier.clone(),
+        vertices: f
+            .vertices
+            .iter()
+            .filter(|v| v.round <= selected.proposal_carrier.round)
+            .cloned()
+            .collect(),
+    };
+    let propose = AuthenticatedSlotAgreementRequest::Propose {
+        lineage: lineage.clone(),
+        vertices: f
+            .vertices
+            .iter()
+            .filter(|v| v.round > selected.proposal_carrier.round)
+            .cloned()
+            .collect(),
+    };
+    let requests = vec![
+        proposal,
+        propose,
+        AuthenticatedSlotAgreementRequest::ObserveProposal {
+            proposal: selected.proposal.clone(),
+            carrier: selected.proposal_carrier.clone(),
+            vertices: vec![],
+        },
+        AuthenticatedSlotAgreementRequest::AdvanceView {
+            from: AgreementView(0),
+        },
+        AuthenticatedSlotAgreementRequest::Timeout {
+            view: AgreementView(1),
+            phase: AgreementPhase::Prevote,
+        },
+        AuthenticatedSlotAgreementRequest::Timeout {
+            view: AgreementView(1),
+            phase: AgreementPhase::Precommit,
+        },
+    ];
+    for (offset, request) in requests.into_iter().enumerate() {
+        let sequence = offset as u64 + 1;
+        owner.apply(sequence, request).unwrap();
+        let full = store
+            .recover_authenticated_slot_agreement(bootstrap.clone())
+            .unwrap();
+        let folded = owner.ordering_snapshot().unwrap();
+        let recovered = full.ordering_snapshot().unwrap();
+        assert_eq!(folded.order(), recovered.order(), "step {sequence} order");
+        assert_eq!(
+            folded.applications(),
+            recovered.applications(),
+            "step {sequence} applications"
+        );
+        assert_eq!(
+            folded.binding(),
+            recovered.binding(),
+            "step {sequence} binding"
+        );
+        assert_eq!(
+            folded.vertices(),
+            recovered.vertices(),
+            "step {sequence} vertices"
+        );
+        assert_eq!(
+            owner.binding().unwrap(),
+            full.binding().unwrap(),
+            "step {sequence} active binding"
+        );
+        assert_eq!(
+            owner
+                .signing_outbox()
+                .unwrap()
+                .iter()
+                .map(|intent| intent.id)
+                .collect::<Vec<_>>(),
+            full.signing_outbox()
+                .unwrap()
+                .iter()
+                .map(|intent| intent.id)
+                .collect::<Vec<_>>(),
+            "step {sequence} intents"
+        );
+        assert_eq!(
+            owner
+                .reserved_carriers()
+                .unwrap()
+                .iter()
+                .map(|reserved| reserved.id.clone())
+                .collect::<Vec<_>>(),
+            full.reserved_carriers()
+                .unwrap()
+                .iter()
+                .map(|reserved| reserved.id.clone())
+                .collect::<Vec<_>>(),
+            "step {sequence} reservations"
+        );
+        assert_eq!(
+            owner
+                .completed_carriers()
+                .unwrap()
+                .iter()
+                .map(|completed| completed.reservation.id.clone())
+                .collect::<Vec<_>>(),
+            full.completed_carriers()
+                .unwrap()
+                .iter()
+                .map(|completed| completed.reservation.id.clone())
+                .collect::<Vec<_>>(),
+            "step {sequence} completions"
+        );
+        assert_eq!(
+            owner.completed_nil_votes().unwrap(),
+            full.completed_nil_votes().unwrap(),
+            "step {sequence} nil votes"
+        );
+        assert_eq!(
+            owner.entered_view_certificate().unwrap(),
+            full.entered_view_certificate().unwrap(),
+            "step {sequence} view certificate"
+        );
+    }
+}
+
+#[test]
 fn authenticated_dual_journal_rejects_raw_apply_and_open() {
     use validator::slot_agreement::AgreementInput;
     let (f, lineage, bootstrap) = fixture(true);

@@ -172,6 +172,12 @@ impl SlotAgreementDriver {
         self.session.sequence()
     }
 
+    /// Diagnostic journal fold count, replay/read nanoseconds and the resumed subset.
+    /// Cost observation only; grants no freshness, durability or progress authority.
+    pub fn replay_costs(&self) -> (u64, u64, u64, u64, u64) {
+        self.session.replay_costs()
+    }
+
     /// Delegates inspection and durability before releasing replay-derived output.
     ///
     /// # Errors
