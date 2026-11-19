@@ -417,6 +417,9 @@ impl JournaledFinalization {
     }
 
     /// One local turn: at most one authored publication, without local receipt.
+    /// Owner health is checked once at import and once after the mutation, not again in
+    /// every helper: the owner is single-threaded, so no sibling write can interleave
+    /// inside this turn. Repeated full-journal refreshes here were the dominant cost.
     fn drive_local_turn(&mut self, vertices: Vec<Vertex>) -> Result<Vec<Message>, String> {
         self.import_local(vertices)?;
         if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
@@ -577,7 +580,6 @@ impl JournaledFinalization {
     /// Rejects unhealthy owners, histories above 4096 events, arithmetic
     /// exhaustion, and durable authoring failures.
     fn propose_plain_local(&mut self) -> Result<Vec<Message>, String> {
-        self.check_health()?;
         if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
             return Err("local proposal selection exceeds 4096 events".into());
         }
@@ -719,7 +721,6 @@ impl JournaledFinalization {
     /// Rejects unhealthy owners, histories above 4096 events, missing authoring setup,
     /// candidate construction failures and durable authoring failures.
     fn bind_plain_view_local(&mut self) -> Result<Vec<Message>, String> {
-        self.check_health()?;
         if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
             return Err("local view authorization exceeds 4096 events".into());
         }
@@ -813,7 +814,6 @@ impl JournaledFinalization {
     /// [`Self::propose_plain_local`] / [`Self::bind_plain_view_local`] instead; conservative
     /// or indirect initial evidence remains explicit.
     fn elect_view_local(&mut self) -> Result<Vec<Message>, String> {
-        self.check_health()?;
         if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
             return Err("local view election exceeds 4096 durable events".into());
         }
@@ -928,7 +928,6 @@ impl JournaledFinalization {
     /// Only a newly authored publication is returned; an already completed echo is left to the
     /// bounded control-retry cadence so automatic driving cannot starve carrier retries.
     fn echo_view_local(&mut self) -> Result<Vec<Message>, String> {
-        self.check_health()?;
         if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
             return Err("local view echo exceeds 4096 durable events".into());
         }
@@ -998,7 +997,6 @@ impl JournaledFinalization {
         round: u64,
         action: AuthoringAction,
     ) -> Result<Vec<Message>, String> {
-        self.check_health()?;
         let (action, minimum) = if matches!(action, AuthoringAction::Durable) {
             if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
                 return Err("local durable selection exceeds 4096 events".into());
