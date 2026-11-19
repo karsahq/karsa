@@ -242,7 +242,9 @@ impl AgreementQc {
 }
 
 /// Constant-history volatile reducer. No instances are connected to live consensus.
-#[derive(Debug)]
+///
+/// A clone is an independent copy of the same reducer state; it grants no authority.
+#[derive(Debug, Clone)]
 pub struct SlotAgreement {
     context: SlotDecisionTip,
     set: ValidatorSet,

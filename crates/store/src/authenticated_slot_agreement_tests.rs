@@ -1025,12 +1025,40 @@ fn verified_replay_cache_revalidates_ownership_and_refreshes_on_append() {
     assert_eq!(advancing.signing_outbox().unwrap().len(), 1);
     assert!(advancing.ordering_snapshot().is_ok());
 
+    // A rejected request is not a rejected journal. The append writes nothing, so the
+    // verified prefix still describes exactly these durable bytes; dropping the cache
+    // instead would make one invalid retransmission force every later read and append
+    // to re-authenticate the whole journal.
+    let rejected = AuthenticatedSlotAgreementRequest::Timeout {
+        view: AgreementView(2),
+        phase: AgreementPhase::Prevote,
+    };
+    assert!(advancing.apply(3, rejected).is_err());
+    assert_eq!(advancing.sequence(), 2);
+    assert!(advancing.ordering_snapshot().is_ok());
+    let (_, _, _, resumed_before_next, _) = advancing.replay_costs();
+    advancing
+        .apply(
+            3,
+            AuthenticatedSlotAgreementRequest::Timeout {
+                view: AgreementView(1),
+                phase: AgreementPhase::Prevote,
+            },
+        )
+        .unwrap();
+    assert_eq!(advancing.sequence(), 3);
+    assert_eq!(
+        advancing.replay_costs().3,
+        resumed_before_next + 1,
+        "the append after a rejected request resumes the verified prefix"
+    );
+
     // Recovery re-authenticates the whole journal and seeds the new owner's cache.
     let recovered = store
         .recover_authenticated_slot_agreement(bootstrap)
         .unwrap();
-    assert_eq!(recovered.sequence(), 2);
-    assert_eq!(recovered.signing_outbox().unwrap().len(), 1);
+    assert_eq!(recovered.sequence(), 3);
+    assert_eq!(recovered.signing_outbox().unwrap().len(), 2);
     assert!(recovered.ordering_snapshot().unwrap().order().is_empty());
 }
 
@@ -1086,6 +1114,21 @@ fn incremental_append_fold_matches_full_recovery_at_every_step() {
     ];
     for (offset, request) in requests.into_iter().enumerate() {
         let sequence = offset as u64 + 1;
+        // A rejected request advances nothing. It must also leave the resumed prefix
+        // usable: the next append has to reproduce exactly what full recovery derives.
+        let rejected = AuthenticatedSlotAgreementRequest::Timeout {
+            view: AgreementView(sequence + 1),
+            phase: AgreementPhase::Prevote,
+        };
+        assert!(
+            owner.apply(sequence, rejected).is_err(),
+            "step {sequence} rejection"
+        );
+        assert_eq!(
+            owner.sequence(),
+            sequence - 1,
+            "step {sequence} rejection is durable"
+        );
         owner.apply(sequence, request).unwrap();
         let full = store
             .recover_authenticated_slot_agreement(bootstrap.clone())

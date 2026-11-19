@@ -850,7 +850,7 @@ impl AgreementReproposalCandidate {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct VoteBucket {
     lineage: Option<SlotAgreementViewLineage>,
     witnesses: BTreeMap<Vec<u8>, SlotAgreementVoteWitness>,
@@ -897,7 +897,7 @@ pub struct AgreementViewRequestReservation {
     /// Exact signed publication, installed only after verified durable completion.
     pub message: Option<validator::SlotAgreementViewRequest>,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ViewRequests {
     reservations: Vec<AgreementViewRequestReservation>,
     // Latest durable entry certificate for the current slot; cleared by AdvanceSlot.
@@ -1055,6 +1055,7 @@ fn observation_key(
 /// reconstruction state: it carries no evidence authority and is never returned to callers.
 /// Its retained vertices share the journal's `MAX_VERTICES` bound, so the cache is bounded
 /// by the same limits as the journal itself.
+#[derive(Clone)]
 struct ReplayCursor {
     binding: SlotAgreementBinding,
     vertices: BTreeMap<(u64, Vec<u8>), Vertex>,
@@ -2436,8 +2437,10 @@ impl AuthenticatedSlotAgreement {
     /// Same-length in-place corruption of an earlier frame is therefore not re-detected here
     /// (cache reads already accept it the same way), but it still fails every full fold and
     /// every recovery, and any length change forces a full re-read before an append. Duplicate
-    /// and prefix retries keep their exact transition and do not write; a rejected fold drops
-    /// the cache and writes nothing.
+    /// and prefix retries keep their exact transition and do not write. A rejected request
+    /// writes nothing either, so it keeps the verified cache instead of forcing the whole
+    /// journal to be re-authenticated; only a cursor that no longer ends at this owner's
+    /// durable sequence is dropped.
     ///
     /// # Errors
     /// Rejects stale owners, inexact retries, invalid evidence, bounds and uncertain I/O.
@@ -2515,11 +2518,21 @@ impl AuthenticatedSlotAgreement {
                     return Err(invalid("authenticated WAL capacity exhausted"));
                 }
                 let base_bytes = cached.bytes;
-                let cached = cache.take().expect("verified cache entry is present");
+                if cached.cursor.consumed != self.sequence as usize {
+                    // Defensive: a cache that does not end at this owner's durable sequence
+                    // cannot be resumed. Drop it and force a full read on the next access.
+                    *cache = None;
+                    return Err(invalid("replay cache does not end at the durable sequence"));
+                }
+                // The append is folded over a copy of the verified cursor. A rejected
+                // request must not destroy the retained prefix: it writes nothing, and the
+                // cached cursor already folded these exact durable bytes. The copy is bounded
+                // by the same journal limits as the cursor itself.
                 let read_nanos = started_read.elapsed();
                 let started_replay = std::time::Instant::now();
+                let prefix_cursor = cached.cursor.clone();
                 match fold(
-                    cached.cursor,
+                    prefix_cursor,
                     self.sequence as usize,
                     std::slice::from_ref(&request),
                 ) {
@@ -2530,10 +2543,10 @@ impl AuthenticatedSlotAgreement {
                         staged = Some(cursor);
                     }
                     Err(error) => {
-                        // The fold consumed the cached cursor, and a rejected append means the
-                        // retained evidence no longer folds. Drop the cache so every later read
-                        // must re-authenticate or report the same failure; nothing was written.
-                        *cache = None;
+                        // Reject the request, not the retained journal: keep the verified
+                        // cache so one invalid request cannot force every later append and
+                        // read to re-authenticate the whole journal. Nothing was written.
+                        self.record_replay(true, read_nanos, started_replay.elapsed());
                         return Err(error);
                     }
                 }

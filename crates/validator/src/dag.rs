@@ -74,6 +74,9 @@ pub struct SkippedRound {
 }
 
 /// Vertices this node holds, plus what it has already committed.
+///
+/// A clone is an independent copy of the same retained state; it grants no authority.
+#[derive(Clone)]
 pub struct Dag {
     sets: SetSchedule,
     vertices: BTreeMap<(u64, Vec<u8>), Vertex>,
@@ -138,6 +141,8 @@ pub struct Dag {
 ///
 /// This wrapper does not activate consensus, sign, finalize transactions, or provide persistence.
 /// Checkpoint trust and durable request logging remain the caller's responsibility.
+/// A clone is an independent copy of the same retained state; it grants no authority.
+#[derive(Clone)]
 pub struct CertifiedDag {
     dag: Dag,
     binding: crate::SlotDecisionBinding,
