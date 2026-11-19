@@ -265,6 +265,7 @@ impl JournaledFinalization {
     pub fn progress_diagnostics(&self) -> Result<AgreementProgress, String> {
         self.ensure_usable()?;
         let mut progress = self.adapter.progress_diagnostics()?;
+        progress.last_view_error = self.last_view_error.clone();
         let Some(local) = self.authoring.as_ref() else {
             return Ok(progress);
         };
@@ -817,6 +818,7 @@ impl JournaledFinalization {
         if self.adapter.driver.sequence() > super::super::MAX_CARRIER_EXPORT_EVENTS {
             return Err("local view election exceeds 4096 durable events".into());
         }
+        self.last_view_error = None;
         let output = self.adapter.driver.output().map_err(|e| e.to_string())?;
         let Some(transition) = output.transition.as_ref() else {
             return Ok(Vec::new());
@@ -889,13 +891,22 @@ impl JournaledFinalization {
             local.node.id(),
             highest.saturating_add(1).max(reproposal_min_round),
         ) else {
+            self.last_view_error = Some(format!(
+                "no reference-ready carrier round at or above {reproposal_min_round} (highest {highest})"
+            ));
             return Ok(Vec::new());
         };
         local.node.set_round(round);
         let authored = match proposal_carrier {
-            None => self
-                .adapter
-                .author_proposal(&prior.proposal, &mut local.node)?,
+            None => {
+                let authored = self
+                    .adapter
+                    .author_proposal(&prior.proposal, &mut local.node)?;
+                if authored.is_none() {
+                    self.last_view_error = Some("plain proposal carrier not prepared".into());
+                }
+                authored
+            }
             Some(carrier) => {
                 let candidate = validator::SlotAgreementViewCandidate::new(
                     entries.to_vec(),
@@ -905,7 +916,11 @@ impl JournaledFinalization {
                     &self.adapter.set,
                 )
                 .map_err(|e| e.to_string())?;
-                self.adapter.author_view(&candidate, &mut local.node)?
+                let authored = self.adapter.author_view(&candidate, &mut local.node)?;
+                if authored.is_none() {
+                    self.last_view_error = Some("view carrier not prepared".into());
+                }
+                authored
             }
         };
         let result = match authored {

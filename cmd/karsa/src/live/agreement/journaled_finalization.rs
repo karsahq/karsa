@@ -30,6 +30,8 @@ pub struct JournaledFinalization {
     anchor: Header,
     outbox: Build,
     failed: bool,
+    // Latest elected view step that produced no carrier; diagnostics only.
+    last_view_error: Option<String>,
 }
 
 impl JournaledFinalization {
@@ -77,6 +79,7 @@ impl JournaledFinalization {
             anchor,
             outbox: Build::default(),
             failed: false,
+            last_view_error: None,
         })
     }
 

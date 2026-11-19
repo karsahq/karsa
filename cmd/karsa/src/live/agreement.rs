@@ -174,6 +174,10 @@ pub struct AgreementProgress {
     pub authorable_nil: usize,
     /// Latest aggregate carrier that could not be prepared, if any.
     pub last_aggregate_error: Option<String>,
+    /// This validator is the elected Proposer for the current view and next round.
+    pub view_proposer_self: bool,
+    /// Latest elected view step that produced no carrier, if any.
+    pub last_view_error: Option<String>,
     /// Frozen carrier candidates for the current slot.
     pub candidates: usize,
     /// Next slot decision round, fixed by the durable tip.
@@ -825,6 +829,9 @@ impl Adapter {
             candidates: output.candidates.len(),
             next_round: round,
             last_aggregate_error: self.last_aggregate_error.clone(),
+            view_proposer_self: validator::slot_agreement_view_proposer(&self.set, round, view)
+                .map(|id| id == self.validator_id.as_slice())
+                .unwrap_or(false),
             ..AgreementProgress::default()
         };
         for completed in self

@@ -253,7 +253,7 @@ async fn run_mesh(
     for report in &reports {
         let p = &report.progress;
         println!(
-            "  val-{} view {} round {}: proposal {}, view carriers {}, votes {}, POLs {}, finals {}, nil {}/{}, intents {}, authorable {}/{} prevote/precommit, {} nil ({} unready), candidates {}, decided {}, POL {}, local round {}, aggregate {:?}",
+            "  val-{} view {} round {}: proposal {}, view carriers {}, votes {}, POLs {}, finals {}, nil {}/{}, intents {}, authorable {}/{} prevote/precommit, {} nil ({} unready), candidates {}, decided {}, POL {}, local round {}, proposer self {}, aggregate {:?}, view step {:?}",
             report.index,
             p.view,
             p.next_round,
@@ -273,7 +273,9 @@ async fn run_mesh(
             p.decided,
             p.reproposal,
             p.local_round,
-            p.last_aggregate_error
+            p.view_proposer_self,
+            p.last_aggregate_error,
+            p.last_view_error
         );
     }
     for failure in &failures {
@@ -382,6 +384,9 @@ fn print_report(report: &Report) {
     );
     if let Some(error) = &report.progress.last_aggregate_error {
         println!("  aggregate:  {error}");
+    }
+    if let Some(error) = &report.progress.last_view_error {
+        println!("  view step:  {error}");
     }
     println!(
         "  causal:     {} authored, {} imported, {} frames received, {} rejected, {} dropped",
