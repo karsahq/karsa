@@ -52,7 +52,7 @@ use tokio::sync::{mpsc, watch};
 use validator::{EpochSchedule, Header, Share, Vertex, commit_root};
 
 use super::agreement::AgreementProgress;
-use super::agreement::event_pump::{EventPump, LocalEvent};
+use super::agreement::event_pump::{EventPump, LocalEvent, PumpSnapshot};
 use super::agreement::output_dispatcher::{self, SharePeer};
 use super::agreement::{pacemaker, session};
 use super::{Config, Link, LinkTask, credited_genesis};
@@ -100,6 +100,10 @@ struct Report {
     progress: AgreementProgress,
     head_height: u64,
     head_round: u64,
+    pump: PumpSnapshot,
+    local_full: u64,
+    local_accepted: u64,
+    ticks: u64,
     error: Option<String>,
 }
 
@@ -255,7 +259,7 @@ async fn run_mesh(
     for report in &reports {
         let p = &report.progress;
         println!(
-            "  val-{} view {} round {}: proposal {}, view carriers {}, votes {}, POLs {}, finals {}, nil {}/{}, intents {}, authorable {}/{} prevote/precommit, {} nil ({} unready), candidates {}, decided {}, POL {}, local round {}, proposer self {}, aggregate {:?}, view step {:?}",
+            "  val-{} view {} round {}: proposal {}, view carriers {}, votes {}, POLs {}, finals {}, nil {}/{}, intents {}, authorable {}/{} prevote/precommit, {} nil ({} unready), candidates {}, decided {}, POL {}, local round {}, own hole {}, proposer self {}, aggregate {:?}, view step {:?}",
             report.index,
             p.view,
             p.next_round,
@@ -275,10 +279,12 @@ async fn run_mesh(
             p.decided,
             p.reproposal,
             p.local_round,
+            p.own_hole,
             p.view_proposer_self,
             p.last_aggregate_error,
             p.last_view_error
         );
+        print_costs(&format!("  val-{} ", report.index), report);
     }
     for failure in &failures {
         eprintln!("  {failure}");
@@ -368,9 +374,10 @@ fn print_report(report: &Report) {
         report.progress.reproposal
     );
     println!(
-        "  causal:     next round {}, local round {}, authorable {}/{} prevote/precommit, {} nil, {} unready, first {} self {}",
+        "  causal:     next round {}, local round {}, own hole {}, authorable {}/{} prevote/precommit, {} nil, {} unready, first {} self {}",
         report.progress.next_round,
         report.progress.local_round,
+        report.progress.own_hole,
         report.progress.authorable_prevotes,
         report.progress.authorable_precommits,
         report.progress.authorable_nil,
@@ -399,9 +406,39 @@ fn print_report(report: &Report) {
         super::human(report.bytes_in),
         super::human(report.bytes_out)
     );
+    print_costs("  ", report);
     if let Some(error) = &report.error {
         eprintln!("  error: {error}");
     }
+}
+
+/// Prints where the run's wall time went. A slot stall is either owner work (pump turns,
+/// full journal replays) or waiting for availability, and this attributes it. Diagnostic
+/// only: these counts are not progress, delivery or durability evidence.
+fn print_costs(prefix: &str, report: &Report) {
+    let p = &report.pump;
+    println!(
+        "{prefix}pump:       {} local turns {} (max {}), {} frames {}, {} wakes {}; {} ticks, {} local accepted, {} refused",
+        p.local_turns,
+        super::millis(p.local_nanos),
+        super::millis(p.max_local_nanos),
+        p.frame_turns,
+        super::millis(p.frame_nanos),
+        p.scheduled_turns,
+        super::millis(p.scheduled_nanos),
+        report.ticks,
+        report.local_accepted,
+        report.local_full
+    );
+    println!(
+        "{prefix}journal:    {} events, {} folds {} ({} resumed over {}), {} read/decode",
+        report.progress.sequence,
+        report.progress.replays,
+        super::millis(report.progress.replay_nanos),
+        report.progress.resumed_replays,
+        super::millis(report.progress.resumed_replay_nanos),
+        super::millis(report.progress.replay_read_nanos)
+    );
 }
 
 /// One validator's bounded certified session over the shared peer mesh.
@@ -476,6 +513,7 @@ async fn certified_node_task(
         0,
     );
     pump.enable_scheduling(SCHEDULE)?;
+    let pump_stats = Arc::clone(&channels.stats);
 
     let bytes_in = Arc::new(AtomicU64::new(0));
     let bytes_out = Arc::new(AtomicU64::new(0));
@@ -638,6 +676,9 @@ async fn certified_node_task(
     let mut dispatch_open = true;
     let mut advance_after = 0u64;
     let mut author_turn = true;
+    let mut local_full = 0u64;
+    let mut local_accepted = 0u64;
+    let mut ticks = 0u64;
 
     loop {
         if *shutdown.borrow() {
@@ -688,6 +729,7 @@ async fn certified_node_task(
                 }
             }
             _ = ticker.tick(), if inbound_open || dispatch_open => {
+                ticks = ticks.saturating_add(1);
                 // Retry one frame the pump could not accept yet. The backlog is bounded and
                 // the pump's own queue stays the only backpressure boundary.
                 if let Some(frame) = pending_frames.pop_front() {
@@ -711,9 +753,11 @@ async fn certified_node_task(
                         vertices: Vec::new(),
                     };
                     match channels.local.try_send(event) {
-                        Ok(()) => {}
+                        Ok(()) => local_accepted = local_accepted.saturating_add(1),
                         Err(mpsc::error::TrySendError::Closed(_)) => break,
-                        Err(_) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            local_full = local_full.saturating_add(1);
+                        }
                     }
                 } else {
                     author_turn = true;
@@ -726,12 +770,16 @@ async fn certified_node_task(
                     if !batch.is_empty() {
                         let count = batch.len();
                         match channels.local.try_send(LocalEvent::Drive(batch)) {
-                            Ok(()) => imported = imported.saturating_add(count),
+                            Ok(()) => {
+                                local_accepted = local_accepted.saturating_add(1);
+                                imported = imported.saturating_add(count);
+                            }
                             Err(mpsc::error::TrySendError::Full(LocalEvent::Drive(vertices))) => {
                                 // Keep the availability for the next turn; the pump is busy,
                                 // not unhealthy, and dropping signed vertices would just force
                                 // a peer to resend them.
                                 requeue_vertices(&mut pending, vertices);
+                                local_full = local_full.saturating_add(1);
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => break,
                             Err(_) => {}
@@ -792,6 +840,7 @@ async fn certified_node_task(
     }
 
     let _ = cancel.send(true);
+    let pump = pump_stats.snapshot();
     let mut report = Report {
         index,
         authored,
@@ -807,6 +856,10 @@ async fn certified_node_task(
         progress: AgreementProgress::default(),
         head_height: 0,
         head_round: 0,
+        pump,
+        local_full,
+        local_accepted,
+        ticks,
         error: None,
     };
     drop(channels.local);

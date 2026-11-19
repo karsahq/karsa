@@ -1,6 +1,8 @@
 //! Isolated async runtime with opt-in bounded local maintenance, not production integration.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use net::wire::{Frame, Message};
 use tokio::sync::{mpsc, watch};
@@ -76,6 +78,84 @@ pub struct PumpChannels {
     pub local: mpsc::Sender<LocalEvent>,
     /// Backpressured volatile responses in processing order, without delivery acknowledgement.
     pub output: mpsc::Receiver<PumpOutput>,
+    /// Wall-clock processing cost, sampled by the caller after the pump stops.
+    pub stats: Arc<PumpStats>,
+}
+
+/// Aggregate pump wall-clock cost, grouped by input kind.
+///
+/// Diagnostic only. The pump is single-threaded, so these totals say how much of the run the
+/// owner spent processing each kind of event. They are not a delivery, freshness or progress
+/// statement, and they grant no authority.
+#[derive(Debug, Default)]
+pub struct PumpStats {
+    local_turns: AtomicU64,
+    local_nanos: AtomicU64,
+    max_local_nanos: AtomicU64,
+    frame_turns: AtomicU64,
+    frame_nanos: AtomicU64,
+    scheduled_turns: AtomicU64,
+    scheduled_nanos: AtomicU64,
+}
+
+/// Immutable copy of [`PumpStats`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PumpSnapshot {
+    /// Local turns processed and their cumulative handling time.
+    pub local_turns: u64,
+    /// Cumulative nanoseconds spent in local turns.
+    pub local_nanos: u64,
+    /// Slowest single local turn; one durable action can hold the pump this long.
+    pub max_local_nanos: u64,
+    /// Peer frames processed and their cumulative handling time.
+    pub frame_turns: u64,
+    /// Cumulative nanoseconds spent in peer frame handling.
+    pub frame_nanos: u64,
+    /// Scheduled maintenance wakes processed and their cumulative handling time.
+    pub scheduled_turns: u64,
+    /// Cumulative nanoseconds spent in scheduled maintenance.
+    pub scheduled_nanos: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PumpKind {
+    Local,
+    Frame,
+    Scheduled,
+}
+
+impl PumpStats {
+    fn record(&self, kind: PumpKind, elapsed: std::time::Duration) {
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        match kind {
+            PumpKind::Local => {
+                self.local_turns.fetch_add(1, Ordering::Relaxed);
+                self.local_nanos.fetch_add(nanos, Ordering::Relaxed);
+                self.max_local_nanos.fetch_max(nanos, Ordering::Relaxed);
+            }
+            PumpKind::Frame => {
+                self.frame_turns.fetch_add(1, Ordering::Relaxed);
+                self.frame_nanos.fetch_add(nanos, Ordering::Relaxed);
+            }
+            PumpKind::Scheduled => {
+                self.scheduled_turns.fetch_add(1, Ordering::Relaxed);
+                self.scheduled_nanos.fetch_add(nanos, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Takes one coherent-enough diagnostic sample; counters are read independently.
+    pub fn snapshot(&self) -> PumpSnapshot {
+        PumpSnapshot {
+            local_turns: self.local_turns.load(Ordering::Relaxed),
+            local_nanos: self.local_nanos.load(Ordering::Relaxed),
+            max_local_nanos: self.max_local_nanos.load(Ordering::Relaxed),
+            frame_turns: self.frame_turns.load(Ordering::Relaxed),
+            frame_nanos: self.frame_nanos.load(Ordering::Relaxed),
+            scheduled_turns: self.scheduled_turns.load(Ordering::Relaxed),
+            scheduled_nanos: self.scheduled_nanos.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Owns journaled ordering/execution and a digest-validated, bounded payload index.
@@ -108,6 +188,7 @@ pub struct EventPump {
     frames: mpsc::Receiver<Frame>,
     local: mpsc::Receiver<LocalEvent>,
     output: mpsc::Sender<PumpOutput>,
+    stats: Arc<PumpStats>,
 }
 
 struct LocalSchedule {
@@ -226,6 +307,7 @@ impl EventPump {
         let (frames_tx, frames) = mpsc::channel(capacity.get());
         let (local_tx, local) = mpsc::channel(capacity.get());
         let (output, output_rx) = mpsc::channel(capacity.get());
+        let stats = Arc::new(PumpStats::default());
         (
             Self {
                 owner,
@@ -240,11 +322,13 @@ impl EventPump {
                 frames,
                 local,
                 output,
+                stats: Arc::clone(&stats),
             },
             PumpChannels {
                 frames: frames_tx,
                 local: local_tx,
                 output: output_rx,
+                stats,
             },
         )
     }
@@ -313,6 +397,12 @@ impl EventPump {
                 return (self.owner, Err("event pump output closed".into()));
             }
             let mut carriers = Vec::new();
+            let kind = match &input {
+                Input::Local(_) => PumpKind::Local,
+                Input::Frame(_) => PumpKind::Frame,
+                Input::Scheduled => PumpKind::Scheduled,
+            };
+            let started = std::time::Instant::now();
             let result = match input {
                 Input::Scheduled => {
                     let now = tokio::time::Instant::now();
@@ -382,6 +472,7 @@ impl EventPump {
                     continue;
                 }
             };
+            self.stats.record(kind, started.elapsed());
             let (output, fatal) = match result {
                 Ok(build) => (
                     PumpOutput {

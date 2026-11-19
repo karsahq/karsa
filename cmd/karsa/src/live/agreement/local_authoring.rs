@@ -204,8 +204,15 @@ fn reference_ready_blocker(dag: &validator::Dag, id: &[u8], min: u64) -> String 
                 "round {round} is reference-ready (own hole {own_hole}, highest {highest})"
             );
         }
+        let missing: Vec<usize> = set
+            .validators
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| dag.get(round - 1, &record.validator_id).is_none())
+            .map(|(index, _)| index)
+            .collect();
         return format!(
-            "round {round} needs {held}/{} authors of round {} (own hole {own_hole}, highest {highest})",
+            "round {round} needs {held}/{} authors of round {} (missing set indexes {missing:?}, own hole {own_hole}, highest {highest})",
             set.quorum_size(),
             round - 1
         );
@@ -315,6 +322,7 @@ impl JournaledFinalization {
             .map_err(|error| error.to_string())?;
         let dag = local.node.dag();
         progress.local_round = dag.highest_round().unwrap_or(0);
+        progress.own_hole = next_local_round(dag, local.node.id());
         // An authorable obligation whose exact prerequisite carrier is missing cannot be
         // signed this turn: the prospective cone would reject it. These counters separate
         // "waiting for causal availability" from "reducer has no obligation yet".

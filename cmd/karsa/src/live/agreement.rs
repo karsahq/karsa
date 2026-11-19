@@ -190,6 +190,20 @@ pub struct AgreementProgress {
     pub first_unready_self: Option<bool>,
     /// Highest causal round retained by the owned Node; zero when empty or absent.
     pub local_round: u64,
+    /// Earliest causal round this node has not authored; zero when empty or absent.
+    pub own_hole: u64,
+    /// Durable requests installed by this owner; the full replay size per read.
+    pub sequence: u64,
+    /// Full journal read/replay count for this owner, diagnostic only.
+    pub replays: u64,
+    /// Cumulative nanoseconds spent in those full replays, diagnostic only.
+    pub replay_nanos: u64,
+    /// Cumulative nanoseconds spent reading and decoding the journal, diagnostic only.
+    pub replay_read_nanos: u64,
+    /// Folds resumed from a cached verified prefix, and their cumulative nanoseconds.
+    pub resumed_replays: u64,
+    /// Cumulative nanoseconds spent in resumed (incremental) folds.
+    pub resumed_replay_nanos: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -834,6 +848,14 @@ impl Adapter {
                 .unwrap_or(false),
             ..AgreementProgress::default()
         };
+        progress.sequence = self.driver.sequence();
+        (
+            progress.replays,
+            progress.replay_nanos,
+            progress.replay_read_nanos,
+            progress.resumed_replays,
+            progress.resumed_replay_nanos,
+        ) = self.driver.replay_costs();
         for completed in self
             .driver
             .completed_carriers()
