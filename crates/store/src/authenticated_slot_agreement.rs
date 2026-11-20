@@ -2164,6 +2164,8 @@ type DriverSnapshot = (
     Option<AgreementReproposalCandidate>,
     SlotAgreementBinding,
     Vec<[u8; 32]>,
+    bool,
+    bool,
 );
 
 impl AuthenticatedSlotAgreement {
@@ -2344,6 +2346,14 @@ impl AuthenticatedSlotAgreement {
                 state.reproposal.clone(),
                 state.binding.clone(),
                 state.authorable(),
+                state
+                    .reducer
+                    .voted_value(validator::slot_agreement::AgreementPhase::Prevote)
+                    .is_some(),
+                state
+                    .reducer
+                    .voted_value(validator::slot_agreement::AgreementPhase::Precommit)
+                    .is_some(),
             ))
         })
     }

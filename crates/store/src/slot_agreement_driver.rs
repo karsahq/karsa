@@ -33,6 +33,11 @@ pub struct SlotAgreementDriverOutput {
     /// Current undecided vote obligations appropriate to the reducer phase and lock.
     /// These IDs are not transport or signing authority without local DAG checks.
     pub authorable_vote_ids: Vec<[u8; 32]>,
+    /// The reducer already emitted a prevote in its current view. A further proposal
+    /// in this view cannot cast another one; it only produces a refused duplicate.
+    pub voted_prevote: bool,
+    /// The reducer already emitted a precommit in its current view.
+    pub voted_precommit: bool,
 }
 
 impl SlotAgreementDriver {
@@ -229,8 +234,16 @@ impl SlotAgreementDriver {
     /// # Errors
     /// Rejects stale or uncertain owners, corrupt evidence, and invalid candidates.
     pub fn output(&self) -> Result<SlotAgreementDriverOutput, StoreError> {
-        let (bootstrap, transition, frozen, reproposal, binding, authorable_vote_ids) =
-            self.session.driver_snapshot()?;
+        let (
+            bootstrap,
+            transition,
+            frozen,
+            reproposal,
+            binding,
+            authorable_vote_ids,
+            voted_prevote,
+            voted_precommit,
+        ) = self.session.driver_snapshot()?;
         let mut candidates = Vec::new();
         let view = transition
             .as_ref()
@@ -263,6 +276,8 @@ impl SlotAgreementDriver {
             reproposal,
             binding,
             authorable_vote_ids,
+            voted_prevote,
+            voted_precommit,
         })
     }
 }

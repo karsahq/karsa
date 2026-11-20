@@ -634,6 +634,12 @@ impl JournaledFinalization {
         if decided || output.reproposal.is_some() {
             return Ok(Vec::new());
         }
+        // The reducer already cast this view's prevote, whether for a proposal or on
+        // timeout. A second proposal in the same view cannot vote again, so authoring one
+        // only burns a turn and reports a refused duplicate; the next view resets the phase.
+        if output.voted_prevote {
+            return Ok(Vec::new());
+        }
         let tip = output.binding.tip().clone();
         let round = tip.next_round();
         let elected = validator::slot_agreement_view_proposer(&self.adapter.set, round, view)

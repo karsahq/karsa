@@ -967,3 +967,55 @@ fn nil_interleaved_phase_subquorums_preserve_authorable_publication() {
     assert_eq!(completed[0].message, message);
     assert_eq!(driver.signing_outbox().unwrap().len(), 1);
 }
+
+/// A view that already voted a phase reports it, and the next view resets the phase.
+/// Local authoring uses this to stop re-proposing a vote the reducer would refuse.
+#[test]
+fn a_current_view_reports_its_phase_votes_and_a_new_view_resets_them() {
+    let (f, proof, _) = unified_fixture(true);
+    let bootstrap = AuthenticatedSlotAgreementBootstrap {
+        agreement: SlotAgreementBootstrap {
+            context: f.binding.tip().clone(),
+            set: f.set.clone(),
+            local_validator: f.set.validators[0].validator_id.clone(),
+        },
+        predecessor: None,
+        order: vec![],
+        vertices: vec![],
+    };
+    let dir = TempDir::new();
+    let store = Store::open(&dir.0).unwrap();
+    let mut owner = store.begin_authenticated_slot_agreement(bootstrap).unwrap();
+    let mut lineage = SlotAgreementViewLineage {
+        entries: proof.entries.clone(),
+    };
+    lineage.entries[0].pol.take().unwrap();
+    let vote = owner
+        .apply(
+            1,
+            AuthenticatedSlotAgreementRequest::Propose {
+                lineage,
+                vertices: f.vertices.clone(),
+            },
+        )
+        .unwrap()
+        .vote
+        .unwrap();
+    assert_eq!(vote.phase, AgreementPhase::Prevote);
+    let mut driver = SlotAgreementDriver::new(owner);
+    let output = driver.output().unwrap();
+    assert!(output.voted_prevote);
+    assert!(!output.voted_precommit);
+    let sequence = driver.sequence() + 1;
+    driver
+        .apply(
+            sequence,
+            AuthenticatedSlotAgreementRequest::AdvanceView {
+                from: AgreementView(0),
+            },
+        )
+        .unwrap();
+    let output = driver.output().unwrap();
+    assert!(!output.voted_prevote, "a new view reopens the phase");
+    assert!(!output.voted_precommit);
+}
