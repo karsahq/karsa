@@ -8877,6 +8877,35 @@ mod tests {
     }
 
     #[test]
+    fn a_certified_session_live_run_refuses_to_resume_a_durable_store() {
+        let _mesh = mesh_test_lock();
+        let dir = TestDir::new("certified-reopen");
+        let mut first = mesh_config(&dir, a_free_port_base(1), 0, 0);
+        first.validators = 1;
+        first.timeout = Duration::from_secs(10);
+        first.execute = false;
+        first.agreement_session = true;
+        let first_run = run(first);
+        assert!(
+            first_run.is_ok(),
+            "the first certified session failed: {first_run:?}"
+        );
+
+        // Payload bytes, the owned causal DAG and the control classification are all
+        // volatile in the live pump, so resuming this store would decide nothing.
+        let mut second = mesh_config(&dir, a_free_port_base(1), 0, 0);
+        second.validators = 1;
+        second.timeout = Duration::from_secs(10);
+        second.execute = false;
+        second.agreement_session = true;
+        let error = run(second).expect_err("a live run must refuse a durable certified store");
+        assert!(
+            error.to_string().contains("fresh store"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    #[test]
     fn a_mesh_authorizes_a_set_change_and_crosses_the_boundary() {
         let _mesh = mesh_test_lock();
         let dir = TestDir::new("set-change");

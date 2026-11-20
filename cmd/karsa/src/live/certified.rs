@@ -5,7 +5,9 @@
 //! durable certified session owns ordering, execution and header production. It is a
 //! bounded first live wiring, not a production authority claim:
 //!
-//! - every node opens or recovers a certified session from the same trusted genesis;
+//! - every node opens a fresh certified session from the same trusted genesis. A live
+//!   run refuses to resume a durable session: payload bytes and the owned causal DAG
+//!   are volatile here, so offline recovery stays a separate caller-driven path;
 //! - plain causal vertices feed the owned availability DAG, which is the only thing the
 //!   certified proposal and vote rules read;
 //! - only the elected view proposer authors the POL carrier: a carrier is a locally
@@ -312,10 +314,19 @@ async fn run_mesh(
         }
     }
     if reports.is_empty() {
-        return Err("no certified node reported a result".into());
+        return Err(match failures.first() {
+            Some(failure) => format!("no certified node reported a result: {failure}").into(),
+            None => "no certified node reported a result".into(),
+        });
     }
     if reports.iter().any(|report| report.error.is_some()) {
-        return Err("at least one certified node stopped with an error".into());
+        // Keep the first concrete node error: a stopped node's reason is the actionable
+        // part, and the aggregate message alone hides it.
+        let reason = reports
+            .iter()
+            .find_map(|report| report.error.as_deref())
+            .unwrap_or("unknown error");
+        return Err(format!("at least one certified node stopped with an error: {reason}").into());
     }
     let certifying = reports.iter().filter(|report| report.certified > 0).count();
     if certifying == 0 {
@@ -501,28 +512,26 @@ async fn certified_node_task(
         commit_root(&[]),
     );
     let epoch_schedule = EpochSchedule::single(epoch);
-    let mut owner = if store
+    if store
         .has_authenticated_slot_agreement()
         .map_err(|error| error.to_string())?
     {
-        session::recover_at_genesis(
-            &store,
-            &committee,
-            index,
-            &genesis,
-            genesis_state.clone(),
-            epoch_schedule,
-        )?
-    } else {
-        session::open_at_genesis(
-            &store,
-            &committee,
-            index,
-            &genesis,
-            genesis_state,
-            epoch_schedule,
-        )?
-    };
+        // A live run cannot resume durable agreement state: the admitted payload index,
+        // the owned causal DAG and the volatile control classification are not recovered,
+        // so a resumed node would still decide nothing. Refuse instead of running a
+        // degraded session; offline recovery remains an explicit caller-driven path.
+        return Err(format!(
+            "node {index} cannot resume a durable certified session: payload bytes and owned causal history are volatile; start a fresh store"
+        ));
+    }
+    let mut owner = session::open_at_genesis(
+        &store,
+        &committee,
+        index,
+        &genesis,
+        genesis_state,
+        epoch_schedule,
+    )?;
     // One epoch, matching the single-set schedule: epoch transitions are not supported.
     let authoring = Node::with_chain_id_and_epoch_length(
         committee.set.clone(),
