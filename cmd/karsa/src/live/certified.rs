@@ -46,7 +46,7 @@
 //! The owner's causal import budget bounds one run, and both histories stay mutually
 //! exclusive on disk: a store holding a legacy chain is refused by the session opener.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -115,6 +115,8 @@ struct Report {
     order_root: [u8; 32],
     /// Exact applied certified entries; empty when the node did not stop cleanly.
     order: Vec<VertexId>,
+    /// Exact headers this node built, keyed by height.
+    headers: BTreeMap<u64, Header>,
     blocked: Option<(u64, usize, [u8; 32], bool)>,
     certified: usize,
     progress: AgreementProgress,
@@ -379,6 +381,42 @@ async fn run_mesh(
         )
         .into());
     }
+    // The same certified entries and payloads must produce the same header. Comparing the
+    // highest height every node reached is the strongest execution check this report can
+    // make; a differing field is divergence, not lag.
+    let headers = header_relation(
+        &reports
+            .iter()
+            .map(|report| (report.index, &report.headers))
+            .collect::<Vec<_>>(),
+    );
+    match &headers {
+        HeaderRelation::Identical { height } if *height > 0 => println!(
+            "  headers:    identical at height {height} on {} nodes",
+            reports.len()
+        ),
+        HeaderRelation::Divergent {
+            height,
+            left,
+            right,
+            field,
+        } => println!(
+            "  headers:    divergent at height {height}: nodes {left} and {right} disagree on {field}"
+        ),
+        _ => {}
+    }
+    if let HeaderRelation::Divergent {
+        height,
+        left,
+        right,
+        field,
+    } = headers
+    {
+        return Err(format!(
+            "certified headers diverge at height {height}: nodes {left} and {right} disagree on {field}"
+        )
+        .into());
+    }
     if !failures.is_empty() {
         return Err(format!("{} certified node(s) stopped with an error", failures.len()).into());
     }
@@ -453,6 +491,65 @@ fn order_relation(orders: &[(usize, &[VertexId])]) -> Option<OrderRelation> {
             shared,
         })
     }
+}
+
+/// How the built headers of a finished run relate.
+#[derive(Debug, PartialEq, Eq)]
+enum HeaderRelation {
+    /// No node built a header.
+    Empty,
+    /// Every node that reached the comparable height built the identical header.
+    Identical { height: u64 },
+    /// Two nodes built different headers at the same height: executed entries diverged.
+    Divergent {
+        height: u64,
+        left: usize,
+        right: usize,
+        field: &'static str,
+    },
+}
+
+/// Compares the highest header height every node reached, pairwise against the first node.
+///
+/// Certification fixes the entry at every applied index and payloads are content-addressed,
+/// so the same height must yield the identical header. Heights a node never built are the
+/// lag the order comparison already reports, never a divergence. Diagnostic only.
+fn header_relation(headers: &[(usize, &BTreeMap<u64, Header>)]) -> HeaderRelation {
+    let Some(height) = headers
+        .iter()
+        .filter_map(|(_, built)| built.keys().next_back().copied())
+        .min()
+    else {
+        return HeaderRelation::Empty;
+    };
+    let mut first: Option<(usize, &Header)> = None;
+    for (node, built) in headers {
+        let Some(header) = built.get(&height) else {
+            continue;
+        };
+        match first {
+            None => first = Some((*node, header)),
+            Some((left, expected)) if expected != header => {
+                let field = if header.state_root != expected.state_root {
+                    "state root"
+                } else if header.dag_root != expected.dag_root {
+                    "commit root"
+                } else if header.previous != expected.previous {
+                    "previous header"
+                } else {
+                    "applied count"
+                };
+                return HeaderRelation::Divergent {
+                    height,
+                    left,
+                    right: *node,
+                    field,
+                };
+            }
+            Some(_) => {}
+        }
+    }
+    HeaderRelation::Identical { height }
 }
 
 fn print_report(report: &Report) {
@@ -1035,6 +1132,7 @@ async fn certified_node_task(
         applications: 0,
         order_root: [0; 32],
         order: Vec::new(),
+        headers: BTreeMap::new(),
         blocked: None,
         certified: 0,
         progress: AgreementProgress::default(),
@@ -1062,6 +1160,7 @@ async fn certified_node_task(
                     report.applications = owner.finalization().execution().applied_slots();
                     report.order_root = owner.finalization().execution().order_root();
                     report.order = owner.finalization().execution().applied_order().to_vec();
+                    report.headers = owner.finalization().built_headers().clone();
                     report.blocked = owner.finalization().execution().blocked().map(
                         |(round, author, payload, id_matches)| {
                             let author = committee
@@ -1172,8 +1271,9 @@ fn flush_shares(
 
 #[cfg(test)]
 mod tests {
-    use super::{OrderRelation, order_relation};
-    use validator::VertexId;
+    use super::{HeaderRelation, OrderRelation, header_relation, order_relation};
+    use std::collections::BTreeMap;
+    use validator::{Header, VertexId};
 
     fn entry(round: u64, digest: u8) -> VertexId {
         VertexId {
@@ -1181,6 +1281,26 @@ mod tests {
             author: vec![0],
             digest: [digest; 32],
         }
+    }
+
+    fn header(height: u64, state_root: u8) -> Header {
+        Header {
+            chain_id: b"karsa".to_vec(),
+            epoch: 0,
+            height,
+            round: height,
+            state_root: [state_root; 32],
+            dag_root: [7; 32],
+            previous: [8; 32],
+            applied: height * 3,
+        }
+    }
+
+    fn built(headers: &[Header]) -> BTreeMap<u64, Header> {
+        headers
+            .iter()
+            .map(|header| (header.height, header.clone()))
+            .collect()
     }
 
     /// Independent nodes that stop at different moments share their prefix.
@@ -1232,5 +1352,33 @@ mod tests {
             OrderRelation::Identical { len: 2 }
         );
         assert_eq!(order_relation(&[]), None);
+    }
+
+    /// The highest height every node reached is the strongest available header check.
+    #[test]
+    fn a_lower_header_height_is_compared_at_the_shared_height() {
+        let ahead = built(&[header(1, 1), header(2, 2), header(3, 3)]);
+        let behind = built(&[header(1, 1), header(2, 2)]);
+        assert_eq!(
+            header_relation(&[(0, &ahead), (1, &behind)]),
+            HeaderRelation::Identical { height: 2 }
+        );
+    }
+
+    #[test]
+    fn a_different_state_root_at_the_same_height_is_divergence() {
+        let first = built(&[header(1, 1), header(2, 2)]);
+        let other = built(&[header(1, 1), header(2, 9)]);
+        assert_eq!(
+            header_relation(&[(0, &first), (2, &other)]),
+            HeaderRelation::Divergent {
+                height: 2,
+                left: 0,
+                right: 2,
+                field: "state root"
+            }
+        );
+        let empty = BTreeMap::new();
+        assert_eq!(header_relation(&[(0, &empty)]), HeaderRelation::Empty);
     }
 }

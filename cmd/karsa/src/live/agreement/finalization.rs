@@ -301,6 +301,13 @@ impl CertifiedFinalization {
         &self.finalizer
     }
 
+    /// Exact headers this node built, keyed by height. Comparing them across nodes shows
+    /// whether execution converged. Diagnostics only: it grants no publication, sharing or
+    /// legacy-commit authority.
+    pub fn built_headers(&self) -> &BTreeMap<u64, Header> {
+        &self.built_headers
+    }
+
     fn ensure_usable(&self) -> Result<(), String> {
         if self.failed {
             return Err(
