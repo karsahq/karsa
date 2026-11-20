@@ -1544,18 +1544,41 @@ impl Dag {
         if d.round == 0 || d.round == u64::MAX || self.is_pruned(d.round) {
             return Err(invalid("unsupported slot proposal round"));
         }
-        if d.chain_id != self.chain_id
-            || d.chain_id != tip.chain_id()
-            || d.validator_set_id != *tip.set_id()
-            || d.epoch != tip.epoch()
-            || d.round != tip.next_round()
-            || d.previous != *tip.previous_id()
-            || d.before_len != tip.order_len()
-            || d.before_root != *tip.order_root()
-            || d.before_len != self.order_len() as u64
-            || d.before_root != self.commit_root()
-        {
-            return Err(invalid("slot proposal context or continuity mismatch"));
+        if d.chain_id != self.chain_id || d.chain_id != tip.chain_id() {
+            return Err(invalid(
+                "slot proposal context or continuity mismatch: another chain",
+            ));
+        }
+        if d.validator_set_id != *tip.set_id() || d.epoch != tip.epoch() {
+            return Err(invalid(
+                "slot proposal context or continuity mismatch: another validator set or epoch",
+            ));
+        }
+        if d.round != tip.next_round() {
+            return Err(invalid(&format!(
+                "slot proposal context or continuity mismatch: round {} is not the local next round {}",
+                d.round,
+                tip.next_round()
+            )));
+        }
+        if d.previous != *tip.previous_id() {
+            return Err(invalid(
+                "slot proposal context or continuity mismatch: predecessor is not the local decision tip",
+            ));
+        }
+        if d.before_len != tip.order_len() || d.before_root != *tip.order_root() {
+            return Err(invalid(&format!(
+                "slot proposal context or continuity mismatch: order {} does not match the local decision tip {}",
+                d.before_len,
+                tip.order_len()
+            )));
+        }
+        if d.before_len != self.order_len() as u64 || d.before_root != self.commit_root() {
+            return Err(invalid(&format!(
+                "slot proposal context or continuity mismatch: order {} does not match the local certified order {}",
+                d.before_len,
+                self.order_len()
+            )));
         }
         let (evidence_target, voters) = match &proposal.evidence {
             crate::SlotProposalEvidence::Direct { voters }

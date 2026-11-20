@@ -446,7 +446,7 @@ fn print_report(report: &Report) {
 fn print_costs(prefix: &str, report: &Report) {
     let p = &report.pump;
     println!(
-        "{prefix}pump:       {} local turns {} (max {}), {} frames {}, {} wakes {}; {} ticks, {} local accepted, {} refused, {} payload wants, {} served",
+        "{prefix}pump:       {} local turns {} (max {}), {} frames {}, {} wakes {}; {} ticks, {} local accepted, {} refused, {} payload wants, {} served, {} early",
         p.local_turns,
         super::millis(p.local_nanos),
         super::millis(p.max_local_nanos),
@@ -458,7 +458,8 @@ fn print_costs(prefix: &str, report: &Report) {
         report.local_accepted,
         report.local_full,
         p.payload_wants,
-        p.payload_served
+        p.payload_served,
+        p.payload_early
     );
     println!(
         "{prefix}journal:    {} events, {} applied slots, {} consumed vertices, root {:02x?}, {} folds {} ({} resumed over {}), {} read/decode, {} duplicate receipts skipped",

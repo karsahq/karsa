@@ -112,6 +112,7 @@ pub struct PumpStats {
     scheduled_nanos: AtomicU64,
     payload_wants: AtomicU64,
     payload_served: AtomicU64,
+    payload_early: AtomicU64,
 }
 
 /// Immutable copy of [`PumpStats`].
@@ -135,6 +136,8 @@ pub struct PumpSnapshot {
     pub payload_wants: u64,
     /// Payload requests this node answered from its own retained certified batch.
     pub payload_served: u64,
+    /// Requested payloads retained before the naming slot was applied locally.
+    pub payload_early: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -176,6 +179,7 @@ impl PumpStats {
             scheduled_nanos: self.scheduled_nanos.load(Ordering::Relaxed),
             payload_wants: self.payload_wants.load(Ordering::Relaxed),
             payload_served: self.payload_served.load(Ordering::Relaxed),
+            payload_early: self.payload_early.load(Ordering::Relaxed),
         }
     }
 }
@@ -184,8 +188,10 @@ impl PumpStats {
 /// Controls are trusted at construction and cannot be inferred or added by network input.
 /// Payload arrival resumes journaled execution using the latest trusted local build time;
 /// receipt of agreement evidence never applies a slot. No wire timestamp authorizes signing.
-/// Only payload digests referenced by currently applied certified ordering are admitted.
-/// Payloads arriving before certified application are rejected and require retransmission.
+/// Payload digests referenced by currently applied certified ordering are admitted, and
+/// the exact digest this node requested is retained even before that naming slot is applied
+/// locally: the holder has applied it, the requester has not. Every other pre-application
+/// payload is rejected and requires retransmission.
 /// A node whose execution is blocked on another's batch requests that exact digest; a
 /// holder of a certified batch answers with one ordinary payload frame. Requests and
 /// answers are volatile and are not delivery acknowledgements.
@@ -230,6 +236,21 @@ const PAYLOAD_BURST: usize = 2;
 /// Drip cadence between payload retransmissions: no acknowledgement exists, so a
 /// peer that applies later still receives the bytes, just less often.
 const PAYLOAD_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+/// Most repeated requests for one unanswered payload digest wait this long. A holder may
+/// simply not have heard the first request, so repeats continue; they stop crowding the
+/// wire by doubling up to this fixed cap. No repeat is a delivery promise.
+const PAYLOAD_WANT_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// The one payload digest execution is currently blocked on, and its bounded repeat cadence.
+/// A new blocked digest supersedes the record: the previous digest is either answered or
+/// no longer named by the locally applied certified order.
+struct PayloadWant {
+    hash: [u8; 32],
+    /// Earliest next by-digest request.
+    next: std::time::Instant,
+    /// Requests emitted for this digest; drives the bounded backoff.
+    attempts: u32,
+}
 
 struct LocalSchedule {
     interval: std::time::Duration,
@@ -243,8 +264,8 @@ struct LocalSchedule {
     payload_burst: usize,
     /// Earliest next volatile payload retransmission.
     payload_next: std::time::Instant,
-    /// Earliest next by-digest request for a peer payload execution is blocked on.
-    payload_want_next: std::time::Instant,
+    /// Outstanding by-digest request for a peer payload execution is blocked on.
+    payload_want: Option<PayloadWant>,
     retry_controls: bool,
 }
 
@@ -304,7 +325,7 @@ impl EventPump {
             payload_growth: 0,
             payload_burst: 0,
             payload_next: std::time::Instant::now() + interval,
-            payload_want_next: std::time::Instant::now() + interval,
+            payload_want: None,
             retry_controls: true,
         });
         Ok(())
@@ -405,6 +426,11 @@ impl EventPump {
     /// retained local batches: the order only grows at its end, while the local batch set
     /// keeps receiving new digests that would shift a position-based cursor and starve
     /// earlier entries.
+    ///
+    /// When execution is blocked on a peer batch that is not held locally, this asks for
+    /// that one exact digest instead, through a bounded record that doubles its wait up to
+    /// [`PAYLOAD_WANT_MAX_WAIT`]. The record also marks the digest as expected, so the answer
+    /// is retained even when it arrives before the naming slot is applied here.
     fn required_payload_retry(&mut self, now: std::time::Instant) -> Option<Message> {
         let applied = self
             .owner
@@ -447,12 +473,27 @@ impl EventPump {
         // holder answers, which is demand-driven instead of waiting for whichever
         // author happens to rotate it. Requests have their own cadence and leave the
         // local retransmission burst intact, so peers still receive our own batches.
-        if let Some(hash) = blocked.filter(|hash| !self.batches.contains_key(hash))
-            && now >= schedule.payload_want_next
-        {
-            schedule.payload_want_next = now + PAYLOAD_RETRY;
-            self.stats.payload_wants.fetch_add(1, Ordering::Relaxed);
-            return Some(Message::PayloadWant(hash));
+        // A cadence is not an acknowledgement, so repeats do not stop when one is lost.
+        if let Some(hash) = blocked.filter(|hash| !self.batches.contains_key(hash)) {
+            if !matches!(&schedule.payload_want, Some(want) if want.hash == hash) {
+                schedule.payload_want = Some(PayloadWant {
+                    hash,
+                    next: now,
+                    attempts: 0,
+                });
+            }
+            let mut due = false;
+            if let Some(want) = schedule.payload_want.as_mut()
+                && now >= want.next
+            {
+                want.attempts = want.attempts.saturating_add(1);
+                want.next = now + want_backoff(want.attempts);
+                due = true;
+            }
+            if due {
+                self.stats.payload_wants.fetch_add(1, Ordering::Relaxed);
+                return Some(Message::PayloadWant(hash));
+            }
         }
         let selection = {
             let snapshot = self.owner.finalization().execution().snapshot();
@@ -794,15 +835,26 @@ impl EventPump {
                 if hash == [0; 32] || self.controls.contains(&hash) {
                     return Err("payload conflicts with trusted control classification".into());
                 }
-                if !self
+                // A requested digest may arrive before its naming slot is applied here: the
+                // holder has applied it, this node has not. Rejecting it would waste the
+                // round trip, so the answer is retained under the same index bounds. Bytes
+                // are content-addressed by the digest just computed, so an early batch cannot
+                // mislabel what execution later reads; admission still grants nothing.
+                let named = self
                     .owner
                     .finalization()
                     .execution()
                     .snapshot()
                     .vertices()
                     .iter()
-                    .any(|vertex| vertex.payload_hash == hash)
-                {
+                    .any(|vertex| vertex.payload_hash == hash);
+                let wanted = requested_digest(
+                    self.schedule
+                        .as_ref()
+                        .and_then(|schedule| schedule.payload_want.as_ref()),
+                    &hash,
+                );
+                if !named && !wanted {
                     return Err(format!(
                         "payload is not required by applied certified ordering; retransmit after certified application (order {})",
                         self.owner
@@ -823,6 +875,15 @@ impl EventPump {
                     }
                     self.batches.insert(hash, batch);
                     self.payload_bytes = size;
+                }
+                // The answer settles the request whether or not the naming slot is applied.
+                if wanted {
+                    if !named {
+                        self.stats.payload_early.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(schedule) = self.schedule.as_mut() {
+                        schedule.payload_want = None;
+                    }
                 }
                 // Resume only work already authorized with a trusted local timestamp.
                 // A wire timestamp never supplies local header-authoring time.
@@ -873,6 +934,21 @@ impl EventPump {
             _ => Err("message is not isolated agreement input".into()),
         }
     }
+}
+
+/// Re-request delay for one unanswered by-digest request: it doubles up to a fixed cap, so
+/// repeats keep probing a holder that missed the first frame without crowding the wire.
+fn want_backoff(attempts: u32) -> std::time::Duration {
+    let doublings = attempts.min(3);
+    PAYLOAD_RETRY
+        .saturating_mul(1 << doublings)
+        .min(PAYLOAD_WANT_MAX_WAIT)
+}
+
+/// True while this node is still waiting for that exact digest. Requests are only made for
+/// a payload the applied certified order names, so an expected digest is admitted early.
+fn requested_digest(want: Option<&PayloadWant>, hash: &[u8; 32]) -> bool {
+    want.is_some_and(|want| want.hash == *hash)
 }
 
 /// Answers a by-digest request only when this node holds the batch and the applied
@@ -1008,6 +1084,35 @@ mod tests {
     }
 
     #[test]
+    fn an_unanswered_payload_request_backs_off_to_a_fixed_cap() {
+        assert_eq!(want_backoff(0), PAYLOAD_RETRY);
+        assert_eq!(want_backoff(1), PAYLOAD_RETRY.saturating_mul(2));
+        assert_eq!(want_backoff(2), PAYLOAD_RETRY.saturating_mul(4));
+        assert_eq!(want_backoff(3), PAYLOAD_RETRY.saturating_mul(8));
+        assert_eq!(
+            want_backoff(64),
+            PAYLOAD_WANT_MAX_WAIT,
+            "repeats keep probing a holder without crowding the wire"
+        );
+    }
+
+    #[test]
+    fn only_the_requested_digest_is_admitted_before_certified_application() {
+        let requested = [0xc1; 32];
+        let want = PayloadWant {
+            hash: requested,
+            next: std::time::Instant::now(),
+            attempts: 1,
+        };
+        assert!(requested_digest(Some(&want), &requested));
+        assert!(!requested_digest(Some(&want), &[0x3d; 32]));
+        assert!(
+            !requested_digest(None, &requested),
+            "an unsolicited digest still needs the naming slot"
+        );
+    }
+
+    #[test]
     fn order_position_cursor_does_not_skip_an_earlier_entry_after_insertions() {
         let vertices = [
             named_vertex([0x3d; 32]),
@@ -1050,7 +1155,7 @@ mod tests {
             payload_growth: 0,
             payload_burst: 0,
             payload_next: std::time::Instant::now(),
-            payload_want_next: std::time::Instant::now(),
+            payload_want: None,
             retry_controls: true,
         };
         let after_backpressure = start + interval * 100;
