@@ -8877,6 +8877,52 @@ mod tests {
     }
 
     #[test]
+    fn a_four_validator_certified_session_mesh_certifies_and_agrees() {
+        let _mesh = mesh_test_lock();
+        let dir = TestDir::new("certified-mesh-four");
+        let mut config = mesh_config(&dir, a_free_port_base(4), 0, 0);
+        config.validators = 4;
+        config.timeout = Duration::from_secs(30);
+        config.execute = true;
+        config.agreement_session = true;
+        // `run` fails on a fork in the applied certified order or a built header that
+        // diverges at the shared height, so success is the agreement assertion here.
+        let result = run(config);
+        assert!(
+            result.is_ok(),
+            "the four-validator certified mesh failed: {result:?}"
+        );
+
+        let committee = chain::membership(4, None).unwrap();
+        let chain_id = chain::demo_chain_id();
+        let genesis_state = credited_genesis(&committee.accounts).unwrap();
+        let genesis = Header::genesis(
+            chain_id.clone(),
+            committee.set.epoch,
+            genesis_state.state_root(),
+            commit_root(&[]),
+        );
+        for index in 0..4 {
+            let store = Store::open(dir.0.join(format!("val-{index}"))).unwrap();
+            assert!(
+                store.has_authenticated_slot_agreement().unwrap(),
+                "mesh node {index} opened no certified session"
+            );
+            let bootstrap =
+                agreement::session::genesis_bootstrap(&committee, index, &chain_id, &genesis)
+                    .unwrap();
+            let session = store
+                .recover_authenticated_slot_agreement(bootstrap)
+                .unwrap();
+            let applications = session.ordering_snapshot().unwrap().applications().len();
+            assert!(
+                applications >= 2,
+                "mesh node {index} applied {applications} certified slot(s)"
+            );
+        }
+    }
+
+    #[test]
     fn a_certified_session_live_run_refuses_to_resume_a_durable_store() {
         let _mesh = mesh_test_lock();
         let dir = TestDir::new("certified-reopen");
