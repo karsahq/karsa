@@ -208,6 +208,14 @@ pub struct AgreementProgress {
     pub resumed_replay_nanos: u64,
     /// Peer receipts skipped because the exact observation was already a durable no-op.
     pub duplicate_receipts: u64,
+    /// Vertices currently retained by the owned causal Node, across all rounds.
+    pub held_vertices: usize,
+    /// Held author count per causal round with at least one retained vertex.
+    pub held_by_round: Vec<(u64, usize)>,
+    /// Held authors of the previous round at the next unauthored local round.
+    pub write_round_authors: usize,
+    /// Authors of the previous round the next unauthored local round requires.
+    pub write_round_quorum: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -132,6 +132,14 @@ struct Report {
     taken_batches: usize,
     /// Taken batches a receipt confirmed as named by an authored vertex.
     named_batches: usize,
+    /// Standalone causal vertices received from peers.
+    vertex_frames: usize,
+    /// Vertices received inside authenticated carrier exports.
+    carrier_vertices: usize,
+    /// Distinct vertices queued for a trusted import turn.
+    queued_vertices: usize,
+    /// Import turns that actually carried vertices.
+    drive_turns: u64,
     execution_rejected: Vec<(&'static str, usize)>,
     ticks: u64,
     rejections: Vec<(String, usize)>,
@@ -671,6 +679,32 @@ fn print_costs(prefix: &str, report: &Report) {
         super::millis(report.progress.replay_read_nanos),
         report.progress.duplicate_receipts
     );
+    let held = report
+        .progress
+        .held_by_round
+        .iter()
+        .rev()
+        .take(12)
+        .rev()
+        .map(|(round, authors)| format!("{round}:{authors}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let held = if held.is_empty() {
+        String::from("-")
+    } else {
+        held
+    };
+    println!(
+        "{prefix}availability: {} vertices held (round:authors {held}), next authoring round {} references {}/{} previous-round authors",
+        report.progress.held_vertices,
+        report.progress.own_hole,
+        report.progress.write_round_authors,
+        report.progress.write_round_quorum
+    );
+    println!(
+        "{prefix}imports:     {} vertex frames, {} carrier vertices, {} queued distinct, {} drive turns",
+        report.vertex_frames, report.carrier_vertices, report.queued_vertices, report.drive_turns
+    );
     println!(
         "{prefix}rpc:        {} batches taken, {} named by a vertex",
         report.taken_batches, report.named_batches
@@ -960,6 +994,10 @@ async fn certified_node_task(
     let mut import_exhausted = false;
     let mut authored = 0usize;
     let mut imported = 0usize;
+    let mut vertex_frames = 0usize;
+    let mut carrier_vertices = 0usize;
+    let mut queued_vertices = 0usize;
+    let mut drive_turns = 0u64;
     let mut received = 0usize;
     let mut rejected = 0usize;
     let mut dropped = 0u64;
@@ -997,12 +1035,18 @@ async fn certified_node_task(
                 received += 1;
                 match &frame.message {
                     Message::Vertex(vertex) => {
-                        remember_vertex(&mut seen, &mut pending, vertex);
+                        vertex_frames = vertex_frames.saturating_add(1);
+                        if remember_vertex(&mut seen, &mut pending, vertex) {
+                            queued_vertices = queued_vertices.saturating_add(1);
+                        }
                         continue;
                     }
                     Message::AgreementCarrier { vertices, .. } => {
                         for vertex in vertices {
-                            remember_vertex(&mut seen, &mut pending, vertex);
+                            carrier_vertices = carrier_vertices.saturating_add(1);
+                            if remember_vertex(&mut seen, &mut pending, vertex) {
+                                queued_vertices = queued_vertices.saturating_add(1);
+                            }
                         }
                     }
                     Message::Share(share) => {
@@ -1097,6 +1141,7 @@ async fn certified_node_task(
                         pending.drain(..take).collect()
                     };
                     if !batch.is_empty() {
+                        drive_turns = drive_turns.saturating_add(1);
                         let count = batch.len();
                         match channels.local.try_send(LocalEvent::Drive(batch)) {
                             Ok(()) => {
@@ -1210,6 +1255,10 @@ async fn certified_node_task(
         local_accepted,
         taken_batches,
         named_batches,
+        vertex_frames,
+        carrier_vertices,
+        queued_vertices,
+        drive_turns,
         execution_rejected: Vec::new(),
         ticks,
         rejections: rejections.into_iter().collect(),
@@ -1274,20 +1323,22 @@ async fn certified_node_task(
 }
 
 /// Remembers one distinct signed vertex for a bounded causal import turn.
+/// Returns whether the vertex was newly queued.
 fn remember_vertex(
     seen: &mut BTreeSet<(u64, Vec<u8>, [u8; 32])>,
     pending: &mut Vec<Vertex>,
     vertex: &Vertex,
-) {
+) -> bool {
     if pending.len() >= MAX_PENDING_VERTICES || seen.len() >= MAX_SEEN_VERTICES {
-        return;
+        return false;
     }
-    let Ok(id) = vertex.id() else { return };
+    let Ok(id) = vertex.id() else { return false };
     let key = (id.round, id.author.clone(), id.digest);
     if !seen.insert(key) {
-        return;
+        return false;
     }
     pending.push(vertex.clone());
+    true
 }
 
 fn requeue_vertices(pending: &mut Vec<Vertex>, vertices: Vec<Vertex>) {

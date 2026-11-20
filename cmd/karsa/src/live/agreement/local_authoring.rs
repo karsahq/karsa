@@ -323,6 +323,38 @@ impl JournaledFinalization {
         let dag = local.node.dag();
         progress.local_round = dag.highest_round().unwrap_or(0);
         progress.own_hole = next_local_round(dag, local.node.id());
+        // Availability accounting, diagnostics only. A plain causal round can only be signed
+        // once the node holds a quorum of the previous round's authors, so the per-round held
+        // count separates "peer evidence never arrived" from "it arrived but not enough".
+        let highest = dag.highest_round().unwrap_or(0);
+        let mut held = 0usize;
+        let mut held_by_round = Vec::new();
+        for round in 0..=highest {
+            let authors = dag
+                .set_for_round(round)
+                .validators
+                .iter()
+                .filter(|record| dag.get(round, &record.validator_id).is_some())
+                .count();
+            if authors > 0 {
+                held_by_round.push((round, authors));
+                held += authors;
+            }
+        }
+        progress.held_vertices = held;
+        progress.held_by_round = held_by_round;
+        if progress.own_hole > 0 {
+            let set = dag.set_for_round(progress.own_hole);
+            progress.write_round_quorum = set.quorum_size();
+            progress.write_round_authors = set
+                .validators
+                .iter()
+                .filter(|record| {
+                    dag.get(progress.own_hole - 1, &record.validator_id)
+                        .is_some()
+                })
+                .count();
+        }
         // An authorable obligation whose exact prerequisite carrier is missing cannot be
         // signed this turn: the prospective cone would reject it. These counters separate
         // "waiting for causal availability" from "reducer has no obligation yet".
