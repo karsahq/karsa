@@ -329,6 +329,8 @@ impl JournaledFinalization {
         let highest = dag.highest_round().unwrap_or(0);
         let mut held = 0usize;
         let mut held_by_round = Vec::new();
+        let mut empty_rounds = 0usize;
+        let mut first_empty_rounds = Vec::new();
         for round in 0..=highest {
             let authors = dag
                 .set_for_round(round)
@@ -339,10 +341,17 @@ impl JournaledFinalization {
             if authors > 0 {
                 held_by_round.push((round, authors));
                 held += authors;
+            } else {
+                empty_rounds += 1;
+                if first_empty_rounds.len() < 8 {
+                    first_empty_rounds.push(round);
+                }
             }
         }
         progress.held_vertices = held;
         progress.held_by_round = held_by_round;
+        progress.empty_rounds = empty_rounds;
+        progress.first_empty_rounds = first_empty_rounds;
         if progress.own_hole > 0 {
             let set = dag.set_for_round(progress.own_hole);
             progress.write_round_quorum = set.quorum_size();

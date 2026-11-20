@@ -212,6 +212,10 @@ pub struct AgreementProgress {
     pub held_vertices: usize,
     /// Held author count per causal round with at least one retained vertex.
     pub held_by_round: Vec<(u64, usize)>,
+    /// Rounds below the highest held round with no retained vertex at all.
+    pub empty_rounds: usize,
+    /// First empty rounds below the highest held round, bounded for reporting.
+    pub first_empty_rounds: Vec<u64>,
     /// Held authors of the previous round at the next unauthored local round.
     pub write_round_authors: usize,
     /// Authors of the previous round the next unauthored local round requires.
@@ -1160,8 +1164,29 @@ impl Adapter {
                     .take(4)
                     .map(|carrier| carrier.round)
                     .collect();
+                // A missing witness is either never imported or never authored at all: the
+                // author's own view answers that, and it is the difference between a transport
+                // gap and an intent that references a carrier no DAG contains.
+                let details: Vec<String> = missing
+                    .iter()
+                    .take(4)
+                    .map(|carrier| {
+                        let author = self
+                            .set
+                            .validators
+                            .iter()
+                            .position(|record| record.validator_id == carrier.author)
+                            .unwrap_or(usize::MAX);
+                        let local = carrier.author.as_slice() == self.validator_id.as_slice();
+                        let other = node.dag().get(carrier.round, &carrier.author).is_some();
+                        format!(
+                            "round {} val-{author} self {local} other-held {other}",
+                            carrier.round
+                        )
+                    })
+                    .collect();
                 self.last_aggregate_error = Some(format!(
-                    "{label} carrier unavailable ({error}): missing {}/{} prerequisites at rounds {rounds:?}",
+                    "{label} carrier unavailable ({error}): missing {}/{} prerequisites at rounds {rounds:?} {details:?}",
                     missing.len(),
                     prerequisites.len()
                 ));

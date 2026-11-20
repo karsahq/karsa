@@ -695,8 +695,10 @@ fn print_costs(prefix: &str, report: &Report) {
         held
     };
     println!(
-        "{prefix}availability: {} vertices held (round:authors {held}), next authoring round {} references {}/{} previous-round authors",
+        "{prefix}availability: {} vertices held (round:authors {held}), {} empty rounds {:?}, next authoring round {} references {}/{} previous-round authors",
         report.progress.held_vertices,
+        report.progress.empty_rounds,
+        report.progress.first_empty_rounds,
         report.progress.own_hole,
         report.progress.write_round_authors,
         report.progress.write_round_quorum
