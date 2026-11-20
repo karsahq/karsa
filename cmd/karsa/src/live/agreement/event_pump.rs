@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use net::wire::{Frame, Message};
 use tokio::sync::{mpsc, watch};
 use tx::batch::Batch;
-use validator::Build;
+use validator::{Build, Vertex};
 
 use super::{JournaledFinalization, Membership};
 
@@ -224,7 +224,8 @@ struct LocalSchedule {
     interval: std::time::Duration,
     next: tokio::time::Instant,
     publication_offset: usize,
-    payload_offset: usize,
+    /// Cursor into the applied certified order, not into the retained batches.
+    payload_order_cursor: usize,
     /// Applied order length observed at the last payload growth check.
     payload_growth: usize,
     /// Retransmissions left in the current burst.
@@ -286,7 +287,7 @@ impl EventPump {
             interval,
             next: tokio::time::Instant::now() + interval,
             publication_offset: 0,
-            payload_offset: 0,
+            payload_order_cursor: 0,
             payload_growth: 0,
             payload_burst: 0,
             payload_next: std::time::Instant::now() + interval,
@@ -385,6 +386,11 @@ impl EventPump {
     /// small burst; afterward the same rotation drips, because there is no acknowledgement
     /// and a peer that applies later still needs the bytes. Nothing here invents a delivery
     /// promise or eviction policy.
+    ///
+    /// The rotation cursor is an index into the applied certified order, never into the
+    /// retained local batches: the order only grows at its end, while the local batch set
+    /// keeps receiving new digests that would shift a position-based cursor and starve
+    /// earlier entries.
     fn required_payload_retry(&mut self, now: std::time::Instant) -> Option<Message> {
         let applied = self
             .owner
@@ -423,17 +429,18 @@ impl EventPump {
             }
             return Some(Message::Payload(batch));
         }
-        let required = {
+        let selection = {
             let snapshot = self.owner.finalization().execution().snapshot();
-            snapshot
-                .vertices()
-                .iter()
-                .map(|vertex| vertex.payload_hash)
-                .collect::<BTreeSet<_>>()
+            next_required_payload(
+                snapshot.vertices(),
+                &self.local_batches,
+                &self.controls,
+                &self.batches,
+                schedule.payload_order_cursor,
+            )
         };
-        let offset = schedule.payload_offset;
-        let (hash, next) = next_required_payload(&self.local_batches, &required, offset)?;
-        schedule.payload_offset = next;
+        let (index, hash) = selection?;
+        schedule.payload_order_cursor = index + 1;
         schedule.payload_burst -= 1;
         if schedule.payload_burst == 0 {
             schedule.payload_next = now + PAYLOAD_RETRY;
@@ -500,6 +507,15 @@ impl EventPump {
             }
         };
         let messages = self.owner.author_causal_local(vertices, hash)?;
+        // No free local round means no naming vertex and no reason to retain bytes an
+        // order will never name. The bounds check above still runs first so a naming
+        // vertex can never be authored without its payload held.
+        let named = messages.iter().any(
+            |message| matches!(message, Message::Vertex(vertex) if vertex.payload_hash == hash),
+        );
+        if !named {
+            return Ok(messages);
+        }
         if let std::collections::btree_map::Entry::Vacant(entry) = self.batches.entry(hash) {
             entry.insert(batch);
             self.payload_bytes = size;
@@ -814,24 +830,34 @@ impl EventPump {
 
 /// Selects the next caller-supplied local batch an applied certified order names.
 ///
-/// Returns the digest and the rotation cursor after it. At most one full rotation is
-/// scanned, so a wake's selection work is bounded by the retained local payload count.
+/// Returns its order index and digest. At most one full rotation is scanned, so a wake's
+/// selection work is bounded by the applied order length. The cursor is an order index:
+/// the applied prefix only grows at its end, while the retained local batch set keeps
+/// receiving new digests. A cursor into that set would be shifted by insertions and
+/// starve entries it already passed.
 fn next_required_payload(
+    vertices: &[Vertex],
     local: &BTreeSet<[u8; 32]>,
-    required: &BTreeSet<[u8; 32]>,
-    offset: usize,
-) -> Option<([u8; 32], usize)> {
-    if local.is_empty() {
+    controls: &BTreeSet<[u8; 32]>,
+    batches: &BTreeMap<[u8; 32], Batch>,
+    cursor: usize,
+) -> Option<(usize, [u8; 32])> {
+    if vertices.is_empty() {
         return None;
     }
-    let hashes: Vec<[u8; 32]> = local.iter().copied().collect();
-    let len = hashes.len();
-    let start = offset % len;
+    let len = vertices.len();
+    let start = cursor % len;
     for step in 0..len {
-        let selected = (start + step) % len;
-        if required.contains(&hashes[selected]) {
-            return Some((hashes[selected], (selected + 1) % len));
+        let index = (start + step) % len;
+        let hash = vertices[index].payload_hash;
+        if hash == [0; 32]
+            || controls.contains(&hash)
+            || !local.contains(&hash)
+            || !batches.contains_key(&hash)
+        {
+            continue;
         }
+        return Some((index, hash));
     }
     None
 }
@@ -840,35 +866,89 @@ fn next_required_payload(
 mod tests {
     use super::*;
 
+    fn named_vertex(payload_hash: [u8; 32]) -> Vertex {
+        Vertex {
+            chain_id: Vec::new(),
+            epoch: 0,
+            round: 0,
+            author: Vec::new(),
+            payload_hash,
+            references: Vec::new(),
+            signature: Vec::new(),
+        }
+    }
+
     #[test]
     fn local_payload_rotation_selects_only_required_hashes() {
-        let local: BTreeSet<[u8; 32]> = [[1; 32], [2; 32], [3; 32]].into_iter().collect();
-        let none: BTreeSet<[u8; 32]> = BTreeSet::new();
-        assert_eq!(next_required_payload(&local, &none, 0), None);
+        let vertices = [
+            named_vertex([1; 32]),
+            named_vertex([2; 32]),
+            named_vertex([3; 32]),
+        ];
+        let batches: BTreeMap<[u8; 32], Batch> = [[2; 32], [3; 32]]
+            .into_iter()
+            .map(|hash| (hash, Batch::new(Vec::new())))
+            .collect();
+        let local: BTreeSet<[u8; 32]> = [[2; 32], [3; 32]].into_iter().collect();
         assert_eq!(
-            next_required_payload(&BTreeSet::new(), &local, 0),
+            next_required_payload(&vertices, &local, &BTreeSet::new(), &batches, 0),
+            Some((1, [2; 32])),
+            "the rotation skips a vertex the author does not hold a batch for"
+        );
+        assert_eq!(
+            next_required_payload(&vertices, &local, &BTreeSet::new(), &batches, 2),
+            Some((2, [3; 32]))
+        );
+        assert_eq!(
+            next_required_payload(&vertices, &local, &BTreeSet::new(), &batches, 3),
+            Some((1, [2; 32])),
+            "the rotation wraps to the earliest required entry"
+        );
+        let controls: BTreeSet<[u8; 32]> = [[2; 32]].into_iter().collect();
+        assert_eq!(
+            next_required_payload(&vertices, &local, &controls, &batches, 0),
+            Some((2, [3; 32])),
+            "a classified control digest is not a batch"
+        );
+        assert_eq!(
+            next_required_payload(&vertices, &BTreeSet::new(), &BTreeSet::new(), &batches, 0),
             None,
             "retransmission is only for caller-supplied local batches"
         );
-        let required: BTreeSet<[u8; 32]> = [[2; 32], [3; 32]].into_iter().collect();
         assert_eq!(
-            next_required_payload(&local, &required, 0),
-            Some(([2; 32], 2)),
-            "the rotation skips a local batch the applied order does not name"
+            next_required_payload(&[], &local, &BTreeSet::new(), &batches, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn order_position_cursor_does_not_skip_an_earlier_entry_after_insertions() {
+        let vertices = [
+            named_vertex([0x3d; 32]),
+            named_vertex([0xbe; 32]),
+            named_vertex([0xc1; 32]),
+        ];
+        let batches: BTreeMap<[u8; 32], Batch> = [[0x3d; 32], [0xbe; 32], [0xc1; 32]]
+            .into_iter()
+            .map(|hash| (hash, Batch::new(Vec::new())))
+            .collect();
+        let mut local: BTreeSet<[u8; 32]> =
+            [[0x3d; 32], [0xbe; 32], [0xc1; 32]].into_iter().collect();
+        // A position cursor into `local` would advance past 0x3d as new, smaller
+        // digests arrive and never select it again. The order cursor cannot move.
+        local.insert([0x01; 32]);
+        local.insert([0x22; 32]);
+        assert_eq!(
+            next_required_payload(&vertices, &local, &BTreeSet::new(), &batches, 0),
+            Some((0, [0x3d; 32]))
         );
         assert_eq!(
-            next_required_payload(&local, &required, 1),
-            Some(([2; 32], 2))
+            next_required_payload(&vertices, &local, &BTreeSet::new(), &batches, 1),
+            Some((1, [0xbe; 32]))
         );
         assert_eq!(
-            next_required_payload(&local, &required, 2),
-            Some(([3; 32], 0))
-        );
-        let only_last: BTreeSet<[u8; 32]> = [[3; 32]].into_iter().collect();
-        assert_eq!(
-            next_required_payload(&local, &only_last, 0),
-            Some(([3; 32], 0)),
-            "a scan is bounded to one full rotation"
+            next_required_payload(&vertices, &local, &BTreeSet::new(), &batches, 2),
+            Some((2, [0xc1; 32]))
         );
     }
 
@@ -880,7 +960,7 @@ mod tests {
             interval,
             next: start + interval,
             publication_offset: 63,
-            payload_offset: 7,
+            payload_order_cursor: 7,
             payload_growth: 0,
             payload_burst: 0,
             payload_next: std::time::Instant::now(),
