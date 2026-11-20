@@ -20,8 +20,11 @@
 //! - with `--execute`, each node authors bounded local demo batches and names them in its
 //!   plain causal vertices. The pump retains those bytes, broadcasts them with the naming
 //!   vertex, and retries them once applied certified ordering requires them, so peers admit
-//!   the payload after they apply the same slot. Without `--execute`, payload hashes stay
-//!   zero and applied slots order vertices without executing transactions;
+//!   the payload after they apply the same slot. A peer blocked on another node's batch
+//!   asks for that exact digest, and any holder answers with an ordinary payload frame;
+//!   the request changes who triggers delivery, not the no-acknowledgement contract.
+//!   Without `--execute`, payload hashes stay zero and applied slots order vertices
+//!   without executing transactions;
 //! - no RPC, snapshot, epoch transition, pruning or delivery acknowledgement is wired here.
 //!
 //! The single-validator path is proven end to end: plain causal rounds decide whenever a
@@ -432,7 +435,7 @@ fn print_report(report: &Report) {
 fn print_costs(prefix: &str, report: &Report) {
     let p = &report.pump;
     println!(
-        "{prefix}pump:       {} local turns {} (max {}), {} frames {}, {} wakes {}; {} ticks, {} local accepted, {} refused",
+        "{prefix}pump:       {} local turns {} (max {}), {} frames {}, {} wakes {}; {} ticks, {} local accepted, {} refused, {} payload wants, {} served",
         p.local_turns,
         super::millis(p.local_nanos),
         super::millis(p.max_local_nanos),
@@ -442,7 +445,9 @@ fn print_costs(prefix: &str, report: &Report) {
         super::millis(p.scheduled_nanos),
         report.ticks,
         report.local_accepted,
-        report.local_full
+        report.local_full,
+        p.payload_wants,
+        p.payload_served
     );
     println!(
         "{prefix}journal:    {} events, {} applied slots, {} consumed vertices, root {:02x?}, {} folds {} ({} resumed over {}), {} read/decode, {} duplicate receipts skipped",

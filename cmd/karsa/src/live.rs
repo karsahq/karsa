@@ -4049,6 +4049,9 @@ async fn node_task(
                     | Message::AgreementViewRequest(_)
                     | Message::AgreementViewCertificate(_)
                     | Message::AgreementNilVote(_) => rejected += 1,
+                    // Legacy execution has no certified order to answer from, so a
+                    // by-digest request for a batch is not served here.
+                    Message::PayloadWant(_) => rejected += 1,
                     Message::Want(id) => {
                         // Answering is a broadcast: the reply is a vertex, and a
                         // vertex is exactly what the original sender would have
@@ -6346,6 +6349,8 @@ async fn archive_task(
                     Message::Want(_) => {}
                     // A slot want is the same repair as a named want.
                     Message::WantSlot { .. } => {}
+                    // A payload want needs a certified order, which an archive has none of.
+                    Message::PayloadWant(_) => {}
                     // An archive does not certify; the shares it receives are for
                     // validators to build certificates from.
                     Message::Share(_) => {}

@@ -91,6 +91,7 @@ const KIND_AGREEMENT_CARRIER: u8 = 17;
 const KIND_AGREEMENT_VIEW_REQUEST: u8 = 18;
 const KIND_AGREEMENT_VIEW_CERTIFICATE: u8 = 19;
 const KIND_AGREEMENT_NIL_VOTE: u8 = 20;
+const KIND_PAYLOAD_WANT: u8 = 21;
 
 // Matches the slot-decision codec's maximum validator roster; bytes remain capped separately.
 const MAX_AGREEMENT_VIEW_REQUESTS: usize = 4096;
@@ -200,6 +201,12 @@ pub enum Message {
     },
     /// A batch a vertex names, sent on the data plane.
     Payload(Batch),
+    /// A request for one data-plane batch, named by the digest its vertex signs.
+    ///
+    /// A requester that has applied the ordering vertex but lacks the bytes asks by
+    /// digest instead of waiting for a blind retransmission. Only a peer holding that
+    /// exact batch answers, and the answer is an ordinary [`Message::Payload`] frame.
+    PayloadWant([u8; 32]),
     /// A protocol payload a vertex names, carrying the same causal weight as a
     /// batch.
     ///
@@ -689,6 +696,7 @@ pub fn frame(message: &Message, sent_at_nanos: u64) -> Result<Vec<u8>, CryptoErr
             (KIND_WANT_SLOT, encoder.finish())
         }
         Message::Payload(batch) => (KIND_PAYLOAD, batch.encode()?),
+        Message::PayloadWant(hash) => (KIND_PAYLOAD_WANT, hash.to_vec()),
         Message::Control(payload) => (KIND_CONTROL, payload.encode()?),
         Message::Share(share) => (KIND_SHARE, encode_share(share)?),
         Message::SnapshotWant => (KIND_SNAPSHOT_WANT, Vec::new()),
@@ -821,6 +829,12 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, CryptoError> {
             Message::WantSlot { round, author }
         }
         KIND_PAYLOAD => Message::Payload(Batch::decode(payload)?),
+        KIND_PAYLOAD_WANT => {
+            let hash: [u8; 32] = payload
+                .try_into()
+                .map_err(|_| invalid("payload want is not a digest"))?;
+            Message::PayloadWant(hash)
+        }
         KIND_CONTROL => Message::Control(Box::new(ControlPayload::decode(payload)?)),
         KIND_SHARE => Message::Share(decode_share(payload)?),
         KIND_SNAPSHOT_WANT => {
@@ -1305,6 +1319,28 @@ mod tests {
         let mut buffer = frame(&Message::Payload(batch.clone()), 5).unwrap();
         let frame = take_frame(&mut buffer).unwrap().unwrap();
         assert_eq!(frame.message, Message::Payload(batch));
+    }
+
+    #[test]
+    fn a_payload_want_round_trips_one_digest() {
+        let hash = [0x3d; 32];
+        let mut buffer = frame(&Message::PayloadWant(hash), 9).unwrap();
+        let frame = take_frame(&mut buffer).unwrap().unwrap();
+        assert_eq!(frame.message, Message::PayloadWant(hash));
+    }
+
+    #[test]
+    fn a_payload_want_of_the_wrong_length_is_refused() {
+        let mut buffer = Vec::new();
+        let body_len = (HEADER - 4 + 31) as u32;
+        buffer.extend_from_slice(&body_len.to_le_bytes());
+        buffer.extend_from_slice(&[0u8; 8]);
+        buffer.push(KIND_PAYLOAD_WANT);
+        buffer.extend_from_slice(&[0x3d; 31]);
+        assert!(matches!(
+            take_frame(&mut buffer),
+            Err(error) if error.kind() == CryptoErrorKind::InvalidVertex
+        ));
     }
 
     #[test]

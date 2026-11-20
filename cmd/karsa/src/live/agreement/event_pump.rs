@@ -110,6 +110,8 @@ pub struct PumpStats {
     frame_nanos: AtomicU64,
     scheduled_turns: AtomicU64,
     scheduled_nanos: AtomicU64,
+    payload_wants: AtomicU64,
+    payload_served: AtomicU64,
 }
 
 /// Immutable copy of [`PumpStats`].
@@ -129,6 +131,10 @@ pub struct PumpSnapshot {
     pub scheduled_turns: u64,
     /// Cumulative nanoseconds spent in scheduled maintenance.
     pub scheduled_nanos: u64,
+    /// By-digest payload requests emitted because execution was blocked on a peer batch.
+    pub payload_wants: u64,
+    /// Payload requests this node answered from its own retained certified batch.
+    pub payload_served: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -168,6 +174,8 @@ impl PumpStats {
             frame_nanos: self.frame_nanos.load(Ordering::Relaxed),
             scheduled_turns: self.scheduled_turns.load(Ordering::Relaxed),
             scheduled_nanos: self.scheduled_nanos.load(Ordering::Relaxed),
+            payload_wants: self.payload_wants.load(Ordering::Relaxed),
+            payload_served: self.payload_served.load(Ordering::Relaxed),
         }
     }
 }
@@ -178,6 +186,9 @@ impl PumpStats {
 /// receipt of agreement evidence never applies a slot. No wire timestamp authorizes signing.
 /// Only payload digests referenced by currently applied certified ordering are admitted.
 /// Payloads arriving before certified application are rejected and require retransmission.
+/// A node whose execution is blocked on another's batch requests that exact digest; a
+/// holder of a certified batch answers with one ordinary payload frame. Requests and
+/// answers are volatile and are not delivery acknowledgements.
 /// Admitted batches are never evicted: this offline owner's lifetime must fit its limits;
 /// it has no pruning authority and does not support unbounded continued operation.
 ///
@@ -232,6 +243,8 @@ struct LocalSchedule {
     payload_burst: usize,
     /// Earliest next volatile payload retransmission.
     payload_next: std::time::Instant,
+    /// Earliest next by-digest request for a peer payload execution is blocked on.
+    payload_want_next: std::time::Instant,
     retry_controls: bool,
 }
 
@@ -291,6 +304,7 @@ impl EventPump {
             payload_growth: 0,
             payload_burst: 0,
             payload_next: std::time::Instant::now() + interval,
+            payload_want_next: std::time::Instant::now() + interval,
             retry_controls: true,
         });
         Ok(())
@@ -428,6 +442,17 @@ impl EventPump {
                 schedule.payload_next = now + PAYLOAD_RETRY;
             }
             return Some(Message::Payload(batch));
+        }
+        // The first missing payload belongs to a peer. Ask for that exact digest; a
+        // holder answers, which is demand-driven instead of waiting for whichever
+        // author happens to rotate it. Requests have their own cadence and leave the
+        // local retransmission burst intact, so peers still receive our own batches.
+        if let Some(hash) = blocked.filter(|hash| !self.batches.contains_key(hash))
+            && now >= schedule.payload_want_next
+        {
+            schedule.payload_want_next = now + PAYLOAD_RETRY;
+            self.stats.payload_wants.fetch_add(1, Ordering::Relaxed);
+            return Some(Message::PayloadWant(hash));
         }
         let selection = {
             let snapshot = self.owner.finalization().execution().snapshot();
@@ -709,7 +734,12 @@ impl EventPump {
                     local_open = false;
                     continue;
                 }
-                Input::Frame(Some(frame)) => self.receive(frame.message),
+                Input::Frame(Some(frame)) => {
+                    self.receive(frame.message).map(|(build, responses)| {
+                        carriers = responses;
+                        build
+                    })
+                }
                 Input::Frame(None) => {
                     frames_open = false;
                     continue;
@@ -756,7 +786,7 @@ impl EventPump {
             .build_ready(&self.membership, &self.batches, &self.controls, at)
     }
 
-    fn receive(&mut self, message: Message) -> Result<Build, String> {
+    fn receive(&mut self, message: Message) -> Result<(Build, Vec<Message>), String> {
         match message {
             Message::Payload(batch) => {
                 let bytes = batch.encode().map_err(|error| error.to_string())?;
@@ -797,14 +827,31 @@ impl EventPump {
                 // Resume only work already authorized with a trusted local timestamp.
                 // A wire timestamp never supplies local header-authoring time.
                 match self.build_at {
-                    Some(at) => self.build(at),
-                    None => Ok(Build::default()),
+                    Some(at) => self.build(at).map(|build| (build, Vec::new())),
+                    None => Ok((Build::default(), Vec::new())),
                 }
             }
-            Message::Share(share) => Ok(Build {
-                shares: Vec::new(),
-                certified: self.owner.receive_share(&self.membership, share)?,
-            }),
+            Message::PayloadWant(hash) => {
+                // Answer only with a batch this node still holds and that the applied
+                // certified order names. The reply is broadcast like any payload; a
+                // duplicate is ordinary and grants no delivery acknowledgement.
+                let snapshot = self.owner.finalization().execution().snapshot();
+                let served = serve_payload(snapshot.vertices(), &self.batches, &hash);
+                if served.is_some() {
+                    self.stats.payload_served.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok((
+                    Build::default(),
+                    served.map(Message::Payload).into_iter().collect(),
+                ))
+            }
+            Message::Share(share) => Ok((
+                Build {
+                    shares: Vec::new(),
+                    certified: self.owner.receive_share(&self.membership, share)?,
+                },
+                Vec::new(),
+            )),
             message @ (Message::AgreementCarrier { .. }
             | Message::AgreementNilVote(_)
             | Message::AgreementViewRequest(_)
@@ -821,11 +868,25 @@ impl EventPump {
                     Ok(Build::default())
                 };
                 received?;
-                built
+                Ok((built?, Vec::new()))
             }
             _ => Err("message is not isolated agreement input".into()),
         }
     }
+}
+
+/// Answers a by-digest request only when this node holds the batch and the applied
+/// certified order names its digest. An unknown or not-yet-applied digest is ignored;
+/// the reply carries no delivery guarantee of its own.
+fn serve_payload(
+    vertices: &[Vertex],
+    batches: &BTreeMap<[u8; 32], Batch>,
+    hash: &[u8; 32],
+) -> Option<Batch> {
+    if !vertices.iter().any(|vertex| vertex.payload_hash == *hash) {
+        return None;
+    }
+    batches.get(hash).cloned()
 }
 
 /// Selects the next caller-supplied local batch an applied certified order names.
@@ -876,6 +937,31 @@ mod tests {
             references: Vec::new(),
             signature: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_payload_request_is_served_only_for_certified_held_batches() {
+        let certified = [0x3d; 32];
+        let held_only = [0xbe; 32];
+        let vertices = [named_vertex(certified), named_vertex([0; 32])];
+        let batches: BTreeMap<[u8; 32], Batch> = [certified, held_only]
+            .into_iter()
+            .map(|hash| (hash, Batch::new(Vec::new())))
+            .collect();
+        assert_eq!(
+            serve_payload(&vertices, &batches, &certified),
+            Some(Batch::new(Vec::new()))
+        );
+        assert_eq!(
+            serve_payload(&vertices, &batches, &[0x45; 32]),
+            None,
+            "a digest no applied vertex names is not served"
+        );
+        assert_eq!(
+            serve_payload(&vertices, &batches, &held_only),
+            None,
+            "a held batch the applied order does not name is not served"
+        );
     }
 
     #[test]
@@ -964,6 +1050,7 @@ mod tests {
             payload_growth: 0,
             payload_burst: 0,
             payload_next: std::time::Instant::now(),
+            payload_want_next: std::time::Instant::now(),
             retry_controls: true,
         };
         let after_backpressure = start + interval * 100;
