@@ -59,7 +59,7 @@ use net::wire::{self, Message};
 use store::Store;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
-use validator::{EpochSchedule, Header, Share, Vertex, commit_root};
+use validator::{EpochSchedule, Header, Share, Vertex, VertexId, commit_root};
 
 use super::agreement::AgreementProgress;
 use super::agreement::event_pump::{EventPump, LocalEvent, PumpSnapshot};
@@ -113,6 +113,8 @@ struct Report {
     consumed: usize,
     applications: usize,
     order_root: [u8; 32],
+    /// Exact applied certified entries; empty when the node did not stop cleanly.
+    order: Vec<VertexId>,
     blocked: Option<(u64, usize, [u8; 32], bool)>,
     certified: usize,
     progress: AgreementProgress,
@@ -347,6 +349,36 @@ async fn run_mesh(
             .unwrap_or(0),
         reports.iter().map(|report| report.applied_tx).sum::<u64>()
     );
+    // Certification fixes the entry at every applied index, so comparing the applied
+    // prefixes is what separates an ordinary laggard from a fork. It grants no authority:
+    // execution still comes only from the node's own certified ordering.
+    let relation = order_relation(
+        &reports
+            .iter()
+            .map(|report| (report.index, report.order.as_slice()))
+            .collect::<Vec<_>>(),
+    );
+    match &relation {
+        Some(OrderRelation::Identical { len }) => println!(
+            "  order:      identical {len} entries on {} nodes",
+            reports.len()
+        ),
+        Some(OrderRelation::Lagging {
+            laggard,
+            ahead,
+            shared,
+        }) => println!("  order:      node {laggard} lags node {ahead}: {shared} shared entries"),
+        Some(OrderRelation::Fork { index, left, right }) => {
+            println!("  order:      forked at entry {index}: nodes {left} and {right} differ")
+        }
+        None => {}
+    }
+    if let Some(OrderRelation::Fork { index, left, right }) = relation {
+        return Err(format!(
+            "certified ordering forked at entry {index}: nodes {left} and {right} applied different entries"
+        )
+        .into());
+    }
     if !failures.is_empty() {
         return Err(format!("{} certified node(s) stopped with an error", failures.len()).into());
     }
@@ -361,6 +393,65 @@ fn join(
         Ok(Ok(report)) => Ok(report),
         Ok(Err(error)) => Err(format!("node {index}: {error}").into()),
         Err(error) => Err(format!("node {index} stopped: {error}").into()),
+    }
+}
+
+/// How the applied certified orders of a finished run relate to each other.
+#[derive(Debug, PartialEq, Eq)]
+enum OrderRelation {
+    /// Every node applied the same entries.
+    Identical { len: usize },
+    /// One node stopped before applying entries another node already had: ordinary lag.
+    Lagging {
+        laggard: usize,
+        ahead: usize,
+        shared: usize,
+    },
+    /// Two nodes applied different entries at the same index: not lag, a fork.
+    Fork {
+        index: usize,
+        left: usize,
+        right: usize,
+    },
+}
+
+/// Compares independently applied certified orders, pairwise against the first node.
+///
+/// Every order is compared with the first one: prefix-consistent orders are transitive, so
+/// two later nodes that both match the first also match each other. A differing digest at
+/// a shared index is a fork; merely fewer entries is lag. Diagnostic only.
+fn order_relation(orders: &[(usize, &[VertexId])]) -> Option<OrderRelation> {
+    let (first_node, first) = *orders.first()?;
+    let mut shared = first.len();
+    let mut shortest = (first_node, first.len());
+    let mut longest = (first_node, first.len());
+    for (node, order) in orders {
+        let common = order.len().min(first.len());
+        for index in 0..common {
+            if order[index].digest != first[index].digest {
+                return Some(OrderRelation::Fork {
+                    index,
+                    left: first_node,
+                    right: *node,
+                });
+            }
+        }
+        shared = shared.min(common);
+        if order.len() < shortest.1 {
+            shortest = (*node, order.len());
+        }
+        if order.len() > longest.1 {
+            longest = (*node, order.len());
+        }
+    }
+    if shortest.1 == longest.1 {
+        Some(OrderRelation::Identical { len: longest.1 })
+    } else {
+        Some(OrderRelation::Lagging {
+            laggard: shortest.0,
+            ahead: longest.0,
+            shared,
+        })
     }
 }
 
@@ -943,6 +1034,7 @@ async fn certified_node_task(
         consumed: 0,
         applications: 0,
         order_root: [0; 32],
+        order: Vec::new(),
         blocked: None,
         certified: 0,
         progress: AgreementProgress::default(),
@@ -969,6 +1061,7 @@ async fn certified_node_task(
                     report.consumed = owner.finalization().execution().consumed_order().len();
                     report.applications = owner.finalization().execution().applied_slots();
                     report.order_root = owner.finalization().execution().order_root();
+                    report.order = owner.finalization().execution().applied_order().to_vec();
                     report.blocked = owner.finalization().execution().blocked().map(
                         |(round, author, payload, id_matches)| {
                             let author = committee
@@ -1074,5 +1167,70 @@ fn flush_shares(
     }
     for share in deferred {
         shares.push_front(share);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OrderRelation, order_relation};
+    use validator::VertexId;
+
+    fn entry(round: u64, digest: u8) -> VertexId {
+        VertexId {
+            round,
+            author: vec![0],
+            digest: [digest; 32],
+        }
+    }
+
+    /// Independent nodes that stop at different moments share their prefix.
+    #[test]
+    fn a_shorter_applied_order_is_a_laggard_not_a_fork() {
+        let first = [entry(1, 1), entry(2, 2), entry(3, 3)];
+        let shorter = [entry(1, 1), entry(2, 2)];
+        let relation = order_relation(&[(0, &first), (2, &shorter)]).unwrap();
+        assert_eq!(
+            relation,
+            OrderRelation::Lagging {
+                laggard: 2,
+                ahead: 0,
+                shared: 2
+            }
+        );
+    }
+
+    /// Equal lengths with one different digest is divergence, not lag.
+    #[test]
+    fn a_different_entry_at_a_shared_index_is_a_fork() {
+        let first = [entry(1, 1), entry(2, 2)];
+        let other = [entry(1, 1), entry(2, 9)];
+        assert_eq!(
+            order_relation(&[(0, &first), (1, &other)]).unwrap(),
+            OrderRelation::Fork {
+                index: 1,
+                left: 0,
+                right: 1
+            }
+        );
+    }
+
+    #[test]
+    fn identical_prefixes_compare_as_identical() {
+        let first = [entry(1, 1), entry(2, 2)];
+        let same = [entry(1, 1), entry(2, 2)];
+        let empty: [VertexId; 0] = [];
+        assert_eq!(
+            order_relation(&[(0, &first), (1, &same), (2, &empty)]).unwrap(),
+            OrderRelation::Lagging {
+                laggard: 2,
+                ahead: 0,
+                shared: 0
+            }
+        );
+        assert_eq!(
+            order_relation(&[(0, &first), (1, &same)]).unwrap(),
+            OrderRelation::Identical { len: 2 }
+        );
+        assert_eq!(order_relation(&[]), None);
     }
 }

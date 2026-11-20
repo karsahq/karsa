@@ -168,6 +168,12 @@ impl CertifiedExecution {
     pub fn order_root(&self) -> [u8; 32] {
         *self.consumer.snapshot().binding().tip().order_root()
     }
+    /// Exact certified entries the applied execution boundary covers. Comparing these
+    /// across nodes is the only diagnostic that separates a laggard from a fork; it grants
+    /// no ordering authority of its own.
+    pub fn applied_order(&self) -> &[VertexId] {
+        self.consumer.snapshot().order()
+    }
     /// First certified vertex whose payload is still missing, if execution is blocked.
     /// The last flag reports whether the retained vertex's digest still equals the
     /// certified order ID's digest at that index.
