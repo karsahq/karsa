@@ -347,7 +347,9 @@ pub struct Config {
     ///
     /// Zero disables the server. A nonzero port implies `--execute` and turns the
     /// data plane into a mempool: batches come from submitted transactions instead
-    /// of [`chain::demo_batch`], and authoring does not stop at `rounds`.
+    /// of [`chain::demo_batch`], and authoring does not stop at `rounds`. With
+    /// `--agreement-session` the port serves `POST /tx` only; the certified session
+    /// authors the admitted envelopes, and its execution state has no reader yet.
     pub rpc_port: u16,
     /// Most mempool transactions one authored batch may carry.
     pub rpc_batch_max: usize,
@@ -399,8 +401,10 @@ pub struct Config {
     /// histories never share one directory. A single validator proves the local path
     /// through a certified header; a multi-validator mesh exchanges the same evidence
     /// but advances much slower because the durable owner replays its whole journal on
-    /// every read. It has no data-plane payload, RPC, snapshot or epoch-transition
-    /// support yet, and its bounded owner lifetime is a single run, not a production
+    /// every read. With [`Self::rpc_port`] the data plane is client-submitted envelopes,
+    /// served by a submission-only endpoint; without it the session orders zero-payload
+    /// causal vertices. Snapshots, epoch transitions and delivery acknowledgements are
+    /// not wired, and its bounded owner lifetime is a single run, not a production
     /// authority claim.
     pub agreement_session: bool,
 }
@@ -6930,15 +6934,12 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         }
         if config.txs > 0 {
             return Err(
-                "--agreement-session has no data-plane payload yet; leave --txs at 0".into(),
+                "--agreement-session takes payload only from --rpc-port submissions; leave --txs at 0"
+                    .into(),
             );
         }
-        if config.rpc_port > 0
-            || config.snapshot_port > 0
-            || config.sync_from_peers
-            || config.checkpoint_every > 0
-        {
-            return Err("--agreement-session does not wire RPC, snapshots or checkpoints".into());
+        if config.snapshot_port > 0 || config.sync_from_peers || config.checkpoint_every > 0 {
+            return Err("--agreement-session does not wire snapshots or checkpoints".into());
         }
         if config.pre_sign || config.shard {
             return Err("--agreement-session does not pre-sign or shard payloads".into());
@@ -8701,7 +8702,12 @@ mod tests {
 
     /// Finds one contiguous port range the mesh can bind.
     fn a_free_port_base(validators: usize) -> u16 {
-        for base in (20000u16..50000).step_by(8) {
+        a_free_port_base_from(20000, validators)
+    }
+
+    /// Finds a free range above `start`, so the peer and RPC ranges of one test differ.
+    fn a_free_port_base_from(start: u16, validators: usize) -> u16 {
+        for base in (start..50000u16).step_by(8) {
             let mut probes = Vec::new();
             let mut free = true;
             for offset in 0..validators {
@@ -8721,6 +8727,95 @@ mod tests {
             }
         }
         panic!("no free contiguous port range for the live mesh");
+    }
+
+    /// Signs one client envelope for the committee fixture, as `karsa send` does.
+    fn client_transfer(
+        chain_id: &[u8],
+        account: &chain::Account,
+        recipient: [u8; 32],
+        sequence: u64,
+    ) -> tx::envelope::Transaction {
+        use crypto::registry::ALG_ED25519;
+        use tx::envelope::PROTOCOL_VERSION_V1;
+        use tx::policy::Authorization;
+        let mut transaction = tx::envelope::Transaction {
+            protocol_version: PROTOCOL_VERSION_V1,
+            chain_id: chain_id.to_vec(),
+            sender: account.address.to_vec(),
+            sequence,
+            fee: 1,
+            expiration: u64::MAX,
+            policy_version: 1,
+            payload: exec::Transfer::new(recipient.to_vec(), 1)
+                .encode()
+                .expect("transfer payload encodes"),
+            authorization: Vec::new(),
+        };
+        let message = transaction.signing_payload().expect("signing payload");
+        let signature = Ed25519Scheme.sign(&account.private_key, &message).unwrap();
+        transaction.authorization = vec![Authorization {
+            algorithm_id: ALG_ED25519,
+            key_id: account.key_id.clone(),
+            signature,
+        }];
+        transaction
+    }
+
+    /// Posts one envelope to the submission-only certified RPC endpoint.
+    fn post_client_transfer(port: u16, envelope: &[u8]) -> Result<u16, String> {
+        use std::io::{Read, Write};
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut stream = loop {
+            match std::net::TcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => break stream,
+                Err(error) => {
+                    if Instant::now() >= deadline {
+                        return Err(format!("cannot reach RPC {port}: {error}"));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        };
+        let body = hex::encode(envelope);
+        let request = format!(
+            "POST /tx HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|error| error.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|error| error.to_string())?;
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .map_err(|error| error.to_string())?;
+        Ok(response
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|status| status.parse().ok())
+            .unwrap_or(0))
+    }
+
+    /// Root of the trusted genesis after exactly the submitted transaction is applied.
+    fn the_only_transaction_root(
+        committee: &chain::Membership,
+        transaction: &tx::envelope::Transaction,
+    ) -> [u8; 32] {
+        let batch = Batch::new(vec![transaction.clone()]);
+        let mut state = credited_genesis(&committee.accounts).unwrap();
+        let mut rejected = BTreeMap::new();
+        let count = chain::apply_batch(&mut state, &committee.accounts, &batch, &mut rejected);
+        assert_eq!(
+            count, 1,
+            "the client transaction must apply to the trusted genesis; rejected {:?}",
+            rejected
+        );
+        state.state_root()
     }
 
     fn mesh_config(dir: &TestDir, port_base: u16, rounds: u64, checkpoint_every: u64) -> Config {
@@ -8880,21 +8975,44 @@ mod tests {
     fn a_four_validator_certified_session_mesh_certifies_and_agrees() {
         let _mesh = mesh_test_lock();
         let dir = TestDir::new("certified-mesh-four");
-        let mut config = mesh_config(&dir, a_free_port_base(4), 0, 0);
+        let peer = a_free_port_base(4);
+        let rpc = a_free_port_base_from(peer.saturating_add(8), 4);
+        let mut config = mesh_config(&dir, peer, 0, 0);
         config.validators = 4;
         config.timeout = Duration::from_secs(30);
         config.execute = true;
         config.agreement_session = true;
+        config.rpc_port = rpc;
+
+        // One client-signed envelope goes to node 0. The certified authoring turn names
+        // it there; every node must still apply it after the slot is decided, which is
+        // what makes this a payload test and not an order-only one.
+        let committee = chain::membership(4, None).unwrap();
+        let chain_id = chain::demo_chain_id();
+        let transaction = client_transfer(
+            &chain_id,
+            &committee.accounts[0],
+            committee.accounts[1].address,
+            1,
+        );
+        let envelope = transaction.encode().unwrap();
+        let expected = the_only_transaction_root(&committee, &transaction);
+        let submit = std::thread::spawn(move || post_client_transfer(rpc, &envelope));
+
         // `run` fails on a fork in the applied certified order or a built header that
         // diverges at the shared height, so success is the agreement assertion here.
         let result = run(config);
+        let status = submit.join().expect("submitter panicked");
         assert!(
             result.is_ok(),
-            "the four-validator certified mesh failed: {result:?}"
+            "the four-validator certified mesh failed: {result:?} (submit {status:?})"
+        );
+        assert_eq!(
+            status,
+            Ok(202),
+            "node 0 did not accept the client transaction"
         );
 
-        let committee = chain::membership(4, None).unwrap();
-        let chain_id = chain::demo_chain_id();
         let genesis_state = credited_genesis(&committee.accounts).unwrap();
         let genesis = Header::genesis(
             chain_id.clone(),
@@ -8918,6 +9036,96 @@ mod tests {
             assert!(
                 applications >= 2,
                 "mesh node {index} applied {applications} certified slot(s)"
+            );
+            let driver = store::SlotAgreementDriver::new(session);
+            let intents = driver.header_intents().unwrap();
+            let header = intents
+                .iter()
+                .find(|intent| intent.header().applied >= 1)
+                .unwrap_or_else(|| {
+                    panic!("mesh node {index} never applied the client transaction")
+                });
+            assert_eq!(
+                header.header().applied,
+                1,
+                "mesh node {index} applied transactions other than the client's"
+            );
+            assert_eq!(
+                header.header().state_root,
+                expected,
+                "mesh node {index} executed a different state"
+            );
+        }
+    }
+
+    /// One process per validator is the deployment shape: each run owns one store, one
+    /// listening port and one certified session, and peer evidence arrives over sockets.
+    /// The three runs are independent runtimes, so any agreement here is reconstructed
+    /// from each node's own durable journal, not shared process state.
+    #[test]
+    fn three_node_index_runs_converge_on_one_certified_order() {
+        let _mesh = mesh_test_lock();
+        let dir = TestDir::new("certified-node-processes");
+        let base = a_free_port_base(3);
+        let mut handles = Vec::with_capacity(3);
+        for index in 0..3 {
+            let mut config = mesh_config(&dir, base, 0, 0);
+            config.validators = 3;
+            config.node_index = Some(index);
+            config.timeout = Duration::from_secs(25);
+            config.execute = true;
+            config.agreement_session = true;
+            handles.push(std::thread::spawn(move || {
+                run(config).map_err(|error| error.to_string())
+            }));
+        }
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("node thread panicked"))
+            .collect();
+        for (index, result) in results.iter().enumerate() {
+            assert!(
+                result.is_ok(),
+                "single-node process {index} failed: {result:?}"
+            );
+        }
+
+        let committee = chain::membership(3, None).unwrap();
+        let chain_id = chain::demo_chain_id();
+        let genesis_state = credited_genesis(&committee.accounts).unwrap();
+        let genesis = Header::genesis(
+            chain_id.clone(),
+            committee.set.epoch,
+            genesis_state.state_root(),
+            commit_root(&[]),
+        );
+        let mut orders = Vec::new();
+        for index in 0..3 {
+            let store = Store::open(dir.0.join(format!("val-{index}"))).unwrap();
+            let bootstrap =
+                agreement::session::genesis_bootstrap(&committee, index, &chain_id, &genesis)
+                    .unwrap();
+            let session = store
+                .recover_authenticated_slot_agreement(bootstrap)
+                .unwrap();
+            let snapshot = session.ordering_snapshot().unwrap();
+            assert!(
+                snapshot.applications().len() >= 2,
+                "node {index} applied {} certified slot(s)",
+                snapshot.applications().len()
+            );
+            orders.push(snapshot.order().to_vec());
+        }
+        let first = orders[0].len();
+        assert!(
+            orders.iter().all(|order| order.len() == first),
+            "independent nodes applied different certified lengths: {:?}",
+            orders.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        for (index, order) in orders.iter().enumerate().skip(1) {
+            assert!(
+                order == &orders[0],
+                "single-node process {index} applied a different certified order"
             );
         }
     }

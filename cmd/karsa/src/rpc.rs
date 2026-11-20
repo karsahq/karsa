@@ -1521,6 +1521,18 @@ pub(crate) fn router(rpc: SharedRpc) -> Router {
         .with_state(rpc)
 }
 
+/// Builds the submission-only surface used while the certified session owns execution.
+///
+/// The certified task feeds this core from client submissions only. It has no state
+/// snapshots, finalizer queue or certified order to answer `/account`, `/tx/{id}` or
+/// `/status` from, so mounting those routes here would report legacy-shaped defaults as
+/// if they were live facts. The transaction is admitted exactly as in the full router and
+/// is authored by the node's certified loop; reads stay unimplemented until certified
+/// execution publishes that state.
+pub(crate) fn submission_router(rpc: SharedRpc) -> Router {
+    Router::new().route("/tx", post(submit)).with_state(rpc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

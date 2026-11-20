@@ -326,7 +326,9 @@ enum Command {
         ///
         /// A nonzero port requires `--execute` and takes batches from submitted
         /// transactions instead of the demo data plane. Authoring then runs until
-        /// the process lifetime ends rather than stopping after `--rounds`.
+        /// the process lifetime ends rather than stopping after `--rounds`. With
+        /// `--agreement-session` the endpoint accepts `POST /tx` only; the legacy
+        /// status, account and finality reads stay unmounted there.
         #[arg(long, default_value_t = 0)]
         rpc_port: u16,
         /// Most mempool transactions one authored batch may carry.
@@ -370,9 +372,12 @@ enum Command {
         round_skip: bool,
         /// Run the certified slot-agreement session instead of the legacy commit loop.
         ///
-        /// Needs `--store`, no archives, and no data-plane payload yet: the session
-        /// orders plain causal vertices and produces certified headers without executing
-        /// transactions. A single validator proves the local path through a certified
+        /// Needs `--store` and no archives. `--txs` stays at 0: with `--execute --rpc-port`
+        /// the data plane is client submissions, and without it the session orders
+        /// zero-payload causal vertices and produces certified headers without executing
+        /// transactions. The certified RPC endpoint accepts `POST /tx` only; it has no
+        /// status, account or finality reads while execution state stays unpublished.
+        /// A single validator proves the local path through a certified
         /// header; a multi-validator mesh exchanges the same evidence and advances with
         /// the causal quorum, not with a legacy commit loop. Duplicate peer receipts are
         /// skipped and durable appends fold only the new event over a verified replay, so

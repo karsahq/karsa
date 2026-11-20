@@ -19,15 +19,17 @@
 //!   into incompatible views;
 //! - a decided slot is applied from the durable transition, then executed and built into
 //!   a header whose shares are dispatched over the existing writer queues;
-//! - with `--execute`, each node authors bounded local demo batches and names them in its
-//!   plain causal vertices. The pump retains those bytes, broadcasts them with the naming
-//!   vertex, and retries them once applied certified ordering requires them, so peers admit
-//!   the payload after they apply the same slot. A peer blocked on another node's batch
-//!   asks for that exact digest, and any holder answers with an ordinary payload frame;
-//!   the request changes who triggers delivery, not the no-acknowledgement contract.
-//!   Without `--execute`, payload hashes stay zero and applied slots order vertices
-//!   without executing transactions;
-//! - no RPC, snapshot, epoch transition, pruning or delivery acknowledgement is wired here.
+//! - with `--execute --rpc-port`, client-signed transactions are the only payload source:
+//!   the node serves `POST /tx`, takes a bounded batch from its mempool on an authoring
+//!   turn, names its digest in a plain causal vertex, and retains the bytes for
+//!   retransmission once applied certified ordering requires them. Peers admit the
+//!   payload after they apply the same slot, and any holder answers an exact
+//!   `PayloadWant`. The request changes who triggers delivery, not the no-acknowledgement
+//!   contract. Without `--rpc-port`, payload hashes stay zero and applied slots order
+//!   vertices without executing transactions;
+//! - no snapshot, epoch transition, pruning or delivery acknowledgement is wired here.
+//!   The certified RPC surface accepts submissions only: execution state, account reads
+//!   and finality status stay unpublished, so the full legacy router is not mounted.
 //!
 //! The single-validator path is proven end to end: plain causal rounds decide whenever a
 //! majority of authors is held, the initial proposal and view bind, durable votes follow,
@@ -36,9 +38,9 @@
 //! verified replay, refused peer receipts are dropped instead of poisoning the owner, and a
 //! single elected publisher owns the shared POL carrier. A bounded three-validator test
 //! certifies the first slots on every node. Without `--execute`, payloads stay zero and
-//! slots order without executing transactions; with `--execute`, nodes author bounded demo
-//! batches and exchange them after certified application, so headers carry real state roots.
-//! Multi-slot progress is not free at this size: the causal DAG
+//! slots order without executing transactions; with `--execute --rpc-port`, a client-signed
+//! transaction submitted over HTTP crosses the same certified path, and every node applies it
+//! after the slot that names it is decided. Multi-slot progress is not free at this size: the causal DAG
 //! requires a quorum of the previous round's authors, and a three-validator set has no
 //! spare author, so every node has to fill every round before the next one is reference
 //! ready. The test therefore proves the first decisions, not sustained slot throughput.
@@ -67,6 +69,7 @@ use super::agreement::output_dispatcher::{self, SharePeer};
 use super::agreement::{pacemaker, session};
 use super::{Config, Link, LinkTask, credited_genesis};
 use crate::chain;
+use crate::rpc::{self, RpcCore};
 
 /// Local maintenance and causal authoring cadence.
 const TICK: Duration = Duration::from_millis(50);
@@ -125,6 +128,11 @@ struct Report {
     pump: PumpSnapshot,
     local_full: u64,
     local_accepted: u64,
+    /// Distinct mempool batches taken from the RPC source.
+    taken_batches: usize,
+    /// Taken batches a receipt confirmed as named by an authored vertex.
+    named_batches: usize,
+    execution_rejected: Vec<(&'static str, usize)>,
     ticks: u64,
     rejections: Vec<(String, usize)>,
     error: Option<String>,
@@ -617,6 +625,7 @@ fn print_report(report: &Report) {
         "  causal:     {} authored, {} imported, {} frames received, {} rejected, {} dropped",
         report.authored, report.imported, report.received, report.rejected, report.dropped
     );
+
     println!(
         "  wire:       {} in, {} out",
         super::human(report.bytes_in),
@@ -662,6 +671,13 @@ fn print_costs(prefix: &str, report: &Report) {
         super::millis(report.progress.replay_read_nanos),
         report.progress.duplicate_receipts
     );
+    println!(
+        "{prefix}rpc:        {} batches taken, {} named by a vertex",
+        report.taken_batches, report.named_batches
+    );
+    for (reason, count) in &report.execution_rejected {
+        println!("{prefix}execution:  {count}x rejected transaction ({reason})");
+    }
     for (reason, count) in &report.rejections {
         println!("{prefix}rejected:   {count}x {reason}");
     }
@@ -701,6 +717,42 @@ async fn certified_node_task(
         commit_root(&[]),
     );
     let epoch_schedule = EpochSchedule::single(epoch);
+    // The certified session is the only execution authority, so the RPC surface here is
+    // submission-only: a client-signed envelope enters the local mempool and the certified
+    // authoring turn names its batch. Reads stay off until certified execution publishes
+    // state, because a full router would answer from legacy defaults it never fills.
+    let rpc = if config.rpc_port > 0 {
+        let target = super::rpc_address(config.rpc_port, index)?;
+        let listener = tokio::net::TcpListener::bind(&target)
+            .await
+            .map_err(|error| format!("node {index} cannot listen for RPC on {target}: {error}"))?;
+        let shared = Arc::new(Mutex::new(RpcCore::new(
+            index,
+            chain_id.clone(),
+            &committee.accounts,
+            &genesis,
+            total,
+        )));
+        shared
+            .lock()
+            .expect("rpc lock poisoned")
+            .note_state(0, &genesis_state);
+        let mut rpc_shutdown = shutdown.clone();
+        let app = rpc::submission_router(Arc::clone(&shared));
+        tokio::spawn(async move {
+            let served = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rpc_shutdown.changed().await;
+                })
+                .await;
+            if let Err(error) = served {
+                eprintln!("certified node {index} RPC server stopped: {error}");
+            }
+        });
+        Some(shared)
+    } else {
+        None
+    };
     if store
         .has_authenticated_slot_agreement()
         .map_err(|error| error.to_string())?
@@ -734,9 +786,9 @@ async fn certified_node_task(
     // A live set must not drift into different views on independent timers: a grace
     // deadline signs one advisory next-view request, and only a quorum certificate enters.
     owner.require_certificate_view_change();
-    // A one-account genesis cannot author a transfer batch, and a run without `--execute`
-    // keeps the order-only zero-payload path.
-    let authored_payloads = config.execute && committee.accounts.len() >= 2;
+    // A run without an RPC source keeps the order-only zero-payload path: payload hashes
+    // stay zero and applied slots order vertices without executing transactions.
+    let authored_payloads = config.execute && config.rpc_port > 0;
     let (mut pump, mut channels) = EventPump::new(
         owner,
         committee.clone(),
@@ -920,7 +972,13 @@ async fn certified_node_task(
     let mut local_full = 0u64;
     let mut local_accepted = 0u64;
     let mut ticks = 0u64;
-    let mut batch_round: u64 = 0;
+    // The batch taken from the mempool stays here until a naming vertex actually appears in
+    // a receipt. Authoring can legitimately decline a free local round, and a taken batch is
+    // already marked as batched in the mempool, so dropping it on send would strand the
+    // client's transactions in a state the loop cannot see.
+    let mut held_batch: Option<tx::batch::Batch> = None;
+    let mut taken_batches = 0usize;
+    let mut named_batches = 0usize;
     let mut rejections: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
 
@@ -992,43 +1050,38 @@ async fn certified_node_task(
                 // because each turn is one or the other and imports arrive between them.
                 if author_turn {
                     author_turn = false;
-                    // With --execute the vertex names a real local demo batch. The pump
-                    // retains it, publishes it with the vertex, and retries it once applied
-                    // certified ordering requires the bytes; peers admit it after they
-                    // apply the same slot. Batch authoring failure falls back to a zero
-                    // payload rather than stopping the node.
-                    let event = if authored_payloads {
-                        match chain::demo_batch(
-                            &chain_id,
-                            &committee.accounts,
-                            index,
-                            batch_round,
-                            1,
-                        ) {
-                            Ok(batch) => LocalEvent::AuthorCausalBatch {
+                    // Client-signed transactions are the only payload source. The batch is
+                    // taken once and retried here until a naming vertex is observed, so a
+                    // declined local round does not lose the transaction or reorder it.
+                    let pending = match held_batch.clone() {
+                        Some(batch) => Some(batch),
+                        None => rpc.as_ref().and_then(|rpc| {
+                            let batch = rpc
+                                .lock()
+                                .expect("rpc lock poisoned")
+                                .take_batch(config.rpc_batch_max);
+                            if batch.is_some() {
+                                taken_batches = taken_batches.saturating_add(1);
+                            }
+                            batch
+                        }),
+                    };
+                    let event = match pending {
+                        Some(batch) => {
+                            held_batch = Some(batch.clone());
+                            LocalEvent::AuthorCausalBatch {
                                 vertices: Vec::new(),
                                 batch,
-                            },
-                            Err(error) => {
-                                *rejections
-                                    .entry(format!("batch authoring failed: {error}"))
-                                    .or_insert(0) += 1;
-                                LocalEvent::AuthorCausal {
-                                    payload_hash: [0u8; 32],
-                                    vertices: Vec::new(),
-                                }
                             }
                         }
-                    } else {
-                        LocalEvent::AuthorCausal {
+                        None => LocalEvent::AuthorCausal {
                             payload_hash: [0u8; 32],
                             vertices: Vec::new(),
-                        }
+                        },
                     };
                     match channels.local.try_send(event) {
                         Ok(()) => {
                             local_accepted = local_accepted.saturating_add(1);
-                            batch_round = batch_round.saturating_add(1);
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => break,
                         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -1109,6 +1162,20 @@ async fn certified_node_task(
                         authored = authored.saturating_add(1);
                     }
                 }
+                // Only a naming vertex clears the held batch. A peer frame or a maintenance
+                // turn can produce a receipt too, so the check is the payload digest on the
+                // vertex itself, not the receipt order.
+                let named = held_batch.as_ref().is_some_and(|batch| {
+                    batch.digest().is_ok_and(|digest| {
+                        receipt.local.carriers.iter().any(
+                            |message| matches!(message, Message::Vertex(vertex) if vertex.payload_hash == digest),
+                        )
+                    })
+                });
+                if named {
+                    held_batch = None;
+                    named_batches = named_batches.saturating_add(1);
+                }
                 for _ in &receipt.failed_peers {
                     dropped = dropped.saturating_add(1);
                 }
@@ -1141,6 +1208,9 @@ async fn certified_node_task(
         pump,
         local_full,
         local_accepted,
+        taken_batches,
+        named_batches,
+        execution_rejected: Vec::new(),
         ticks,
         rejections: rejections.into_iter().collect(),
         error: None,
@@ -1161,6 +1231,13 @@ async fn certified_node_task(
                     report.order_root = owner.finalization().execution().order_root();
                     report.order = owner.finalization().execution().applied_order().to_vec();
                     report.headers = owner.finalization().built_headers().clone();
+                    report.execution_rejected = owner
+                        .finalization()
+                        .execution()
+                        .rejected()
+                        .iter()
+                        .map(|(reason, count)| (*reason, *count))
+                        .collect();
                     report.blocked = owner.finalization().execution().blocked().map(
                         |(round, author, payload, id_matches)| {
                             let author = committee
