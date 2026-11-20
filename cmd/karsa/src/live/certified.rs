@@ -132,6 +132,8 @@ struct Report {
     taken_batches: usize,
     /// Taken batches a receipt confirmed as named by an authored vertex.
     named_batches: usize,
+    /// Round of the vertex that named the last taken batch, if one was named.
+    named_round: Option<u64>,
     /// Standalone causal vertices received from peers.
     vertex_frames: usize,
     /// Vertices received inside authenticated carrier exports.
@@ -695,21 +697,26 @@ fn print_costs(prefix: &str, report: &Report) {
         held
     };
     println!(
-        "{prefix}availability: {} vertices held (round:authors {held}), {} empty rounds {:?}, next authoring round {} references {}/{} previous-round authors",
+        "{prefix}availability: {} vertices held (round:authors {held}), {} empty rounds {:?}, next authoring round {} references {}/{} previous-round authors, next decision round {}",
         report.progress.held_vertices,
         report.progress.empty_rounds,
         report.progress.first_empty_rounds,
         report.progress.own_hole,
         report.progress.write_round_authors,
-        report.progress.write_round_quorum
+        report.progress.write_round_quorum,
+        report.progress.next_round
     );
     println!(
         "{prefix}imports:     {} vertex frames, {} carrier vertices, {} queued distinct, {} drive turns",
         report.vertex_frames, report.carrier_vertices, report.queued_vertices, report.drive_turns
     );
     println!(
-        "{prefix}rpc:        {} batches taken, {} named by a vertex",
-        report.taken_batches, report.named_batches
+        "{prefix}rpc:        {} batches taken, {} named by a vertex at round {}",
+        report.taken_batches,
+        report.named_batches,
+        report
+            .named_round
+            .map_or_else(|| String::from("none"), |round| round.to_string())
     );
     for (reason, count) in &report.execution_rejected {
         println!("{prefix}execution:  {count}x rejected transaction ({reason})");
@@ -1019,6 +1026,7 @@ async fn certified_node_task(
     let mut held_batch: Option<tx::batch::Batch> = None;
     let mut taken_batches = 0usize;
     let mut named_batches = 0usize;
+    let mut named_round: Option<u64> = None;
     let mut rejections: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
 
@@ -1220,6 +1228,17 @@ async fn certified_node_task(
                     })
                 });
                 if named {
+                    // Evidence for the frontier question: the round a payload entered the
+                    // causal DAG has to be below a leader a slot can still decide.
+                    let digest = held_batch.as_ref().and_then(|batch| batch.digest().ok());
+                    named_round = receipt.local.carriers.iter().find_map(|message| match message {
+                        Message::Vertex(vertex)
+                            if digest.is_some_and(|digest| vertex.payload_hash == digest) =>
+                        {
+                            Some(vertex.round)
+                        }
+                        _ => None,
+                    });
                     held_batch = None;
                     named_batches = named_batches.saturating_add(1);
                 }
@@ -1257,6 +1276,7 @@ async fn certified_node_task(
         local_accepted,
         taken_batches,
         named_batches,
+        named_round,
         vertex_frames,
         carrier_vertices,
         queued_vertices,
