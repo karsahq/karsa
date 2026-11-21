@@ -39,6 +39,15 @@ pub struct AuthoringRequest {
 /// Canonical bytes admitted by one trusted causal import, excluding decoded allocations.
 const MAX_CAUSAL_BYTES: usize = 2 * 1024 * 1024;
 
+/// Protocol rounds a plain availability vertex may sit above the durable next decision round.
+///
+/// Availability runs on every authoring tick, carriers only when a phase is selectable. A
+/// frontier that outruns the carriers by hundreds of rounds names payloads no leader can
+/// still reach, and it publishes the same vertices to every peer over and over. The lead
+/// has to absorb one slot of phase rounds so a node whose carriers arrive late can still
+/// fill the rounds those carriers need; it is a ceiling, not a target.
+const AVAILABILITY_LEAD: u64 = 4;
+
 // Mirrors Vertex::encode: version(2), epoch/round(16), reference count(4),
 // payload hash field(36), and chain/author/signature length prefixes(12).
 // Each reference adds round(8), author prefix(4), and digest field(36).
@@ -610,10 +619,25 @@ impl JournaledFinalization {
                 "Node differs from pinned agreement identity, chain, epoch, set or key".into(),
             );
         }
-        // Fill the earliest local gap, not merely the frontier: a node that learns peers'
-        // round-zero vertices before its first turn must still author its own, or it waits
-        // forever for a quorum it can no longer join.
-        let round = next_local_round(local.node.dag(), local.node.id());
+        // Plain availability fills holes up to the carrier frontier plus the protocol lead
+        // and stops there; the carriers move the frontier. A payload is exempt and stands at
+        // the next round above the frontier, because anything below is already referenced
+        // without it and would never be an ancestor of a leader.
+        let frontier = local.node.dag().highest_round();
+        let round = if payload_hash == [0u8; 32] {
+            let round = next_local_round(local.node.dag(), local.node.id());
+            let lead = output
+                .binding
+                .tip()
+                .next_round()
+                .saturating_add(AVAILABILITY_LEAD);
+            if round > self.adapter.carrier_frontier().max(lead) {
+                return Ok(Vec::new());
+            }
+            round
+        } else {
+            frontier.map_or(0, |highest| highest.saturating_add(1))
+        };
         // Re-setting the round is deliberate: the durable obligation path moves the
         // Node to a carrier round between turns, and the next free round is what the
         // reference rule accepts, not whatever the last carrier used.

@@ -134,6 +134,13 @@ pub struct Adapter {
     last_aggregate_error: Option<String>,
     // Peer receipts skipped because the exact observation is already a durable no-op.
     duplicate_receipts: u64,
+    // Highest round a durable carrier reached locally or was received.
+    //
+    // Plain causal availability publishes on every authoring tick. Left unbounded it runs
+    // hundreds of rounds ahead of the carriers, and a payload named at that tip is not an
+    // ancestor of any leader a slot can still decide. Availability may fill up to this
+    // round and the protocol lead above it; the carriers themselves move it.
+    carrier_frontier: u64,
 }
 
 /// End-of-run durable counters for the current slot and view.
@@ -1185,8 +1192,15 @@ impl Adapter {
                         )
                     })
                     .collect();
+                // Held is not the same as reachable: a carrier's cone is built from the held
+                // vertices of the previous round, so a prerequisite deep below the frontier
+                // is present and still outside the cone. Comparing the prerequisite rounds
+                // with the frontier is what separates a transport gap from that orphaning.
+                let frontier = node.dag().highest_round().unwrap_or(0);
+                let prerequisite_rounds: Vec<u64> =
+                    prerequisites.iter().map(|carrier| carrier.round).collect();
                 self.last_aggregate_error = Some(format!(
-                    "{label} carrier unavailable ({error}): missing {}/{} prerequisites at rounds {rounds:?} {details:?}",
+                    "{label} carrier unavailable ({error}): missing {}/{} prerequisites at rounds {rounds:?} {details:?}; frontier {frontier}, prerequisite rounds {prerequisite_rounds:?}",
                     missing.len(),
                     prerequisites.len()
                 ));
@@ -1738,6 +1752,9 @@ impl Adapter {
         reservation_sequence: u64,
         signed: validator::Vertex,
     ) -> Result<AuthoredCarrier, String> {
+        // The authored carrier is the highest round this node can justify retaining; the
+        // causal path may fill up to it, not past it.
+        self.carrier_frontier = self.carrier_frontier.max(signed.round);
         let result = (|| {
             let id = signed.id().map_err(|e| e.to_string())?;
             if let Some(publication) = self
@@ -1955,6 +1972,7 @@ impl Adapter {
             view_change: ViewChange::LocalAdvance,
             last_aggregate_error: None,
             duplicate_receipts: 0,
+            carrier_frontier: 0,
             readiness: Readiness::DisabledMissingCausalReadinessAndTransport,
         })
     }
@@ -1989,9 +2007,15 @@ impl Adapter {
             view_change: ViewChange::LocalAdvance,
             last_aggregate_error: None,
             duplicate_receipts: 0,
+            carrier_frontier: 0,
             readiness: Readiness::RecoveryRequiredHistoricalIntentsUnavailable,
         };
         let output = adapter.driver.output();
+        // A recovered checkpoint may name a predecessor carrier; availability has to start
+        // below it or the first carrier would be placed under an already-published round.
+        if let Ok(output) = &output {
+            adapter.carrier_frontier = output.binding.carrier().map_or(0, |carrier| carrier.round);
+        }
         adapter.consume_durable_result(output, None)?;
         Ok(adapter)
     }
@@ -2010,6 +2034,14 @@ impl Adapter {
     /// Retained across later observations; reading never signs or releases anything.
     pub fn pending(&self) -> &[PendingIntent] {
         &self.pending
+    }
+
+    /// Highest round a durable carrier reached locally or was received.
+    ///
+    /// Diagnostics and local round planning only: it grants no ordering, voting or
+    /// publication authority, and a peer may hold a carrier this node has not seen yet.
+    pub fn carrier_frontier(&self) -> u64 {
+        self.carrier_frontier
     }
 
     /// Dispatches a decoded agreement message through the pinned authenticated session.
@@ -2031,6 +2063,9 @@ impl Adapter {
             Message::AgreementCarrier { envelope, vertices } => {
                 let envelope = CarrierEnvelope::decode(&envelope, &self.set)
                     .map_err(|error| error.to_string())?;
+                // A received carrier is evidence that its round exists; availability may
+                // fill up to it so the carrier's own round keeps a reference quorum.
+                self.carrier_frontier = self.carrier_frontier.max(envelope.carrier().round);
                 self.receive_envelope(envelope, vertices)
             }
             Message::AgreementViewRequest(bytes) => {
