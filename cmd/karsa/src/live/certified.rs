@@ -134,6 +134,8 @@ struct Report {
     named_batches: usize,
     /// Round of the vertex that named the last taken batch, if one was named.
     named_round: Option<u64>,
+    /// Decision round when that naming vertex was authored, if it was observed here.
+    named_decision_round: Option<u64>,
     /// Standalone causal vertices received from peers.
     vertex_frames: usize,
     /// Vertices received inside authenticated carrier exports.
@@ -697,26 +699,31 @@ fn print_costs(prefix: &str, report: &Report) {
         held
     };
     println!(
-        "{prefix}availability: {} vertices held (round:authors {held}), {} empty rounds {:?}, next authoring round {} references {}/{} previous-round authors, next decision round {}",
+        "{prefix}availability: {} vertices held (round:authors {held}), {} empty rounds {:?}, next authoring round {} references {}/{} previous-round authors, next decision round {}, causal round {}, carrier frontier {}",
         report.progress.held_vertices,
         report.progress.empty_rounds,
         report.progress.first_empty_rounds,
         report.progress.own_hole,
         report.progress.write_round_authors,
         report.progress.write_round_quorum,
-        report.progress.next_round
+        report.progress.next_round,
+        report.progress.local_round,
+        report.progress.carrier_frontier
     );
     println!(
         "{prefix}imports:     {} vertex frames, {} carrier vertices, {} queued distinct, {} drive turns",
         report.vertex_frames, report.carrier_vertices, report.queued_vertices, report.drive_turns
     );
     println!(
-        "{prefix}rpc:        {} batches taken, {} named by a vertex at round {}",
+        "{prefix}rpc:        {} batches taken, {} named by a vertex at round {}, next decision round {}",
         report.taken_batches,
         report.named_batches,
         report
             .named_round
-            .map_or_else(|| String::from("none"), |round| round.to_string())
+            .map_or_else(|| String::from("none"), |round| round.to_string()),
+        report
+            .named_decision_round
+            .map_or_else(|| String::from("-"), |round| round.to_string())
     );
     for (reason, count) in &report.execution_rejected {
         println!("{prefix}execution:  {count}x rejected transaction ({reason})");
@@ -1027,6 +1034,7 @@ async fn certified_node_task(
     let mut taken_batches = 0usize;
     let mut named_batches = 0usize;
     let mut named_round: Option<u64> = None;
+    let mut named_decision_round: Option<u64> = None;
     let mut rejections: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
 
@@ -1229,7 +1237,9 @@ async fn certified_node_task(
                 });
                 if named {
                     // Evidence for the frontier question: the round a payload entered the
-                    // causal DAG has to be below a leader a slot can still decide.
+                    // causal DAG has to be below a leader a slot can still decide, and the
+                    // decision round at that moment measures how many decisions ordering
+                    // still needs before the naming vertex can be committed.
                     let digest = held_batch.as_ref().and_then(|batch| batch.digest().ok());
                     named_round = receipt.local.carriers.iter().find_map(|message| match message {
                         Message::Vertex(vertex)
@@ -1239,6 +1249,8 @@ async fn certified_node_task(
                         }
                         _ => None,
                     });
+                    named_decision_round =
+                        receipt.local.payload_naming.map(|(_, decision)| decision);
                     held_batch = None;
                     named_batches = named_batches.saturating_add(1);
                 }
@@ -1277,6 +1289,7 @@ async fn certified_node_task(
         taken_batches,
         named_batches,
         named_round,
+        named_decision_round,
         vertex_frames,
         carrier_vertices,
         queued_vertices,

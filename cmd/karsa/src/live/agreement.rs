@@ -199,6 +199,8 @@ pub struct AgreementProgress {
     pub first_unready_self: Option<bool>,
     /// Highest causal round retained by the owned Node; zero when empty or absent.
     pub local_round: u64,
+    /// Highest round a durable carrier reached locally or was received.
+    pub carrier_frontier: u64,
     /// Earliest causal round this node has not authored; zero when empty or absent.
     pub own_hole: u64,
     /// Durable requests installed by this owner; the full replay size per read.

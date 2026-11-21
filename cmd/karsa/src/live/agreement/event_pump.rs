@@ -80,6 +80,9 @@ pub struct PumpOutput {
     pub carriers: Vec<Message>,
     /// Volatile shares and certificates; grants no pruning or store-publication authority.
     pub build: Build,
+    /// Round of a payload vertex this local turn authored, with the decision round it was
+    /// signed at. Diagnostics only: ordering decides when it is committed.
+    pub payload_naming: Option<(u64, u64)>,
     /// Processing error; fatal ownership errors also terminate `run`.
     pub error: Option<String>,
 }
@@ -792,10 +795,17 @@ impl EventPump {
                     // Locally authored carriers are authenticated by the owner itself; their
                     // exact payload digests are agreement evidence, never batches.
                     self.record_agreement_controls(&carriers);
+                    // Only a local turn can author a naming vertex; a frame turn carries no
+                    // naming record and must not consume one.
+                    let payload_naming = match kind {
+                        PumpKind::Local => self.owner.take_payload_naming(),
+                        PumpKind::Frame | PumpKind::Scheduled => None,
+                    };
                     (
                         PumpOutput {
                             carriers,
                             build,
+                            payload_naming,
                             error: None,
                         },
                         None,
@@ -807,6 +817,7 @@ impl EventPump {
                         PumpOutput {
                             carriers: Vec::new(),
                             build: Build::default(),
+                            payload_naming: None,
                             error: Some(error),
                         },
                         fatal,

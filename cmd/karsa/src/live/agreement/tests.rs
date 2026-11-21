@@ -8128,6 +8128,7 @@ async fn exercise_dispatcher_false_updates(share: validator::Share) {
             local: PumpOutput {
                 carriers: Vec::new(),
                 build: validator::Build::default(),
+                payload_naming: None,
                 error: Some("saturated result".into()),
             },
             failed_peers: vec![],
@@ -8142,6 +8143,7 @@ async fn exercise_dispatcher_false_updates(share: validator::Share) {
                 shares: vec![share],
                 certified: vec![],
             },
+            payload_naming: None,
             error: None,
         })
         .await
@@ -8409,6 +8411,7 @@ fn exercise_share_mesh(
                             shares: vec![shares[index].clone()],
                             certified: vec![],
                         },
+                        payload_naming: None,
                         error: None,
                     })
                     .await
@@ -8473,6 +8476,7 @@ fn exercise_share_mesh(
                         shares: vec![shares[0].clone()],
                         certified: vec![],
                     },
+                    payload_naming: None,
                     error: None,
                 })
                 .await
@@ -8509,6 +8513,7 @@ fn exercise_share_mesh(
                         shares: vec![shares[0].clone()],
                         certified: vec![],
                     },
+                    payload_naming: None,
                     error: None,
                 })
                 .await

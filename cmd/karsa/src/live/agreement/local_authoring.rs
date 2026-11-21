@@ -331,6 +331,7 @@ impl JournaledFinalization {
             .map_err(|error| error.to_string())?;
         let dag = local.node.dag();
         progress.local_round = dag.highest_round().unwrap_or(0);
+        progress.carrier_frontier = self.adapter.carrier_frontier();
         progress.own_hole = next_local_round(dag, local.node.id());
         // Availability accounting, diagnostics only. A plain causal round can only be signed
         // once the node holds a quorum of the previous round's authors, so the per-round held
@@ -649,6 +650,11 @@ impl JournaledFinalization {
         else {
             return Ok(Vec::new());
         };
+        if payload_hash != [0u8; 32] {
+            // A naming vertex is committed by the leader one round above it, so the decision
+            // round at signing time is the distance ordering still has to cover.
+            self.payload_naming = Some((vertex.round, output.binding.tip().next_round()));
+        }
         Ok(vec![Message::Vertex(vertex)])
     }
 

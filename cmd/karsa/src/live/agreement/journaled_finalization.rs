@@ -32,6 +32,10 @@ pub struct JournaledFinalization {
     failed: bool,
     // Latest elected view step that produced no carrier; diagnostics only.
     last_view_error: Option<String>,
+    // Round of the last authored payload vertex and the decision round when it was
+    // signed; diagnostics only. A naming vertex is committed only by the leader of a
+    // later round, so the gap is the decisions that ordering still needs.
+    payload_naming: Option<(u64, u64)>,
 }
 
 impl JournaledFinalization {
@@ -80,6 +84,7 @@ impl JournaledFinalization {
             outbox: Build::default(),
             failed: false,
             last_view_error: None,
+            payload_naming: None,
         })
     }
 
@@ -239,6 +244,14 @@ impl JournaledFinalization {
     /// Read-only execution and finalizer diagnostics; mutation cannot bypass reservation.
     pub fn finalization(&self) -> &CertifiedFinalization {
         &self.coordinator
+    }
+
+    /// Round of the last authored payload vertex and the decision round it was signed at.
+    ///
+    /// Consumed by the caller once per local turn and never used for ordering, voting or
+    /// publication; it only measures how far the naming round sits above the decision tip.
+    pub fn take_payload_naming(&mut self) -> Option<(u64, u64)> {
+        self.payload_naming.take()
     }
 
     fn persist_share(&mut self, share: &Share) -> Result<Share, String> {
